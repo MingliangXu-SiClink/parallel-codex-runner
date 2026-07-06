@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallel-codex-runner"
+version = "0.1.0"
+description = "Run multiple isolated Codex agents in parallel and sync back the selected result."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+pretty = [
+    "loguru",
+    "rich",
+    "tqdm",
+]
+
+[project.scripts]
+pcr = "parallel_codex_runner:main"
+
+[tool.setuptools]
+py-modules = ["parallel_codex_runner"]
