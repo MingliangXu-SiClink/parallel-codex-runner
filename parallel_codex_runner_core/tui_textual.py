@@ -13,6 +13,7 @@ from typing import Any
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show commands"),
+    ("/status", "show current run state"),
     ("/numofagents", "show current agent count"),
     ("/numofagents 8", "set agent count"),
     ("/resume", "show resumable Codex sessions"),
@@ -123,6 +124,7 @@ else:
     HELP_TEXT = """
 Commands:
   /help                 show this help
+  /status               show current run state
   /numofagents          show current agent count
   /numofagents <n>      set agent count for the next run
   /resume               show recent sessions
@@ -350,9 +352,13 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.running = False
                 self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
                 self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
+                if self.best_agent and self.best_agent in self.agents:
+                    self.selected_agent = self.best_agent
+                    self.agents[self.best_agent].append(self._run_result_text(payload))
             elif kind == "run_failed":
                 self.running = False
                 self.status = f"Run failed: {payload.get('message') or ''}"
+                self.agents[self.selected_agent].append(self.status)
             self._sync()
 
         def action_clear_view(self) -> None:
@@ -383,6 +389,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 return
             if name == "/help":
                 self._show_text(HELP_TEXT)
+                return
+            if name == "/status":
+                self._show_status()
                 return
             if name == "/clear":
                 self.action_clear_view()
@@ -459,6 +468,19 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 lines.append(f"{index}. {session.session_id}  {session.title[:80]}")
             self.status = "Choose a resume session" if len(lines) > 3 else "No resumable sessions found"
             self._show_text("\n".join(lines) if len(lines) > 3 else "No resumable sessions found")
+
+        def _show_status(self) -> None:
+            self._show_text(self._tree_text())
+
+        def _run_result_text(self, payload: dict[str, Any]) -> str:
+            lines = [
+                "Run result:",
+                f"best agent: agent_{self.best_agent:03d}" if self.best_agent else "best agent: -",
+                f"synced: {'yes' if payload.get('synced') else 'no'}",
+            ]
+            if payload.get("run_root"):
+                lines.append(f"run root: {payload['run_root']}")
+            return "\n".join(lines)
 
         def _start_run(self, prompt: str) -> None:
             if self.running:
