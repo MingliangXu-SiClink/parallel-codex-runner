@@ -115,7 +115,7 @@ except ModuleNotFoundError as exc:
     _TEXTUAL_IMPORT_ERROR = exc
 
     def run_textual_tui(_args: argparse.Namespace, _exc: ModuleNotFoundError = _TEXTUAL_IMPORT_ERROR) -> int:
-        raise SystemExit("交互式 TUI 需要 textual：python3 -m pip install 'parallel-codex-runner[tui]'") from _exc
+        raise SystemExit("交互式 TUI 需要 textual：请运行 python3 -m pip install -e . 重新安装本项目依赖。") from _exc
 
 else:
     from .app import list_resume_sessions, run_once
@@ -133,6 +133,7 @@ Commands:
   /exit                 quit
 
 Enter any non-command text to run PCR. Left/right switches agent panes.
+Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 """.strip()
 
 
@@ -170,11 +171,21 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
 
 
     class PromptEditor(TextArea):
+        def action_copy(self) -> None:
+            action = getattr(self.app, "action_interrupt_or_exit", None)
+            if callable(action):
+                action()
+
         async def _on_key(self, event: events.Key) -> None:
             if event.key == "enter":
                 event.stop()
                 event.prevent_default()
                 self.post_message(PromptSubmitted(self.text))
+                return
+            if event.key == "ctrl+c":
+                event.stop()
+                event.prevent_default()
+                self.action_copy()
                 return
             if event.key in {"left", "right"} and not self.text.strip():
                 event.stop()
@@ -229,7 +240,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
         #prompt {
             height: 3;
             min-height: 3;
-            max-height: 10;
+            max-height: 20;
             margin: 0 1;
             padding: 0 1;
             border: round #4c5f74;
@@ -247,7 +258,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
         """
 
         BINDINGS = [
-            ("ctrl+q", "quit", "Quit"),
+            ("ctrl+c", "interrupt_or_exit", "Exit"),
             ("ctrl+l", "clear_view", "Clear"),
         ]
 
@@ -265,6 +276,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.best_agent: int | None = None
             self.started_at: float | None = None
             self.prompt_height = 3
+            self.work_frame = 0
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
@@ -337,7 +349,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             elif kind == "run_finished":
                 self.running = False
                 self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
-                self.status = "Finished" if payload.get("success") else "No successful agent"
+                self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
             elif kind == "run_failed":
                 self.running = False
                 self.status = f"Run failed: {payload.get('message') or ''}"
@@ -351,6 +363,16 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.best_agent = None
             self.status = "Ready"
             self._sync()
+
+        def action_interrupt_or_exit(self) -> None:
+            prompt = self.query_one("#prompt", PromptEditor)
+            if prompt.text.strip():
+                prompt.clear()
+                self._update_suggestions("")
+                self._sync_prompt_height()
+                prompt.focus()
+            else:
+                self.exit()
 
         def _handle_command(self, raw: str) -> None:
             parts = raw.split()
@@ -494,7 +516,9 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
 
         def _tick(self) -> None:
             if self.running and self.started_at is not None:
-                self.status = f"Running {int(time.monotonic() - self.started_at)}s"
+                self.work_frame += 1
+                pulses = ("▰▱▱", "▰▰▱", "▰▰▰", "▱▰▰", "▱▱▰", "▱▱▱")
+                self.status = f"Working {int(time.monotonic() - self.started_at)}s {pulses[self.work_frame % len(pulses)]}"
                 self._sync()
 
         def _sync(self) -> None:
@@ -512,7 +536,8 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             execution = "serial" if max_parallel == 1 else "parallel"
             lines = [
                 f"workspace: {self.workspace}",
-                f"status: {self.status}",
+                f"conversation: {self.status}",
+                f"agents: {self._agent_summary()}",
                 f"num agents: {self.num_agents}",
                 f"max parallel: {max_parallel}",
                 f"execution: {execution}",
@@ -539,7 +564,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             return f"Agent detail (agent_{pane.idx:03d}, {pane.status}, rtok={rtok}{best}; left/right to switch)"
 
         def _state_text(self) -> str:
-            return f"{self.status} | left/right: switch agent | /help"
+            return f"{self.status} | {self._agent_summary()} | Ctrl-C clear/exit | left/right switch"
 
         def _update_suggestions(self, value: str) -> None:
             self.query_one("#suggestions", Static).update("\n".join(command_suggestions(value)))
@@ -560,10 +585,16 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
                 text = self.query_one("#prompt", PromptEditor).text
                 width = self._prompt_content_width()
                 visible_lines = sum(max(1, (len(line) + width - 1) // width) for line in (text or "").split("\n"))
-                self.prompt_height = max(3, min(10, visible_lines + 2))
+                self.prompt_height = max(3, min(20, visible_lines + 2))
                 self.query_one("#prompt", PromptEditor).styles.height = self.prompt_height
             except Exception:
                 return
+
+        def _agent_summary(self) -> str:
+            counts: dict[str, int] = {}
+            for pane in self.agents.values():
+                counts[pane.status] = counts.get(pane.status, 0) + 1
+            return " ".join(f"{status}={count}" for status, count in sorted(counts.items()))
 
 
     def run_textual_tui(args: argparse.Namespace) -> int:

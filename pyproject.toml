@@ -15,10 +15,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tui = [
-    "rich",
-    "textual>=0.60",
-]
 pretty = [
     "loguru",
     "rich",
