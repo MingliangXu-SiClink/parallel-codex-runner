@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence, Set
 from .paths import is_relative_to
 
 
-EXCLUDE_NAMES: Set[str] = {".codex_parallel_runs", ".codex_parallel_meta"}
+EXCLUDE_NAMES: Set[str] = {".codex_parallel_runs", ".codex_parallel_meta", ".git"}
 SYNC_EXCLUDE_NAMES: Set[str] = EXCLUDE_NAMES | {".git"}
 
 
@@ -104,6 +104,19 @@ def prune_git_worktrees(original_workspace: Path) -> None:
     )
 
 
+def ensure_removed(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise OSError(f"failed to remove path: {path}")
+
+
+def remove_tree_checked(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+    ensure_removed(path)
+
+
 def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> None:
     if not workspace_copy.exists() and not workspace_copy.is_symlink():
         return
@@ -116,8 +129,9 @@ def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> No
             check=False,
         )
         if result.returncode == 0:
+            ensure_removed(workspace_copy)
             return
-    shutil.rmtree(workspace_copy, ignore_errors=True)
+    remove_tree_checked(workspace_copy)
     prune_git_worktrees(original_workspace)
 
 
@@ -131,7 +145,7 @@ def cleanup_workspace_copies(original_workspace: Path, workspaces_root: Path) ->
     if workspaces_root.exists():
         for child in workspaces_root.iterdir():
             cleanup_workspace_copy(original_workspace, child)
-        shutil.rmtree(workspaces_root, ignore_errors=True)
+        remove_tree_checked(workspaces_root)
     prune_git_worktrees(original_workspace)
 
 

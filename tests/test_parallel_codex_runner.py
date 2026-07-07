@@ -13,6 +13,7 @@ from pathlib import Path
 
 import parallel_codex_runner_core.tui_textual as tui_textual
 import parallel_codex_runner_core.app as app_core
+import parallel_codex_runner_core.workspace as workspace_core
 from parallel_codex_runner import (
     AgentResult,
     AgentState,
@@ -149,6 +150,35 @@ class WorkspaceCopyTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotIn(str(dst), result.stdout)
+
+    def test_plain_workspace_copy_excludes_git_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            dst = root / "runs" / "workspaces" / "agent_001"
+            workspace.mkdir()
+            (workspace / ".git").mkdir()
+            (workspace / ".git" / "config").write_text("private git data", encoding="utf-8")
+            (workspace / "file.txt").write_text("content", encoding="utf-8")
+
+            with mock.patch.object(workspace_core, "copy_workspace_with_git_worktree", return_value=False):
+                copy_workspace(workspace, dst, root / "runs")
+
+            self.assertEqual((dst / "file.txt").read_text(encoding="utf-8"), "content")
+            self.assertFalse((dst / ".git").exists())
+
+    def test_cleanup_workspace_copy_raises_when_delete_leaves_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace_copy = root / "agent_001"
+            workspace.mkdir()
+            workspace_copy.mkdir()
+            (workspace_copy / "file.txt").write_text("content", encoding="utf-8")
+
+            with mock.patch.object(workspace_core.shutil, "rmtree", return_value=None):
+                with self.assertRaises(OSError):
+                    cleanup_workspace_copy(workspace, workspace_copy)
 
 
 class RunRootTests(unittest.TestCase):
@@ -438,6 +468,54 @@ class TuiCommandTests(unittest.TestCase):
         finalize.assert_not_called()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_clear_finalizes_pending_without_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            candidate = root / "run" / "workspaces" / "agent_002"
+            workspace.mkdir()
+            candidate.mkdir(parents=True)
+            args = parse_args([])
+            args.workspace = str(workspace)
+            app = tui_textual.PcrTextualApp(args)
+            app._sync = lambda: None
+            app.pending_workspaces_root = root / "run" / "workspaces"
+            app.best_agent = 2
+            app.selected_agent = 2
+            app.resume_session_id = "old-session"
+            app.agents[2].result = {
+                "idx": 2,
+                "workspace_dir": str(candidate),
+                "meta_dir": "",
+                "codex_home": "",
+                "stdout_log": "",
+                "stderr_log": "",
+                "final_message": "",
+                "command": [],
+                "returncode": 0,
+                "status": "success",
+                "seconds": 1.0,
+                "codex_thread_id": "session-2",
+                "reasoning_tokens": 10,
+                "reasoning_token_values": [10],
+                "error": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+            with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
+                with mock.patch.object(tui_textual, "sync_best_workspace_back") as sync_back:
+                    with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
+                        promote.side_effect = lambda result, _workspace: result
+                        app._handle_resume(["clear"])
+
+            self.assertEqual(app.resume_session_id, "")
+            self.assertFalse(app._has_pending_run())
+            self.assertEqual(app.status, "Resume cleared")
+            sync_back.assert_called_once_with(candidate, workspace.resolve())
+            cleanup.assert_called_once_with(workspace.resolve(), root / "run" / "workspaces")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_archives_selected_detail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -502,6 +580,44 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_left_right_switches_agent_once(self) -> None:
+        async def run() -> None:
+            args = parse_args(["-n", "5"])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test() as pilot:
+                app.query_one("#prompt").focus()
+                await pilot.pause()
+                await pilot.press("right")
+
+                self.assertEqual(app.selected_agent, 2)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_left_right_moves_cursor_once_when_text_exists(self) -> None:
+        async def run() -> None:
+            args = parse_args(["-n", "5"])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test() as pilot:
+                prompt = app.query_one("#prompt")
+                prompt.focus()
+                await pilot.press("a")
+                await pilot.press("b")
+                await pilot.press("c")
+                await pilot.pause()
+
+                self.assertEqual(prompt.cursor_location, (0, 3))
+                await pilot.press("left")
+                await pilot.pause()
+                self.assertEqual(prompt.cursor_location, (0, 2))
+                await pilot.press("right")
+                await pilot.pause()
+                self.assertEqual(prompt.cursor_location, (0, 3))
+                self.assertEqual(app.selected_agent, 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_detail_frame_title_stays_outside_scroll_body(self) -> None:
         async def run() -> None:
             args = parse_args([])
@@ -510,6 +626,13 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
                 frame = app.query_one("#detail-frame")
 
+                self.assertFalse(frame.display)
+                app.agents[1].input_text = "hello"
+                app._mark_detail_dirty(app.agents[1])
+                app._sync()
+                await pilot.pause()
+
+                self.assertTrue(frame.display)
                 self.assertEqual(frame.border_title, "AGENT-001, ←/→ switch")
 
         asyncio.run(run())
@@ -544,6 +667,7 @@ class TuiCommandTests(unittest.TestCase):
             async with app.run_test(size=(80, 40)) as pilot:
                 pane = app.agents[1]
                 pane.output_lines = [f"line {idx}" for idx in range(120)]
+                app._mark_detail_dirty(pane)
                 app._sync()
                 scroll = app.query_one("#detail-scroll")
                 await pilot.pause()
@@ -556,6 +680,7 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertEqual(scroll.scroll_y, 0)
 
                 pane.output_lines.append("new line")
+                app._mark_detail_dirty(pane)
                 app._sync()
                 await pilot.pause()
 
@@ -571,6 +696,7 @@ class TuiCommandTests(unittest.TestCase):
             async with app.run_test(size=(80, 40)) as pilot:
                 pane = app.agents[1]
                 pane.output_lines = [f"line {idx}" for idx in range(80)]
+                app._mark_detail_dirty(pane)
                 app._sync()
                 scroll = app.query_one("#detail-scroll")
                 await pilot.pause()
@@ -578,6 +704,7 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
 
                 pane.output_lines.extend(f"new line {idx}" for idx in range(30))
+                app._mark_detail_dirty(pane)
                 app._sync()
                 await pilot.pause()
 

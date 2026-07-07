@@ -359,10 +359,15 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 event.prevent_default()
                 self.action_copy()
                 return
-            if event.key in {"left", "right"} and not self.text.strip():
+            if event.key in {"left", "right"}:
                 event.stop()
                 event.prevent_default()
-                self.post_message(AgentSwitchRequested(-1 if event.key == "left" else 1))
+                if not self.text.strip():
+                    self.post_message(AgentSwitchRequested(-1 if event.key == "left" else 1))
+                elif event.key == "left":
+                    self.action_cursor_left()
+                else:
+                    self.action_cursor_right()
                 return
             if event.key in {"shift+enter", "ctrl+j"}:
                 event.stop()
@@ -547,7 +552,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         async def _on_key(self, event: events.Key) -> None:
             if event.key in {"left", "right"}:
                 prompt = self.query_one("#prompt", PromptEditor)
-                if not prompt.text.strip():
+                if self.focused is not prompt and not prompt.text.strip():
                     event.stop()
                     event.prevent_default()
                     self._switch_agent(-1 if event.key == "left" else 1)
@@ -757,6 +762,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync()
                 return
             if args and args[0].lower() in {"clear", "new"}:
+                if self._has_pending_run():
+                    if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
+                        if not self._discard_pending_run():
+                            self._sync()
+                            return
+                    elif not self._finalize_agent(self.selected_agent, require_resume=False, archive_detail=True):
+                        self._sync()
+                        return
                 self.resume_session_id = ""
                 self.run_info_rows = self._base_info_rows()
                 self.status = "Resume cleared"
@@ -971,9 +984,11 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.query_one("#tree", Static).update(self._tree_renderable())
             frame = self.query_one("#detail-frame", Vertical)
             pane = self.agents.get(self.selected_agent)
+            detail_visible = self._has_detail_content(pane)
+            frame.display = detail_visible
             border_style = "green" if pane is not None and pane.idx == self.best_agent else "cyan"
             frame.styles.border = ("round", border_style)
-            frame.border_title = self._detail_title(pane) if pane is not None else ""
+            frame.border_title = self._detail_title(pane) if detail_visible and pane is not None else ""
 
             scroll = self.query_one("#detail-scroll", VerticalScroll)
             should_follow_end = scroll.is_vertical_scroll_end
@@ -983,7 +998,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             detail_changed = self._detail_cache_key != cache_key_before
             if detail_changed:
                 detail.update(detail_renderable)
-            if detail_changed and should_follow_end:
+            if detail_visible and detail_changed and should_follow_end:
                 self.call_after_refresh(scroll.scroll_end, animate=False, immediate=True)
             self.query_one("#state", Static).update(self._state_text())
 
@@ -1095,6 +1110,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             return [*self.detail_history, *self._pane_detail_blocks(pane)]
+
+        def _has_detail_content(self, pane: AgentPane | None) -> bool:
+            return pane is not None and (bool(pane.command_text) or bool(self._detail_blocks(pane)))
 
         def _pane_detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
