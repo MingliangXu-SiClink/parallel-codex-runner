@@ -206,6 +206,18 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 | `--no-sync-back` | Do not modify the original workspace |
 | `--keep-workspaces` | Keep candidate workspaces after the run |
 
+## Project Layout
+
+| Path | Purpose |
+| --- | --- |
+| `parallel_codex_runner.py` | Compatibility wrapper for `python3 parallel_codex_runner.py` and old imports |
+| `parallel_codex_runner_core/app.py` | CLI orchestration, agent execution, summaries, and session promotion flow |
+| `parallel_codex_runner_core/codex_cli.py` | Codex CLI capability detection and command construction |
+| `parallel_codex_runner_core/workspace.py` | Workspace copy, `git worktree`, cleanup, and sync-back logic |
+| `parallel_codex_runner_core/paths.py` | Path and run-directory helpers |
+| `parallel_codex_runner_core/models.py` | Dataclasses shared across modules |
+| `tests/` | Regression tests |
+
 ## Development
 
 ```bash
@@ -214,7 +226,7 @@ python3 -m unittest discover
 python3 parallel_codex_runner.py --help
 ```
 
-The project intentionally stays small: one CLI file, one test file, no required third-party runtime dependencies.
+The project intentionally stays small: a compatibility CLI wrapper, a focused core package, one test file, and no required third-party runtime dependencies.
 
 ## License
 
