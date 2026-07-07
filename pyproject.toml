@@ -4,14 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallel-codex-runner"
-version = "0.1.1"
+version = "0.1.2"
 description = "Run multiple isolated Codex agents in parallel and sync back the selected result."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "rich",
+    "textual>=0.60",
+]
 
 [project.optional-dependencies]
+tui = [
+    "rich",
+    "textual>=0.60",
+]
 pretty = [
     "loguru",
     "rich",

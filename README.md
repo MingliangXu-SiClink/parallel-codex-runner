@@ -25,13 +25,14 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 
 ## Highlights
 
+- **Interactive TUI**: run `pcr`, type prompts, use slash commands, and switch agent panes with left/right.
 - **Parallel candidates**: run many `codex exec` attempts at once, or serialize them with `--serial`.
 - **Real isolation**: every candidate gets its own workspace and temporary `CODEX_HOME`.
 - **Git-aware copies**: Git workspaces use `git worktree` first, then mirror dirty, deleted, and untracked files.
 - **Delete-aware sync**: if the winning agent deletes a file, the original workspace loses it too.
 - **Simple selection**: choose the winner by observed reasoning tokens or runtime.
 - **Resume support**: continue from an existing Codex session and promote the winning session back.
-- **Plain Python**: no required runtime dependencies beyond the standard library.
+- **Small core**: Textual powers the TUI; the runner logic stays in plain Python modules.
 
 ## Installation
 
@@ -40,6 +41,7 @@ Requirements:
 - Python 3.8+
 - Codex CLI available as `codex`
 - Git for the best workspace-copy path
+- `textual` and `rich`, installed automatically by this package
 
 Install from a checkout:
 
@@ -60,6 +62,22 @@ python3 parallel_codex_runner.py "fix the failing tests"
 ```
 
 ## Quick Start
+
+Start the interactive TUI:
+
+```bash
+pcr
+```
+
+Inside the TUI:
+
+```text
+/numofagents 8
+/resume
+fix the failing tests
+```
+
+Use left/right to switch between agent panes while a run is active.
 
 Run the default five candidates in the current directory:
 
@@ -206,6 +224,18 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 | `--no-sync-back` | Do not modify the original workspace |
 | `--keep-workspaces` | Keep candidate workspaces after the run |
 
+Interactive slash commands:
+
+| Command | Description |
+| --- | --- |
+| `/numofagents <n>` | Set agent count for the next run |
+| `/resume` | Load the latest resumable Codex session |
+| `/resume list` | Show recent resumable sessions |
+| `/resume <n|session>` | Resume a listed or explicit session id |
+| `/resume clear` | Disable resume for the next run |
+| `/clear` | Clear the current TUI view |
+| `/exit` | Quit |
+
 ## Project Layout
 
 | Path | Purpose |
@@ -214,6 +244,7 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 | `parallel_codex_runner_core/app.py` | CLI orchestration, agent execution, summaries, and session promotion flow |
 | `parallel_codex_runner_core/codex_cli.py` | Codex CLI capability detection and command construction |
 | `parallel_codex_runner_core/workspace.py` | Workspace copy, `git worktree`, cleanup, and sync-back logic |
+| `parallel_codex_runner_core/tui_textual.py` | Interactive Textual TUI |
 | `parallel_codex_runner_core/paths.py` | Path and run-directory helpers |
 | `parallel_codex_runner_core/models.py` | Dataclasses shared across modules |
 | `tests/` | Regression tests |
@@ -226,7 +257,7 @@ python3 -m unittest discover
 python3 parallel_codex_runner.py --help
 ```
 
-The project intentionally stays small: a compatibility CLI wrapper, a focused core package, one test file, and no required third-party runtime dependencies.
+The project intentionally stays small: a compatibility CLI wrapper, a focused core package, and one test file.
 
 ## License
 

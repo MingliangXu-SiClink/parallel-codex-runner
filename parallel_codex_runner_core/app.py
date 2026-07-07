@@ -75,7 +75,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
 from .models import AgentResult, AgentState, CodexSessionPromotion, ResumeSession
@@ -88,6 +88,8 @@ from .paths import (
     safe_tail,
 )
 from .workspace import cleanup_workspace_copies, copy_workspace, sync_best_workspace_back
+
+ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
 # -----------------------------------------------------------------------------
 # Optional UI dependencies
@@ -1050,6 +1052,7 @@ async def stream_to_log(
     log_path: Path,
     state: AgentState,
     stream_name: str,
+    progress_callback: ProgressCallback = None,
 ) -> None:
     if reader is None:
         return
@@ -1070,6 +1073,8 @@ async def stream_to_log(
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
+            if progress_callback is not None:
+                progress_callback({"type": "agent_line", "idx": state.idx, "stream": stream_name, "text": text})
             try:
                 obj = json.loads(text)
             except json.JSONDecodeError:
@@ -1081,6 +1086,8 @@ async def stream_to_log(
             vals = extract_reasoning_tokens_from_json(obj)
             if vals:
                 state.reasoning_values.extend(vals)
+                if progress_callback is not None:
+                    progress_callback({"type": "agent_tokens", "idx": state.idx, "reasoning_tokens": state.reasoning_tokens})
 
 
 # -----------------------------------------------------------------------------
@@ -1095,6 +1102,7 @@ async def run_one_agent(
     codex_home: Path,
     prompt: str,
     command: List[str],
+    progress_callback: ProgressCallback = None,
 ) -> AgentResult:
     meta_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = meta_dir / "stdout.log"
@@ -1125,6 +1133,8 @@ async def run_one_agent(
     error: Optional[str] = None
 
     try:
+        if progress_callback is not None:
+            progress_callback({"type": "agent_started", "idx": idx})
         env = os.environ.copy()
         env["CODEX_HOME"] = str(codex_home)
         proc = await asyncio.create_subprocess_exec(
@@ -1141,8 +1151,8 @@ async def run_one_agent(
         await proc.stdin.drain()
         proc.stdin.close()
 
-        stdout_task = asyncio.create_task(stream_to_log(proc.stdout, stdout_log, state, "stdout"))
-        stderr_task = asyncio.create_task(stream_to_log(proc.stderr, stderr_log, state, "stderr"))
+        stdout_task = asyncio.create_task(stream_to_log(proc.stdout, stdout_log, state, "stdout", progress_callback))
+        stderr_task = asyncio.create_task(stream_to_log(proc.stderr, stderr_log, state, "stderr", progress_callback))
 
         returncode = await proc.wait()
         await asyncio.gather(stdout_task, stderr_task)
@@ -1173,6 +1183,8 @@ async def run_one_agent(
         stderr_tail=safe_tail(stderr_log),
     )
     status_json.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    if progress_callback is not None:
+        progress_callback({"type": "agent_finished", "idx": idx, "result": asdict(result)})
     return result
 
 
@@ -1184,6 +1196,7 @@ async def run_all_agents(
     command_by_agent: Dict[int, List[str]],
     codex_home_by_agent: Dict[int, Path],
     max_parallel: int,
+    progress_callback: ProgressCallback = None,
 ) -> List[AgentResult]:
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
@@ -1197,11 +1210,12 @@ async def run_all_agents(
                 codex_home=codex_home_by_agent[idx],
                 prompt=prompt,
                 command=command_by_agent[idx],
+                progress_callback=progress_callback,
             )
 
     tasks = [asyncio.create_task(run_limited(idx)) for idx in range(1, n + 1)]
 
-    if HAS_RICH:
+    if HAS_RICH and progress_callback is None:
         assert Progress is not None
         with Progress(
             SpinnerColumn(),
@@ -1222,7 +1236,7 @@ async def run_all_agents(
                     advance=1,
                     description=f"agent_{res.idx:03d} {res.status} rtok={token_text}",
                 )
-    elif HAS_TQDM:
+    elif HAS_TQDM and progress_callback is None:
         with tqdm(total=n, desc="codex agents", unit="agent") as bar:
             for finished in asyncio.as_completed(tasks):
                 res = await finished
@@ -1234,14 +1248,15 @@ async def run_all_agents(
         for finished in asyncio.as_completed(tasks):
             res = await finished
             results.append(res)
-            logger.info(
-                "completed {}/{}: agent_{:03d} {} {:.2f}s",
-                len(results),
-                n,
-                res.idx,
-                res.status,
-                res.seconds,
-            )
+            if progress_callback is None:
+                logger.info(
+                    "completed {}/{}: agent_{:03d} {} {:.2f}s",
+                    len(results),
+                    n,
+                    res.idx,
+                    res.status,
+                    res.seconds,
+                )
     return results
 
 
@@ -1512,11 +1527,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run N isolated Codex agents in parallel on full copies of a workspace, then sync "
-            "the selected successful result back."
+            "the selected successful result back. With no prompt on an interactive terminal, "
+            "opens the PCR TUI."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("prompt", nargs="?", help="Prompt text. Prefer --prompt-file for long prompts.")
+    parser.add_argument("prompt", nargs="?", help="Prompt text. Omit it in a TTY to open the interactive TUI.")
     parser.add_argument("-n", "--num-agents", type=int, default=5, help="Number of Codex agents to run.")
     parser.add_argument(
         "--max-parallel",
@@ -1560,8 +1576,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+def validate_args(args: argparse.Namespace) -> None:
     if args.num_agents <= 0:
         raise SystemExit("-n / --num-agents 必须大于 0。")
     if args.max_parallel is not None and args.max_parallel <= 0:
@@ -1569,15 +1584,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.serial and args.max_parallel not in (None, 1):
         raise SystemExit("--serial 不能和 --max-parallel > 1 同时使用。")
 
+
+def should_start_tui(args: argparse.Namespace) -> bool:
+    return args.prompt is None and args.prompt_file is None and sys.stdin.isatty()
+
+
+def run_once(
+    args: argparse.Namespace,
+    prompt: str,
+    progress_callback: ProgressCallback = None,
+    print_output: bool = True,
+) -> int:
     max_parallel = 1 if args.serial else (args.max_parallel or args.num_agents)
     max_parallel = min(max_parallel, args.num_agents)
+
+    def log(level: str, message: str, *values: Any) -> None:
+        if progress_callback is None or HAS_LOGURU:
+            getattr(logger, level)(message, *values)
 
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
     if not workspace.exists() or not workspace.is_dir():
         raise SystemExit(f"workspace 不存在或不是目录：{workspace}")
 
     resume_session = resolve_resume_session(args, workspace)
-    prompt = read_prompt(args)
     resume_session_id = resume_session.session_id if resume_session else None
 
     module_dir = Path(__file__).resolve().parent
@@ -1594,17 +1623,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if HAS_LOGURU:
         logger.remove()
-        logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
+        if progress_callback is None:
+            logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
         logger.add(run_root / "runner.log", level="DEBUG", encoding="utf-8", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}")
 
     stale_workspace_runs = workspace / ".codex_parallel_runs"
     if stale_workspace_runs.exists():
-        logger.warning(
+        log(
+            "warning",
             "workspace 内存在历史残留 .codex_parallel_runs，本脚本不会使用、不会复制、不会同步它：{}",
             stale_workspace_runs,
         )
 
-    if HAS_RICH:
+    if HAS_RICH and progress_callback is None:
         assert console is not None
         overview = Table.grid(padding=(0, 2))
         overview.add_column(style="bold")
@@ -1627,22 +1658,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 border_style="cyan",
             )
         )
-    else:
-        logger.info("workspace = {}", workspace)
-        logger.info("module_dir = {}", module_dir)
-        logger.info("run_anchor = {}", run_anchor)
-        logger.info("runs_root = {}", run_root)
-        logger.info("agents = {}", args.num_agents)
-        logger.info("execution = {}", "serial" if max_parallel == 1 else "parallel")
-        logger.info("max_parallel = {}", max_parallel)
-        logger.info("best_by = {}", args.best_by)
-        logger.info("resume = {}", resume_session_id or "NO")
+    elif progress_callback is None:
+        log("info", "workspace = {}", workspace)
+        log("info", "module_dir = {}", module_dir)
+        log("info", "run_anchor = {}", run_anchor)
+        log("info", "runs_root = {}", run_root)
+        log("info", "agents = {}", args.num_agents)
+        log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
+        log("info", "max_parallel = {}", max_parallel)
+        log("info", "best_by = {}", args.best_by)
+        log("info", "resume = {}", resume_session_id or "NO")
 
     help_text = read_codex_exec_resume_help(args.codex_bin) if resume_session_id else read_codex_exec_help(args.codex_bin)
     real_codex_home = get_codex_home()
 
-    logger.info("copying workspace into {} isolated agent folders", args.num_agents)
-    if HAS_RICH:
+    log("info", "copying workspace into {} isolated agent folders", args.num_agents)
+    if HAS_RICH and progress_callback is None:
         assert Progress is not None
         iterable_cm = Progress(
             SpinnerColumn(),
@@ -1654,7 +1685,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             console=console,
         )
         iterable = None
-    elif HAS_TQDM:
+    elif HAS_TQDM and progress_callback is None:
         iterable = tqdm(range(1, args.num_agents + 1), desc="copy workspace", unit="agent")
     else:
         iterable = range(1, args.num_agents + 1)
@@ -1662,7 +1693,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command_by_agent: Dict[int, List[str]] = {}
     caps_by_agent: Dict[int, Dict[str, bool]] = {}
     codex_home_by_agent: Dict[int, Path] = {}
-    if HAS_RICH:
+    if HAS_RICH and progress_callback is None:
         with iterable_cm as progress:
             task_id = progress.add_task("copy workspace", total=args.num_agents)
             for idx in range(1, args.num_agents + 1):
@@ -1687,6 +1718,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         assert iterable is not None
         for idx in iterable:
+            if progress_callback is not None:
+                progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
             agent_workspace = workspaces_root / f"agent_{idx:03d}"
             agent_meta_dir = meta_root / f"agent_{idx:03d}"
             agent_codex_home = agent_meta_dir / "codex_home"
@@ -1711,10 +1744,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     caps = caps_by_agent[1]
     if not caps.get("json", False):
-        logger.warning("当前 Codex CLI help 中未检测到 --json；reasoning_tokens 可能无法观测，将显示为 N/A。")
+        log("warning", "当前 Codex CLI help 中未检测到 --json；reasoning_tokens 可能无法观测，将显示为 N/A。")
     if not (caps.get("dangerously_bypass") or caps.get("sandbox")):
-        logger.warning("当前 Codex CLI help 中未检测到全权限相关参数；将按 CLI 默认权限运行。")
-    logger.info(
+        log("warning", "当前 Codex CLI help 中未检测到全权限相关参数；将按 CLI 默认权限运行。")
+    log(
+        "info",
         "starting {} codex agents with max_parallel={}",
         args.num_agents,
         max_parallel,
@@ -1728,6 +1762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             command_by_agent,
             codex_home_by_agent,
             max_parallel,
+            progress_callback=progress_callback,
         )
     )
 
@@ -1737,24 +1772,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     synced = False
     codex_session_promotion: Optional[CodexSessionPromotion] = None
     if best is not None and not args.no_sync_back:
-        logger.info("syncing selected workspace back to original workspace")
+        log("info", "syncing selected workspace back to original workspace")
         sync_best_workspace_back(Path(best.workspace_dir), workspace)
         synced = True
-        logger.info("sync complete: {} -> {}", best.workspace_dir, workspace)
+        log("info", "sync complete: {} -> {}", best.workspace_dir, workspace)
         try:
             codex_session_promotion = promote_best_codex_session_to_workspace(best, workspace)
             if codex_session_promotion is None:
-                logger.warning("could not identify a Codex session id for the selected agent; --resume may not show this run.")
+                log("warning", "could not identify a Codex session id for the selected agent; --resume may not show this run.")
             elif codex_session_promotion.error:
-                logger.warning("Codex session promotion partially failed: {}", codex_session_promotion.error)
+                log("warning", "Codex session promotion partially failed: {}", codex_session_promotion.error)
             else:
-                logger.info("Codex session {} is now resumable from {}", codex_session_promotion.session_id, workspace)
+                log("info", "Codex session {} is now resumable from {}", codex_session_promotion.session_id, workspace)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Codex session promotion failed: {}", exc)
+            log("warning", "Codex session promotion failed: {}", exc)
     elif best is not None and args.no_sync_back:
-        logger.warning("--no-sync-back set; original workspace was not modified")
+        log("warning", "--no-sync-back set; original workspace was not modified")
     else:
-        logger.error("no successful agent; original workspace was not modified")
+        log("error", "no successful agent; original workspace was not modified")
 
     workspaces_deleted = False
     if not args.keep_workspaces:
@@ -1776,9 +1811,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         resume_session,
         codex_session_promotion,
     )
-    print_summary(results, workspace, run_root, best, args.best_by, synced, codex_session_promotion)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "type": "run_finished",
+                "run_root": str(run_root),
+                "best_agent": best.idx if best else None,
+                "success": best is not None,
+                "synced": synced,
+            }
+        )
+    if print_output:
+        print_summary(results, workspace, run_root, best, args.best_by, synced, codex_session_promotion)
 
     return 0 if best is not None else 2
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    validate_args(args)
+    if should_start_tui(args):
+        from .tui_textual import run_textual_tui
+
+        return run_textual_tui(args)
+    prompt = read_prompt(args)
+    return run_once(args, prompt)
 
 
 if __name__ == "__main__":
