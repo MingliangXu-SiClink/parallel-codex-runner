@@ -520,6 +520,11 @@ def load_resume_sessions_from_state(
     workspace: Path,
     include_non_interactive: bool = False,
 ) -> List[ResumeSession]:
+    workspace_text = str(workspace)
+    workspace = workspace.resolve()
+    workspace_values = [str(workspace)]
+    if workspace_text not in workspace_values:
+        workspace_values.append(workspace_text)
     state_db = codex_home / "state_5.sqlite"
     if not state_db.exists():
         return []
@@ -552,8 +557,8 @@ def load_resume_sessions_from_state(
             "archived",
         ]
         selected = [name for name in wanted if name in columns]
-        where = ["cwd = ?"]
-        params: List[Any] = [str(workspace)]
+        where = [f"cwd IN ({', '.join('?' for _ in workspace_values)})"]
+        params: List[Any] = workspace_values
         if "archived" in columns:
             where.append("COALESCE(archived, 0) = 0")
         if not include_non_interactive and "source" in columns:
@@ -1281,10 +1286,101 @@ def make_ignore_func(extra_excluded_abs: Sequence[Path]):
     return ignore
 
 
+def git_workspace_toplevel(workspace: Path) -> Optional[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    top = Path(result.stdout.strip()).resolve()
+    if top != workspace.resolve():
+        return None
+
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--verify", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return top if head.returncode == 0 else None
+
+
+def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> None:
+    if not workspace_copy.exists() and not workspace_copy.is_symlink():
+        return
+    if (workspace_copy / ".git").is_file() and git_workspace_toplevel(original_workspace) is not None:
+        result = subprocess.run(
+            ["git", "-C", str(original_workspace), "worktree", "remove", "--force", "--force", str(workspace_copy)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+    shutil.rmtree(workspace_copy, ignore_errors=True)
+
+
+def cleanup_workspace_copies(original_workspace: Path, workspaces_root: Path) -> None:
+    if not workspaces_root.exists():
+        return
+    for child in workspaces_root.iterdir():
+        cleanup_workspace_copy(original_workspace, child)
+    shutil.rmtree(workspaces_root, ignore_errors=True)
+    if git_workspace_toplevel(original_workspace) is not None:
+        subprocess.run(
+            ["git", "-C", str(original_workspace), "worktree", "prune"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+
+def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
+    if git_workspace_toplevel(workspace) is None:
+        return False
+
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "worktree", "add", "--detach", str(dst), "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        cleanup_workspace_copy(workspace, dst)
+        return False
+
+    try:
+        sync_back_with_python(workspace, dst)
+    except Exception:
+        cleanup_workspace_copy(workspace, dst)
+        raise
+    return True
+
+
 def copy_workspace(workspace: Path, dst: Path, run_base: Path) -> None:
     if dst.exists():
         raise FileExistsError(f"destination already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if copy_workspace_with_git_worktree(workspace, dst):
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("git worktree copy failed, falling back to plain copy: {}", exc)
+        cleanup_workspace_copy(workspace, dst)
+
     shutil.copytree(
         workspace,
         dst,
@@ -2174,7 +2270,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Safety check before recursive delete.
         if is_relative_to(workspaces_root, workspace):
             raise SystemExit(f"拒绝删除：workspaces_root 位于 workspace 内部：{workspaces_root}")
-        shutil.rmtree(workspaces_root, ignore_errors=True)
+        cleanup_workspace_copies(workspace, workspaces_root)
         workspaces_deleted = not workspaces_root.exists()
 
     write_run_files(

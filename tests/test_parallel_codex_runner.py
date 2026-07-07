@@ -1,5 +1,7 @@
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,8 @@ from pathlib import Path
 from parallel_codex_runner import (
     AgentResult,
     build_codex_command,
+    cleanup_workspace_copy,
+    copy_workspace,
     create_unique_run_root,
     extract_codex_thread_id_from_json,
     import_codex_session_to_workspace,
@@ -18,6 +22,20 @@ from parallel_codex_runner import (
 
 
 class SyncBackTests(unittest.TestCase):
+    def test_python_sync_deletes_destination_file_missing_from_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dst = root / "dst"
+            src.mkdir()
+            dst.mkdir()
+
+            (dst / "deleted.txt").write_text("old", encoding="utf-8")
+
+            sync_back_with_python(src, dst)
+
+            self.assertFalse((dst / "deleted.txt").exists())
+
     def test_python_sync_preserves_git_and_replaces_file_with_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -40,6 +58,44 @@ class SyncBackTests(unittest.TestCase):
             self.assertTrue((dst / "replace_me").is_dir())
             self.assertEqual((dst / "replace_me" / "new.txt").read_text(encoding="utf-8"), "new")
             self.assertEqual((dst / ".git" / "config").read_text(encoding="utf-8"), "original git")
+
+
+class WorkspaceCopyTests(unittest.TestCase):
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_workspace_copy_uses_worktree_and_preserves_dirty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            subprocess.run(
+                ["git", "-c", "init.defaultBranch=main", "init"],
+                cwd=workspace,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+
+            (workspace / "keep.txt").write_text("clean", encoding="utf-8")
+            (workspace / "delete.txt").write_text("delete me", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=workspace, check=True, stdout=subprocess.PIPE)
+
+            (workspace / "keep.txt").write_text("dirty", encoding="utf-8")
+            (workspace / "delete.txt").unlink()
+            (workspace / "untracked.txt").write_text("untracked", encoding="utf-8")
+
+            run_base = root / "runs"
+            dst = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, dst, run_base)
+            try:
+                self.assertTrue((dst / ".git").is_file())
+                self.assertEqual((dst / "keep.txt").read_text(encoding="utf-8"), "dirty")
+                self.assertFalse((dst / "delete.txt").exists())
+                self.assertEqual((dst / "untracked.txt").read_text(encoding="utf-8"), "untracked")
+            finally:
+                cleanup_workspace_copy(workspace, dst)
 
 
 class RunRootTests(unittest.TestCase):
@@ -229,10 +285,10 @@ class ResumeSessionTests(unittest.TestCase):
                 row = conn.execute("SELECT cwd, source, recency_at, recency_at_ms FROM threads WHERE id = ?", (session_id,)).fetchone()
             finally:
                 conn.close()
-            self.assertEqual(row, (str(workspace), "cli", 20, 20000))
+            self.assertEqual(row, (str(workspace.resolve()), "cli", 20, 20000))
 
             meta = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])["payload"]
-            self.assertEqual(meta["cwd"], str(workspace))
+            self.assertEqual(meta["cwd"], str(workspace.resolve()))
             self.assertEqual(meta["source"], "cli")
             self.assertEqual(meta["originator"], "codex-tui")
 
@@ -335,9 +391,9 @@ class ResumeSessionTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(row, (str(workspace), str(imported_rollout), "cli", "user", 20, 20000, "Isolated title"))
+            self.assertEqual(row, (str(workspace.resolve()), str(imported_rollout.resolve()), "cli", "user", 20, 20000, "Isolated title"))
             meta = json.loads(imported_rollout.read_text(encoding="utf-8").splitlines()[0])["payload"]
-            self.assertEqual(meta["cwd"], str(workspace))
+            self.assertEqual(meta["cwd"], str(workspace.resolve()))
             self.assertEqual(meta["source"], "cli")
             self.assertEqual(meta["originator"], "codex-tui")
 

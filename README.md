@@ -10,6 +10,7 @@
 - 默认启动 5 个候选，可通过 `-n/--num-agents` 调整。
 - 支持按 reasoning tokens 或运行时长选择候选。
 - 支持命令行参数、文件或 stdin 传入 prompt。
+- Git 仓库会优先用 `git worktree` 创建候选工作区，并保留当前未提交的文件状态。
 - 支持从当前 workspace 的 Codex 历史会话中选择 `--resume`。
 - 每个候选使用独立的临时 `CODEX_HOME`，便于保留可追踪的候选日志和 Codex session。
 - 同步时保留原工作区的 Git 元数据和 runner 自身运行目录。
