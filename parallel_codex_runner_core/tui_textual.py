@@ -63,7 +63,7 @@ def text_value(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, dict):
-        for key in ("message", "text", "content", "delta", "summary", "reasoning"):
+        for key in ("message", "text", "content", "delta", "summary", "reasoning", "item"):
             text = text_value(value.get(key))
             if text:
                 return text
@@ -72,8 +72,60 @@ def text_value(value: Any) -> str:
     return ""
 
 
+def is_detail_noise_line(text: str) -> bool:
+    normalized = " ".join(text.casefold().replace("_", " ").replace("-", " ").split())
+    return (
+        "codex models manager" in normalized
+        or "apply patch verification failed" in normalized
+        or "failed to find expected lines" in normalized
+        or "run result" in normalized
+        or "best agent" in normalized
+        or normalized.startswith(("synced", "run root"))
+    )
+
+
+def strip_detail_event_prefix(text: str) -> str:
+    lowered = text.casefold()
+    for prefix in ("agent_reasoning", "agent_message"):
+        if lowered.startswith(f"{prefix}:"):
+            return text.split(":", 1)[1].strip()
+    return text
+
+
+def detail_display_text(text: str) -> str:
+    stripped = strip_detail_event_prefix(text.strip())
+    if not stripped or is_detail_noise_line(stripped):
+        return ""
+    return compact_text(stripped)
+
+
+def line_category_from_json(payload: dict[str, Any]) -> str:
+    signals = [
+        payload.get("type"),
+        payload.get("event"),
+        value_at(payload, "payload", "type"),
+        value_at(payload, "item", "type"),
+        value_at(payload, "payload", "item", "type"),
+        value_at(payload, "role"),
+        value_at(payload, "payload", "role"),
+        value_at(payload, "item", "role"),
+        value_at(payload, "payload", "item", "role"),
+    ]
+    signal = " ".join(str(value) for value in signals if value).casefold()
+    if "reasoning" in signal or "thinking" in signal:
+        return "thought"
+    if "agent_message" in signal or "assistant" in signal:
+        return "output"
+    if " message" in f" {signal} " and "user" not in signal:
+        return "output"
+    return "activity"
+
+
 def display_line_from_json(payload: dict[str, Any]) -> str:
-    kind = str(payload.get("type") or payload.get("event") or "").strip()
+    return display_line_parts_from_json(payload)[1]
+
+
+def display_line_parts_from_json(payload: dict[str, Any]) -> tuple[str, str]:
     text_paths = [
         ("message",),
         ("text",),
@@ -81,29 +133,63 @@ def display_line_from_json(payload: dict[str, Any]) -> str:
         ("delta",),
         ("summary",),
         ("reasoning",),
+        ("item", "message"),
+        ("item", "text"),
+        ("item", "content"),
+        ("item", "delta"),
+        ("item", "summary"),
+        ("item", "reasoning"),
         ("payload", "message"),
         ("payload", "text"),
         ("payload", "content"),
         ("payload", "delta"),
         ("payload", "summary"),
         ("payload", "reasoning"),
+        ("payload", "item", "message"),
+        ("payload", "item", "text"),
+        ("payload", "item", "content"),
+        ("payload", "item", "delta"),
+        ("payload", "item", "summary"),
+        ("payload", "item", "reasoning"),
     ]
     for path in text_paths:
         text = text_value(value_at(payload, *path))
         if text:
-            prefix = f"{kind}: " if kind else ""
-            return prefix + compact_text(text)
-    return ""
+            return line_category_from_json(payload), detail_display_text(text)
+    return "activity", ""
 
 
 def display_line_from_output(text: str) -> str:
+    return display_line_parts_from_output(text)[1]
+
+
+def display_line_parts_from_output(text: str) -> tuple[str, str]:
+    stripped = text.strip()
+    if not stripped or is_detail_noise_line(stripped):
+        return "activity", ""
     try:
-        payload = json.loads(text)
+        payload = json.loads(stripped)
     except json.JSONDecodeError:
-        return compact_text(text)
+        lowered = stripped.casefold()
+        category = "thought" if lowered.startswith("agent_reasoning:") else "output" if lowered.startswith("agent_message:") else "activity"
+        return category, detail_display_text(stripped)
     if isinstance(payload, dict):
-        return display_line_from_json(payload)
-    return ""
+        return display_line_parts_from_json(payload)
+    return "activity", ""
+
+
+def same_display_message(left: str, right: str) -> bool:
+    a = " ".join(left.split())
+    b = " ".join(right.split())
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a.endswith("..."):
+        return b.startswith(a[:-3].rstrip())
+    if b.endswith("..."):
+        return a.startswith(b[:-3].rstrip())
+    return False
 
 
 try:
@@ -119,7 +205,14 @@ except ModuleNotFoundError as exc:
         raise SystemExit("交互式 TUI 需要 textual：请运行 python3 -m pip install -e . 重新安装本项目依赖。") from _exc
 
 else:
-    from .app import list_resume_sessions, run_once
+    from .app import list_resume_sessions, promote_best_codex_session_to_workspace, run_once
+    from .models import AgentResult
+    from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
+    from .workspace import cleanup_workspace_copies, sync_best_workspace_back
+    from rich.cells import cell_len
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
 
     HELP_TEXT = """
 Commands:
@@ -144,14 +237,26 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         idx: int
         status: str = "idle"
         reasoning_tokens: int | None = None
+        input_text: str = ""
+        final_text: str = ""
+        command_text: str = ""
+        result: dict[str, Any] | None = None
         lines: list[str] = field(default_factory=list)
+        thought_lines: list[str] = field(default_factory=list)
+        output_lines: list[str] = field(default_factory=list)
 
-        def append(self, text: str) -> None:
+        def append(self, text: str, category: str = "activity") -> None:
             text = text.strip()
             if not text:
                 return
-            self.lines.append(text)
-            del self.lines[:-80]
+            bucket = self.thought_lines if category == "thought" else self.output_lines if category == "output" else self.lines
+            bucket.append(text)
+            del bucket[:-80]
+
+        def clear_detail(self) -> None:
+            self.lines.clear()
+            self.thought_lines.clear()
+            self.output_lines.clear()
 
 
     class RunnerEvent(Message):
@@ -219,20 +324,17 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             color: #8fb3ff;
             text-style: bold;
         }
-        .box {
-            margin: 0 1;
-            padding: 1;
-            border: round #3b4656;
-            background: #111722;
-        }
         #tree {
-            height: 9;
+            height: 17;
+            margin: 0 1;
         }
         #detail {
             height: 1fr;
+            margin: 0 1;
         }
         #suggestions {
-            height: auto;
+            height: 0;
+            min-height: 0;
             max-height: 6;
             margin: 0 1;
             padding: 0 1;
@@ -278,16 +380,26 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.best_agent: int | None = None
             self.started_at: float | None = None
             self.prompt_height = 3
+            self.suggestion_line_count = 0
             self.work_frame = 0
+            self.exit_after_run = False
+            self.cancel_event: threading.Event | None = None
+            self.run_info_rows = self._base_info_rows()
+            self.pending_run_root: Path | None = None
+            self.pending_workspaces_root: Path | None = None
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
-                yield Static("Run state", classes="caption")
-                yield Static("", id="tree", classes="box")
-                yield Static("", id="detail_caption", classes="caption")
-                yield Static("", id="detail", classes="box")
+                yield Static("", id="tree")
+                yield Static("", id="detail")
                 yield Static("", id="suggestions")
-                yield PromptEditor("", id="prompt", soft_wrap=True, show_line_numbers=False)
+                yield PromptEditor(
+                    "",
+                    id="prompt",
+                    soft_wrap=True,
+                    show_line_numbers=False,
+                    placeholder="输入需求，或输入 / 查看命令",
+                )
                 yield Static("", id="state")
 
         def on_mount(self) -> None:
@@ -330,7 +442,12 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             idx = int(payload.get("idx") or 0)
             pane = self.agents.get(idx)
             kind = str(payload.get("type") or "")
-            if kind == "agent_status" and pane is not None:
+            if kind == "run_prepared":
+                rows = payload.get("rows")
+                if isinstance(rows, list):
+                    self.run_info_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
+                    self._remember_run_paths(self.run_info_rows)
+            elif kind == "agent_status" and pane is not None:
                 pane.status = str(payload.get("status") or pane.status)
             elif kind == "agent_started" and pane is not None:
                 pane.status = "running"
@@ -339,34 +456,54 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
             elif kind == "agent_line" and pane is not None:
                 pane.status = "running"
-                pane.append(display_line_from_output(str(payload.get("text") or "")))
+                category, text = display_line_parts_from_output(str(payload.get("text") or ""))
+                pane.append(text, category)
             elif kind == "agent_finished" and pane is not None:
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+                pane.result = result
                 pane.status = str(result.get("status") or "finished")
+                value = result.get("reasoning_tokens")
+                pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
                 final_text = self._read_final_message(result)
                 if final_text:
-                    pane.append(final_text)
-                elif pane.status != "success":
-                    pane.append(str(result.get("stderr_tail") or result.get("stdout_tail") or ""))
+                    pane.final_text = final_text
             elif kind == "run_finished":
                 self.running = False
+                self.cancel_event = None
+                run_root = payload.get("run_root")
+                if isinstance(run_root, str) and run_root:
+                    self.pending_run_root = Path(run_root)
+                    self.pending_workspaces_root = self.pending_run_root / "workspaces"
                 self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
-                self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
+                if payload.get("cancelled"):
+                    self.status = "Cancelled"
+                    if self._cleanup_after_pending_run():
+                        self._clear_pending_run()
+                else:
+                    self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
                 if self.best_agent and self.best_agent in self.agents:
                     self.selected_agent = self.best_agent
-                    self.agents[self.best_agent].append(self._run_result_text(payload))
             elif kind == "run_failed":
                 self.running = False
+                self.cancel_event = None
                 self.status = f"Run failed: {payload.get('message') or ''}"
-                self.agents[self.selected_agent].append(self.status)
+                if self._cleanup_after_pending_run():
+                    self._clear_pending_run()
             self._sync()
+            if kind in {"run_finished", "run_failed"} and self.exit_after_run and not self._has_pending_run():
+                self.exit()
 
         def action_clear_view(self) -> None:
             for pane in self.agents.values():
                 pane.status = "idle"
                 pane.reasoning_tokens = None
-                pane.lines.clear()
+                pane.input_text = ""
+                pane.final_text = ""
+                pane.command_text = ""
+                pane.result = None
+                pane.clear_detail()
             self.best_agent = None
+            self.run_info_rows = self._base_info_rows()
             self.status = "Ready"
             self._sync()
 
@@ -378,14 +515,33 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync_prompt_height()
                 prompt.focus()
             else:
-                self.exit()
+                self._request_exit()
+
+        def _request_exit(self) -> None:
+            if self.running:
+                self.exit_after_run = True
+                if self.cancel_event is not None:
+                    self.cancel_event.set()
+                self.status = "Stopping and cleaning up"
+                self._sync()
+                return
+            if self._has_pending_run():
+                if self.best_agent is not None and not self._finalize_agent(self.best_agent):
+                    self._sync()
+                    return
+                if self.best_agent is None:
+                    if not self._cleanup_after_pending_run():
+                        self._sync()
+                        return
+                    self._clear_pending_run()
+            self.exit()
 
         def _handle_command(self, raw: str) -> None:
             parts = raw.split()
             name = parts[0].lower()
             args = parts[1:]
             if name in {"/exit", "/quit"}:
-                self.exit()
+                self._request_exit()
                 return
             if name == "/help":
                 self._show_text(HELP_TEXT)
@@ -421,9 +577,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "numofagents must be > 0"
                 self._sync()
                 return
+            if self._has_pending_run() and not self._finalize_agent(self.selected_agent):
+                self._sync()
+                return
             self.num_agents = value
             self.selected_agent = min(self.selected_agent, value)
-            self.agents = {idx: self.agents.get(idx, AgentPane(idx)) for idx in range(1, value + 1)}
+            self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
+            self.best_agent = None
+            self.run_info_rows = self._base_info_rows()
             self.status = f"Next run will use {value} agents"
             self._show_text(self.status)
             self._sync()
@@ -431,6 +592,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _handle_resume(self, args: list[str]) -> None:
             if args and args[0].lower() in {"clear", "new"}:
                 self.resume_session_id = ""
+                self.run_info_rows = self._base_info_rows()
                 self.status = "Resume cleared"
                 self._sync()
                 return
@@ -451,6 +613,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                         break
                 if chosen is None:
                     self.resume_session_id = selector
+                    self.run_info_rows = self._base_info_rows()
                     self.status = f"Resume session set: {selector}"
                     self._sync()
                     return
@@ -459,6 +622,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync()
                 return
             self.resume_session_id = chosen.session_id
+            self.run_info_rows = self._base_info_rows()
             self.status = f"Resume session set: {chosen.session_id}"
             self._sync()
 
@@ -472,28 +636,24 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _show_status(self) -> None:
             self._show_text(self._tree_text())
 
-        def _run_result_text(self, payload: dict[str, Any]) -> str:
-            lines = [
-                "Run result:",
-                f"best agent: agent_{self.best_agent:03d}" if self.best_agent else "best agent: -",
-                f"synced: {'yes' if payload.get('synced') else 'no'}",
-            ]
-            if payload.get("run_root"):
-                lines.append(f"run root: {payload['run_root']}")
-            return "\n".join(lines)
-
         def _start_run(self, prompt: str) -> None:
             if self.running:
                 self.status = "A run is already active"
                 self._sync()
                 return
+            if self._has_pending_run() and not self._finalize_agent(self.selected_agent):
+                self._sync()
+                return
             self.running = True
+            self.exit_after_run = False
+            self.cancel_event = threading.Event()
             self.best_agent = None
             self.started_at = time.monotonic()
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             for pane in self.agents.values():
-                pane.append(f"Input:\n{prompt}")
+                pane.input_text = prompt
             self.selected_agent = min(self.selected_agent, self.num_agents)
+            self.run_info_rows = self._base_info_rows()
             self.status = "Preparing agents"
             self._sync()
 
@@ -504,6 +664,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             run_args.max_parallel = min(run_args.max_parallel or self.num_agents, self.num_agents)
             run_args.resume = False
             run_args.resume_session_id = self.resume_session_id or None
+            run_args.no_sync_back = True
+            run_args.keep_workspaces = True
+            run_args.cancel_event = self.cancel_event
 
             def target() -> None:
                 previous_disable = logging.root.manager.disable
@@ -516,14 +679,77 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 finally:
                     logging.disable(previous_disable)
 
-            threading.Thread(target=target, name="pcr-tui-runner", daemon=True).start()
+            threading.Thread(target=target, name="pcr-tui-runner", daemon=False).start()
 
         def _post_progress(self, payload: dict[str, Any]) -> None:
-            self.call_from_thread(self.post_message, RunnerEvent(payload))
+            try:
+                self.call_from_thread(self.post_message, RunnerEvent(payload))
+            except RuntimeError:
+                pass
+
+        def _remember_run_paths(self, rows: list[tuple[str, str]]) -> None:
+            data = dict(rows)
+            if data.get("RUNS_ROOT"):
+                self.pending_run_root = Path(data["RUNS_ROOT"])
+            if data.get("WORKSPACE COPIES"):
+                self.pending_workspaces_root = Path(data["WORKSPACE COPIES"])
+
+        def _has_pending_run(self) -> bool:
+            return self.pending_workspaces_root is not None
+
+        def _clear_pending_run(self) -> None:
+            self.pending_run_root = None
+            self.pending_workspaces_root = None
+
+        def _cleanup_after_pending_run(self) -> bool:
+            if getattr(self.args, "keep_workspaces", False):
+                return True
+            root = self.pending_workspaces_root
+            if root is None:
+                return True
+            try:
+                if is_relative_to(root, self.workspace):
+                    raise RuntimeError(f"refusing to delete workspace-owned path: {root}")
+                cleanup_workspace_copies(self.workspace, root)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self.status = f"Cleanup failed: {exc}"
+                return False
+
+        def _finalize_agent(self, idx: int) -> bool:
+            pane = self.agents.get(idx)
+            result_data = pane.result if pane is not None else None
+            if not result_data:
+                self.status = f"AGENT-{idx:03d} has no finished result"
+                return False
+            result = AgentResult(**result_data)
+            if result.status != "success":
+                self.status = f"AGENT-{idx:03d} is not successful"
+                return False
+            try:
+                promotion = promote_best_codex_session_to_workspace(result, self.workspace)
+                if promotion is None or not result.codex_thread_id:
+                    self.status = f"AGENT-{idx:03d} has no resumable session"
+                    return False
+                sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
+                result_data["codex_thread_id"] = result.codex_thread_id
+                self.resume_session_id = result.codex_thread_id
+                if not self._cleanup_after_pending_run():
+                    return False
+                self._clear_pending_run()
+                self.run_info_rows = self._base_info_rows()
+                self.status = f"Continuing from AGENT-{idx:03d}"
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self.status = f"Cannot continue AGENT-{idx:03d}: {exc}"
+                return False
 
         def _show_text(self, text: str) -> None:
             pane = self.agents.setdefault(self.selected_agent, AgentPane(self.selected_agent))
-            pane.lines = text.splitlines()
+            pane.input_text = ""
+            pane.final_text = ""
+            pane.command_text = text
+            pane.clear_detail()
             self._sync()
 
         def _read_final_message(self, result: dict[str, Any]) -> str:
@@ -539,57 +765,147 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _tick(self) -> None:
             if self.running and self.started_at is not None:
                 self.work_frame += 1
-                pulses = ("▰▱▱", "▰▰▱", "▰▰▰", "▱▰▰", "▱▱▰", "▱▱▱")
-                self.status = f"Working {int(time.monotonic() - self.started_at)}s {pulses[self.work_frame % len(pulses)]}"
+                self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
                 self._sync()
 
         def _sync(self) -> None:
-            self.query_one("#tree", Static).update(self._tree_text())
-            self.query_one("#detail_caption", Static).update(self._detail_caption_text())
-            self.query_one("#detail", Static).update(self._detail_text())
+            self.query_one("#tree", Static).update(self._tree_renderable())
+            detail = self.query_one("#detail", Static)
+            detail_renderable = self._detail_renderable()
+            detail.display = bool(detail_renderable)
+            detail.update(detail_renderable)
             self.query_one("#state", Static).update(self._state_text())
 
+        def _tree_renderable(self) -> Panel:
+            table = Table.grid(padding=(0, 2))
+            table.add_column(style="bold")
+            table.add_column()
+            for label, value in self._tree_rows():
+                table.add_row(label, value)
+            return Panel(table, title="parallel-codex-runner", border_style="cyan")
+
         def _tree_text(self) -> str:
+            rows = self._tree_rows()
+            label_width = max(len(label) for label, _value in rows)
+            return "\n".join(f"{label:<{label_width}}  {value}" for label, value in rows)
+
+        def _tree_rows(self) -> list[tuple[str, str]]:
+            rows: list[tuple[str, str]] = [
+                ("CONVERSATION", self.status),
+                *self.run_info_rows,
+            ]
+            if self.best_agent is not None:
+                rows.append(("BEST AGENT", f"agent_{self.best_agent:03d}"))
+            return rows
+
+        def _base_info_rows(self) -> list[tuple[str, str]]:
             max_parallel = (
                 1
                 if getattr(self.args, "serial", False)
                 else min(getattr(self.args, "max_parallel", None) or self.num_agents, self.num_agents)
             )
             execution = "serial" if max_parallel == 1 else "parallel"
-            lines = [
-                f"workspace: {self.workspace}",
-                f"conversation: {self.status}",
-                f"agents: {self._agent_summary()}",
-                f"num agents: {self.num_agents}",
-                f"max parallel: {max_parallel}",
-                f"execution: {execution}",
-                f"best by: {getattr(self.args, 'best_by', 'reasoning_tokens')}",
-                f"resume: {self.resume_session_id or '-'}",
-                f"selected agent: agent_{self.selected_agent:03d}",
+            module_dir = Path(__file__).resolve().parent
+            run_anchor = default_run_anchor(module_dir, self.workspace)
+            run_base = choose_run_base(run_anchor, self.workspace, getattr(self.args, "runs_dir", None))
+            return [
+                ("WORKSPACE", absolute_path_for_display(self.workspace)),
+                ("MODULE_DIR", absolute_path_for_display(module_dir)),
+                ("RUN_ANCHOR", absolute_path_for_display(run_anchor)),
+                ("RUNS_ROOT", f"pending under {absolute_path_for_display(run_base)}"),
+                ("AGENTS", str(self.num_agents)),
+                ("EXECUTION", execution),
+                ("MAX_PARALLEL", str(max_parallel)),
+                ("BEST_BY", str(getattr(self.args, "best_by", "reasoning_tokens"))),
+                ("RESUME", self.resume_session_id or "NO"),
+                ("METADATA", "pending"),
+                ("WORKSPACE COPIES", "pending"),
             ]
-            if self.best_agent is not None:
-                lines.append(f"best agent: agent_{self.best_agent:03d}")
-            return "\n".join(lines)
 
         def _detail_text(self) -> str:
             pane = self.agents.get(self.selected_agent)
             if pane is None:
                 return ""
-            return "\n".join(pane.lines[-40:] or ["No input or output yet."])
+            if pane.command_text:
+                return f"> {pane.command_text}"
+            blocks = self._detail_blocks(pane)
+            if not blocks:
+                return ""
+            return "\n\n".join(f"{prefix} {text}" for prefix, text, _style in blocks)
 
-        def _detail_caption_text(self) -> str:
+        def _detail_renderable(self) -> object:
             pane = self.agents.get(self.selected_agent)
+            border_style = "green" if pane is not None and pane.idx == self.best_agent else "cyan"
             if pane is None:
-                return "Agent detail"
-            rtok = "-" if pane.reasoning_tokens is None else str(pane.reasoning_tokens)
-            best = ", best" if pane.idx == self.best_agent else ""
-            return f"Agent detail (agent_{pane.idx:03d}, {pane.status}, rtok={rtok}{best}; left/right to switch)"
+                return ""
+            if pane.command_text:
+                return Panel(
+                    Text(f"> {pane.command_text}", style="yellow"),
+                    title=self._detail_title(pane),
+                    border_style=border_style,
+                )
+
+            table = Table.grid()
+            table.add_column()
+            blocks = self._detail_blocks(pane)
+            if not blocks:
+                return ""
+            for idx, (prefix, block, style) in enumerate(blocks):
+                if idx:
+                    table.add_row("")
+                table.add_row(Text(f"{prefix} {block}", style=style))
+            return Panel(table, title=self._detail_title(pane), border_style=border_style)
+
+        def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
+            blocks: list[tuple[str, str, str]] = []
+            if pane.input_text:
+                blocks.append((">", pane.input_text, "cyan"))
+            thoughts = "\n".join(pane.thought_lines[-40:])
+            if pane.status == "running" and (thoughts or not pane.output_lines):
+                text = f"{self._pulse()} {thoughts}".rstrip()
+                if text:
+                    blocks.append(("·", text, "dim white"))
+            elif thoughts:
+                blocks.append(("·", thoughts, "dim white"))
+            output_lines = [
+                line
+                for line in pane.output_lines[-40:]
+                if not (pane.final_text and same_display_message(line, pane.final_text))
+            ]
+            output = "\n".join(output_lines)
+            if output:
+                blocks.append(("◇", output, "white"))
+            activity = "\n".join(pane.lines[-40:])
+            if activity:
+                blocks.append(("•", activity, "dim white"))
+            if pane.final_text:
+                blocks.append(("✓", pane.final_text, "green"))
+            return blocks
+
+        def _detail_title(self, pane: AgentPane) -> Text:
+            title = Text(f"AGENT-{pane.idx:03d}", style="bold")
+            parts = []
+            if pane.reasoning_tokens is not None:
+                parts.append(f"reasoning_tokens={pane.reasoning_tokens}")
+            if pane.idx == self.best_agent:
+                parts.append("best")
+            parts.append("←/→ switch")
+            title.append(f", {', '.join(parts)}")
+            return title
 
         def _state_text(self) -> str:
-            return f"{self.status} | {self._agent_summary()} | Ctrl-C clear/exit | left/right switch"
+            parts = [self.status]
+            if summary := self._agent_summary():
+                parts.append(summary)
+            parts.extend(["Ctrl-C clear/exit", "←/→ switch"])
+            return " | ".join(parts)
 
         def _update_suggestions(self, value: str) -> None:
-            self.query_one("#suggestions", Static).update("\n".join(command_suggestions(value)))
+            suggestions = command_suggestions(value)
+            self.suggestion_line_count = len(suggestions)
+            widget = self.query_one("#suggestions", Static)
+            widget.update("\n".join(suggestions))
+            widget.styles.height = self.suggestion_line_count
 
         def _prompt_content_width(self) -> int:
             try:
@@ -606,7 +922,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             try:
                 text = self.query_one("#prompt", PromptEditor).text
                 width = self._prompt_content_width()
-                visible_lines = sum(max(1, (len(line) + width - 1) // width) for line in (text or "").split("\n"))
+                visible_lines = sum(max(1, (cell_len(line) + width - 1) // width) for line in (text or "").split("\n"))
                 self.prompt_height = max(3, min(20, visible_lines + 2))
                 self.query_one("#prompt", PromptEditor).styles.height = self.prompt_height
             except Exception:
@@ -615,8 +931,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _agent_summary(self) -> str:
             counts: dict[str, int] = {}
             for pane in self.agents.values():
+                if pane.status == "idle":
+                    continue
                 counts[pane.status] = counts.get(pane.status, 0) + 1
-            return " ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+            return " · ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+
+        def _pulse(self) -> str:
+            pulses = ("▰▱▱", "▰▰▱", "▰▰▰", "▱▰▰", "▱▱▰", "▱▱▱")
+            return pulses[self.work_frame % len(pulses)]
 
 
     def run_textual_tui(args: argparse.Namespace) -> int:

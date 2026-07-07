@@ -1,13 +1,19 @@
+import asyncio
 import json
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
+import parallel_codex_runner_core.tui_textual as tui_textual
 from parallel_codex_runner import (
     AgentResult,
+    AgentState,
     build_codex_command,
     cleanup_workspace_copy,
     copy_workspace,
@@ -17,9 +23,11 @@ from parallel_codex_runner import (
     load_resume_sessions_from_state,
     parse_args,
     promote_codex_session_to_workspace,
+    run_one_agent,
+    stream_to_log,
     sync_back_with_python,
 )
-from parallel_codex_runner_core.tui_textual import command_suggestions, display_line_from_output
+from parallel_codex_runner_core.tui_textual import command_suggestions, display_line_from_output, display_line_parts_from_output
 
 
 class SyncBackTests(unittest.TestCase):
@@ -154,7 +162,121 @@ class TuiCommandTests(unittest.TestCase):
 
     def test_display_line_filters_lifecycle_noise(self) -> None:
         self.assertEqual(display_line_from_output('{"type":"thread.started","thread_id":"abc"}'), "")
-        self.assertIn("thinking", display_line_from_output('{"type":"agent_reasoning","text":"thinking"}'))
+        self.assertEqual(display_line_from_output('{"type":"agent_reasoning","text":"thinking"}'), "thinking")
+        self.assertEqual(display_line_from_output("agent_reasoning:thinking"), "thinking")
+        self.assertEqual(display_line_from_output("2026-07-07 ERROR codex_models_manager: timeout"), "")
+        self.assertEqual(display_line_from_output("2026-07-07 ERROR codex models_manager: timeout"), "")
+        self.assertEqual(display_line_from_output("error=apply_patch verification failed"), "")
+        self.assertEqual(display_line_from_output("Failed to find expected lines"), "")
+        self.assertEqual(display_line_from_output("Run result:"), "")
+        self.assertEqual(display_line_from_output("2026-07-07 Run result:"), "")
+        self.assertEqual(display_line_from_output("- best agent: agent_005"), "")
+        self.assertEqual(display_line_from_output('{"payload":{"item":{"text":"real content"}}}'), "real content")
+
+    def test_display_line_keeps_reasoning_and_output_separate(self) -> None:
+        self.assertEqual(
+            display_line_parts_from_output('{"type":"agent_reasoning","text":"thinking"}'),
+            ("thought", "thinking"),
+        )
+        self.assertEqual(
+            display_line_parts_from_output('{"type":"item.completed","item":{"type":"agent_message","text":"answer"}}'),
+            ("output", "answer"),
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            candidate = root / "run" / "workspaces" / "agent_002"
+            workspace.mkdir()
+            candidate.mkdir(parents=True)
+            args = parse_args([])
+            args.workspace = str(workspace)
+            app = tui_textual.PcrTextualApp(args)
+            workspaces_root = root / "run" / "workspaces"
+            app.pending_workspaces_root = workspaces_root
+            app.agents[2].result = {
+                "idx": 2,
+                "workspace_dir": str(candidate),
+                "meta_dir": "",
+                "codex_home": "",
+                "stdout_log": "",
+                "stderr_log": "",
+                "final_message": "",
+                "command": [],
+                "returncode": 0,
+                "status": "success",
+                "seconds": 1.0,
+                "codex_thread_id": "session-2",
+                "reasoning_tokens": 10,
+                "reasoning_token_values": [10],
+                "error": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+            with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
+                with mock.patch.object(tui_textual, "sync_best_workspace_back") as sync_back:
+                    with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
+                        promote.side_effect = lambda result, _workspace: result
+
+                        self.assertTrue(app._finalize_agent(2))
+
+            self.assertEqual(app.resume_session_id, "session-2")
+            sync_back.assert_called_once_with(candidate, workspace.resolve())
+            cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
+
+
+class StreamLogTests(unittest.TestCase):
+    def test_stream_to_log_handles_long_json_line(self) -> None:
+        async def run() -> None:
+            reader = asyncio.StreamReader(limit=8)
+            line = json.dumps({"type": "thread.started", "thread_id": "abc", "message": "x" * 100}).encode() + b"\n"
+            reader.feed_data(line)
+            reader.feed_eof()
+            state = AgentState(idx=1)
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = Path(tmp) / "stdout.log"
+                await stream_to_log(reader, log_path, state, "stdout")
+                self.assertEqual(log_path.read_bytes(), line)
+                self.assertEqual(state.codex_thread_id, "abc")
+
+        asyncio.run(run())
+
+
+class AgentCancelTests(unittest.TestCase):
+    def test_run_one_agent_stops_process_on_cancel(self) -> None:
+        async def run() -> None:
+            cancel_event = threading.Event()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+
+                async def cancel_soon() -> None:
+                    await asyncio.sleep(0.1)
+                    cancel_event.set()
+
+                canceller = asyncio.create_task(cancel_soon())
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=meta,
+                    codex_home=codex_home,
+                    prompt="",
+                    command=[sys.executable, "-c", "import time; time.sleep(10)"],
+                    cancel_event=cancel_event,
+                )
+                await canceller
+
+            self.assertEqual(result.status, "cancelled")
+            self.assertLess(result.seconds, 3)
+
+        asyncio.run(run())
 
 
 class ResumeSessionTests(unittest.TestCase):

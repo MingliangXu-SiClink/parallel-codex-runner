@@ -75,7 +75,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
 from .models import AgentResult, AgentState, CodexSessionPromotion, ResumeSession
@@ -90,6 +90,10 @@ from .paths import (
 from .workspace import cleanup_workspace_copies, copy_workspace, sync_best_workspace_back
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
+
+
+def cancel_requested(cancel_event: Any = None) -> bool:
+    return bool(cancel_event is not None and cancel_event.is_set())
 
 # -----------------------------------------------------------------------------
 # Optional UI dependencies
@@ -1058,10 +1062,7 @@ async def stream_to_log(
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as f:
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
+        async for line in iter_stream_lines(reader):
             f.write(line)
             f.flush()
 
@@ -1090,6 +1091,24 @@ async def stream_to_log(
                     progress_callback({"type": "agent_tokens", "idx": state.idx, "reasoning_tokens": state.reasoning_tokens})
 
 
+async def iter_stream_lines(reader: asyncio.StreamReader, chunk_size: int = 65536) -> AsyncIterator[bytes]:
+    pending = b""
+    while True:
+        chunk = await reader.read(chunk_size)
+        if not chunk:
+            if pending:
+                yield pending
+            return
+        pending += chunk
+        while True:
+            line, sep, rest = pending.partition(b"\n")
+            if not sep:
+                pending = line
+                break
+            yield line + sep
+            pending = rest
+
+
 # -----------------------------------------------------------------------------
 # Agent execution
 # -----------------------------------------------------------------------------
@@ -1103,6 +1122,7 @@ async def run_one_agent(
     prompt: str,
     command: List[str],
     progress_callback: ProgressCallback = None,
+    cancel_event: Any = None,
 ) -> AgentResult:
     meta_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = meta_dir / "stdout.log"
@@ -1133,6 +1153,9 @@ async def run_one_agent(
     error: Optional[str] = None
 
     try:
+        if cancel_requested(cancel_event):
+            status = "cancelled"
+            raise RuntimeError("__pcr_cancelled_before_start__")
         if progress_callback is not None:
             progress_callback({"type": "agent_started", "idx": idx})
         env = os.environ.copy()
@@ -1154,13 +1177,34 @@ async def run_one_agent(
         stdout_task = asyncio.create_task(stream_to_log(proc.stdout, stdout_log, state, "stdout", progress_callback))
         stderr_task = asyncio.create_task(stream_to_log(proc.stderr, stderr_log, state, "stderr", progress_callback))
 
-        returncode = await proc.wait()
+        while True:
+            if cancel_requested(cancel_event):
+                status = "cancelled"
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    returncode = await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    returncode = await proc.wait()
+                break
+            try:
+                returncode = await asyncio.wait_for(proc.wait(), timeout=0.2)
+                break
+            except asyncio.TimeoutError:
+                continue
         await asyncio.gather(stdout_task, stderr_task)
-        status = "success" if returncode == 0 else "failed"
+        if status != "cancelled":
+            status = "success" if returncode == 0 else "failed"
     except Exception as exc:  # noqa: BLE001
-        error = repr(exc)
-        status = "error"
-        logger.error("agent_{:03d} error: {}", idx, error)
+        if status == "cancelled":
+            error = None
+        else:
+            error = repr(exc)
+            status = "error"
+            logger.error("agent_{:03d} error: {}", idx, error)
 
     seconds = time.perf_counter() - started
     result = AgentResult(
@@ -1197,6 +1241,7 @@ async def run_all_agents(
     codex_home_by_agent: Dict[int, Path],
     max_parallel: int,
     progress_callback: ProgressCallback = None,
+    cancel_event: Any = None,
 ) -> List[AgentResult]:
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
@@ -1211,6 +1256,7 @@ async def run_all_agents(
                 prompt=prompt,
                 command=command_by_agent[idx],
                 progress_callback=progress_callback,
+                cancel_event=cancel_event,
             )
 
     tasks = [asyncio.create_task(run_limited(idx)) for idx in range(1, n + 1)]
@@ -1597,6 +1643,7 @@ def run_once(
 ) -> int:
     max_parallel = 1 if args.serial else (args.max_parallel or args.num_agents)
     max_parallel = min(max_parallel, args.num_agents)
+    cancel_event = getattr(args, "cancel_event", None)
 
     def log(level: str, message: str, *values: Any) -> None:
         if progress_callback is None or HAS_LOGURU:
@@ -1621,6 +1668,26 @@ def run_once(
     workspaces_root.mkdir(parents=True, exist_ok=True)
     meta_root.mkdir(parents=True, exist_ok=True)
 
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "type": "run_prepared",
+                "rows": [
+                    ["WORKSPACE", absolute_path_for_display(workspace)],
+                    ["MODULE_DIR", absolute_path_for_display(module_dir)],
+                    ["RUN_ANCHOR", absolute_path_for_display(run_anchor)],
+                    ["RUNS_ROOT", absolute_path_for_display(run_root)],
+                    ["AGENTS", str(args.num_agents)],
+                    ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
+                    ["MAX_PARALLEL", str(max_parallel)],
+                    ["BEST_BY", args.best_by],
+                    ["RESUME", resume_session_id or "NO"],
+                    ["METADATA", absolute_path_for_display(meta_root)],
+                    ["WORKSPACE COPIES", absolute_path_for_display(workspaces_root)],
+                ],
+            }
+        )
+
     if HAS_LOGURU:
         logger.remove()
         if progress_callback is None:
@@ -1640,21 +1707,21 @@ def run_once(
         overview = Table.grid(padding=(0, 2))
         overview.add_column(style="bold")
         overview.add_column()
-        overview.add_row("workspace", absolute_path_for_display(workspace))
-        overview.add_row("module_dir", absolute_path_for_display(module_dir))
-        overview.add_row("run_anchor", absolute_path_for_display(run_anchor))
-        overview.add_row("runs_root", absolute_path_for_display(run_root))
-        overview.add_row("agents", str(args.num_agents))
-        overview.add_row("execution", "serial" if max_parallel == 1 else "parallel")
-        overview.add_row("max_parallel", str(max_parallel))
-        overview.add_row("best_by", args.best_by)
-        overview.add_row("resume", resume_session_id or "NO")
-        overview.add_row("metadata", absolute_path_for_display(meta_root))
-        overview.add_row("workspace copies", absolute_path_for_display(workspaces_root))
+        overview.add_row("WORKSPACE", absolute_path_for_display(workspace))
+        overview.add_row("MODULE_DIR", absolute_path_for_display(module_dir))
+        overview.add_row("RUN_ANCHOR", absolute_path_for_display(run_anchor))
+        overview.add_row("RUNS_ROOT", absolute_path_for_display(run_root))
+        overview.add_row("AGENTS", str(args.num_agents))
+        overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
+        overview.add_row("MAX_PARALLEL", str(max_parallel))
+        overview.add_row("BEST_BY", args.best_by)
+        overview.add_row("RESUME", resume_session_id or "NO")
+        overview.add_row("METADATA", absolute_path_for_display(meta_root))
+        overview.add_row("WORKSPACE COPIES", absolute_path_for_display(workspaces_root))
         console.print(
             Panel(
                 overview,
-                title="codex runner",
+                title="parallel-codex-runner",
                 border_style="cyan",
             )
         )
@@ -1697,6 +1764,8 @@ def run_once(
         with iterable_cm as progress:
             task_id = progress.add_task("copy workspace", total=args.num_agents)
             for idx in range(1, args.num_agents + 1):
+                if cancel_requested(cancel_event):
+                    break
                 progress.update(task_id, description=f"copy agent_{idx:03d}")
                 agent_workspace = workspaces_root / f"agent_{idx:03d}"
                 agent_meta_dir = meta_root / f"agent_{idx:03d}"
@@ -1718,6 +1787,8 @@ def run_once(
     else:
         assert iterable is not None
         for idx in iterable:
+            if cancel_requested(cancel_event):
+                break
             if progress_callback is not None:
                 progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
             agent_workspace = workspaces_root / f"agent_{idx:03d}"
@@ -1736,6 +1807,22 @@ def run_once(
             command_by_agent[idx] = cmd
             caps_by_agent[idx] = caps
             codex_home_by_agent[idx] = agent_codex_home
+
+    if cancel_requested(cancel_event):
+        if not args.keep_workspaces and not is_relative_to(workspaces_root, workspace):
+            cleanup_workspace_copies(workspace, workspaces_root)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "type": "run_finished",
+                    "run_root": str(run_root),
+                    "best_agent": None,
+                    "success": False,
+                    "synced": False,
+                    "cancelled": True,
+                }
+            )
+        return 130
 
     (run_root / "codex_capabilities.json").write_text(json.dumps(caps_by_agent[1], ensure_ascii=False, indent=2), encoding="utf-8")
     (run_root / "sample_command.json").write_text(json.dumps(command_by_agent[1], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1763,15 +1850,19 @@ def run_once(
             codex_home_by_agent,
             max_parallel,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
     )
 
-    successes = [r for r in results if r.status == "success"]
+    cancelled = cancel_requested(cancel_event)
+    successes = [] if cancelled else [r for r in results if r.status == "success"]
     best = select_best_result(successes, args.best_by)
 
     synced = False
     codex_session_promotion: Optional[CodexSessionPromotion] = None
-    if best is not None and not args.no_sync_back:
+    if cancelled:
+        log("warning", "run cancelled; original workspace was not modified")
+    elif best is not None and not args.no_sync_back:
         log("info", "syncing selected workspace back to original workspace")
         sync_best_workspace_back(Path(best.workspace_dir), workspace)
         synced = True
@@ -1819,12 +1910,13 @@ def run_once(
                 "best_agent": best.idx if best else None,
                 "success": best is not None,
                 "synced": synced,
+                "cancelled": cancelled,
             }
         )
     if print_output:
         print_summary(results, workspace, run_root, best, args.best_by, synced, codex_session_promotion)
 
-    return 0 if best is not None else 2
+    return 130 if cancelled else (0 if best is not None else 2)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
