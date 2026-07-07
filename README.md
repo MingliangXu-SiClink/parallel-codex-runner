@@ -1,173 +1,212 @@
+<div align="center">
+
 # parallel-codex-runner
 
-`parallel-codex-runner` 是一个轻量级 Python CLI，用来把同一个开发任务交给多个隔离的 Codex agent 并行探索，然后按策略选出一个结果同步回原工作区。
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)](#requirements)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-它适合用于修复问题、补测试、重构、改文档、比较实现方案等需要多路尝试的代码任务。每个候选 agent 都在复制出来的工作区中运行，主工作区保持清晰；运行结束后，工具会汇总结果、记录日志，并把被采纳的候选同步回来。
+[Installation](#installation) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [Safety](#safety-model) · [CLI](#cli-reference)
 
-## 特性
+Run several isolated Codex agents on the same task, keep the evidence, and sync back one winning workspace.
 
-- 并行或串行运行多个 `codex exec` 候选。
-- 默认启动 5 个候选，可通过 `-n/--num-agents` 调整。
-- 支持按 reasoning tokens 或运行时长选择候选。
-- 支持命令行参数、文件或 stdin 传入 prompt。
-- Git 仓库会优先用 `git worktree` 创建候选工作区，并保留当前未提交的文件状态。
-- 支持从当前 workspace 的 Codex 历史会话中选择 `--resume`。
-- 每个候选使用独立的临时 `CODEX_HOME`，便于保留可追踪的候选日志和 Codex session。
-- 同步时保留原工作区的 Git 元数据和 runner 自身运行目录。
-- 可选安装 `rich`、`tqdm`、`loguru` 获得更好的终端输出。
+<code>pcr "fix the failing tests" -n 8</code>
 
-## 安装
+</div>
 
-需要 Python 3.8+，并确保 Codex CLI 可通过 `codex` 命令访问。
+`parallel-codex-runner` is a tiny local CLI for multi-shot Codex work. It is useful when a task is important enough that one Codex attempt is too random, but not important enough to hand-build a queue, a judge, and a merge system.
 
-从源码安装：
+## Why
+
+Codex can sometimes fall into a low-quality "dumb mode": it stops early, misses nearby context, or returns a shallow patch. The same prompt, run again in a fresh workspace, may produce a much better result.
+
+This project is a practical workaround for that variance. It runs independent Codex attempts, records what happened, picks a winner, and syncs only that candidate back.
+
+Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/issues/30364), which discusses Codex reasoning-token clustering at fixed boundaries and possible degraded performance on complex tasks.
+
+## Highlights
+
+- **Parallel candidates**: run many `codex exec` attempts at once, or serialize them with `--serial`.
+- **Real isolation**: every candidate gets its own workspace and temporary `CODEX_HOME`.
+- **Git-aware copies**: Git workspaces use `git worktree` first, then mirror dirty, deleted, and untracked files.
+- **Delete-aware sync**: if the winning agent deletes a file, the original workspace loses it too.
+- **Simple selection**: choose the winner by observed reasoning tokens or runtime.
+- **Resume support**: continue from an existing Codex session and promote the winning session back.
+- **Plain Python**: no required runtime dependencies beyond the standard library.
+
+## Installation
+
+Requirements:
+
+- Python 3.8+
+- Codex CLI available as `codex`
+- Git for the best workspace-copy path
+
+Install from a checkout:
 
 ```bash
 python3 -m pip install .
 ```
 
-开发时推荐 editable 安装：
+For development and nicer terminal output:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e '.[pretty]'
 ```
 
-安装可选终端输出依赖：
+You can also run the script directly:
 
 ```bash
-python3 -m pip install '.[pretty]'
+python3 parallel_codex_runner.py "fix the failing tests"
 ```
 
-安装后可使用 `pcr` 命令：
+## Quick Start
 
-```bash
-pcr "fix the failing tests" -n 8
-```
-
-也可以直接运行脚本：
-
-```bash
-python3 parallel_codex_runner.py "fix the failing tests" -n 8
-```
-
-## 快速开始
-
-在当前目录启动多个候选，按默认策略选择结果：
+Run the default five candidates in the current directory:
 
 ```bash
 pcr "implement the requested change"
 ```
 
-启动 20 个候选：
+Run more candidates:
 
 ```bash
-pcr "implement the requested change" -n 20
+pcr "fix the flaky test and add coverage" -n 10
 ```
 
-设置同时运行的 Codex 进程数量：
+Limit concurrency:
 
 ```bash
-pcr "refactor the API client and update tests" -n 20 --max-parallel 5
+pcr "refactor the API client" -n 20 --max-parallel 5
 ```
 
-串行运行候选：
-
-```bash
-pcr "make the migration idempotent" -n 6 --serial
-```
-
-从文件读取长 prompt：
-
-```bash
-pcr --prompt-file /tmp/prompt.txt -n 10 --workspace /path/to/project
-```
-
-使用指定模型：
-
-```bash
-pcr "improve error handling" -n 10 --model gpt-5
-```
-
-## Resume 工作流
-
-从当前 workspace 的 Codex 历史会话中选择一个继续：
-
-```bash
-pcr --resume "continue the previous task"
-```
-
-在脚本或自动化中指定 session id：
-
-```bash
-pcr --resume-session-id 019f2dde-d5ab-7473-856b-ab1b8001f6da "continue the previous task"
-```
-
-候选阶段会使用隔离的临时 `CODEX_HOME`。采纳结果同步回原工作区后，最佳候选的 Codex session 会导入真实 Codex 索引，并绑定到原 workspace，便于后续通过 `codex resume` 或 `pcr --resume` 继续。
-
-## 选择策略
-
-默认策略是 `reasoning_tokens`，即选择成功候选中观测到的最大 reasoning token 值最高的结果：
-
-```bash
-pcr "fix a tricky bug" --best-by reasoning_tokens
-```
-
-也可以按运行时间选择最长的成功候选：
-
-```bash
-pcr "explore possible fixes" --best-by duration
-```
-
-## 探索模式
-
-有时你可能想先比较候选结果，再手动决定后续操作：
+Keep candidates for manual inspection and do not touch the original workspace:
 
 ```bash
 pcr "investigate this bug" -n 5 --no-sync-back --keep-workspaces
 ```
 
-`--no-sync-back` 会生成完整运行结果和日志。`--keep-workspaces` 会保留候选工作区，方便继续检查 diff、运行测试或手动挑选实现。
+Run against another project:
 
-## 输出目录
+```bash
+pcr "update the docs" --workspace /path/to/project
+```
 
-每次运行会在工作区外部创建 `.codex_parallel_runs/<timestamp>/`，常见内容包括：
+Use a long prompt file:
 
-- `prompt.txt`：本次传给候选 agent 的 prompt。
-- `summary.json`：运行摘要、候选结果和采纳结果。
-- `BEST_AGENT.txt`：被采纳的候选编号。
-- `BEST_CODEX_SESSION.txt`：被采纳候选的 Codex session id。
-- `FINAL_RESULT_WORKSPACE.txt`：同步目标工作区。
-- `reasoning_tokens.tsv`：每个候选观测到的 reasoning token 数据。
-- `resume_session.json`：使用 `--resume` 时记录被选中的来源 session。
-- `codex_session_promotion.json`：采纳 session 导入 Codex 索引的结果。
-- `meta/agent_*/stdout.log` 和 `stderr.log`：每个 Codex 进程的输出日志。
-- `meta/agent_*/final_message.md`：每个候选的最终回复。
-- `meta/agent_*/codex_home/`：候选运行时使用的临时 Codex home。
+```bash
+pcr --prompt-file /tmp/prompt.txt -n 8
+```
 
-候选工作区默认在同步结束后清理；运行日志、摘要和候选 Codex home 会保留在运行目录中。
+## How It Works
 
-## 常用选项
+```text
+your workspace
+    |
+    | copied into isolated candidates
+    v
+.codex_parallel_runs/<timestamp>/workspaces/
+    agent_001/  -> codex exec -
+    agent_002/  -> codex exec -
+    agent_003/  -> codex exec -
+    ...
+    |
+    | select one successful run
+    v
+sync winning workspace back to your workspace
+```
 
-| 选项 | 说明 |
+The runner:
+
+1. Creates a run directory outside the target workspace.
+2. Creates one candidate workspace per agent.
+3. Runs `codex exec -` or `codex exec resume <session_id> -` in each candidate.
+4. Captures logs, final messages, Codex session ids, and reasoning-token metadata.
+5. Selects one successful candidate.
+6. Syncs that workspace back, excluding `.git`, `.codex_parallel_runs`, and `.codex_parallel_meta`.
+
+It does not merge candidates. One candidate wins.
+
+## Choosing The Winner
+
+By default, the runner chooses the successful candidate with the highest observed reasoning-token value:
+
+```bash
+pcr "fix a tricky bug" --best-by reasoning_tokens
+```
+
+You can instead choose the longest successful run:
+
+```bash
+pcr "explore possible fixes" --best-by duration
+```
+
+Both are heuristics. Review the final diff before committing.
+
+## Resume
+
+Pick a previous Codex session for this workspace:
+
+```bash
+pcr --resume "continue the previous task"
+```
+
+Use a known session id:
+
+```bash
+pcr --resume-session-id 019f2dde-d5ab-7473-856b-ab1b8001f6da "continue the previous task"
+```
+
+Candidate runs use isolated Codex homes. After sync, the winning session is imported into the real Codex home and rebound to the original workspace when possible.
+
+## Artifacts
+
+Each run writes metadata under `.codex_parallel_runs/<timestamp>/`.
+
+| Path | Description |
 | --- | --- |
-| `-n, --num-agents` | 候选数量，默认 5 |
-| `--max-parallel` | 最大并发数 |
-| `--serial` | 串行运行，等价于 `--max-parallel 1` |
-| `--best-by` | 选择策略：`reasoning_tokens` 或 `duration` |
-| `--prompt-file` | 从 UTF-8 文本文件读取 prompt |
-| `--workspace` | 指定目标工作区 |
-| `--runs-dir` | 指定运行记录目录 |
-| `--codex-bin` | 指定 Codex CLI 路径 |
-| `--model` | 传递 Codex 模型名 |
-| `--resume` | 从当前 workspace 的 Codex 历史中选择 session |
-| `--resume-session-id` | 使用指定 Codex session id |
-| `--resume-include-non-interactive` | 在 resume 列表中包含非交互 session |
-| `--no-sync-back` | 生成候选结果后跳过同步 |
-| `--keep-workspaces` | 保留候选工作区 |
+| `prompt.txt` | Prompt sent to every candidate |
+| `summary.json` | Machine-readable run summary |
+| `BEST_AGENT.txt` | Selected candidate number |
+| `BEST_CODEX_SESSION.txt` | Selected Codex session id, when detected |
+| `FINAL_RESULT_WORKSPACE.txt` | Workspace that received the sync |
+| `reasoning_tokens.tsv` | Observed reasoning-token values |
+| `codex_capabilities.json` | Detected Codex CLI flags |
+| `sample_command.json` | Example command used for an agent |
+| `meta/agent_*/stdout.log` | Candidate stdout |
+| `meta/agent_*/stderr.log` | Candidate stderr |
+| `meta/agent_*/final_message.md` | Candidate final response |
+| `meta/agent_*/codex_home/` | Candidate Codex home |
 
-## 开发
+Candidate workspaces are deleted after a normal synced run. Use `--keep-workspaces` to keep them.
 
-运行基础检查：
+## Safety Model
+
+- The original workspace is changed only after a successful candidate is selected.
+- `--no-sync-back` leaves the original workspace untouched.
+- Sync is delete-aware, so winner deletions are propagated.
+- `.git` is never copied back over the original repository metadata.
+- Run `git diff` after every synced run.
+
+## CLI Reference
+
+| Option | Description |
+| --- | --- |
+| `-n, --num-agents` | Number of candidates, default `5` |
+| `--max-parallel` | Maximum concurrent Codex processes |
+| `--serial` | Run one candidate at a time |
+| `--best-by, --candidate-by` | Selection strategy: `reasoning_tokens` or `duration` |
+| `--prompt-file` | Read prompt from a UTF-8 file |
+| `--workspace` | Target workspace, default current directory |
+| `--runs-dir` | Directory for run records; must be outside the workspace |
+| `--codex-bin` | Codex executable, default `codex` |
+| `--model` | Optional Codex model name |
+| `--resume` | Choose a resumable Codex session interactively |
+| `--resume-session-id` | Resume a specific Codex session id |
+| `--resume-include-non-interactive` | Include `codex exec` sessions in the resume picker |
+| `--no-sync-back` | Do not modify the original workspace |
+| `--keep-workspaces` | Keep candidate workspaces after the run |
+
+## Development
 
 ```bash
 python3 -m py_compile parallel_codex_runner.py
@@ -175,8 +214,8 @@ python3 -m unittest discover
 python3 parallel_codex_runner.py --help
 ```
 
-项目当前保持单文件 CLI 结构，便于阅读、复制和调试。欢迎通过 issue 或 pull request 讨论改进方向。
+The project intentionally stays small: one CLI file, one test file, no required third-party runtime dependencies.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
