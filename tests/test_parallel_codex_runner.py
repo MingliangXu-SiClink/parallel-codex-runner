@@ -634,6 +634,12 @@ class TuiCommandTests(unittest.TestCase):
 
                 self.assertTrue(frame.display)
                 self.assertEqual(frame.border_title, "AGENT-001, ←/→ switch")
+                app.agents[1].result = {"seconds": 1.234, "reasoning_tokens": 42}
+                app.agents[1].reasoning_tokens = 42
+                app._sync()
+                await pilot.pause()
+
+                self.assertEqual(frame.border_title, "AGENT-001, seconds=1.23s, reasoning_tokens=42, ←/→ switch")
 
         asyncio.run(run())
 

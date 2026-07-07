@@ -45,6 +45,18 @@ def compact_block(text: str, limit: int = 2400) -> str:
     return text.strip()
 
 
+def format_seconds(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if seconds < 0 or seconds != seconds:
+        return ""
+    return f"{seconds:.2f}s"
+
+
 def value_at(payload: dict[str, Any], *path: str) -> Any:
     current: Any = payload
     for key in path:
@@ -1161,6 +1173,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _detail_title(self, pane: AgentPane) -> str:
             title = f"AGENT-{pane.idx:03d}"
             parts = []
+            if isinstance(pane.result, dict):
+                seconds = format_seconds(pane.result.get("seconds"))
+                if seconds:
+                    parts.append(f"seconds={seconds}")
             if pane.reasoning_tokens is not None:
                 parts.append(f"reasoning_tokens={pane.reasoning_tokens}")
             if pane.idx == self.best_agent:
