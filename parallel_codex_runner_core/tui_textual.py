@@ -494,6 +494,16 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.exit()
 
         def action_clear_view(self) -> None:
+            if self.running:
+                self.status = "Cannot clear while a run is active"
+                self._sync()
+                return
+            if self._has_pending_run():
+                for pane in self.agents.values():
+                    pane.command_text = ""
+                self.status = "Cleared command view"
+                self._sync()
+                return
             for pane in self.agents.values():
                 pane.status = "idle"
                 pane.reasoning_tokens = None
@@ -526,7 +536,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync()
                 return
             if self._has_pending_run():
-                if self.best_agent is not None and not self._finalize_agent(self.best_agent):
+                if getattr(self.args, "no_sync_back", False):
+                    if not self._cleanup_after_pending_run():
+                        self._sync()
+                        return
+                    self._clear_pending_run()
+                    self.exit()
+                    return
+                if self.best_agent is not None and not self._finalize_agent(self.best_agent, require_resume=False):
                     self._sync()
                     return
                 if self.best_agent is None:
@@ -562,6 +579,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self._sync()
 
         def _handle_numofagents(self, args: list[str]) -> None:
+            if self.running:
+                self.status = "Cannot change agent count while running"
+                self._sync()
+                return
             if not args:
                 self.status = f"numofagents={self.num_agents}"
                 self._show_text(self.status)
@@ -577,9 +598,15 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "numofagents must be > 0"
                 self._sync()
                 return
-            if self._has_pending_run() and not self._finalize_agent(self.selected_agent):
-                self._sync()
-                return
+            if self._has_pending_run():
+                if getattr(self.args, "no_sync_back", False):
+                    if not self._cleanup_after_pending_run():
+                        self._sync()
+                        return
+                    self._clear_pending_run()
+                elif not self._finalize_agent(self.best_agent or self.selected_agent):
+                    self._sync()
+                    return
             self.num_agents = value
             self.selected_agent = min(self.selected_agent, value)
             self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
@@ -590,6 +617,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self._sync()
 
         def _handle_resume(self, args: list[str]) -> None:
+            if self.running:
+                self.status = "Cannot change resume session while running"
+                self._sync()
+                return
             if args and args[0].lower() in {"clear", "new"}:
                 self.resume_session_id = ""
                 self.run_info_rows = self._base_info_rows()
@@ -641,7 +672,12 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "A run is already active"
                 self._sync()
                 return
-            if self._has_pending_run() and not self._finalize_agent(self.selected_agent):
+            if self._has_pending_run() and getattr(self.args, "no_sync_back", False):
+                if not self._cleanup_after_pending_run():
+                    self._sync()
+                    return
+                self._clear_pending_run()
+            if self._has_pending_run() and not self._finalize_agent(self.best_agent or self.selected_agent):
                 self._sync()
                 return
             self.running = True
@@ -716,7 +752,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = f"Cleanup failed: {exc}"
                 return False
 
-        def _finalize_agent(self, idx: int) -> bool:
+        def _finalize_agent(self, idx: int, require_resume: bool = True) -> bool:
             pane = self.agents.get(idx)
             result_data = pane.result if pane is not None else None
             if not result_data:
@@ -727,13 +763,20 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = f"AGENT-{idx:03d} is not successful"
                 return False
             try:
-                promotion = promote_best_codex_session_to_workspace(result, self.workspace)
-                if promotion is None or not result.codex_thread_id:
+                promotion = None
+                try:
+                    promotion = promote_best_codex_session_to_workspace(result, self.workspace)
+                except Exception:
+                    if require_resume:
+                        raise
+                if require_resume and (promotion is None or not result.codex_thread_id):
                     self.status = f"AGENT-{idx:03d} has no resumable session"
                     return False
                 sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
-                result_data["codex_thread_id"] = result.codex_thread_id
-                self.resume_session_id = result.codex_thread_id
+                if result.codex_thread_id:
+                    result_data["codex_thread_id"] = result.codex_thread_id
+                    if require_resume:
+                        self.resume_session_id = result.codex_thread_id
                 if not self._cleanup_after_pending_run():
                     return False
                 self._clear_pending_run()
@@ -746,10 +789,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 
         def _show_text(self, text: str) -> None:
             pane = self.agents.setdefault(self.selected_agent, AgentPane(self.selected_agent))
-            pane.input_text = ""
-            pane.final_text = ""
             pane.command_text = text
-            pane.clear_detail()
             self._sync()
 
         def _read_final_message(self, result: dict[str, Any]) -> str:

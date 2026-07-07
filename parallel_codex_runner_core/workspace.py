@@ -73,6 +73,37 @@ def git_workspace_toplevel(workspace: Path) -> Optional[Path]:
     return top if head.returncode == 0 else None
 
 
+def git_worktree_paths(original_workspace: Path) -> List[Path]:
+    if git_workspace_toplevel(original_workspace) is None:
+        return []
+    result = subprocess.run(
+        ["git", "-C", str(original_workspace), "worktree", "list", "--porcelain"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    paths: List[Path] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line.removeprefix("worktree ")).resolve())
+    return paths
+
+
+def prune_git_worktrees(original_workspace: Path) -> None:
+    if git_workspace_toplevel(original_workspace) is None:
+        return
+    subprocess.run(
+        ["git", "-C", str(original_workspace), "worktree", "prune", "--expire", "now"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> None:
     if not workspace_copy.exists() and not workspace_copy.is_symlink():
         return
@@ -87,22 +118,21 @@ def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> No
         if result.returncode == 0:
             return
     shutil.rmtree(workspace_copy, ignore_errors=True)
+    prune_git_worktrees(original_workspace)
 
 
 def cleanup_workspace_copies(original_workspace: Path, workspaces_root: Path) -> None:
-    if not workspaces_root.exists():
-        return
-    for child in workspaces_root.iterdir():
-        cleanup_workspace_copy(original_workspace, child)
-    shutil.rmtree(workspaces_root, ignore_errors=True)
-    if git_workspace_toplevel(original_workspace) is not None:
-        subprocess.run(
-            ["git", "-C", str(original_workspace), "worktree", "prune"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
+    root = workspaces_root.resolve()
+    original_top = git_workspace_toplevel(original_workspace)
+    if original_top is not None:
+        for path in git_worktree_paths(original_workspace):
+            if path != original_top and (path == root or is_relative_to(path, root)):
+                cleanup_workspace_copy(original_workspace, path)
+    if workspaces_root.exists():
+        for child in workspaces_root.iterdir():
+            cleanup_workspace_copy(original_workspace, child)
+        shutil.rmtree(workspaces_root, ignore_errors=True)
+    prune_git_worktrees(original_workspace)
 
 
 def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:

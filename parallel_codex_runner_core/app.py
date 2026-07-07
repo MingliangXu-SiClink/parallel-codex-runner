@@ -285,12 +285,11 @@ def prepare_agent_codex_home(
     if not resume_session_id or not agent_state_db.exists():
         return
 
+    isolated_rollout: Optional[Path] = None
     rollout_path = find_rollout_path_for_session(real_codex_home, resume_session_id)
-    if rollout_path is None or not rollout_path.exists():
-        return
-
-    isolated_rollout = agent_codex_home / relative_path_or_import_path(rollout_path, real_codex_home)
-    copy_file_atomic(rollout_path, isolated_rollout)
+    if rollout_path is not None and rollout_path.exists():
+        isolated_rollout = agent_codex_home / relative_path_or_import_path(rollout_path, real_codex_home)
+        copy_file_atomic(rollout_path, isolated_rollout)
 
     conn: Optional[sqlite3.Connection] = None
     try:
@@ -298,7 +297,7 @@ def prepare_agent_codex_home(
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
         assignments = []
         params: List[Any] = []
-        if "rollout_path" in columns:
+        if isolated_rollout is not None and "rollout_path" in columns:
             assignments.append("rollout_path = ?")
             params.append(str(isolated_rollout))
         if "cwd" in columns:

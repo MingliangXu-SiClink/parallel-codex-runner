@@ -16,12 +16,14 @@ from parallel_codex_runner import (
     AgentState,
     build_codex_command,
     cleanup_workspace_copy,
+    cleanup_workspace_copies,
     copy_workspace,
     create_unique_run_root,
     extract_codex_thread_id_from_json,
     import_codex_session_to_workspace,
     load_resume_sessions_from_state,
     parse_args,
+    prepare_agent_codex_home,
     promote_codex_session_to_workspace,
     run_one_agent,
     stream_to_log,
@@ -105,6 +107,45 @@ class WorkspaceCopyTests(unittest.TestCase):
                 self.assertEqual((dst / "untracked.txt").read_text(encoding="utf-8"), "untracked")
             finally:
                 cleanup_workspace_copy(workspace, dst)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_cleanup_workspace_copies_prunes_worktree_record_when_root_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            workspace = root / "workspace"
+            workspaces_root = root / "runs" / "workspaces"
+            dst = workspaces_root / "agent_001"
+            workspace.mkdir()
+            workspaces_root.mkdir(parents=True)
+            subprocess.run(
+                ["git", "-c", "init.defaultBranch=main", "init"],
+                cwd=workspace,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            (workspace / "keep.txt").write_text("clean", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=workspace, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "-C", str(workspace), "worktree", "add", "--detach", str(dst), "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            shutil.rmtree(workspaces_root)
+            cleanup_workspace_copies(workspace, workspaces_root)
+
+            result = subprocess.run(
+                ["git", "-C", str(workspace), "worktree", "list", "--porcelain"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotIn(str(dst), result.stdout)
 
 
 class RunRootTests(unittest.TestCase):
@@ -346,6 +387,35 @@ class ResumeSessionTests(unittest.TestCase):
 
             self.assertEqual([s.session_id for s in default_sessions], ["interactive"])
             self.assertEqual([s.session_id for s in all_sessions], ["exec", "interactive"])
+
+    def test_prepare_agent_codex_home_rebinds_cwd_when_rollout_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real"
+            agent_home = root / "agent"
+            agent_workspace = root / "workspaces" / "agent_001"
+            real_home.mkdir()
+            agent_workspace.mkdir(parents=True)
+
+            session_id = "019f-missing-rollout"
+            missing_rollout = real_home / "sessions" / "missing.jsonl"
+            conn = sqlite3.connect(real_home / "state_5.sqlite")
+            try:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (session_id, "/old/workspace", str(missing_rollout)))
+                conn.commit()
+            finally:
+                conn.close()
+
+            prepare_agent_codex_home(real_home, agent_home, agent_workspace, session_id)
+
+            conn = sqlite3.connect(agent_home / "state_5.sqlite")
+            try:
+                row = conn.execute("SELECT cwd, rollout_path FROM threads WHERE id = ?", (session_id,)).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(row, (str(agent_workspace), str(missing_rollout)))
 
     def test_promote_codex_session_rebinds_state_and_rollout_to_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
