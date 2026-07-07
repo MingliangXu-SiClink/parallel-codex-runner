@@ -11,6 +11,100 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/help", "show commands"),
+    ("/numofagents", "show current agent count"),
+    ("/numofagents 8", "set agent count"),
+    ("/resume", "show resumable Codex sessions"),
+    ("/resume 1", "load a listed session"),
+    ("/resume latest", "load latest session"),
+    ("/resume clear", "start without resume"),
+    ("/clear", "clear the current view"),
+    ("/exit", "quit"),
+)
+
+
+def command_suggestions(value: str) -> list[str]:
+    text = str(value or "").strip()
+    if not text.startswith("/"):
+        return []
+    return [
+        f"{command}  {description}"
+        for command, description in TEXTUAL_COMMANDS
+        if command.startswith(text)
+    ][:6]
+
+
+def compact_text(text: str, limit: int = 600) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def compact_block(text: str, limit: int = 2400) -> str:
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: max(0, limit - 4)].rstrip() + "\n..."
+
+
+def value_at(payload: dict[str, Any], *path: str) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("message", "text", "content", "delta", "summary", "reasoning"):
+            text = text_value(value.get(key))
+            if text:
+                return text
+    if isinstance(value, list):
+        return "\n".join(part for item in value if (part := text_value(item)))
+    return ""
+
+
+def display_line_from_json(payload: dict[str, Any]) -> str:
+    kind = str(payload.get("type") or payload.get("event") or "").strip()
+    text_paths = [
+        ("message",),
+        ("text",),
+        ("content",),
+        ("delta",),
+        ("summary",),
+        ("reasoning",),
+        ("payload", "message"),
+        ("payload", "text"),
+        ("payload", "content"),
+        ("payload", "delta"),
+        ("payload", "summary"),
+        ("payload", "reasoning"),
+    ]
+    for path in text_paths:
+        text = text_value(value_at(payload, *path))
+        if text:
+            prefix = f"{kind}: " if kind else ""
+            return prefix + compact_text(text)
+    return ""
+
+
+def display_line_from_output(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return compact_text(text)
+    if isinstance(payload, dict):
+        return display_line_from_json(payload)
+    return ""
+
+
 try:
     from textual import events, on
     from textual.app import App, ComposeResult
@@ -31,81 +125,15 @@ Commands:
   /help                 show this help
   /numofagents          show current agent count
   /numofagents <n>      set agent count for the next run
-  /resume               load latest Codex session for this workspace
-  /resume list          show recent sessions
+  /resume               show recent sessions
   /resume <n|session>   load a listed session or explicit session id
+  /resume latest        load latest Codex session
   /resume clear         start next run without resume
   /clear                clear the current view
   /exit                 quit
 
 Enter any non-command text to run PCR. Left/right switches agent panes.
 """.strip()
-
-
-    def compact_text(text: str, limit: int = 600) -> str:
-        compact = " ".join(text.split())
-        if len(compact) <= limit:
-            return compact
-        return compact[: max(0, limit - 3)].rstrip() + "..."
-
-
-    def compact_block(text: str, limit: int = 2400) -> str:
-        stripped = text.strip()
-        if len(stripped) <= limit:
-            return stripped
-        return stripped[: max(0, limit - 4)].rstrip() + "\n..."
-
-
-    def value_at(payload: dict[str, Any], *path: str) -> Any:
-        current: Any = payload
-        for key in path:
-            if not isinstance(current, dict):
-                return None
-            current = current.get(key)
-        return current
-
-
-    def display_line_from_json(payload: dict[str, Any]) -> str:
-        kind = str(payload.get("type") or payload.get("event") or "").strip()
-        text_paths = [
-            ("message",),
-            ("text",),
-            ("content",),
-            ("delta",),
-            ("summary",),
-            ("payload", "message"),
-            ("payload", "text"),
-            ("payload", "content"),
-            ("payload", "delta"),
-            ("payload", "summary"),
-        ]
-        for path in text_paths:
-            value = value_at(payload, *path)
-            if isinstance(value, str) and value.strip():
-                prefix = f"{kind}: " if kind else ""
-                return prefix + compact_text(value)
-
-        session_id = (
-            value_at(payload, "thread_id")
-            or value_at(payload, "session_id")
-            or value_at(payload, "payload", "session_id")
-            or value_at(payload, "payload", "id")
-        )
-        if kind and isinstance(session_id, str) and session_id.strip():
-            return f"{kind}: {session_id.strip()}"
-        if kind:
-            return kind
-        return compact_text(json.dumps(payload, ensure_ascii=False))
-
-
-    def display_line_from_output(text: str) -> str:
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            return compact_text(text)
-        if isinstance(payload, dict):
-            return display_line_from_json(payload)
-        return compact_text(text)
 
 
     @dataclass
@@ -174,6 +202,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
         .caption {
             height: 1;
             margin: 0 1;
+            padding: 0 1;
             color: #8fb3ff;
             text-style: bold;
         }
@@ -184,15 +213,23 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             background: #111722;
         }
         #tree {
-            height: 12;
+            height: 9;
         }
         #detail {
             height: 1fr;
         }
+        #suggestions {
+            height: auto;
+            max-height: 6;
+            margin: 0 1;
+            padding: 0 1;
+            color: #b7c8e6;
+            background: #101216;
+        }
         #prompt {
             height: 3;
             min-height: 3;
-            max-height: 8;
+            max-height: 10;
             margin: 0 1;
             padding: 0 1;
             border: round #4c5f74;
@@ -202,8 +239,10 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             height: 1;
             margin: 0 1;
             padding: 0 1;
+            content-align: left middle;
             background: #171d25;
             color: #ffffff;
+            text-style: bold;
         }
         """
 
@@ -225,13 +264,15 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.status = "Ready"
             self.best_agent: int | None = None
             self.started_at: float | None = None
+            self.prompt_height = 3
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
-                yield Static("Agents", classes="caption")
+                yield Static("Run state", classes="caption")
                 yield Static("", id="tree", classes="box")
-                yield Static("Agent detail", classes="caption")
+                yield Static("", id="detail_caption", classes="caption")
                 yield Static("", id="detail", classes="box")
+                yield Static("", id="suggestions")
                 yield PromptEditor("", id="prompt", soft_wrap=True, show_line_numbers=False)
                 yield Static("", id="state")
 
@@ -248,6 +289,8 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             prompt = self.query_one("#prompt", PromptEditor)
             value = event.value.strip()
             prompt.clear()
+            self._update_suggestions("")
+            self._sync_prompt_height()
             if not value:
                 return
             if value.startswith("/"):
@@ -255,6 +298,12 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             else:
                 self._start_run(value)
             prompt.focus()
+
+        @on(TextArea.Changed)
+        def _on_text_changed(self, event: TextArea.Changed) -> None:
+            if event.text_area.id == "prompt":
+                self._update_suggestions(event.text_area.text)
+                self._sync_prompt_height()
 
         @on(AgentSwitchRequested)
         def _on_switch(self, event: AgentSwitchRequested) -> None:
@@ -281,7 +330,10 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 pane.status = str(result.get("status") or "finished")
                 final_text = self._read_final_message(result)
-                pane.append(final_text or str(result.get("stdout_tail") or result.get("stderr_tail") or ""))
+                if final_text:
+                    pane.append(final_text)
+                elif pane.status != "success":
+                    pane.append(str(result.get("stderr_tail") or result.get("stdout_tail") or ""))
             elif kind == "run_finished":
                 self.running = False
                 self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
@@ -325,6 +377,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
         def _handle_numofagents(self, args: list[str]) -> None:
             if not args:
                 self.status = f"numofagents={self.num_agents}"
+                self._show_text(self.status)
                 self._sync()
                 return
             try:
@@ -341,6 +394,7 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.selected_agent = min(self.selected_agent, value)
             self.agents = {idx: self.agents.get(idx, AgentPane(idx)) for idx in range(1, value + 1)}
             self.status = f"Next run will use {value} agents"
+            self._show_text(self.status)
             self._sync()
 
         def _handle_resume(self, args: list[str]) -> None:
@@ -350,13 +404,10 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
                 self._sync()
                 return
             self.resume_entries = list_resume_sessions(self.workspace, include_non_interactive=True)
-            if args and args[0].lower() == "list":
-                lines = ["Recent sessions:"]
-                for index, session in enumerate(self.resume_entries[:8], 1):
-                    lines.append(f"{index}. {session.session_id}  {session.title[:80]}")
-                self._show_text("\n".join(lines) if len(lines) > 1 else "No resumable sessions found")
+            if not args or args[0].lower() == "list":
+                self._show_resume_list()
                 return
-            selector = args[0] if args else "1"
+            selector = "1" if args[0].lower() == "latest" else args[0]
             chosen = None
             if selector.isdigit():
                 idx = int(selector)
@@ -380,6 +431,13 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.status = f"Resume session set: {chosen.session_id}"
             self._sync()
 
+        def _show_resume_list(self) -> None:
+            lines = ["Recent sessions:", "Use /resume <number> or /resume <session_id> to load one.", ""]
+            for index, session in enumerate(self.resume_entries[:8], 1):
+                lines.append(f"{index}. {session.session_id}  {session.title[:80]}")
+            self.status = "Choose a resume session" if len(lines) > 3 else "No resumable sessions found"
+            self._show_text("\n".join(lines) if len(lines) > 3 else "No resumable sessions found")
+
         def _start_run(self, prompt: str) -> None:
             if self.running:
                 self.status = "A run is already active"
@@ -389,6 +447,8 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
             self.best_agent = None
             self.started_at = time.monotonic()
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
+            for pane in self.agents.values():
+                pane.append(f"Input:\n{prompt}")
             self.selected_agent = min(self.selected_agent, self.num_agents)
             self.status = "Preparing agents"
             self._sync()
@@ -439,29 +499,71 @@ Enter any non-command text to run PCR. Left/right switches agent panes.
 
         def _sync(self) -> None:
             self.query_one("#tree", Static).update(self._tree_text())
+            self.query_one("#detail_caption", Static).update(self._detail_caption_text())
             self.query_one("#detail", Static).update(self._detail_text())
             self.query_one("#state", Static).update(self._state_text())
 
         def _tree_text(self) -> str:
-            lines = [f"workspace: {self.workspace}", f"agents: {self.num_agents}  resume: {self.resume_session_id or '-'}", ""]
-            for idx in range(1, self.num_agents + 1):
-                pane = self.agents[idx]
-                marker = ">" if idx == self.selected_agent else " "
-                best = " *best*" if idx == self.best_agent else ""
-                rtok = "-" if pane.reasoning_tokens is None else str(pane.reasoning_tokens)
-                lines.append(f"{marker} agent_{idx:03d}  {pane.status:<9}  rtok={rtok}{best}")
+            max_parallel = (
+                1
+                if getattr(self.args, "serial", False)
+                else min(getattr(self.args, "max_parallel", None) or self.num_agents, self.num_agents)
+            )
+            execution = "serial" if max_parallel == 1 else "parallel"
+            lines = [
+                f"workspace: {self.workspace}",
+                f"status: {self.status}",
+                f"num agents: {self.num_agents}",
+                f"max parallel: {max_parallel}",
+                f"execution: {execution}",
+                f"best by: {getattr(self.args, 'best_by', 'reasoning_tokens')}",
+                f"resume: {self.resume_session_id or '-'}",
+                f"selected agent: agent_{self.selected_agent:03d}",
+            ]
+            if self.best_agent is not None:
+                lines.append(f"best agent: agent_{self.best_agent:03d}")
             return "\n".join(lines)
 
         def _detail_text(self) -> str:
             pane = self.agents.get(self.selected_agent)
             if pane is None:
                 return ""
-            lines = [f"agent_{pane.idx:03d}  status={pane.status}  rtok={pane.reasoning_tokens if pane.reasoning_tokens is not None else '-'}", ""]
-            lines.extend(pane.lines[-30:] or ["No output yet."])
-            return "\n".join(lines)
+            return "\n".join(pane.lines[-40:] or ["No input or output yet."])
+
+        def _detail_caption_text(self) -> str:
+            pane = self.agents.get(self.selected_agent)
+            if pane is None:
+                return "Agent detail"
+            rtok = "-" if pane.reasoning_tokens is None else str(pane.reasoning_tokens)
+            best = ", best" if pane.idx == self.best_agent else ""
+            return f"Agent detail (agent_{pane.idx:03d}, {pane.status}, rtok={rtok}{best}; left/right to switch)"
 
         def _state_text(self) -> str:
             return f"{self.status} | left/right: switch agent | /help"
+
+        def _update_suggestions(self, value: str) -> None:
+            self.query_one("#suggestions", Static).update("\n".join(command_suggestions(value)))
+
+        def _prompt_content_width(self) -> int:
+            try:
+                prompt = self.query_one("#prompt", PromptEditor)
+                width = int(getattr(prompt, "wrap_width", 0) or 0)
+                if width > 0:
+                    return width
+                width = int(getattr(prompt.content_size, "width", 0) or getattr(prompt.size, "width", 0) or 0)
+            except Exception:
+                width = 0
+            return max(20, width or 80)
+
+        def _sync_prompt_height(self) -> None:
+            try:
+                text = self.query_one("#prompt", PromptEditor).text
+                width = self._prompt_content_width()
+                visible_lines = sum(max(1, (len(line) + width - 1) // width) for line in (text or "").split("\n"))
+                self.prompt_height = max(3, min(10, visible_lines + 2))
+                self.query_one("#prompt", PromptEditor).styles.height = self.prompt_height
+            except Exception:
+                return
 
 
     def run_textual_tui(args: argparse.Namespace) -> int:

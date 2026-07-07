@@ -19,6 +19,7 @@ from parallel_codex_runner import (
     promote_codex_session_to_workspace,
     sync_back_with_python,
 )
+from parallel_codex_runner_core.tui_textual import command_suggestions, display_line_from_output
 
 
 class SyncBackTests(unittest.TestCase):
@@ -144,6 +145,16 @@ class ArgParseTests(unittest.TestCase):
         args = parse_args(["fix tests"])
 
         self.assertEqual(args.num_agents, 5)
+
+
+class TuiCommandTests(unittest.TestCase):
+    def test_command_suggestions_only_for_slash_commands(self) -> None:
+        self.assertEqual(command_suggestions("hello"), [])
+        self.assertIn("/resume 1", "\n".join(command_suggestions("/resume")))
+
+    def test_display_line_filters_lifecycle_noise(self) -> None:
+        self.assertEqual(display_line_from_output('{"type":"thread.started","thread_id":"abc"}'), "")
+        self.assertIn("thinking", display_line_from_output('{"type":"agent_reasoning","text":"thinking"}'))
 
 
 class ResumeSessionTests(unittest.TestCase):

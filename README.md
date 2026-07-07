@@ -74,6 +74,7 @@ Inside the TUI:
 ```text
 /numofagents 8
 /resume
+/resume 1
 fix the failing tests
 ```
 
@@ -229,9 +230,9 @@ Interactive slash commands:
 | Command | Description |
 | --- | --- |
 | `/numofagents <n>` | Set agent count for the next run |
-| `/resume` | Load the latest resumable Codex session |
-| `/resume list` | Show recent resumable sessions |
+| `/resume` | Show recent resumable sessions |
 | `/resume <n|session>` | Resume a listed or explicit session id |
+| `/resume latest` | Load the latest resumable Codex session |
 | `/resume clear` | Disable resume for the next run |
 | `/clear` | Clear the current TUI view |
 | `/exit` | Quit |
