@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -45,7 +46,7 @@ def read_codex_exec_resume_help(codex_bin: str) -> str:
 
 
 def flag_supported(help_text: str, flag: str) -> bool:
-    return flag in help_text
+    return re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", help_text) is not None
 
 
 def short_flag_supported(help_text: str, flag: str) -> bool:

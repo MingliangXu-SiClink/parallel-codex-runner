@@ -66,6 +66,28 @@ def text_value(value: Any) -> str:
     return ""
 
 
+def compact_output_line(line: str, max_chars: int = 1000) -> str:
+    if len(line) <= max_chars:
+        return line
+    keep = max(1, (max_chars - 5) // 2)
+    return f"{line[:keep].rstrip()} ... {line[-keep:].lstrip()}"
+
+
+def compact_command_output(output: str) -> str:
+    lines = output.rstrip().splitlines()
+    if len(lines) <= 3:
+        return "\n".join(compact_output_line(line) for line in lines)
+    return "\n".join([compact_output_line(lines[0]), compact_output_line(lines[1]), "...", compact_output_line(lines[-1])])
+
+
+def command_status_suffix(status: str, exit_code: Any) -> str:
+    if exit_code is not None:
+        return f" [exit {exit_code}]"
+    if status and status != "in_progress":
+        return f" [{status}]"
+    return ""
+
+
 def is_detail_noise_line(text: str) -> bool:
     normalized = " ".join(text.casefold().replace("_", " ").replace("-", " ").split())
     return (
@@ -130,11 +152,10 @@ def display_line_parts_from_json(payload: dict[str, Any]) -> tuple[str, str]:
         exit_code = item.get("exit_code")
         if output:
             header = f"$ {command}" if command else "$ command"
-            return "activity", f"{header}\n{output.rstrip()}"
+            header += command_status_suffix(status, exit_code)
+            return "activity", f"{header}\n{compact_command_output(output)}"
         if command:
-            suffix = f" [{status}]" if status and status != "in_progress" else ""
-            if exit_code is not None:
-                suffix = f" [exit {exit_code}]"
+            suffix = command_status_suffix(status, exit_code)
             return "activity", f"$ {command}{suffix}"
 
     text_paths = [
@@ -425,6 +446,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.run_info_rows = self._base_info_rows()
             self.pending_run_root: Path | None = None
             self.pending_workspaces_root: Path | None = None
+            self.detail_history: list[tuple[str, str, str]] = []
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
@@ -536,15 +558,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                         self._clear_pending_run()
                 else:
                     self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
-                if self.best_agent and self.best_agent in self.agents:
-                    self.selected_agent = self.best_agent
             elif kind == "run_failed":
                 self.running = False
                 self.cancel_event = None
                 self.status = f"Run failed: {payload.get('message') or ''}"
                 if self._cleanup_after_pending_run():
                     self._clear_pending_run()
-            self._sync()
+            if kind not in {"agent_line", "agent_tokens", "agent_status"}:
+                self._sync()
             if kind in {"run_finished", "run_failed"} and self.exit_after_run and not self._has_pending_run():
                 self.exit()
 
@@ -554,11 +575,16 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync()
                 return
             if self._has_pending_run():
-                for pane in self.agents.values():
-                    pane.command_text = ""
-                self.status = "Cleared command view"
-                self._sync()
-                return
+                if self.best_agent is None:
+                    if not self._discard_pending_run():
+                        self._sync()
+                        return
+                else:
+                    for pane in self.agents.values():
+                        pane.command_text = ""
+                    self.status = "Cleared command view"
+                    self._sync()
+                    return
             for pane in self.agents.values():
                 pane.status = "idle"
                 pane.reasoning_tokens = None
@@ -568,6 +594,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 pane.result = None
                 pane.clear_detail()
             self.best_agent = None
+            self.detail_history.clear()
             self.run_info_rows = self._base_info_rows()
             self.status = "Ready"
             self._sync()
@@ -654,12 +681,11 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self._sync()
                 return
             if self._has_pending_run():
-                if getattr(self.args, "no_sync_back", False):
-                    if not self._cleanup_after_pending_run():
+                if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
+                    if not self._discard_pending_run():
                         self._sync()
                         return
-                    self._clear_pending_run()
-                elif not self._finalize_agent(self.best_agent or self.selected_agent):
+                elif not self._finalize_agent(self.selected_agent, archive_detail=True):
                     self._sync()
                     return
             self.num_agents = value
@@ -727,12 +753,11 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "A run is already active"
                 self._sync()
                 return
-            if self._has_pending_run() and getattr(self.args, "no_sync_back", False):
-                if not self._cleanup_after_pending_run():
+            if self._has_pending_run() and (getattr(self.args, "no_sync_back", False) or self.best_agent is None):
+                if not self._discard_pending_run():
                     self._sync()
                     return
-                self._clear_pending_run()
-            if self._has_pending_run() and not self._finalize_agent(self.best_agent or self.selected_agent):
+            if self._has_pending_run() and not self._finalize_agent(self.selected_agent, archive_detail=True):
                 self._sync()
                 return
             self.running = True
@@ -792,6 +817,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.pending_run_root = None
             self.pending_workspaces_root = None
 
+        def _discard_pending_run(self) -> bool:
+            if not self._cleanup_after_pending_run():
+                return False
+            self._clear_pending_run()
+            self.best_agent = None
+            self.run_info_rows = self._base_info_rows()
+            return True
+
         def _cleanup_after_pending_run(self) -> bool:
             if getattr(self.args, "keep_workspaces", False):
                 return True
@@ -807,7 +840,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = f"Cleanup failed: {exc}"
                 return False
 
-        def _finalize_agent(self, idx: int, require_resume: bool = True) -> bool:
+        def _finalize_agent(self, idx: int, require_resume: bool = True, archive_detail: bool = False) -> bool:
             pane = self.agents.get(idx)
             result_data = pane.result if pane is not None else None
             if not result_data:
@@ -839,6 +872,8 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                         self.resume_session_id = result.codex_thread_id
                 if not self._cleanup_after_pending_run():
                     return False
+                if archive_detail and pane is not None:
+                    self._archive_agent_detail(pane)
                 self._clear_pending_run()
                 self.run_info_rows = self._base_info_rows()
                 self.status = f"Continuing from AGENT-{idx:03d}"
@@ -962,7 +997,13 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 table.add_row(Text(self._format_prefixed_block(prefix, block), style=style))
             return table
 
+        def _archive_agent_detail(self, pane: AgentPane) -> None:
+            self.detail_history.extend(self._pane_detail_blocks(pane))
+
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
+            return [*self.detail_history, *self._pane_detail_blocks(pane)]
+
+        def _pane_detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
             if pane.input_text:
                 blocks.append((">", pane.input_text, "cyan"))

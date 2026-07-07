@@ -1131,6 +1131,43 @@ def compact_token_values(values: Iterable[int], limit: int = 16) -> List[int]:
     return seen[: limit - 1] + [seen[-1]]
 
 
+def compact_progress_text_line(line: str, max_chars: int = 1000) -> str:
+    if len(line) <= max_chars:
+        return line
+    keep = max(1, (max_chars - 5) // 2)
+    return f"{line[:keep].rstrip()} ... {line[-keep:].lstrip()}"
+
+
+def compact_command_output_for_progress(output: str) -> str:
+    lines = output.rstrip().splitlines()
+    if not lines:
+        return ""
+    display_lines = lines if len(lines) <= 3 else [lines[0], lines[1], "...", lines[-1]]
+    return "\n".join(compact_progress_text_line(line) if line != "..." else line for line in display_lines)
+
+
+def compact_agent_line_for_progress(text: str, obj: Any = None) -> str:
+    if obj is None:
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    if not isinstance(obj, dict):
+        return text
+
+    item = obj.get("item")
+    if not isinstance(item, dict):
+        payload = obj.get("payload")
+        if isinstance(payload, dict):
+            item = payload.get("item")
+    if isinstance(item, dict) and item.get("type") == "command_execution":
+        output = item.get("aggregated_output")
+        if isinstance(output, str) and output:
+            item["aggregated_output"] = compact_command_output_for_progress(output)
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return text
+
+
 async def stream_to_log(
     reader: Optional[asyncio.StreamReader],
     log_path: Path,
@@ -1154,11 +1191,17 @@ async def stream_to_log(
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
-            if progress_callback is not None:
-                progress_callback({"type": "agent_line", "idx": state.idx, "stream": stream_name, "text": text})
+            obj: Any = None
+            is_json = False
             try:
                 obj = json.loads(text)
+                is_json = True
             except json.JSONDecodeError:
+                pass
+            if progress_callback is not None:
+                progress_text = compact_agent_line_for_progress(text, obj) if is_json else text
+                progress_callback({"type": "agent_line", "idx": state.idx, "stream": stream_name, "text": progress_text})
+            if not is_json:
                 continue
             state.json_events += 1
             thread_id = extract_codex_thread_id_from_json(obj)

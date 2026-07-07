@@ -191,6 +191,16 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("--output-last-message", cmd)
         self.assertEqual(cmd[-2:], ["019f-test-session", "-"])
 
+    def test_long_flag_detection_does_not_match_substrings(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  --json\n  --model-provider <PROVIDER>\n",
+            Path("final.md"),
+        )
+
+        self.assertFalse(caps["model"])
+        self.assertNotIn("--model", cmd)
+
 
 class ArgParseTests(unittest.TestCase):
     def test_default_num_agents_is_five(self) -> None:
@@ -279,8 +289,45 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(display_line_parts_from_output(json.dumps(started)), ("activity", "$ /bin/zsh -lc 'pytest -q'"))
         self.assertEqual(
             display_line_parts_from_output(json.dumps(completed)),
-            ("activity", "$ /bin/zsh -lc 'pytest -q'\none\ntwo"),
+            ("activity", "$ /bin/zsh -lc 'pytest -q' [exit 0]\none\ntwo"),
         )
+
+    def test_display_line_compacts_long_command_output(self) -> None:
+        completed = {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "/bin/zsh -lc 'pytest -q'",
+                "aggregated_output": "one\ntwo\nthree\nfour\nfive\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        }
+
+        self.assertEqual(
+            display_line_parts_from_output(json.dumps(completed)),
+            ("activity", "$ /bin/zsh -lc 'pytest -q' [exit 0]\none\ntwo\n...\nfive"),
+        )
+
+    def test_display_line_compacts_very_long_command_output_line(self) -> None:
+        long_line = "a" * 3000
+        completed = {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "python big.py",
+                "aggregated_output": long_line,
+                "exit_code": 1,
+                "status": "completed",
+            },
+        }
+
+        category, text = display_line_parts_from_output(json.dumps(completed))
+
+        self.assertEqual(category, "activity")
+        self.assertIn("$ python big.py [exit 1]", text)
+        self.assertLess(len(text), len(long_line))
+        self.assertIn(" ... ", text)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
@@ -325,6 +372,104 @@ class TuiCommandTests(unittest.TestCase):
             self.assertEqual(app.resume_session_id, "session-2")
             sync_back.assert_called_once_with(candidate, workspace.resolve())
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_start_run_continues_from_selected_agent_not_best_agent(self) -> None:
+        args = parse_args([])
+        app = tui_textual.PcrTextualApp(args)
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.best_agent = 5
+        app.selected_agent = 2
+
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+            with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                thread_cls.return_value.start.return_value = None
+                app._start_run("next question")
+
+        finalize.assert_called_once_with(2, archive_detail=True)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_run_finished_does_not_auto_switch_to_best_agent(self) -> None:
+        args = parse_args(["-n", "5"])
+        app = tui_textual.PcrTextualApp(args)
+        app._sync = lambda: None
+        app.selected_agent = 2
+
+        app._on_runner_event(tui_textual.RunnerEvent({"type": "run_finished", "run_root": "/tmp/pcr-test/run", "best_agent": 5}))
+
+        self.assertEqual(app.selected_agent, 2)
+        self.assertEqual(app.best_agent, 5)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_start_run_discards_no_success_pending_run(self) -> None:
+        args = parse_args([])
+        app = tui_textual.PcrTextualApp(args)
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.best_agent = None
+
+        def discard_side_effect() -> bool:
+            app._clear_pending_run()
+            return True
+
+        with mock.patch.object(app, "_discard_pending_run", side_effect=discard_side_effect) as discard:
+            with mock.patch.object(app, "_finalize_agent", return_value=False) as finalize:
+                with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                    thread_cls.return_value.start.return_value = None
+                    app._start_run("next question")
+
+        discard.assert_called_once_with()
+        finalize.assert_not_called()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_finalize_archives_selected_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            candidate = root / "run" / "workspaces" / "agent_002"
+            workspace.mkdir()
+            candidate.mkdir(parents=True)
+            args = parse_args([])
+            args.workspace = str(workspace)
+            app = tui_textual.PcrTextualApp(args)
+            app.pending_workspaces_root = root / "run" / "workspaces"
+            pane = app.agents[2]
+            pane.input_text = "first question"
+            pane.thought_lines = ["thought"]
+            pane.output_lines = ["draft answer"]
+            pane.final_text = "final answer"
+            pane.result = {
+                "idx": 2,
+                "workspace_dir": str(candidate),
+                "meta_dir": "",
+                "codex_home": "",
+                "stdout_log": "",
+                "stderr_log": "",
+                "final_message": "",
+                "command": [],
+                "returncode": 0,
+                "status": "success",
+                "seconds": 1.0,
+                "codex_thread_id": "session-2",
+                "reasoning_tokens": 10,
+                "reasoning_token_values": [10],
+                "error": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+            with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
+                with mock.patch.object(tui_textual, "sync_best_workspace_back"):
+                    with mock.patch.object(tui_textual, "cleanup_workspace_copies"):
+                        promote.side_effect = lambda result, _workspace: result
+                        self.assertTrue(app._finalize_agent(2, archive_detail=True))
+
+            history_text = "\n".join(block for _prefix, block, _style in app.detail_history)
+            self.assertIn("first question", history_text)
+            self.assertIn("thought", history_text)
+            self.assertIn("draft answer", history_text)
+            self.assertIn("final answer", history_text)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_left_right_switches_when_detail_scroll_has_focus(self) -> None:
@@ -439,6 +584,41 @@ class StreamLogTests(unittest.TestCase):
                 await stream_to_log(reader, log_path, state, "stdout")
                 self.assertEqual(log_path.read_bytes(), line)
                 self.assertEqual(state.codex_thread_id, "abc")
+
+        asyncio.run(run())
+
+    def test_stream_to_log_sends_compact_command_output_to_progress(self) -> None:
+        async def run() -> None:
+            raw = {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "pytest -q",
+                    "aggregated_output": "one\ntwo\nthree\nfour\nfive\n",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+            raw_line = json.dumps(raw).encode() + b"\n"
+            reader = asyncio.StreamReader(limit=8)
+            reader.feed_data(raw_line)
+            reader.feed_eof()
+            events = []
+            state = AgentState(idx=1)
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = Path(tmp) / "stdout.log"
+                await stream_to_log(reader, log_path, state, "stdout", events.append)
+
+                self.assertEqual(log_path.read_bytes(), raw_line)
+
+            line_events = [event for event in events if event["type"] == "agent_line"]
+            self.assertEqual(len(line_events), 1)
+            compact_text = line_events[0]["text"]
+            self.assertLess(len(compact_text), len(raw_line.decode()))
+            self.assertEqual(
+                display_line_parts_from_output(compact_text),
+                ("activity", "$ pytest -q [exit 0]\none\ntwo\n...\nfive"),
+            )
 
         asyncio.run(run())
 
