@@ -37,17 +37,11 @@ def command_suggestions(value: str) -> list[str]:
 
 
 def compact_text(text: str, limit: int = 600) -> str:
-    compact = " ".join(text.split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: max(0, limit - 3)].rstrip() + "..."
+    return text.strip()
 
 
 def compact_block(text: str, limit: int = 2400) -> str:
-    stripped = text.strip()
-    if len(stripped) <= limit:
-        return stripped
-    return stripped[: max(0, limit - 4)].rstrip() + "\n..."
+    return text.strip()
 
 
 def value_at(payload: dict[str, Any], *path: str) -> Any:
@@ -126,6 +120,23 @@ def display_line_from_json(payload: dict[str, Any]) -> str:
 
 
 def display_line_parts_from_json(payload: dict[str, Any]) -> tuple[str, str]:
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        item = value_at(payload, "payload", "item")
+    if isinstance(item, dict) and item.get("type") == "command_execution":
+        command = text_value(item.get("command"))
+        output = text_value(item.get("aggregated_output"))
+        status = text_value(item.get("status"))
+        exit_code = item.get("exit_code")
+        if output:
+            header = f"$ {command}" if command else "$ command"
+            return "activity", f"{header}\n{output.rstrip()}"
+        if command:
+            suffix = f" [{status}]" if status and status != "in_progress" else ""
+            if exit_code is not None:
+                suffix = f" [exit {exit_code}]"
+            return "activity", f"$ {command}{suffix}"
+
     text_paths = [
         ("message",),
         ("text",),
@@ -195,7 +206,7 @@ def same_display_message(left: str, right: str) -> bool:
 try:
     from textual import events, on
     from textual.app import App, ComposeResult
-    from textual.containers import Vertical
+    from textual.containers import Vertical, VerticalScroll
     from textual.message import Message
     from textual.widgets import Static, TextArea
 except ModuleNotFoundError as exc:
@@ -213,6 +224,26 @@ else:
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
+    def fold_text_by_cells(text: str, width: int) -> str:
+        if width <= 1:
+            return text
+        folded_lines: list[str] = []
+        source_lines = text.splitlines() or [""]
+        for source in source_lines:
+            current = ""
+            current_width = 0
+            for char in source:
+                char_width = max(1, cell_len(char))
+                if current and current_width + char_width > width:
+                    folded_lines.append(current)
+                    current = char
+                    current_width = char_width
+                else:
+                    current += char
+                    current_width += char_width
+            folded_lines.append(current)
+        return "\n".join(folded_lines)
 
     HELP_TEXT = """
 Commands:
@@ -251,7 +282,6 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 return
             bucket = self.thought_lines if category == "thought" else self.output_lines if category == "output" else self.lines
             bucket.append(text)
-            del bucket[:-80]
 
         def clear_detail(self) -> None:
             self.lines.clear()
@@ -325,12 +355,20 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             text-style: bold;
         }
         #tree {
-            height: 17;
+            height: auto;
             margin: 0 1;
         }
-        #detail {
+        #detail-frame {
             height: 1fr;
             margin: 0 1;
+            border: round cyan;
+        }
+        #detail-scroll {
+            height: 1fr;
+        }
+        #detail {
+            width: 100%;
+            padding: 0 1;
         }
         #suggestions {
             height: 0;
@@ -391,7 +429,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
                 yield Static("", id="tree")
-                yield Static("", id="detail")
+                with Vertical(id="detail-frame"):
+                    with VerticalScroll(id="detail-scroll"):
+                        yield Static("", id="detail")
                 yield Static("", id="suggestions")
                 yield PromptEditor(
                     "",
@@ -433,7 +473,21 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 
         @on(AgentSwitchRequested)
         def _on_switch(self, event: AgentSwitchRequested) -> None:
-            self.selected_agent = min(self.num_agents, max(1, self.selected_agent + event.delta))
+            self._switch_agent(event.delta)
+
+        async def _on_key(self, event: events.Key) -> None:
+            if event.key in {"left", "right"}:
+                prompt = self.query_one("#prompt", PromptEditor)
+                if not prompt.text.strip():
+                    event.stop()
+                    event.prevent_default()
+                    self._switch_agent(-1 if event.key == "left" else 1)
+                    prompt.focus()
+                    return
+            await super()._on_key(event)
+
+        def _switch_agent(self, delta: int) -> None:
+            self.selected_agent = min(self.num_agents, max(1, self.selected_agent + delta))
             self._sync()
 
         @on(RunnerEvent)
@@ -445,8 +499,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             if kind == "run_prepared":
                 rows = payload.get("rows")
                 if isinstance(rows, list):
-                    self.run_info_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
-                    self._remember_run_paths(self.run_info_rows)
+                    run_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
+                    self._remember_run_paths(run_rows)
+                    self.run_info_rows = self._visible_info_rows(run_rows)
             elif kind == "agent_status" and pane is not None:
                 pane.status = str(payload.get("status") or pane.status)
             elif kind == "agent_started" and pane is not None:
@@ -769,9 +824,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 except Exception:
                     if require_resume:
                         raise
-                if require_resume and (promotion is None or not result.codex_thread_id):
-                    self.status = f"AGENT-{idx:03d} has no resumable session"
-                    return False
+                if require_resume:
+                    if promotion is None or not result.codex_thread_id:
+                        self.status = f"AGENT-{idx:03d} has no resumable session"
+                        return False
+                    promotion_error = getattr(promotion, "error", None)
+                    if promotion_error:
+                        self.status = f"AGENT-{idx:03d} session promotion failed: {promotion_error}"
+                        return False
                 sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
                 if result.codex_thread_id:
                     result_data["codex_thread_id"] = result.codex_thread_id
@@ -810,10 +870,19 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 
         def _sync(self) -> None:
             self.query_one("#tree", Static).update(self._tree_renderable())
+            frame = self.query_one("#detail-frame", Vertical)
+            pane = self.agents.get(self.selected_agent)
+            border_style = "green" if pane is not None and pane.idx == self.best_agent else "cyan"
+            frame.styles.border = ("round", border_style)
+            frame.border_title = self._detail_title(pane) if pane is not None else ""
+
+            scroll = self.query_one("#detail-scroll", VerticalScroll)
+            should_follow_end = scroll.is_vertical_scroll_end
             detail = self.query_one("#detail", Static)
             detail_renderable = self._detail_renderable()
-            detail.display = bool(detail_renderable)
             detail.update(detail_renderable)
+            if should_follow_end:
+                self.call_after_refresh(scroll.scroll_end, animate=False, immediate=True)
             self.query_one("#state", Static).update(self._state_text())
 
         def _tree_renderable(self) -> Panel:
@@ -822,7 +891,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             table.add_column()
             for label, value in self._tree_rows():
                 table.add_row(label, value)
-            return Panel(table, title="parallel-codex-runner", border_style="cyan")
+            return Panel(table, title=Text("PARALLEL-CODEX-RUNNER", style="bold"), border_style="cyan")
 
         def _tree_text(self) -> str:
             rows = self._tree_rows()
@@ -837,6 +906,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             if self.best_agent is not None:
                 rows.append(("BEST AGENT", f"agent_{self.best_agent:03d}"))
             return rows
+
+        def _visible_info_rows(self, rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+            hidden = {"METADATA", "WORKSPACE COPIES"}
+            return [(label, value) for label, value in rows if label not in hidden]
 
         def _base_info_rows(self) -> list[tuple[str, str]]:
             max_parallel = (
@@ -858,8 +931,6 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 ("MAX_PARALLEL", str(max_parallel)),
                 ("BEST_BY", str(getattr(self.args, "best_by", "reasoning_tokens"))),
                 ("RESUME", self.resume_session_id or "NO"),
-                ("METADATA", "pending"),
-                ("WORKSPACE COPIES", "pending"),
             ]
 
         def _detail_text(self) -> str:
@@ -867,23 +938,18 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             if pane is None:
                 return ""
             if pane.command_text:
-                return f"> {pane.command_text}"
+                return self._format_prefixed_block(">", pane.command_text)
             blocks = self._detail_blocks(pane)
             if not blocks:
                 return ""
-            return "\n\n".join(f"{prefix} {text}" for prefix, text, _style in blocks)
+            return "\n\n".join(self._format_prefixed_block(prefix, text) for prefix, text, _style in blocks)
 
         def _detail_renderable(self) -> object:
             pane = self.agents.get(self.selected_agent)
-            border_style = "green" if pane is not None and pane.idx == self.best_agent else "cyan"
             if pane is None:
                 return ""
             if pane.command_text:
-                return Panel(
-                    Text(f"> {pane.command_text}", style="yellow"),
-                    title=self._detail_title(pane),
-                    border_style=border_style,
-                )
+                return Text(self._format_prefixed_block(">", pane.command_text), style="yellow")
 
             table = Table.grid()
             table.add_column()
@@ -893,14 +959,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             for idx, (prefix, block, style) in enumerate(blocks):
                 if idx:
                     table.add_row("")
-                table.add_row(Text(f"{prefix} {block}", style=style))
-            return Panel(table, title=self._detail_title(pane), border_style=border_style)
+                table.add_row(Text(self._format_prefixed_block(prefix, block), style=style))
+            return table
 
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
             if pane.input_text:
                 blocks.append((">", pane.input_text, "cyan"))
-            thoughts = "\n".join(pane.thought_lines[-40:])
+            thoughts = "\n".join(pane.thought_lines)
             if pane.status == "running" and (thoughts or not pane.output_lines):
                 text = f"{self._pulse()} {thoughts}".rstrip()
                 if text:
@@ -909,29 +975,48 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 blocks.append(("·", thoughts, "dim white"))
             output_lines = [
                 line
-                for line in pane.output_lines[-40:]
+                for line in pane.output_lines
                 if not (pane.final_text and same_display_message(line, pane.final_text))
             ]
             output = "\n".join(output_lines)
             if output:
                 blocks.append(("◇", output, "white"))
-            activity = "\n".join(pane.lines[-40:])
+            activity = "\n".join(pane.lines)
             if activity:
                 blocks.append(("•", activity, "dim white"))
             if pane.final_text:
                 blocks.append(("✓", pane.final_text, "green"))
             return blocks
 
-        def _detail_title(self, pane: AgentPane) -> Text:
-            title = Text(f"AGENT-{pane.idx:03d}", style="bold")
+        def _detail_content_width(self) -> int:
+            try:
+                detail = self.query_one("#detail", Static)
+                width = int(getattr(detail.content_size, "width", 0) or getattr(detail.size, "width", 0) or 0)
+            except Exception:
+                width = 0
+            if width <= 0:
+                try:
+                    width = int(getattr(self.size, "width", 0) or 0) - 4
+                except Exception:
+                    width = 0
+            return max(20, width or 80)
+
+        def _format_prefixed_block(self, prefix: str, block: str) -> str:
+            prefix_width = cell_len(prefix) + 1
+            content_width = max(8, self._detail_content_width() - prefix_width - 4)
+            folded = fold_text_by_cells(block, content_width)
+            indent = " " * prefix_width
+            return f"{prefix} {folded.replace(chr(10), chr(10) + indent)}"
+
+        def _detail_title(self, pane: AgentPane) -> str:
+            title = f"AGENT-{pane.idx:03d}"
             parts = []
             if pane.reasoning_tokens is not None:
                 parts.append(f"reasoning_tokens={pane.reasoning_tokens}")
             if pane.idx == self.best_agent:
                 parts.append("best")
             parts.append("←/→ switch")
-            title.append(f", {', '.join(parts)}")
-            return title
+            return f"{title}, {', '.join(parts)}"
 
         def _state_text(self) -> str:
             parts = [self.status]

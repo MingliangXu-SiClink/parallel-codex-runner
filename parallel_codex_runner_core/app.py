@@ -68,10 +68,12 @@ import asyncio
 import datetime as _dt
 import json
 import os
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -94,6 +96,38 @@ ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
 def cancel_requested(cancel_event: Any = None) -> bool:
     return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def install_cancel_signal_handlers(cancel_event: Any) -> Callable[[], None]:
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    previous: Dict[int, Any] = {}
+
+    def mark_cancelled(_signum: int, _frame: Any) -> None:
+        try:
+            cancel_event.set()
+        except Exception:
+            pass
+
+    for name in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        previous[signum] = signal.getsignal(signum)
+        try:
+            signal.signal(signum, mark_cancelled)
+        except (OSError, ValueError):
+            previous.pop(signum, None)
+
+    def restore() -> None:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                continue
+
+    return restore
 
 # -----------------------------------------------------------------------------
 # Optional UI dependencies
@@ -236,6 +270,54 @@ def copy_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) ->
         except FileNotFoundError:
             continue
 
+
+def make_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def remove_path_best_effort(path: Path) -> bool:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def scrub_codex_home_support_entries(agent_codex_home: Path) -> List[str]:
+    """Remove copied auth/config support files while preserving resumable state."""
+    if not agent_codex_home.exists():
+        return []
+    removed: List[str] = []
+    try:
+        entries = list(agent_codex_home.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        if is_codex_state_entry(entry.name):
+            continue
+        if remove_path_best_effort(entry):
+            removed.append(entry.name)
+    return removed
+
+
+def scrub_agent_codex_homes(meta_root: Path) -> None:
+    if not meta_root.exists():
+        return
+    for path in meta_root.glob("agent_*/codex_home"):
+        scrub_codex_home_support_entries(path)
+
+
 def copy_sqlite_database(src: Path, dst: Path) -> None:
     if not src.exists():
         return
@@ -274,7 +356,7 @@ def prepare_agent_codex_home(
     agent_workspace: Path,
     resume_session_id: Optional[str],
 ) -> None:
-    agent_codex_home.mkdir(parents=True, exist_ok=True)
+    make_private_dir(agent_codex_home)
     copy_codex_support_entries(real_codex_home, agent_codex_home)
 
     real_state_db = real_codex_home / "state_5.sqlite"
@@ -1107,6 +1189,25 @@ async def iter_stream_lines(reader: asyncio.StreamReader, chunk_size: int = 6553
             pending = rest
 
 
+async def terminate_process(proc: Optional[asyncio.subprocess.Process], timeout: float = 2.0) -> Optional[int]:
+    if proc is None:
+        return None
+    if proc.returncode is not None:
+        return proc.returncode
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return proc.returncode
+    try:
+        return await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return proc.returncode
+        return await proc.wait()
+
+
 # -----------------------------------------------------------------------------
 # Agent execution
 # -----------------------------------------------------------------------------
@@ -1149,6 +1250,9 @@ async def run_one_agent(
     returncode: Optional[int] = None
     status = "failed"
     error: Optional[str] = None
+    proc: Optional[asyncio.subprocess.Process] = None
+    stdout_task: Optional[asyncio.Task[None]] = None
+    stderr_task: Optional[asyncio.Task[None]] = None
 
     try:
         if cancel_requested(cancel_event):
@@ -1167,26 +1271,22 @@ async def run_one_agent(
             stderr=asyncio.subprocess.PIPE,
         )
 
-        assert proc.stdin is not None
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-
         stdout_task = asyncio.create_task(stream_to_log(proc.stdout, stdout_log, state, "stdout", progress_callback))
         stderr_task = asyncio.create_task(stream_to_log(proc.stderr, stderr_log, state, "stderr", progress_callback))
+
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            proc.stdin.close()
 
         while True:
             if cancel_requested(cancel_event):
                 status = "cancelled"
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-                try:
-                    returncode = await asyncio.wait_for(proc.wait(), timeout=2)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    returncode = await proc.wait()
+                returncode = await terminate_process(proc)
                 break
             try:
                 returncode = await asyncio.wait_for(proc.wait(), timeout=0.2)
@@ -1196,13 +1296,23 @@ async def run_one_agent(
         await asyncio.gather(stdout_task, stderr_task)
         if status != "cancelled":
             status = "success" if returncode == 0 else "failed"
+    except asyncio.CancelledError:
+        status = "cancelled"
+        error = None
+        returncode = await terminate_process(proc)
     except Exception as exc:  # noqa: BLE001
         if status == "cancelled":
             error = None
         else:
+            returncode = await terminate_process(proc)
             error = repr(exc)
             status = "error"
             logger.error("agent_{:03d} error: {}", idx, error)
+    finally:
+        tasks = [task for task in (stdout_task, stderr_task) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        scrub_codex_home_support_entries(codex_home)
 
     seconds = time.perf_counter() - started
     result = AgentResult(
@@ -1641,7 +1751,9 @@ def run_once(
 ) -> int:
     max_parallel = 1 if args.serial else (args.max_parallel or args.num_agents)
     max_parallel = min(max_parallel, args.num_agents)
-    cancel_event = getattr(args, "cancel_event", None)
+    external_cancel_event = getattr(args, "cancel_event", None)
+    cancel_event = external_cancel_event or threading.Event()
+    restore_cancel_signals: Callable[[], None] = lambda: None
 
     def log(level: str, message: str, *values: Any) -> None:
         if progress_callback is None or HAS_LOGURU:
@@ -1736,6 +1848,8 @@ def run_once(
 
     help_text = read_codex_exec_resume_help(args.codex_bin) if resume_session_id else read_codex_exec_help(args.codex_bin)
     real_codex_home = get_codex_home()
+    if external_cancel_event is None:
+        restore_cancel_signals = install_cancel_signal_handlers(cancel_event)
 
     log("info", "copying workspace into {} isolated agent folders", args.num_agents)
     if HAS_RICH and progress_callback is None:
@@ -1758,13 +1872,44 @@ def run_once(
     command_by_agent: Dict[int, List[str]] = {}
     caps_by_agent: Dict[int, Dict[str, bool]] = {}
     codex_home_by_agent: Dict[int, Path] = {}
-    if HAS_RICH and progress_callback is None:
-        with iterable_cm as progress:
-            task_id = progress.add_task("copy workspace", total=args.num_agents)
-            for idx in range(1, args.num_agents + 1):
+
+    def cleanup_unfinished_run() -> None:
+        scrub_agent_codex_homes(meta_root)
+        if not args.keep_workspaces and not is_relative_to(workspaces_root, workspace):
+            cleanup_workspace_copies(workspace, workspaces_root)
+
+    try:
+        if HAS_RICH and progress_callback is None:
+            with iterable_cm as progress:
+                task_id = progress.add_task("copy workspace", total=args.num_agents)
+                for idx in range(1, args.num_agents + 1):
+                    if cancel_requested(cancel_event):
+                        break
+                    progress.update(task_id, description=f"copy agent_{idx:03d}")
+                    agent_workspace = workspaces_root / f"agent_{idx:03d}"
+                    agent_meta_dir = meta_root / f"agent_{idx:03d}"
+                    agent_codex_home = agent_meta_dir / "codex_home"
+                    copy_workspace(workspace, agent_workspace, run_base=run_base)
+                    prepare_agent_codex_home(real_codex_home, agent_codex_home, agent_workspace, resume_session_id)
+                    final_message_path = agent_meta_dir / "final_message.md"
+                    cmd, caps = build_codex_command(
+                        args.codex_bin,
+                        help_text,
+                        final_message_path,
+                        model=args.model,
+                        resume_session_id=resume_session_id,
+                    )
+                    command_by_agent[idx] = cmd
+                    caps_by_agent[idx] = caps
+                    codex_home_by_agent[idx] = agent_codex_home
+                    progress.update(task_id, advance=1)
+        else:
+            assert iterable is not None
+            for idx in iterable:
                 if cancel_requested(cancel_event):
                     break
-                progress.update(task_id, description=f"copy agent_{idx:03d}")
+                if progress_callback is not None:
+                    progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
                 agent_workspace = workspaces_root / f"agent_{idx:03d}"
                 agent_meta_dir = meta_root / f"agent_{idx:03d}"
                 agent_codex_home = agent_meta_dir / "codex_home"
@@ -1781,34 +1926,15 @@ def run_once(
                 command_by_agent[idx] = cmd
                 caps_by_agent[idx] = caps
                 codex_home_by_agent[idx] = agent_codex_home
-                progress.update(task_id, advance=1)
-    else:
-        assert iterable is not None
-        for idx in iterable:
-            if cancel_requested(cancel_event):
-                break
-            if progress_callback is not None:
-                progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
-            agent_workspace = workspaces_root / f"agent_{idx:03d}"
-            agent_meta_dir = meta_root / f"agent_{idx:03d}"
-            agent_codex_home = agent_meta_dir / "codex_home"
-            copy_workspace(workspace, agent_workspace, run_base=run_base)
-            prepare_agent_codex_home(real_codex_home, agent_codex_home, agent_workspace, resume_session_id)
-            final_message_path = agent_meta_dir / "final_message.md"
-            cmd, caps = build_codex_command(
-                args.codex_bin,
-                help_text,
-                final_message_path,
-                model=args.model,
-                resume_session_id=resume_session_id,
-            )
-            command_by_agent[idx] = cmd
-            caps_by_agent[idx] = caps
-            codex_home_by_agent[idx] = agent_codex_home
+    except BaseException:
+        cleanup_unfinished_run()
+        restore_cancel_signals()
+        if progress_callback is not None:
+            progress_callback({"type": "run_failed", "message": "workspace preparation failed"})
+        raise
 
     if cancel_requested(cancel_event):
-        if not args.keep_workspaces and not is_relative_to(workspaces_root, workspace):
-            cleanup_workspace_copies(workspace, workspaces_root)
+        cleanup_unfinished_run()
         if progress_callback is not None:
             progress_callback(
                 {
@@ -1820,6 +1946,7 @@ def run_once(
                     "cancelled": True,
                 }
             )
+        restore_cancel_signals()
         return 130
 
     (run_root / "codex_capabilities.json").write_text(json.dumps(caps_by_agent[1], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1838,19 +1965,28 @@ def run_once(
         args.num_agents,
         max_parallel,
     )
-    results = asyncio.run(
-        run_all_agents(
-            args.num_agents,
-            workspaces_root,
-            meta_root,
-            prompt,
-            command_by_agent,
-            codex_home_by_agent,
-            max_parallel,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
+    try:
+        results = asyncio.run(
+            run_all_agents(
+                args.num_agents,
+                workspaces_root,
+                meta_root,
+                prompt,
+                command_by_agent,
+                codex_home_by_agent,
+                max_parallel,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+            )
         )
-    )
+    except BaseException:
+        cleanup_unfinished_run()
+        restore_cancel_signals()
+        if progress_callback is not None:
+            progress_callback({"type": "run_failed", "message": "agent execution failed"})
+        raise
+
+    scrub_agent_codex_homes(meta_root)
 
     cancelled = cancel_requested(cancel_event)
     successes = [] if cancelled else [r for r in results if r.status == "success"]
@@ -1914,6 +2050,7 @@ def run_once(
     if print_output:
         print_summary(results, workspace, run_root, best, args.best_by, synced, codex_session_promotion)
 
+    restore_cancel_signals()
     return 130 if cancelled else (0 if best is not None else 2)
 
 

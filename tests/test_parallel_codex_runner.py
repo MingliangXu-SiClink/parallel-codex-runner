@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import shutil
 import sqlite3
@@ -11,6 +12,7 @@ from unittest import mock
 from pathlib import Path
 
 import parallel_codex_runner_core.tui_textual as tui_textual
+import parallel_codex_runner_core.app as app_core
 from parallel_codex_runner import (
     AgentResult,
     AgentState,
@@ -26,6 +28,7 @@ from parallel_codex_runner import (
     prepare_agent_codex_home,
     promote_codex_session_to_workspace,
     run_one_agent,
+    scrub_codex_home_support_entries,
     stream_to_log,
     sync_back_with_python,
 )
@@ -196,6 +199,29 @@ class ArgParseTests(unittest.TestCase):
         self.assertEqual(args.num_agents, 5)
 
 
+class RunOnceCleanupTests(unittest.TestCase):
+    def test_run_once_cleans_partial_workspace_when_copy_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            runs = root / "runs"
+            workspace.mkdir()
+            (workspace / "file.txt").write_text("content", encoding="utf-8")
+            args = parse_args(["prompt", "--workspace", str(workspace), "--runs-dir", str(runs), "-n", "1"])
+
+            def fail_copy(_workspace: Path, dst: Path, run_base: Path) -> None:
+                dst.mkdir(parents=True)
+                (dst / "partial.txt").write_text("partial", encoding="utf-8")
+                raise RuntimeError("copy failed")
+
+            with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec [OPTIONS] [PROMPT]\n  --json\n"):
+                with mock.patch.object(app_core, "copy_workspace", side_effect=fail_copy):
+                    with self.assertRaises(RuntimeError):
+                        app_core.run_once(args, "prompt", progress_callback=lambda _payload: None, print_output=False)
+
+            self.assertFalse(any(path.exists() for path in runs.glob("*/workspaces")))
+
+
 class TuiCommandTests(unittest.TestCase):
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
@@ -222,6 +248,38 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(
             display_line_parts_from_output('{"type":"item.completed","item":{"type":"agent_message","text":"answer"}}'),
             ("output", "answer"),
+        )
+
+    def test_display_line_keeps_full_long_content(self) -> None:
+        long_text = "alpha " + ("x" * 1200) + "\nsecond line"
+
+        self.assertEqual(display_line_from_output(json.dumps({"type": "agent_message", "text": long_text})), long_text)
+
+    def test_display_line_shows_command_execution_from_stdout_log(self) -> None:
+        started = {
+            "type": "item.started",
+            "item": {
+                "type": "command_execution",
+                "command": "/bin/zsh -lc 'pytest -q'",
+                "aggregated_output": "",
+                "status": "in_progress",
+            },
+        }
+        completed = {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "/bin/zsh -lc 'pytest -q'",
+                "aggregated_output": "one\ntwo\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        }
+
+        self.assertEqual(display_line_parts_from_output(json.dumps(started)), ("activity", "$ /bin/zsh -lc 'pytest -q'"))
+        self.assertEqual(
+            display_line_parts_from_output(json.dumps(completed)),
+            ("activity", "$ /bin/zsh -lc 'pytest -q'\none\ntwo"),
         )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -268,6 +326,105 @@ class TuiCommandTests(unittest.TestCase):
             sync_back.assert_called_once_with(candidate, workspace.resolve())
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
 
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_left_right_switches_when_detail_scroll_has_focus(self) -> None:
+        async def run() -> None:
+            args = parse_args(["-n", "3"])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test() as pilot:
+                app.query_one("#detail-scroll").focus()
+                await pilot.pause()
+                await pilot.press("right")
+
+                self.assertEqual(app.selected_agent, 2)
+                self.assertEqual(getattr(app.focused, "id", None), "prompt")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_frame_title_stays_outside_scroll_body(self) -> None:
+        async def run() -> None:
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                frame = app.query_one("#detail-frame")
+
+                self.assertEqual(frame.border_title, "AGENT-001, ←/→ switch")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_tree_title_is_uppercase_bold_and_height_matches_content(self) -> None:
+        async def run() -> None:
+            from rich.console import Console
+
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.pause()
+                tree = app.query_one("#tree")
+                panel = app._tree_renderable()
+                console = Console(width=tree.size.width, record=True, file=io.StringIO())
+                console.print(panel)
+
+                self.assertEqual(panel.title.plain, "PARALLEL-CODEX-RUNNER")
+                self.assertEqual(str(panel.title.style), "bold")
+                self.assertEqual(tree.size.height, len(console.export_text().splitlines()))
+                self.assertNotIn("METADATA", [label for label, _value in app._tree_rows()])
+                self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_refresh_preserves_manual_scroll_position(self) -> None:
+        async def run() -> None:
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test(size=(80, 40)) as pilot:
+                pane = app.agents[1]
+                pane.output_lines = [f"line {idx}" for idx in range(120)]
+                app._sync()
+                scroll = app.query_one("#detail-scroll")
+                await pilot.pause()
+                scroll.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                self.assertGreater(scroll.scroll_y, 0)
+
+                scroll.scroll_home(animate=False, immediate=True)
+                await pilot.pause()
+                self.assertEqual(scroll.scroll_y, 0)
+
+                pane.output_lines.append("new line")
+                app._sync()
+                await pilot.pause()
+
+                self.assertEqual(scroll.scroll_y, 0)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_refresh_follows_when_already_at_bottom(self) -> None:
+        async def run() -> None:
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test(size=(80, 40)) as pilot:
+                pane = app.agents[1]
+                pane.output_lines = [f"line {idx}" for idx in range(80)]
+                app._sync()
+                scroll = app.query_one("#detail-scroll")
+                await pilot.pause()
+                scroll.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+
+                pane.output_lines.extend(f"new line {idx}" for idx in range(30))
+                app._sync()
+                await pilot.pause()
+
+                self.assertTrue(scroll.is_vertical_scroll_end)
+
+        asyncio.run(run())
+
 
 class StreamLogTests(unittest.TestCase):
     def test_stream_to_log_handles_long_json_line(self) -> None:
@@ -287,6 +444,33 @@ class StreamLogTests(unittest.TestCase):
 
 
 class AgentCancelTests(unittest.TestCase):
+    def test_run_one_agent_scrubs_codex_support_entries_after_process_exit(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+                (codex_home / "auth.json").write_text("secret", encoding="utf-8")
+                (codex_home / "state_5.sqlite").write_text("state", encoding="utf-8")
+
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=meta,
+                    codex_home=codex_home,
+                    prompt="hello",
+                    command=[sys.executable, "-c", "import sys; sys.stdin.read(); print('done')"],
+                )
+
+                self.assertEqual(result.status, "success")
+                self.assertFalse((codex_home / "auth.json").exists())
+                self.assertTrue((codex_home / "state_5.sqlite").exists())
+
+        asyncio.run(run())
+
     def test_run_one_agent_stops_process_on_cancel(self) -> None:
         async def run() -> None:
             cancel_event = threading.Event()
@@ -413,6 +597,26 @@ class ResumeSessionTests(unittest.TestCase):
 
             (agent_home / "config.toml").write_text("changed\n", encoding="utf-8")
             self.assertEqual((real_home / "config.toml").read_text(encoding="utf-8"), "approval_policy = 'never'\n")
+
+    def test_scrub_codex_home_removes_support_files_but_keeps_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "codex_home"
+            (home / "sessions").mkdir(parents=True)
+            (home / "sessions" / "rollout.jsonl").write_text("{}\n", encoding="utf-8")
+            (home / "state_5.sqlite").write_text("state", encoding="utf-8")
+            (home / "auth.json").write_text("secret", encoding="utf-8")
+            (home / "config.toml").write_text("secret", encoding="utf-8")
+            (home / "profiles").mkdir()
+            (home / "profiles" / "default.toml").write_text("secret", encoding="utf-8")
+
+            removed = scrub_codex_home_support_entries(home)
+
+            self.assertIn("auth.json", removed)
+            self.assertIn("config.toml", removed)
+            self.assertIn("profiles", removed)
+            self.assertTrue((home / "sessions" / "rollout.jsonl").exists())
+            self.assertTrue((home / "state_5.sqlite").exists())
+            self.assertFalse((home / "auth.json").exists())
 
     def test_prepare_agent_codex_home_rebinds_cwd_when_rollout_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

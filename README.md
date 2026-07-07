@@ -194,7 +194,7 @@ Each run writes metadata under `.codex_parallel_runs/<timestamp>/`.
 | `meta/agent_*/stdout.log` | Candidate stdout |
 | `meta/agent_*/stderr.log` | Candidate stderr |
 | `meta/agent_*/final_message.md` | Candidate final response |
-| `meta/agent_*/codex_home/` | Candidate Codex home |
+| `meta/agent_*/codex_home/` | Candidate Codex state needed for resume; copied auth/config support files are scrubbed after execution |
 
 Candidate workspaces are deleted after a normal synced run. Use `--keep-workspaces` to keep them.
 
@@ -204,6 +204,7 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 - `--no-sync-back` leaves the original workspace untouched.
 - Sync is delete-aware, so winner deletions are propagated.
 - `.git` is never copied back over the original repository metadata.
+- Temporary agent `CODEX_HOME` folders are private and scrub copied support files after each agent exits, while preserving session state needed for resume.
 - Run `git diff` after every synced run.
 
 ## CLI Reference
