@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -90,12 +91,18 @@ def command_status_suffix(status: str, exit_code: Any) -> str:
 
 def is_detail_noise_line(text: str) -> bool:
     normalized = " ".join(text.casefold().replace("_", " ").replace("-", " ").split())
+    timestamp_stripped = re.sub(
+        r"^\d{4}[- ]\d{2}[- ]\d{2}(?:[ t]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?\s*",
+        "",
+        text.casefold(),
+    )
+    without_timestamp = " ".join(timestamp_stripped.replace("_", " ").replace("-", " ").split())
     return (
-        "codex models manager" in normalized
+        re.search(r"\bcodex\s+models\s+manager\b", normalized) is not None
         or "apply patch verification failed" in normalized
         or "failed to find expected lines" in normalized
-        or "run result" in normalized
-        or "best agent" in normalized
+        or without_timestamp in {"run result", "run result:"}
+        or re.match(r"^best agent\s*:", without_timestamp) is not None
         or normalized.startswith(("synced", "run root"))
     )
 
@@ -237,7 +244,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit("交互式 TUI 需要 textual：请运行 python3 -m pip install -e . 重新安装本项目依赖。") from _exc
 
 else:
-    from .app import list_resume_sessions, promote_best_codex_session_to_workspace, run_once
+    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, promote_best_codex_session_to_workspace, run_once
     from .models import AgentResult
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import cleanup_workspace_copies, sync_best_workspace_back
@@ -296,6 +303,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         lines: list[str] = field(default_factory=list)
         thought_lines: list[str] = field(default_factory=list)
         output_lines: list[str] = field(default_factory=list)
+        revision: int = 0
 
         def append(self, text: str, category: str = "activity") -> None:
             text = text.strip()
@@ -329,6 +337,12 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
 
 
     class PromptEditor(TextArea):
+        def __init__(self, *args: Any, placeholder: str = "", **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            if placeholder:
+                with contextlib.suppress(Exception):
+                    setattr(self, "placeholder", placeholder)
+
         def action_copy(self) -> None:
             action = getattr(self.app, "action_interrupt_or_exit", None)
             if callable(action):
@@ -355,6 +369,36 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 event.prevent_default()
                 start, end = self.selection
                 self.replace("\n", start, end, maintain_selection_offset=False)
+                return
+            if event.key in {"backspace", "ctrl+h"}:
+                event.stop()
+                event.prevent_default()
+                self.action_delete_left()
+                return
+            if event.key in {"delete", "ctrl+d"}:
+                event.stop()
+                event.prevent_default()
+                self.action_delete_right()
+                return
+            if event.key in {"ctrl+w", "ctrl+backspace", "alt+backspace"}:
+                event.stop()
+                event.prevent_default()
+                self.action_delete_word_left()
+                return
+            if event.key == "alt+delete":
+                event.stop()
+                event.prevent_default()
+                self.action_delete_word_right()
+                return
+            if event.key in {"ctrl+u", "super+backspace"}:
+                event.stop()
+                event.prevent_default()
+                self.action_delete_to_start_of_line()
+                return
+            if event.key == "ctrl+k":
+                event.stop()
+                event.prevent_default()
+                await self.action_delete_to_end_of_line_or_delete_line()
                 return
             await super()._on_key(event)
 
@@ -447,6 +491,9 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.pending_run_root: Path | None = None
             self.pending_workspaces_root: Path | None = None
             self.detail_history: list[tuple[str, str, str]] = []
+            self.detail_revision = 0
+            self._detail_cache_key: tuple[Any, ...] | None = None
+            self._detail_cache_renderable: object = ""
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
@@ -526,8 +573,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                     self.run_info_rows = self._visible_info_rows(run_rows)
             elif kind == "agent_status" and pane is not None:
                 pane.status = str(payload.get("status") or pane.status)
+                self._mark_detail_dirty(pane)
             elif kind == "agent_started" and pane is not None:
                 pane.status = "running"
+                self._mark_detail_dirty(pane)
             elif kind == "agent_tokens" and pane is not None:
                 value = payload.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
@@ -535,6 +584,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 pane.status = "running"
                 category, text = display_line_parts_from_output(str(payload.get("text") or ""))
                 pane.append(text, category)
+                self._mark_detail_dirty(pane)
             elif kind == "agent_finished" and pane is not None:
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 pane.result = result
@@ -544,6 +594,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 final_text = self._read_final_message(result)
                 if final_text:
                     pane.final_text = final_text
+                self._mark_detail_dirty(pane)
             elif kind == "run_finished":
                 self.running = False
                 self.cancel_event = None
@@ -582,6 +633,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 else:
                     for pane in self.agents.values():
                         pane.command_text = ""
+                    self._mark_detail_dirty()
                     self.status = "Cleared command view"
                     self._sync()
                     return
@@ -595,6 +647,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 pane.clear_detail()
             self.best_agent = None
             self.detail_history.clear()
+            self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self.status = "Ready"
             self._sync()
@@ -692,6 +745,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.selected_agent = min(self.selected_agent, value)
             self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
             self.best_agent = None
+            self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self.status = f"Next run will use {value} agents"
             self._show_text(self.status)
@@ -769,6 +823,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             for pane in self.agents.values():
                 pane.input_text = prompt
             self.selected_agent = min(self.selected_agent, self.num_agents)
+            self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self.status = "Preparing agents"
             self._sync()
@@ -851,6 +906,15 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = f"AGENT-{idx:03d} is not successful"
                 return False
             try:
+                if require_resume and not result.codex_thread_id:
+                    source_codex_home = Path(result.codex_home).expanduser().resolve() if result.codex_home else get_codex_home()
+                    result.codex_thread_id = infer_codex_thread_id_for_result(result, source_codex_home)
+                    if not result.codex_thread_id:
+                        self.status = f"AGENT-{idx:03d} has no resumable session"
+                        return False
+
+                sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
+
                 promotion = None
                 try:
                     promotion = promote_best_codex_session_to_workspace(result, self.workspace)
@@ -865,7 +929,6 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                     if promotion_error:
                         self.status = f"AGENT-{idx:03d} session promotion failed: {promotion_error}"
                         return False
-                sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
                 if result.codex_thread_id:
                     result_data["codex_thread_id"] = result.codex_thread_id
                     if require_resume:
@@ -885,6 +948,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _show_text(self, text: str) -> None:
             pane = self.agents.setdefault(self.selected_agent, AgentPane(self.selected_agent))
             pane.command_text = text
+            self._mark_detail_dirty(pane)
             self._sync()
 
         def _read_final_message(self, result: dict[str, Any]) -> str:
@@ -914,9 +978,12 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             scroll = self.query_one("#detail-scroll", VerticalScroll)
             should_follow_end = scroll.is_vertical_scroll_end
             detail = self.query_one("#detail", Static)
+            cache_key_before = self._detail_cache_key
             detail_renderable = self._detail_renderable()
-            detail.update(detail_renderable)
-            if should_follow_end:
+            detail_changed = self._detail_cache_key != cache_key_before
+            if detail_changed:
+                detail.update(detail_renderable)
+            if detail_changed and should_follow_end:
                 self.call_after_refresh(scroll.scroll_end, animate=False, immediate=True)
             self.query_one("#state", Static).update(self._state_text())
 
@@ -982,23 +1049,49 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def _detail_renderable(self) -> object:
             pane = self.agents.get(self.selected_agent)
             if pane is None:
+                self._detail_cache_key = ("none", self.selected_agent, self.detail_revision)
+                self._detail_cache_renderable = ""
                 return ""
+            key = self._detail_cache_key_for(pane)
+            if key == self._detail_cache_key:
+                return self._detail_cache_renderable
             if pane.command_text:
-                return Text(self._format_prefixed_block(">", pane.command_text), style="yellow")
+                renderable: object = Text(self._format_prefixed_block(">", pane.command_text), style="yellow")
+                self._detail_cache_key = key
+                self._detail_cache_renderable = renderable
+                return renderable
 
             table = Table.grid()
             table.add_column()
             blocks = self._detail_blocks(pane)
             if not blocks:
+                self._detail_cache_key = key
+                self._detail_cache_renderable = ""
                 return ""
             for idx, (prefix, block, style) in enumerate(blocks):
                 if idx:
                     table.add_row("")
                 table.add_row(Text(self._format_prefixed_block(prefix, block), style=style))
+            self._detail_cache_key = key
+            self._detail_cache_renderable = table
             return table
 
         def _archive_agent_detail(self, pane: AgentPane) -> None:
             self.detail_history.extend(self._pane_detail_blocks(pane))
+            self._mark_detail_dirty()
+
+        def _mark_detail_dirty(self, pane: AgentPane | None = None) -> None:
+            if pane is None:
+                self.detail_revision += 1
+                self._detail_cache_key = None
+            else:
+                pane.revision += 1
+                if pane.idx == self.selected_agent:
+                    self._detail_cache_key = None
+
+        def _detail_cache_key_for(self, pane: AgentPane) -> tuple[Any, ...]:
+            pulse = self.work_frame if pane.status == "running" and not pane.thought_lines and not pane.output_lines else None
+            return (pane.idx, pane.revision, self.detail_revision, self._detail_content_width(), pulse)
 
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             return [*self.detail_history, *self._pane_detail_blocks(pane)]
@@ -1008,12 +1101,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             if pane.input_text:
                 blocks.append((">", pane.input_text, "cyan"))
             thoughts = "\n".join(pane.thought_lines)
-            if pane.status == "running" and (thoughts or not pane.output_lines):
-                text = f"{self._pulse()} {thoughts}".rstrip()
-                if text:
-                    blocks.append(("·", text, "dim white"))
-            elif thoughts:
+            if thoughts:
                 blocks.append(("·", thoughts, "dim white"))
+            elif pane.status == "running" and not pane.output_lines:
+                blocks.append(("·", self._pulse(), "dim white"))
             output_lines = [
                 line
                 for line in pane.output_lines

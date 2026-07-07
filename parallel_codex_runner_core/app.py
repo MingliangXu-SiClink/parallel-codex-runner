@@ -252,20 +252,39 @@ def is_codex_state_entry(name: str) -> bool:
     )
 
 
+CODEX_SUPPORT_FILES: Set[str] = {
+    "auth.json",
+    "config.json",
+    "config.toml",
+    "instructions.md",
+    "mcp.json",
+    "settings.json",
+}
+CODEX_SUPPORT_DIRS: Set[str] = {"profiles"}
+
+
+def is_codex_support_entry(name: str) -> bool:
+    return name in CODEX_SUPPORT_FILES or name in CODEX_SUPPORT_DIRS
+
+
+def ignore_symlinked_children(directory: str, names: List[str]) -> List[str]:
+    return [name for name in names if (Path(directory) / name).is_symlink()]
+
+
 def copy_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) -> None:
     if not real_codex_home.exists():
         return
 
     for entry in real_codex_home.iterdir():
-        if is_codex_state_entry(entry.name) or entry.name in {".tmp", "shell_snapshots"}:
+        if is_codex_state_entry(entry.name) or not is_codex_support_entry(entry.name):
             continue
         target = agent_codex_home / entry.name
         if target.exists() or target.is_symlink():
             continue
         try:
-            if entry.is_dir():
-                shutil.copytree(entry, target, symlinks=False)
-            else:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.copytree(entry, target, symlinks=False, ignore=ignore_symlinked_children)
+            elif entry.is_file() or (entry.is_symlink() and entry.resolve().is_file()):
                 shutil.copy2(entry, target, follow_symlinks=True)
         except FileNotFoundError:
             continue

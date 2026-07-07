@@ -249,6 +249,10 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(display_line_from_output("2026-07-07 Run result:"), "")
         self.assertEqual(display_line_from_output("- best agent: agent_005"), "")
         self.assertEqual(display_line_from_output('{"payload":{"item":{"text":"real content"}}}'), "real content")
+        self.assertEqual(
+            display_line_from_output(json.dumps({"type": "agent_message", "text": "the best agent approach is to compare outputs"})),
+            "the best agent approach is to compare outputs",
+        )
 
     def test_display_line_keeps_reasoning_and_output_separate(self) -> None:
         self.assertEqual(
@@ -362,14 +366,25 @@ class TuiCommandTests(unittest.TestCase):
                 "stderr_tail": "",
             }
 
+            calls = []
+
+            def sync_side_effect(_candidate: Path, _workspace: Path) -> None:
+                calls.append("sync")
+
+            def promote_side_effect(result: AgentResult, _workspace: Path) -> AgentResult:
+                calls.append("promote")
+                return result
+
             with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
                 with mock.patch.object(tui_textual, "sync_best_workspace_back") as sync_back:
                     with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
-                        promote.side_effect = lambda result, _workspace: result
+                        sync_back.side_effect = sync_side_effect
+                        promote.side_effect = promote_side_effect
 
                         self.assertTrue(app._finalize_agent(2))
 
             self.assertEqual(app.resume_session_id, "session-2")
+            self.assertEqual(calls, ["sync", "promote"])
             sync_back.assert_called_once_with(candidate, workspace.resolve())
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
 
@@ -570,6 +585,23 @@ class TuiCommandTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_prompt_backspace_deletes_one_character(self) -> None:
+        async def run() -> None:
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test() as pilot:
+                prompt = app.query_one("#prompt")
+                prompt.focus()
+                await pilot.press("a")
+                await pilot.press("b")
+                await pilot.press("c")
+                await pilot.press("backspace")
+
+                self.assertEqual(prompt.text, "ab")
+
+        asyncio.run(run())
+
 
 class StreamLogTests(unittest.TestCase):
     def test_stream_to_log_handles_long_json_line(self) -> None:
@@ -764,6 +796,10 @@ class ResumeSessionTests(unittest.TestCase):
             (real_home / "profiles" / "default.toml").write_text("model = 'gpt-5'\n", encoding="utf-8")
             (real_home / "history.jsonl").write_text("{}\n", encoding="utf-8")
             (real_home / "sessions").mkdir()
+            (real_home / "plugins").mkdir()
+            (real_home / "plugins" / "cache.bin").write_text("large", encoding="utf-8")
+            (real_home / "random").mkdir()
+            (real_home / "random" / "note.txt").write_text("ignored", encoding="utf-8")
 
             prepare_agent_codex_home(real_home, agent_home, agent_workspace, None)
 
@@ -774,6 +810,8 @@ class ResumeSessionTests(unittest.TestCase):
             self.assertEqual((agent_home / "profiles" / "default.toml").read_text(encoding="utf-8"), "model = 'gpt-5'\n")
             self.assertFalse((agent_home / "history.jsonl").exists())
             self.assertFalse((agent_home / "sessions").exists())
+            self.assertFalse((agent_home / "plugins").exists())
+            self.assertFalse((agent_home / "random").exists())
 
             (agent_home / "config.toml").write_text("changed\n", encoding="utf-8")
             self.assertEqual((real_home / "config.toml").read_text(encoding="utf-8"), "approval_policy = 'never'\n")
