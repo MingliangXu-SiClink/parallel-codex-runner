@@ -265,7 +265,69 @@ class RunOnceCleanupTests(unittest.TestCase):
 class TuiCommandTests(unittest.TestCase):
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
-        self.assertIn("/resume 1", "\n".join(command_suggestions("/resume")))
+        slash_commands = "\n".join(command_suggestions("/"))
+        self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
+        self.assertIn("/model <name|clear>", slash_commands)
+        self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
+        self.assertIn("/keepworkspaces <on|off>", slash_commands)
+        self.assertIn("/resumeinclude <on|off>", slash_commands)
+        self.assertGreater(len(command_suggestions("/")), 10)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_config_commands_update_cli_equivalents(self) -> None:
+        args = parse_args([])
+        app = tui_textual.PcrTextualApp(args)
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+
+        app._handle_command("/maxparallel 2")
+        app._handle_command("/serial")
+        app._handle_command("/bestby duration")
+        app._handle_command("/model gpt-5")
+        app._handle_command("/syncback off")
+        app._handle_command("/keepworkspaces on")
+        app._handle_command("/resumeinclude off")
+
+        self.assertEqual(app.args.max_parallel, 2)
+        self.assertTrue(app.args.serial)
+        self.assertEqual(app.args.best_by, "duration")
+        self.assertEqual(app.args.model, "gpt-5")
+        self.assertTrue(app.args.no_sync_back)
+        self.assertTrue(app.args.keep_workspaces)
+        self.assertFalse(app.args.resume_include_non_interactive)
+
+        app._handle_command("/parallel")
+        app._handle_command("/maxparallel auto")
+        app._handle_command("/model clear")
+        self.assertFalse(app.args.serial)
+        self.assertIsNone(app.args.max_parallel)
+        self.assertIsNone(app.args.model)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_path_and_promptfile_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt_file = root / "prompt.txt"
+            prompt_file.write_text("hello from file\n", encoding="utf-8")
+            prompts = []
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            app._sync = lambda: None
+            app._show_text = lambda _text: None
+            app._start_run = prompts.append
+
+            app._handle_command(f"/workspace {workspace}")
+            app._handle_command(f"/runsdir {root / 'runs'}")
+            app._handle_command("/codexbin /usr/local/bin/codex")
+            app._handle_command(f"/promptfile {prompt_file}")
+
+            self.assertEqual(app.workspace, workspace.resolve())
+            self.assertEqual(app.args.workspace, str(workspace.resolve()))
+            self.assertEqual(app.args.runs_dir, str(root / "runs"))
+            self.assertEqual(app.args.codex_bin, "/usr/local/bin/codex")
+            self.assertEqual(prompts, ["hello from file"])
 
     def test_display_line_filters_lifecycle_noise(self) -> None:
         self.assertEqual(display_line_from_output('{"type":"thread.started","thread_id":"abc"}'), "")

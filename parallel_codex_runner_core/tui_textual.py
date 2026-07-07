@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import re
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,17 +14,30 @@ from pathlib import Path
 from typing import Any
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/help", "show commands"),
-    ("/status", "show current run state"),
-    ("/numofagents", "show current agent count"),
-    ("/numofagents 8", "set agent count"),
+    ("/help", "show all TUI commands"),
+    ("/status", "show current run configuration"),
+    ("/config", "show current run configuration"),
+    ("/numofagents <n>", "same as -n / --num-agents"),
+    ("/maxparallel <n|auto>", "same as --max-parallel"),
+    ("/serial", "same as --serial"),
+    ("/parallel", "clear --serial"),
+    ("/bestby <duration|reasoning_tokens>", "same as --best-by"),
+    ("/model <name|clear>", "same as --model"),
+    ("/workspace <path>", "same as --workspace"),
+    ("/runsdir <path|clear>", "same as --runs-dir"),
+    ("/codexbin <path>", "same as --codex-bin"),
+    ("/syncback <on|off>", "toggle --no-sync-back"),
+    ("/keepworkspaces <on|off>", "toggle --keep-workspaces"),
+    ("/promptfile <path>", "same as --prompt-file, then run"),
+    ("/resumeinclude <on|off>", "toggle --resume-include-non-interactive"),
     ("/resume", "show resumable Codex sessions"),
-    ("/resume 1", "load a listed session"),
+    ("/resume <n|session>", "same as --resume-session-id"),
     ("/resume latest", "load latest session"),
     ("/resume clear", "start without resume"),
     ("/clear", "clear the current view"),
     ("/exit", "quit"),
 )
+MAX_SUGGESTIONS = 24
 
 
 def command_suggestions(value: str) -> list[str]:
@@ -34,7 +48,23 @@ def command_suggestions(value: str) -> list[str]:
         f"{command}  {description}"
         for command, description in TEXTUAL_COMMANDS
         if command.startswith(text)
-    ][:6]
+    ][:MAX_SUGGESTIONS]
+
+
+def build_help_text() -> str:
+    command_width = max(len(command) for command, _description in TEXTUAL_COMMANDS)
+    lines = ["Commands:"]
+    lines.extend(f"  {command:<{command_width}}  {description}" for command, description in TEXTUAL_COMMANDS)
+    lines.extend(
+        [
+            "",
+            'Enter normal text to run the same as: pcr "prompt"',
+            "Most option commands apply to the next run.",
+            "If a completed run is pending, PCR finalizes the selected agent before changing config.",
+            "Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def compact_text(text: str, limit: int = 600) -> str:
@@ -256,7 +286,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit("交互式 TUI 需要 textual：请运行 python3 -m pip install -e . 重新安装本项目依赖。") from _exc
 
 else:
-    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, promote_best_codex_session_to_workspace, run_once
+    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, normalize_best_by, promote_best_codex_session_to_workspace, run_once
     from .models import AgentResult
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import cleanup_workspace_copies, sync_best_workspace_back
@@ -285,22 +315,7 @@ else:
             folded_lines.append(current)
         return "\n".join(folded_lines)
 
-    HELP_TEXT = """
-Commands:
-  /help                 show this help
-  /status               show current run state
-  /numofagents          show current agent count
-  /numofagents <n>      set agent count for the next run
-  /resume               show recent sessions
-  /resume <n|session>   load a listed session or explicit session id
-  /resume latest        load latest Codex session
-  /resume clear         start next run without resume
-  /clear                clear the current view
-  /exit                 quit
-
-Enter any non-command text to run PCR. Left/right switches agent panes.
-Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
-""".strip()
+    HELP_TEXT = build_help_text()
 
 
     @dataclass
@@ -455,7 +470,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         #suggestions {
             height: 0;
             min-height: 0;
-            max-height: 6;
+            max-height: 24;
             margin: 0 1;
             padding: 0 1;
             color: #b7c8e6;
@@ -489,6 +504,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
         def __init__(self, args: argparse.Namespace) -> None:
             super().__init__()
             self.args = args
+            self.args.resume_include_non_interactive = True
             self.workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
             self.num_agents = args.num_agents
             self.resume_session_id = (args.resume_session_id or "").strip()
@@ -706,7 +722,14 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.exit()
 
         def _handle_command(self, raw: str) -> None:
-            parts = raw.split()
+            try:
+                parts = shlex.split(raw)
+            except ValueError as exc:
+                self.status = f"Command parse error: {exc}"
+                self._sync()
+                return
+            if not parts:
+                return
             name = parts[0].lower()
             args = parts[1:]
             if name in {"/exit", "/quit"}:
@@ -715,14 +738,50 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             if name == "/help":
                 self._show_text(HELP_TEXT)
                 return
-            if name == "/status":
+            if name in {"/status", "/config"}:
                 self._show_status()
                 return
             if name == "/clear":
                 self.action_clear_view()
                 return
-            if name == "/numofagents":
+            if name in {"/numofagents", "/agents"}:
                 self._handle_numofagents(args)
+                return
+            if name in {"/maxparallel", "/max-parallel"}:
+                self._handle_maxparallel(args)
+                return
+            if name == "/serial":
+                self._handle_execution(serial=True)
+                return
+            if name == "/parallel":
+                self._handle_execution(serial=False)
+                return
+            if name in {"/bestby", "/best-by", "/candidateby", "/candidate-by"}:
+                self._handle_bestby(args)
+                return
+            if name == "/model":
+                self._handle_model(args)
+                return
+            if name == "/workspace":
+                self._handle_workspace(args)
+                return
+            if name in {"/runsdir", "/runs-dir"}:
+                self._handle_runsdir(args)
+                return
+            if name in {"/codexbin", "/codex-bin"}:
+                self._handle_codexbin(args)
+                return
+            if name in {"/syncback", "/sync-back"}:
+                self._handle_syncback(args)
+                return
+            if name in {"/keepworkspaces", "/keep-workspaces"}:
+                self._handle_keepworkspaces(args)
+                return
+            if name in {"/promptfile", "/prompt-file", "/runfile"}:
+                self._handle_promptfile(args)
+                return
+            if name in {"/resumeinclude", "/resume-include", "/resume-include-non-interactive"}:
+                self._handle_resumeinclude(args)
                 return
             if name == "/resume":
                 self._handle_resume(args)
@@ -730,15 +789,40 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.status = f"Unknown command: {name}"
             self._sync()
 
-        def _handle_numofagents(self, args: list[str]) -> None:
+        def _prepare_config_change(self, label: str) -> bool:
             if self.running:
-                self.status = "Cannot change agent count while running"
+                self.status = f"Cannot change {label} while running"
                 self._sync()
-                return
+                return False
+            if self._has_pending_run():
+                if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
+                    if not self._discard_pending_run():
+                        self._sync()
+                        return False
+                elif not self._finalize_agent(self.selected_agent, archive_detail=True):
+                    self._sync()
+                    return False
+            return True
+
+        def _show_setting(self, text: str) -> None:
+            self.status = text
+            self._show_text(text)
+
+        def _parse_bool_arg(self, args: list[str], label: str) -> bool | None:
             if not args:
-                self.status = f"numofagents={self.num_agents}"
-                self._show_text(self.status)
-                self._sync()
+                return None
+            value = args[0].lower()
+            if value in {"1", "yes", "y", "true", "on", "enable", "enabled"}:
+                return True
+            if value in {"0", "no", "n", "false", "off", "disable", "disabled"}:
+                return False
+            self.status = f"Usage: {label} <on|off>"
+            self._sync()
+            return None
+
+        def _handle_numofagents(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"numofagents={self.num_agents}")
                 return
             try:
                 value = int(args[0])
@@ -750,23 +834,188 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "numofagents must be > 0"
                 self._sync()
                 return
-            if self._has_pending_run():
-                if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
-                    if not self._discard_pending_run():
-                        self._sync()
-                        return
-                elif not self._finalize_agent(self.selected_agent, archive_detail=True):
-                    self._sync()
-                    return
+            if not self._prepare_config_change("agent count"):
+                return
             self.num_agents = value
             self.selected_agent = min(self.selected_agent, value)
             self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
             self.best_agent = None
             self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
-            self.status = f"Next run will use {value} agents"
-            self._show_text(self.status)
-            self._sync()
+            self._show_setting(f"Next run will use {value} agents")
+
+        def _handle_maxparallel(self, args: list[str]) -> None:
+            current = getattr(self.args, "max_parallel", None)
+            if not args:
+                self._show_setting(f"maxparallel={current if current is not None else 'auto'}")
+                return
+            value_text = args[0].lower()
+            if value_text in {"auto", "default", "clear", "none"}:
+                value = None
+            else:
+                try:
+                    value = int(value_text)
+                except ValueError:
+                    self.status = "Usage: /maxparallel <positive integer|auto>"
+                    self._sync()
+                    return
+                if value <= 0:
+                    self.status = "maxparallel must be > 0"
+                    self._sync()
+                    return
+            if not self._prepare_config_change("max parallel"):
+                return
+            self.args.max_parallel = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"maxparallel={value if value is not None else 'auto'}")
+
+        def _handle_execution(self, serial: bool) -> None:
+            if not self._prepare_config_change("execution mode"):
+                return
+            self.args.serial = serial
+            if not serial and getattr(self.args, "max_parallel", None) == 1:
+                self.args.max_parallel = None
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting("execution=serial" if serial else "execution=parallel")
+
+        def _handle_bestby(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"bestby={getattr(self.args, 'best_by', 'reasoning_tokens')}")
+                return
+            try:
+                value = normalize_best_by(args[0])
+            except argparse.ArgumentTypeError as exc:
+                self.status = str(exc)
+                self._sync()
+                return
+            if not self._prepare_config_change("selection strategy"):
+                return
+            self.args.best_by = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"bestby={value}")
+
+        def _handle_model(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"model={getattr(self.args, 'model', None) or 'default'}")
+                return
+            value = args[0]
+            if value.lower() in {"clear", "default", "none"}:
+                value = None
+            if not self._prepare_config_change("model"):
+                return
+            self.args.model = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"model={value or 'default'}")
+
+        def _handle_workspace(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"workspace={absolute_path_for_display(self.workspace)}")
+                return
+            workspace = Path(args[0]).expanduser().resolve()
+            if not workspace.exists() or not workspace.is_dir():
+                self.status = f"Workspace not found: {workspace}"
+                self._sync()
+                return
+            if not self._prepare_config_change("workspace"):
+                return
+            self.workspace = workspace
+            self.args.workspace = str(workspace)
+            self.resume_session_id = ""
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"workspace={absolute_path_for_display(workspace)}")
+
+        def _handle_runsdir(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"runsdir={getattr(self.args, 'runs_dir', None) or 'auto'}")
+                return
+            value = None if args[0].lower() in {"clear", "default", "auto", "none"} else str(Path(args[0]).expanduser())
+            try:
+                module_dir = Path(__file__).resolve().parent
+                choose_run_base(default_run_anchor(module_dir, self.workspace), self.workspace, value)
+            except SystemExit as exc:
+                self.status = str(exc)
+                self._sync()
+                return
+            if not self._prepare_config_change("runs dir"):
+                return
+            self.args.runs_dir = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"runsdir={value or 'auto'}")
+
+        def _handle_codexbin(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(f"codexbin={getattr(self.args, 'codex_bin', 'codex')}")
+                return
+            if not self._prepare_config_change("codex binary"):
+                return
+            self.args.codex_bin = args[0]
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"codexbin={args[0]}")
+
+        def _handle_syncback(self, args: list[str]) -> None:
+            current = not bool(getattr(self.args, "no_sync_back", False))
+            if not args:
+                self._show_setting(f"syncback={'on' if current else 'off'}")
+                return
+            value = self._parse_bool_arg(args, "/syncback")
+            if value is None:
+                return
+            if not self._prepare_config_change("sync back"):
+                return
+            self.args.no_sync_back = not value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"syncback={'on' if value else 'off'}")
+
+        def _handle_keepworkspaces(self, args: list[str]) -> None:
+            current = bool(getattr(self.args, "keep_workspaces", False))
+            if not args:
+                self._show_setting(f"keepworkspaces={'on' if current else 'off'}")
+                return
+            value = self._parse_bool_arg(args, "/keepworkspaces")
+            if value is None:
+                return
+            if not self._prepare_config_change("keep workspaces"):
+                return
+            self.args.keep_workspaces = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"keepworkspaces={'on' if value else 'off'}")
+
+        def _handle_promptfile(self, args: list[str]) -> None:
+            if not args:
+                self.status = "Usage: /promptfile <path>"
+                self._sync()
+                return
+            if self.running:
+                self.status = "Cannot run a prompt file while running"
+                self._sync()
+                return
+            path = Path(args[0]).expanduser()
+            try:
+                prompt = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                self.status = f"Cannot read prompt file: {exc}"
+                self._sync()
+                return
+            if not prompt:
+                self.status = "Prompt file is empty"
+                self._sync()
+                return
+            self._start_run(prompt)
+
+        def _handle_resumeinclude(self, args: list[str]) -> None:
+            current = bool(getattr(self.args, "resume_include_non_interactive", True))
+            if not args:
+                self._show_setting(f"resumeinclude={'on' if current else 'off'}")
+                return
+            value = self._parse_bool_arg(args, "/resumeinclude")
+            if value is None:
+                return
+            if self.running:
+                self.status = "Cannot change resume include mode while running"
+                self._sync()
+                return
+            self.args.resume_include_non_interactive = value
+            self._show_setting(f"resumeinclude={'on' if value else 'off'}")
 
         def _handle_resume(self, args: list[str]) -> None:
             if self.running:
@@ -787,7 +1036,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 self.status = "Resume cleared"
                 self._sync()
                 return
-            self.resume_entries = list_resume_sessions(self.workspace, include_non_interactive=True)
+            self.resume_entries = list_resume_sessions(
+                self.workspace,
+                include_non_interactive=bool(getattr(self.args, "resume_include_non_interactive", True)),
+            )
             if not args or args[0].lower() == "list":
                 self._show_resume_list()
                 return
@@ -1059,6 +1311,10 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
                 ("EXECUTION", execution),
                 ("MAX_PARALLEL", str(max_parallel)),
                 ("BEST_BY", str(getattr(self.args, "best_by", "reasoning_tokens"))),
+                ("MODEL", str(getattr(self.args, "model", None) or "default")),
+                ("CODEX_BIN", str(getattr(self.args, "codex_bin", "codex"))),
+                ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
+                ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),
             ]
 
@@ -1196,7 +1452,7 @@ Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.
             self.suggestion_line_count = len(suggestions)
             widget = self.query_one("#suggestions", Static)
             widget.update("\n".join(suggestions))
-            widget.styles.height = self.suggestion_line_count
+            widget.styles.height = min(self.suggestion_line_count, MAX_SUGGESTIONS)
 
         def _prompt_content_width(self) -> int:
             try:

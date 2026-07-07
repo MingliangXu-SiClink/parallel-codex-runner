@@ -73,6 +73,8 @@ Inside the TUI:
 
 ```text
 /numofagents 8
+/maxparallel 4
+/bestby duration
 /resume
 /resume 1
 fix the failing tests
@@ -230,9 +232,23 @@ Interactive slash commands:
 
 | Command | Description |
 | --- | --- |
+| `/help` | Show TUI commands and their CLI equivalents |
+| `/status` or `/config` | Show current run configuration |
 | `/numofagents <n>` | Set agent count for the next run |
+| `/maxparallel <n\|auto>` | Set or clear `--max-parallel` |
+| `/serial` | Run one agent at a time |
+| `/parallel` | Clear serial mode |
+| `/bestby <duration\|reasoning_tokens>` | Set `--best-by` |
+| `/model <name\|clear>` | Set or clear `--model` |
+| `/workspace <path>` | Set `--workspace` |
+| `/runsdir <path\|clear>` | Set or clear `--runs-dir` |
+| `/codexbin <path>` | Set `--codex-bin` |
+| `/syncback <on\|off>` | Toggle `--no-sync-back` |
+| `/keepworkspaces <on\|off>` | Toggle `--keep-workspaces` |
+| `/promptfile <path>` | Run a prompt from a UTF-8 file |
+| `/resumeinclude <on\|off>` | Toggle `--resume-include-non-interactive` |
 | `/resume` | Show recent resumable sessions |
-| `/resume <n|session>` | Resume a listed or explicit session id |
+| `/resume <n\|session>` | Resume a listed or explicit session id |
 | `/resume latest` | Load the latest resumable Codex session |
 | `/resume clear` | Disable resume for the next run |
 | `/clear` | Clear the current TUI view |
