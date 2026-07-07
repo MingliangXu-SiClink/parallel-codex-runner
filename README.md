@@ -2,7 +2,7 @@
 
 # parallel-codex-runner
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)](#requirements)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#requirements)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [Installation](#installation) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [Safety](#safety-model) · [CLI](#cli-reference)
@@ -27,7 +27,7 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 
 - **Interactive TUI**: run `pcr`, type prompts, use slash commands, and switch agent panes with left/right.
 - **Parallel candidates**: run many `codex exec` attempts at once, or serialize them with `--serial`.
-- **Real isolation**: every candidate gets its own workspace and temporary `CODEX_HOME`.
+- **Real isolation**: every candidate gets its own workspace and copied temporary `CODEX_HOME`.
 - **Git-aware copies**: Git workspaces use `git worktree` first, then mirror dirty, deleted, and untracked files.
 - **Delete-aware sync**: if the winning agent deletes a file, the original workspace loses it too.
 - **Simple selection**: choose the winner by observed reasoning tokens or runtime.
@@ -38,7 +38,7 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 
 Requirements:
 
-- Python 3.8+
+- Python 3.10+
 - Codex CLI available as `codex`
 - Git for the best workspace-copy path
 - `textual` and `rich`, installed automatically by this package
@@ -175,7 +175,7 @@ Use a known session id:
 pcr --resume-session-id 019f2dde-d5ab-7473-856b-ab1b8001f6da "continue the previous task"
 ```
 
-Candidate runs use isolated Codex homes. After sync, the winning session is imported into the real Codex home and rebound to the original workspace when possible.
+Candidate runs use isolated Codex homes. Non-state Codex support files are copied into each temporary home rather than linked back to your real `~/.codex`. After sync, the winning session is imported into the real Codex home and rebound to the original workspace when possible.
 
 ## Artifacts
 

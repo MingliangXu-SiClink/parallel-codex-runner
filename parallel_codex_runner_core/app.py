@@ -218,7 +218,7 @@ def is_codex_state_entry(name: str) -> bool:
     )
 
 
-def symlink_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) -> None:
+def copy_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) -> None:
     if not real_codex_home.exists():
         return
 
@@ -229,13 +229,12 @@ def symlink_codex_support_entries(real_codex_home: Path, agent_codex_home: Path)
         if target.exists() or target.is_symlink():
             continue
         try:
-            target.symlink_to(entry, target_is_directory=entry.is_dir())
-        except OSError:
             if entry.is_dir():
-                shutil.copytree(entry, target, symlinks=True)
+                shutil.copytree(entry, target, symlinks=False)
             else:
-                shutil.copy2(entry, target)
-
+                shutil.copy2(entry, target, follow_symlinks=True)
+        except FileNotFoundError:
+            continue
 
 def copy_sqlite_database(src: Path, dst: Path) -> None:
     if not src.exists():
@@ -276,7 +275,7 @@ def prepare_agent_codex_home(
     resume_session_id: Optional[str],
 ) -> None:
     agent_codex_home.mkdir(parents=True, exist_ok=True)
-    symlink_codex_support_entries(real_codex_home, agent_codex_home)
+    copy_codex_support_entries(real_codex_home, agent_codex_home)
 
     real_state_db = real_codex_home / "state_5.sqlite"
     agent_state_db = agent_codex_home / "state_5.sqlite"

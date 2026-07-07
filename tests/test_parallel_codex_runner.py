@@ -388,6 +388,32 @@ class ResumeSessionTests(unittest.TestCase):
             self.assertEqual([s.session_id for s in default_sessions], ["interactive"])
             self.assertEqual([s.session_id for s in all_sessions], ["exec", "interactive"])
 
+    def test_prepare_agent_codex_home_copies_support_entries_without_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real"
+            agent_home = root / "agent"
+            agent_workspace = root / "workspaces" / "agent_001"
+            (real_home / "profiles").mkdir(parents=True)
+            agent_workspace.mkdir(parents=True)
+            (real_home / "config.toml").write_text("approval_policy = 'never'\n", encoding="utf-8")
+            (real_home / "profiles" / "default.toml").write_text("model = 'gpt-5'\n", encoding="utf-8")
+            (real_home / "history.jsonl").write_text("{}\n", encoding="utf-8")
+            (real_home / "sessions").mkdir()
+
+            prepare_agent_codex_home(real_home, agent_home, agent_workspace, None)
+
+            self.assertFalse((agent_home / "config.toml").is_symlink())
+            self.assertFalse((agent_home / "profiles").is_symlink())
+            self.assertFalse((agent_home / "profiles" / "default.toml").is_symlink())
+            self.assertEqual((agent_home / "config.toml").read_text(encoding="utf-8"), "approval_policy = 'never'\n")
+            self.assertEqual((agent_home / "profiles" / "default.toml").read_text(encoding="utf-8"), "model = 'gpt-5'\n")
+            self.assertFalse((agent_home / "history.jsonl").exists())
+            self.assertFalse((agent_home / "sessions").exists())
+
+            (agent_home / "config.toml").write_text("changed\n", encoding="utf-8")
+            self.assertEqual((real_home / "config.toml").read_text(encoding="utf-8"), "approval_policy = 'never'\n")
+
     def test_prepare_agent_codex_home_rebinds_cwd_when_rollout_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
