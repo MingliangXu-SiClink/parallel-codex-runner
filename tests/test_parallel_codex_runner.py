@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import shutil
@@ -77,30 +78,43 @@ class SyncBackTests(unittest.TestCase):
 
 
 class WorkspaceCopyTests(unittest.TestCase):
+    @staticmethod
+    def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _init_git_workspace(self, workspace: Path, files: dict[str, str]) -> None:
+        workspace.mkdir()
+        self._git(workspace, "-c", "init.defaultBranch=main", "init")
+        self._git(workspace, "config", "user.name", "Test User")
+        self._git(workspace, "config", "user.email", "test@example.com")
+        for name, content in files.items():
+            (workspace / name).write_text(content, encoding="utf-8")
+        self._git(workspace, "add", ".")
+        self._git(workspace, "commit", "-m", "initial")
+
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_git_workspace_copy_uses_worktree_and_preserves_dirty_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            workspace.mkdir()
-            subprocess.run(
-                ["git", "-c", "init.defaultBranch=main", "init"],
-                cwd=workspace,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            self._init_git_workspace(
+                workspace,
+                {"keep.txt": "clean", "delete.txt": "delete me"},
             )
-            subprocess.run(["git", "config", "user.name", "Test User"], cwd=workspace, check=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            self._git(workspace, "update-index", "--split-index")
 
-            (workspace / "keep.txt").write_text("clean", encoding="utf-8")
-            (workspace / "delete.txt").write_text("delete me", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=workspace, check=True, stdout=subprocess.PIPE)
-
+            (workspace / "keep.txt").write_text("staged", encoding="utf-8")
+            self._git(workspace, "add", "keep.txt")
             (workspace / "keep.txt").write_text("dirty", encoding="utf-8")
             (workspace / "delete.txt").unlink()
             (workspace / "untracked.txt").write_text("untracked", encoding="utf-8")
+            original_status = self._git(workspace, "status", "--porcelain=v1").stdout
 
             run_base = root / "runs"
             dst = run_base / "workspaces" / "agent_001"
@@ -110,8 +124,141 @@ class WorkspaceCopyTests(unittest.TestCase):
                 self.assertEqual((dst / "keep.txt").read_text(encoding="utf-8"), "dirty")
                 self.assertFalse((dst / "delete.txt").exists())
                 self.assertEqual((dst / "untracked.txt").read_text(encoding="utf-8"), "untracked")
+                copied_status = self._git(dst, "status", "--porcelain=v1").stdout
+                self.assertEqual(copied_status, original_status)
             finally:
                 cleanup_workspace_copy(workspace, dst)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_moves_branch_and_preserves_index_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(
+                workspace,
+                {"tracked.txt": "base", "delete.txt": "base"},
+            )
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("committed", encoding="utf-8")
+                (agent / "committed.txt").write_text("committed", encoding="utf-8")
+                self._git(agent, "add", "-A")
+                self._git(agent, "commit", "-m", "agent commit")
+                self._git(agent, "update-index", "--split-index")
+
+                (agent / "committed.txt").write_text("unstaged after commit", encoding="utf-8")
+                (agent / "delete.txt").unlink()
+                (agent / "staged.txt").write_text("staged after commit", encoding="utf-8")
+                self._git(agent, "add", "staged.txt")
+                agent_head = self._git(agent, "rev-parse", "HEAD").stdout.strip()
+                agent_status = self._git(agent, "status", "--porcelain=v1").stdout
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    agent_head,
+                )
+                self.assertEqual(
+                    self._git(workspace, "branch", "--show-current").stdout.strip(),
+                    "main",
+                )
+                self.assertEqual(
+                    self._git(workspace, "status", "--porcelain=v1").stdout,
+                    agent_status,
+                )
+                self.assertEqual((workspace / "committed.txt").read_text(encoding="utf-8"), "unstaged after commit")
+                self.assertFalse((workspace / "delete.txt").exists())
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+                self.assertEqual(
+                    self._git(workspace, "status", "--porcelain=v1").stdout,
+                    agent_status,
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+            self.assertFalse(agent.exists())
+            self.assertEqual(self._git(workspace, "rev-parse", "HEAD").stdout.strip(), agent_head)
+            self._git(workspace, "cat-file", "-e", f"{agent_head}^{{commit}}")
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_original_head_change_during_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                self._git(agent, "add", ".")
+                self._git(agent, "commit", "-m", "agent commit")
+
+                (workspace / "original.txt").write_text("original", encoding="utf-8")
+                self._git(workspace, "add", ".")
+                self._git(workspace, "commit", "-m", "original commit")
+                original_head = self._git(workspace, "rev-parse", "HEAD").stdout.strip()
+
+                with self.assertRaisesRegex(RuntimeError, "original Git HEAD changed"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    original_head,
+                )
+                self.assertEqual((workspace / "tracked.txt").read_text(encoding="utf-8"), "base")
+                self.assertEqual((workspace / "original.txt").read_text(encoding="utf-8"), "original")
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_original_branch_change_during_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                self._git(workspace, "switch", "-c", "other")
+
+                with self.assertRaisesRegex(RuntimeError, "original Git branch changed"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(self._git(workspace, "branch", "--show-current").stdout.strip(), "other")
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_recovers_commit_from_legacy_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = root / "agent"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+            self._git(workspace, "worktree", "add", "--detach", str(agent), "HEAD")
+            try:
+                (agent / "tracked.txt").write_text("legacy agent", encoding="utf-8")
+                self._git(agent, "add", ".")
+                self._git(agent, "commit", "-m", "legacy agent commit")
+                agent_head = self._git(agent, "rev-parse", "HEAD").stdout.strip()
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    agent_head,
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
 
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_cleanup_workspace_copies_prunes_worktree_record_when_root_is_gone(self) -> None:
@@ -317,6 +464,7 @@ class TuiCommandTests(unittest.TestCase):
         app._sync = lambda: None
         app._show_text = lambda _text: None
 
+        app._handle_command("/numofagents 4")
         app._handle_command("/maxparallel 2")
         app._handle_command("/serial")
         app._handle_command("/bestby duration")
@@ -325,6 +473,8 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/keepworkspaces on")
         app._handle_command("/resumeinclude off")
 
+        self.assertEqual(app.num_agents, 4)
+        self.assertEqual(app.args.num_agents, 4)
         self.assertEqual(app.args.max_parallel, 2)
         self.assertTrue(app.args.serial)
         self.assertEqual(app.args.best_by, "duration")
@@ -352,6 +502,7 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.press("enter")
                     await pilot.pause()
                     self.assertEqual(app.num_agents, 3)
+                    self.assertEqual(app.args.num_agents, 3)
 
                     max_parallel = app.query_one("#config-max-parallel")
                     max_parallel.value = "2"
@@ -371,11 +522,81 @@ class TuiCommandTests(unittest.TestCase):
                         control.value = value
                         await pilot.pause()
 
+                    model = app.query_one("#config-model")
+                    app._set_select_control(
+                        model,
+                        "",
+                        [("default", ""), ("gpt-test", "gpt-test")],
+                    )
+                    model.value = "gpt-test"
+                    await pilot.pause()
+
                     self.assertTrue(app.args.serial)
                     self.assertEqual(app.args.best_by, "duration")
+                    self.assertEqual(app.args.model, "gpt-test")
                     self.assertTrue(app.args.no_sync_back)
                     self.assertTrue(app.args.keep_workspaces)
                     self.assertGreaterEqual(len(app.command_history), 5)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_numeric_controls_commit_on_blur_and_before_run(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    prompt = app.query_one("#prompt")
+                    agents = app.query_one("#config-agents")
+                    agents.focus()
+                    agents.value = "3"
+                    prompt.focus()
+                    await pilot.pause()
+
+                    self.assertEqual(app.num_agents, 3)
+                    self.assertEqual(app.args.num_agents, 3)
+                    self.assertEqual(len(app.agents), 3)
+
+                    max_parallel = app.query_one("#config-max-parallel")
+                    max_parallel.focus()
+                    max_parallel.value = "2"
+                    prompt.focus()
+                    await pilot.pause()
+
+                    self.assertEqual(app.args.max_parallel, 2)
+
+                    best_by = app.query_one("#config-best-by")
+                    best_by.value = "duration"
+                    model = app.query_one("#config-model")
+                    app._set_select_control(
+                        model,
+                        "",
+                        [("default", ""), ("gpt-test", "gpt-test")],
+                    )
+                    model.value = "gpt-test"
+                    await pilot.pause()
+
+                    agents.focus()
+                    agents.value = "4"
+                    captured_args: list[argparse.Namespace] = []
+
+                    def capture_run(run_args: argparse.Namespace, *_args: object, **_kwargs: object) -> int:
+                        captured_args.append(run_args)
+                        return 0
+
+                    with mock.patch.object(tui_textual, "run_once", side_effect=capture_run):
+                        with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                            self.assertTrue(app._start_run("question"))
+                            target = thread_cls.call_args.kwargs["target"]
+                            target()
+
+                    self.assertEqual(app.num_agents, 4)
+                    self.assertEqual(len(app.agents), 4)
+                    self.assertEqual(captured_args[0].num_agents, 4)
+                    self.assertEqual(captured_args[0].max_parallel, 2)
+                    self.assertEqual(captured_args[0].best_by, "duration")
+                    self.assertEqual(captured_args[0].model, "gpt-test")
+                    app.running = False
 
         asyncio.run(run())
 
@@ -475,12 +696,43 @@ class TuiCommandTests(unittest.TestCase):
 
                 self.assertTrue(await pilot.double_click("#detail", offset=(3, 0)))
                 await pilot.pause()
+                copied.clear()
                 prompt.action_copy()
 
                 self.assertEqual(len(copied), 1)
                 self.assertIn("detail question", copied[0])
                 self.assertIn("detail answer", copied[0])
                 self.assertNotEqual(copied[0], "prompt")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_selection_copies_on_mouse_up_and_survives_refresh(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(80, 30)) as pilot:
+                pane = app.agents[1]
+                pane.input_text = "copy this detail"
+                pane.final_text = "and this answer"
+                app._mark_detail_dirty(pane)
+                app._sync()
+                await pilot.pause()
+
+                copied: list[str] = []
+                app.copy_to_clipboard = copied.append
+                self.assertTrue(await pilot.double_click("#detail", offset=(3, 0)))
+                await pilot.pause()
+
+                selected = app.screen.get_selected_text()
+                self.assertIsNotNone(selected)
+                self.assertIn("copy this detail", selected or "")
+                self.assertIn("and this answer", selected or "")
+                self.assertIn(selected, copied)
+
+                app.screen.clear_selection()
+                app._sync()
+                app.action_copy_selection()
+                self.assertEqual(copied[-1], selected)
 
         asyncio.run(run())
 

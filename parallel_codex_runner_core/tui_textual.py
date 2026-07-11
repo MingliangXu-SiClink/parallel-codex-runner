@@ -459,6 +459,10 @@ else:
             self.delta = delta
 
 
+    class DetailSelectionCompleted(Message):
+        pass
+
+
     class PromptEditor(TextArea):
         def __init__(self, *args: Any, placeholder: str = "", **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -568,6 +572,14 @@ else:
 
         def _update_follow_tail(self) -> None:
             self.follow_tail = self.is_vertical_scroll_end
+
+        async def _on_mouse_up(self, event: events.MouseUp) -> None:
+            await super()._on_mouse_up(event)
+            self.post_message(DetailSelectionCompleted())
+
+        async def _on_click(self, event: events.Click) -> None:
+            await super()._on_click(event)
+            self.post_message(DetailSelectionCompleted())
 
 
     class PcrTextualApp(App[None]):
@@ -720,12 +732,25 @@ else:
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self._updating_controls = False
+            self._committed_input_values = {
+                "config-agents": str(self.num_agents),
+                "config-max-parallel": dict(self.run_info_rows).get("MAX_PARALLEL", ""),
+            }
+            self._mouse_down_in_runner_control = False
+            self._last_screen_selection = ""
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
 
         def _is_runner_control(self, node: Any) -> bool:
             while node is not None:
                 if isinstance(node, (Input, Select)) and node.has_class("runner-control"):
+                    return True
+                node = node.parent
+            return False
+
+        def _is_detail_widget(self, node: Any) -> bool:
+            while node is not None:
+                if getattr(node, "id", None) in {"detail", "detail-scroll"}:
                     return True
                 node = node.parent
             return False
@@ -737,12 +762,14 @@ else:
                         event.x,
                         event.y,
                     )
-                    prompt = self.query_one("#prompt", PromptEditor)
                 except Exception:
-                    pass
+                    self._mouse_down_in_runner_control = False
                 else:
-                    if not self._is_runner_control(clicked_widget):
-                        prompt.focus()
+                    self._mouse_down_in_runner_control = self._is_runner_control(clicked_widget)
+                    if not self._is_detail_widget(clicked_widget):
+                        self._last_screen_selection = ""
+            elif isinstance(event, events.MouseUp) and not event.is_forwarded:
+                self.call_after_refresh(self._complete_pointer_selection)
 
             is_text_input = (
                 isinstance(event, events.Key) and event.is_printable
@@ -752,6 +779,7 @@ else:
                 and not event.is_forwarded
                 and not self._is_runner_control(self.focused)
             ):
+                self._last_screen_selection = ""
                 try:
                     prompt = self.query_one("#prompt", PromptEditor)
                 except Exception:
@@ -771,6 +799,21 @@ else:
                         event.prevent_default()
                         return
             await super().on_event(event)
+
+        @on(DetailSelectionCompleted)
+        def _on_detail_selection_completed(self, _event: DetailSelectionCompleted) -> None:
+            self._complete_pointer_selection()
+
+        def _complete_pointer_selection(self) -> None:
+            selected = self.screen.get_selected_text() or ""
+            if selected:
+                if selected != self._last_screen_selection:
+                    self.copy_to_clipboard(selected)
+                self._last_screen_selection = selected
+                return
+            self._last_screen_selection = ""
+            if not self._mouse_down_in_runner_control:
+                self.query_one("#prompt", PromptEditor).focus()
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
@@ -911,31 +954,92 @@ else:
         def _on_switch(self, event: AgentSwitchRequested) -> None:
             self._switch_agent(event.delta)
 
-        @on(Input.Submitted, "#config-agents")
-        def _on_agents_submitted(self, event: Input.Submitted) -> None:
-            if self._updating_controls:
-                return
-            self._handle_numofagents([event.value.strip()])
+        def _set_committed_input_value(self, control: Input, value: str) -> None:
             self._updating_controls = True
             try:
-                event.input.value = str(self.num_agents)
+                control.value = value
+                if control.id is not None:
+                    self._committed_input_values[control.id] = value
             finally:
                 self._updating_controls = False
 
-        @on(Input.Submitted, "#config-max-parallel")
-        def _on_max_parallel_submitted(self, event: Input.Submitted) -> None:
+        def _commit_agents_control(self) -> bool:
+            try:
+                control = self.query_one("#config-agents", Input)
+            except Exception:
+                return True
+            value_text = control.value.strip()
+            if value_text == self._committed_input_values.get("config-agents"):
+                return True
+            try:
+                requested = int(value_text)
+            except ValueError:
+                requested = None
+            self._handle_numofagents([value_text])
+            applied = requested is not None and requested > 0 and self.num_agents == requested
+            self._set_committed_input_value(control, str(self.num_agents))
+            return applied
+
+        def _commit_max_parallel_control(self) -> bool:
+            try:
+                control = self.query_one("#config-max-parallel", Input)
+            except Exception:
+                return True
+            value_text = control.value.strip()
+            if value_text == self._committed_input_values.get("config-max-parallel"):
+                return True
+            normalized = value_text.lower()
+            if normalized in {"auto", "default", "clear", "none"}:
+                requested: int | None = None
+                valid = True
+            else:
+                try:
+                    requested = int(normalized)
+                except ValueError:
+                    requested = None
+                    valid = False
+                else:
+                    valid = requested > 0
+            self._handle_maxparallel([value_text])
+            applied = valid and getattr(self.args, "max_parallel", None) == requested
+            display_value = dict(self._base_info_rows()).get("MAX_PARALLEL", "")
+            self._set_committed_input_value(control, display_value)
+            return applied
+
+        def _commit_runner_inputs(self) -> bool:
+            if not self._commit_agents_control():
+                self.query_one("#config-agents", Input).focus()
+                return False
+            if not self._commit_max_parallel_control():
+                self.query_one("#config-max-parallel", Input).focus()
+                return False
+            return True
+
+        @on(Input.Submitted, "#config-agents")
+        def _on_agents_submitted(self, _event: Input.Submitted) -> None:
             if self._updating_controls:
                 return
-            self._handle_maxparallel([event.value.strip()])
-            self._updating_controls = True
-            try:
-                event.input.value = dict(self._tree_rows()).get("MAX_PARALLEL", "")
-            finally:
-                self._updating_controls = False
+            self._commit_agents_control()
+
+        @on(events.DescendantBlur, "#config-agents")
+        def _on_agents_blurred(self, _event: events.DescendantBlur) -> None:
+            if not self._updating_controls:
+                self._commit_agents_control()
+
+        @on(Input.Submitted, "#config-max-parallel")
+        def _on_max_parallel_submitted(self, _event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._commit_max_parallel_control()
+
+        @on(events.DescendantBlur, "#config-max-parallel")
+        def _on_max_parallel_blurred(self, _event: events.DescendantBlur) -> None:
+            if not self._updating_controls:
+                self._commit_max_parallel_control()
 
         @on(Select.Changed, "#config-execution")
         def _on_execution_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             serial = str(event.value) == "serial"
             current_serial = dict(self._tree_rows()).get("EXECUTION") == "serial"
@@ -944,7 +1048,7 @@ else:
 
         @on(Select.Changed, "#config-best-by")
         def _on_best_by_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             value = str(event.value)
             if value != str(getattr(self.args, "best_by", "reasoning_tokens")):
@@ -952,7 +1056,7 @@ else:
 
         @on(Select.Changed, "#config-model")
         def _on_model_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             value = str(event.value)
             if value != str(getattr(self.args, "model", None) or ""):
@@ -960,7 +1064,7 @@ else:
 
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             current = not bool(getattr(self.args, "no_sync_back", False))
             value = bool(event.value)
@@ -969,7 +1073,7 @@ else:
 
         @on(Select.Changed, "#config-keep-workspaces")
         def _on_keep_workspaces_toggled(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             current = bool(getattr(self.args, "keep_workspaces", False))
             value = bool(event.value)
@@ -978,7 +1082,7 @@ else:
 
         @on(Select.Changed, "#config-resume")
         def _on_resume_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls or not event.select.has_focus:
+            if self._updating_controls:
                 return
             session_id = str(event.value)
             if session_id == self.resume_session_id:
@@ -1168,8 +1272,14 @@ else:
                 pass
 
         def _copy_active_text(self) -> bool:
+            if self._last_screen_selection:
+                selected = self._last_screen_selection
+                self._last_screen_selection = ""
+                self.copy_to_clipboard(selected)
+                return True
             screen_selection = self.screen.get_selected_text()
             if screen_selection:
+                self._last_screen_selection = screen_selection
                 self.copy_to_clipboard(screen_selection)
                 return True
             selected_text = getattr(self.focused, "selected_text", "")
@@ -1351,6 +1461,7 @@ else:
             if not self._prepare_config_change("agent count"):
                 return
             self.num_agents = value
+            self.args.num_agents = value
             self.selected_agent = min(self.selected_agent, value)
             self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
             self.best_agent = None
@@ -1665,6 +1776,9 @@ else:
         def _start_run(self, prompt: str) -> bool:
             if self.running:
                 return self._queue_prompt_from_finished_agent(prompt)
+            if not self._commit_runner_inputs():
+                self._sync()
+                return False
             if self._has_pending_run() and (getattr(self.args, "no_sync_back", False) or self.best_agent is None):
                 if not self._discard_pending_run():
                     self._sync()
@@ -1694,6 +1808,7 @@ else:
             run_args.max_parallel = min(run_args.max_parallel or self.num_agents, self.num_agents)
             run_args.resume = False
             run_args.resume_session_id = self.resume_session_id or None
+            # The TUI owns selection, sync-back, and cleanup after run_once returns.
             run_args.no_sync_back = True
             run_args.keep_workspaces = True
             run_args.cancel_event = self.cancel_event
@@ -2040,10 +2155,14 @@ else:
             try:
                 agents_input = self.query_one("#config-agents", Input)
                 if self.focused is not agents_input:
-                    agents_input.value = str(self.num_agents)
+                    agents_value = str(self.num_agents)
+                    agents_input.value = agents_value
+                    self._committed_input_values["config-agents"] = agents_value
                 max_parallel_input = self.query_one("#config-max-parallel", Input)
                 if self.focused is not max_parallel_input:
-                    max_parallel_input.value = rows.get("MAX_PARALLEL", "")
+                    max_parallel_value = rows.get("MAX_PARALLEL", "")
+                    max_parallel_input.value = max_parallel_value
+                    self._committed_input_values["config-max-parallel"] = max_parallel_value
                 self._set_select_control(
                     execution_select,
                     rows.get("EXECUTION", "parallel"),
