@@ -468,8 +468,8 @@ class TuiCommandTests(unittest.TestCase):
                     first_tip = app.current_tip
                     first_icon = app.current_tip_icon
 
-                    self.assertEqual(tui_textual.TIP_ROTATION_SECONDS, 60.0)
-                    self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.5)
+                    self.assertEqual(tui_textual.TIP_ROTATION_SECONDS, 10.0)
+                    self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.25)
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)

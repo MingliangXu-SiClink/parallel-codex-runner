@@ -46,8 +46,8 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit", "stop active agents, clean up, and quit"),
 )
 MAX_SUGGESTIONS = 8
-TIP_ROTATION_SECONDS = 60.0
-TIP_ICON_REFRESH_SECONDS = 0.5
+TIP_ROTATION_SECONDS = 10.0
+TIP_ICON_REFRESH_SECONDS = 0.25
 TIP_ICON_FRAMES: tuple[str, ...] = ("◐", "◓", "◑", "◒")
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
