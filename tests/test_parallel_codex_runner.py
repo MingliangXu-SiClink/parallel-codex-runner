@@ -458,6 +458,41 @@ class TuiCommandTests(unittest.TestCase):
         self.assertNotIn("same as", tui_textual.build_help_text().lower())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_tip_row_rotates_text_and_animates_icon_above_prompt(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(80, 30)) as pilot:
+                    tips = app.query_one("#tips")
+                    prompt = app.query_one("#prompt")
+                    first_tip = app.current_tip
+                    first_icon = app.current_tip_icon
+
+                    self.assertEqual(tui_textual.TIP_ROTATION_SECONDS, 60.0)
+                    self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.5)
+                    self.assertEqual(tips.region.height, 1)
+                    self.assertLess(tips.region.y, prompt.region.y)
+                    self.assertIn(first_tip, tips.content.plain)
+                    self.assertIn(first_icon, tips.content.plain)
+                    self.assertNotIn("TIPS", tips.content.plain)
+
+                    app._advance_tip_icon()
+                    await pilot.pause()
+
+                    self.assertNotEqual(app.current_tip_icon, first_icon)
+                    self.assertEqual(app.current_tip, first_tip)
+                    self.assertIn(app.current_tip_icon, tips.content.plain)
+
+                    app._advance_tip()
+                    await pilot.pause()
+
+                    self.assertNotEqual(app.current_tip, first_tip)
+                    self.assertIn(app.current_tip, tips.content.plain)
+                    self.assertEqual(tips.region.height, 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_config_commands_update_cli_equivalents(self) -> None:
         args = parse_args([])
         app = tui_textual.PcrTextualApp(args)

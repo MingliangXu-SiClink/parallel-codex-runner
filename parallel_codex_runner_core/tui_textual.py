@@ -46,6 +46,23 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit", "stop active agents, clean up, and quit"),
 )
 MAX_SUGGESTIONS = 8
+TIP_ROTATION_SECONDS = 60.0
+TIP_ICON_REFRESH_SECONDS = 0.5
+TIP_ICON_FRAMES: tuple[str, ...] = ("◐", "◓", "◑", "◒")
+TUI_TIPS: tuple[str, ...] = (
+    "输入 / 可查看并补全命令。",
+    "输入框为空时，←/→ 可切换 Agent。",
+    "Shift-Enter 可在输入框中换行。",
+    "选中 Detail 文本即可复制。",
+    "使用 /resume 可载入之前的 Codex 对话。",
+    "后续提问会从当前显示的 Agent 继续。",
+    "部分 Agent 完成后，即可从该 Agent 继续提问。",
+    "运行前可直接修改上方配置项。",
+    "滚动 Detail 后，实时刷新不会抢走当前位置。",
+    "Ctrl-C 会依次执行复制、清空输入或退出。",
+    "KEEP_WORKSPACES 可保留候选工作目录。",
+    "SYNC_BACK 控制是否同步选中的结果。",
+)
 
 
 def command_suggestions(value: str) -> list[str]:
@@ -670,6 +687,18 @@ else:
             color: #b7c8e6;
             background: #101216;
         }
+        #tips {
+            height: 1;
+            min-height: 1;
+            max-height: 1;
+            margin: 0 1;
+            padding: 0 1;
+            color: #aebed3;
+            background: #171d25;
+            content-align: left middle;
+            text-wrap: nowrap;
+            text-overflow: clip;
+        }
         #prompt {
             height: 3;
             min-height: 3;
@@ -714,6 +743,8 @@ else:
             self.started_at: float | None = None
             self.prompt_height = 3
             self.suggestion_line_count = 0
+            self.tip_index = 0
+            self.tip_icon_index = 0
             self.work_frame = 0
             self.exit_after_run = False
             self.cancel_event: threading.Event | None = None
@@ -900,6 +931,7 @@ else:
                     with DetailScroll(id="detail-scroll"):
                         yield Static("", id="detail")
                 yield Static("", id="suggestions")
+                yield Static(self._tip_renderable(), id="tips")
                 yield PromptEditor(
                     "",
                     id="prompt",
@@ -912,6 +944,8 @@ else:
         def on_mount(self) -> None:
             self.query_one("#runner-frame", Vertical).border_title = "PARALLEL-CODEX-RUNNER"
             self.set_interval(0.25, self._tick)
+            self.set_interval(TIP_ROTATION_SECONDS, self._advance_tip)
+            self.set_interval(TIP_ICON_REFRESH_SECONDS, self._advance_tip_icon)
             if (
                 not self.is_headless
                 and not getattr(self.args, "resume", False)
@@ -2002,6 +2036,31 @@ else:
                 else:
                     self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
                 self._sync()
+
+        @property
+        def current_tip(self) -> str:
+            return TUI_TIPS[self.tip_index]
+
+        @property
+        def current_tip_icon(self) -> str:
+            return TIP_ICON_FRAMES[self.tip_icon_index]
+
+        def _tip_renderable(self) -> Content:
+            return Content.assemble((f"{self.current_tip_icon}  ", "bold cyan"), self.current_tip)
+
+        def _refresh_tip(self) -> None:
+            try:
+                self.query_one("#tips", Static).update(self._tip_renderable(), layout=False)
+            except Exception:
+                return
+
+        def _advance_tip(self) -> None:
+            self.tip_index = (self.tip_index + 1) % len(TUI_TIPS)
+            self._refresh_tip()
+
+        def _advance_tip_icon(self) -> None:
+            self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_FRAMES)
+            self._refresh_tip()
 
         def _sync(self) -> None:
             try:
