@@ -293,7 +293,7 @@ except (ModuleNotFoundError, RuntimeError) as exc:
         ) from _exc
 
 else:
-    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, normalize_best_by, promote_best_codex_session_to_workspace, run_once
+    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, normalize_best_by, promote_best_codex_session_to_workspace, run_once, subagent_resume_error
     from .models import AgentResult
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import cleanup_workspace_copies, sync_best_workspace_back
@@ -1062,6 +1062,11 @@ else:
                         chosen = session
                         break
                 if chosen is None:
+                    error = subagent_resume_error(get_codex_home(), selector)
+                    if error:
+                        self.status = error
+                        self._sync()
+                        return
                     self.resume_session_id = selector
                     self.run_info_rows = self._base_info_rows()
                     self.status = f"Resume session set: {selector}"

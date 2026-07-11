@@ -456,6 +456,41 @@ def same_workspace(value: str, workspace: Path) -> bool:
         return value == str(workspace)
 
 
+def session_meta_thread_id(meta: Dict[str, Any]) -> str:
+    """Return the actual thread id from Codex session metadata."""
+    return str(meta.get("id") or meta.get("session_id") or "").strip()
+
+
+def codex_subagent_parent_thread_id(
+    source: Any,
+    thread_source: Any = None,
+    parent_thread_id: Any = None,
+) -> Optional[str]:
+    """Return a parent id for a Codex subagent, or None for a root thread."""
+    parent = str(parent_thread_id or "").strip()
+    normalized_thread_source = str(thread_source or "").strip().lower()
+    parsed_source = source
+    if isinstance(source, str):
+        source_text = source.strip()
+        if source_text.lower() == "subagent":
+            return parent
+        try:
+            parsed_source = json.loads(source_text)
+        except (json.JSONDecodeError, TypeError):
+            parsed_source = None
+
+    if isinstance(parsed_source, dict) and "subagent" in parsed_source:
+        subagent = parsed_source.get("subagent")
+        if isinstance(subagent, dict):
+            thread_spawn = subagent.get("thread_spawn")
+            if isinstance(thread_spawn, dict):
+                parent = str(thread_spawn.get("parent_thread_id") or parent).strip()
+        return parent
+    if normalized_thread_source == "subagent":
+        return parent
+    return None
+
+
 def load_resume_sessions_from_state(
     codex_home: Path,
     workspace: Path,
@@ -491,6 +526,8 @@ def load_resume_sessions_from_state(
             "updated_at",
             "recency_at",
             "source",
+            "thread_source",
+            "parent_thread_id",
             "model",
             "model_provider",
             "rollout_path",
@@ -518,6 +555,15 @@ def load_resume_sessions_from_state(
         session_id = str(data.get("id") or "").strip()
         cwd = str(data.get("cwd") or "").strip()
         if not session_id or not cwd:
+            continue
+        if (
+            codex_subagent_parent_thread_id(
+                data.get("source"),
+                data.get("thread_source"),
+                data.get("parent_thread_id"),
+            )
+            is not None
+        ):
             continue
         title = str(data.get("title") or data.get("first_user_message") or data.get("preview") or session_id)
         updated_at = parse_epoch(data.get("recency_at")) or parse_epoch(data.get("updated_at"))
@@ -602,11 +648,27 @@ def load_resume_sessions_from_jsonl(
         except OSError:
             continue
 
-        session_id = str(meta.get("session_id") or meta.get("id") or "").strip()
+        session_id = session_meta_thread_id(meta)
         cwd = str(meta.get("cwd") or "").strip()
-        source = str(meta.get("source") or "").strip()
+        source_value = meta.get("source")
+        source = (
+            source_value.strip()
+            if isinstance(source_value, str)
+            else json.dumps(source_value, ensure_ascii=False, separators=(",", ":"))
+            if source_value is not None
+            else ""
+        )
         originator = str(meta.get("originator") or "").strip()
         if not session_id or not cwd or not same_workspace(cwd, workspace):
+            continue
+        if (
+            codex_subagent_parent_thread_id(
+                source_value,
+                meta.get("thread_source"),
+                meta.get("parent_thread_id") or meta.get("forked_from_id"),
+            )
+            is not None
+        ):
             continue
         if not include_non_interactive and (source == "exec" or originator == "codex_exec"):
             continue
@@ -713,6 +775,9 @@ def resolve_resume_session(args: argparse.Namespace, workspace: Path) -> Optiona
         session_id = args.resume_session_id.strip()
         if not session_id:
             raise SystemExit("--resume-session-id 不能为空。")
+        error = subagent_resume_error(get_codex_home(), session_id)
+        if error:
+            raise SystemExit(error)
         for session in list_resume_sessions(workspace, include_non_interactive=True):
             if session.session_id == session_id:
                 return session
@@ -766,12 +831,80 @@ def find_rollout_path_for_session(codex_home: Path, session_id: str) -> Optional
                     payload = obj.get("payload")
                     if obj.get("type") != "session_meta" or not isinstance(payload, dict):
                         continue
-                    ids = {str(payload.get(key) or "").strip() for key in ("session_id", "id")}
-                    if session_id in ids:
+                    if session_meta_thread_id(payload) == session_id:
                         return path
         except OSError:
             continue
     return None
+
+
+def subagent_resume_error(codex_home: Path, session_id: str) -> Optional[str]:
+    """Explain why a known Codex v2 subagent cannot be resumed directly."""
+    state_db = codex_home / "state_5.sqlite"
+    if state_db.exists():
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
+            selected = [name for name in ("source", "thread_source", "parent_thread_id") if name in columns]
+            if "id" in columns and selected:
+                row = conn.execute(
+                    f"SELECT {', '.join(selected)} FROM threads WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is not None:
+                    data = dict(row)
+                    parent = codex_subagent_parent_thread_id(
+                        data.get("source"),
+                        data.get("thread_source"),
+                        data.get("parent_thread_id"),
+                    )
+                    if parent is None:
+                        return None
+                    return format_subagent_resume_error(session_id, parent)
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+
+    rollout_path = find_rollout_path_for_session(codex_home, session_id)
+    if rollout_path is None:
+        return None
+    try:
+        with rollout_path.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = obj.get("payload") if isinstance(obj, dict) else None
+                if (
+                    not isinstance(payload, dict)
+                    or obj.get("type") != "session_meta"
+                    or session_meta_thread_id(payload) != session_id
+                ):
+                    continue
+                parent = codex_subagent_parent_thread_id(
+                    payload.get("source"),
+                    payload.get("thread_source"),
+                    payload.get("parent_thread_id") or payload.get("forked_from_id"),
+                )
+                if parent is not None:
+                    return format_subagent_resume_error(session_id, parent)
+                return None
+    except OSError:
+        pass
+    return None
+
+
+def format_subagent_resume_error(session_id: str, parent_thread_id: str) -> str:
+    parent_hint = f"；请改用父线程 {parent_thread_id}" if parent_thread_id else ""
+    return f"Codex multi-agent v2 子线程不能直接 resume：{session_id}{parent_hint}。"
 
 
 def update_rollout_session_meta(
@@ -800,8 +933,14 @@ def update_rollout_session_meta(
 
                 payload = obj.get("payload")
                 if obj.get("type") == "session_meta" and isinstance(payload, dict):
-                    ids = {str(payload.get(key) or "").strip() for key in ("session_id", "id")}
-                    if session_id in ids:
+                    if session_meta_thread_id(payload) == session_id:
+                        parent = codex_subagent_parent_thread_id(
+                            payload.get("source"),
+                            payload.get("thread_source"),
+                            payload.get("parent_thread_id") or payload.get("forked_from_id"),
+                        )
+                        if parent is not None:
+                            raise ValueError(format_subagent_resume_error(session_id, parent))
                         if payload.get("cwd") != target_cwd:
                             payload["cwd"] = target_cwd
                             changed = True
@@ -879,6 +1018,15 @@ def promote_codex_session_to_workspace(
                     promotion.state_found = True
                     promotion.old_cwd = str(data.get("cwd") or "")
                     rollout_path_text = str(data.get("rollout_path") or "")
+
+                    parent = codex_subagent_parent_thread_id(
+                        data.get("source"),
+                        data.get("thread_source"),
+                        data.get("parent_thread_id"),
+                    )
+                    if parent is not None:
+                        append_promotion_error(promotion, format_subagent_resume_error(session_id, parent))
+                        return promotion
 
                     assignments = []
                     params: List[Any] = []
@@ -1001,6 +1149,15 @@ def import_codex_session_to_workspace(
                     promotion.state_found = True
                     promotion.old_cwd = str(data.get("cwd") or "")
                     source_rollout_text = str(data.get("rollout_path") or "")
+
+                    parent = codex_subagent_parent_thread_id(
+                        data.get("source"),
+                        data.get("thread_source"),
+                        data.get("parent_thread_id"),
+                    )
+                    if parent is not None:
+                        append_promotion_error(promotion, format_subagent_resume_error(session_id, parent))
+                        return promotion
 
                     source_rollout = Path(source_rollout_text).expanduser() if source_rollout_text else find_rollout_path_for_session(source_codex_home, session_id)
                     if source_rollout is not None:

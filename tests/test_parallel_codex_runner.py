@@ -304,6 +304,22 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIsNone(app.args.model)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_rejects_explicit_codex_subagent_resume(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        app._sync = lambda: None
+
+        with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+            with mock.patch.object(
+                tui_textual,
+                "subagent_resume_error",
+                return_value="Codex subagent cannot be resumed",
+            ):
+                app._handle_resume(["child-thread"])
+
+        self.assertEqual(app.resume_session_id, "")
+        self.assertEqual(app.status, "Codex subagent cannot be resumed")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_path_and_promptfile_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -978,6 +994,140 @@ class ResumeSessionTests(unittest.TestCase):
 
             self.assertEqual([s.session_id for s in default_sessions], ["interactive"])
             self.assertEqual([s.session_id for s in all_sessions], ["exec", "interactive"])
+
+    def test_state_loader_excludes_and_rejects_codex_v2_subagents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            child_id = "019f-child"
+            parent_id = "019f-parent"
+            child_source = json.dumps(
+                {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "depth": 1,
+                        }
+                    }
+                }
+            )
+
+            conn = sqlite3.connect(root / "state_5.sqlite")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        cwd TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        thread_source TEXT,
+                        archived INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (parent_id, str(workspace), "Parent", 10, "vscode", "user", 0),
+                        (child_id, str(workspace), "Child", 20, child_source, "subagent", 0),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertEqual(
+                [session.session_id for session in load_resume_sessions_from_state(root, workspace)],
+                [parent_id],
+            )
+            self.assertEqual(
+                [
+                    session.session_id
+                    for session in load_resume_sessions_from_state(
+                        root,
+                        workspace,
+                        include_non_interactive=True,
+                    )
+                ],
+                [parent_id],
+            )
+
+            error = app_core.subagent_resume_error(root, child_id)
+            self.assertIsNotNone(error)
+            self.assertIn(parent_id, error or "")
+
+            args = mock.Mock(resume=False, resume_session_id=child_id)
+            with mock.patch.object(app_core, "get_codex_home", return_value=root):
+                with self.assertRaisesRegex(SystemExit, parent_id):
+                    app_core.resolve_resume_session(args, workspace)
+
+            target_workspace = root / "target"
+            target_workspace.mkdir()
+            promotion = promote_codex_session_to_workspace(root, child_id, target_workspace)
+            self.assertIn(parent_id, promotion.error or "")
+            conn = sqlite3.connect(root / "state_5.sqlite")
+            try:
+                child_cwd = conn.execute(
+                    "SELECT cwd FROM threads WHERE id = ?",
+                    (child_id,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(child_cwd, str(workspace))
+
+    def test_jsonl_loader_excludes_codex_v2_subagents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            sessions = root / "sessions" / "2026" / "07" / "11"
+            workspace.mkdir()
+            sessions.mkdir(parents=True)
+            parent_id = "019f-parent"
+            child_id = "019f-child"
+
+            parent_meta = {
+                "type": "session_meta",
+                "payload": {
+                    "session_id": parent_id,
+                    "id": parent_id,
+                    "cwd": str(workspace),
+                    "source": "vscode",
+                    "thread_source": "user",
+                },
+            }
+            child_meta = {
+                "type": "session_meta",
+                "payload": {
+                    "session_id": parent_id,
+                    "id": child_id,
+                    "parent_thread_id": parent_id,
+                    "cwd": str(workspace),
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent_id,
+                                "depth": 1,
+                            }
+                        }
+                    },
+                    "thread_source": "subagent",
+                },
+            }
+            (sessions / f"rollout-{parent_id}.jsonl").write_text(
+                json.dumps(parent_meta) + "\n",
+                encoding="utf-8",
+            )
+            (sessions / f"rollout-{child_id}.jsonl").write_text(
+                json.dumps(child_meta) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = app_core.load_resume_sessions_from_jsonl(root, workspace)
+            self.assertEqual([session.session_id for session in loaded], [parent_id])
+            self.assertIn(parent_id, app_core.subagent_resume_error(root, child_id) or "")
 
     def test_prepare_agent_codex_home_copies_support_entries_without_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
