@@ -282,6 +282,7 @@ try:
     activate_textual()
     from textual import events, on
     from textual.app import App, ComposeResult
+    from textual.content import Content
     from textual.containers import Grid, Vertical, VerticalScroll
     from textual.message import Message
     from textual.widgets import Input, Select, Static, TextArea
@@ -418,20 +419,29 @@ else:
             session_id: str,
             entries: list[CodexHistoryEntry],
             error: str = "",
+            rejected: bool = False,
         ) -> None:
             super().__init__()
             self.request_id = request_id
             self.session_id = session_id
             self.entries = entries
             self.error = error
+            self.rejected = rejected
 
 
     class ResumeChoicesLoaded(Message):
-        def __init__(self, request_id: int, workspace: Path, entries: list[Any]) -> None:
+        def __init__(
+            self,
+            request_id: int,
+            workspace: Path,
+            entries: list[Any],
+            error: str = "",
+        ) -> None:
             super().__init__()
             self.request_id = request_id
             self.workspace = workspace
             self.entries = entries
+            self.error = error
 
 
     class PromptSubmitted(Message):
@@ -454,12 +464,11 @@ else:
                     setattr(self, "placeholder", placeholder)
 
         def action_copy(self) -> None:
-            if self.selected_text:
-                self.app.copy_to_clipboard(self.selected_text)
-                return
             action = getattr(self.app, "action_interrupt_or_exit", None)
             if callable(action):
                 action()
+            else:
+                super().action_copy()
 
         async def _on_key(self, event: events.Key) -> None:
             if event.key == "enter":
@@ -519,6 +528,43 @@ else:
                 await self.action_delete_to_end_of_line_or_delete_line()
                 return
             await super()._on_key(event)
+
+
+    class DetailScroll(VerticalScroll):
+        """Track user scroll intent separately from the current animated offset."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.follow_tail = True
+
+        def scroll_to(
+            self,
+            x: float | None = None,
+            y: float | None = None,
+            **kwargs: Any,
+        ) -> None:
+            if y is not None:
+                self.follow_tail = y >= self.max_scroll_y
+            super().scroll_to(x, y, **kwargs)
+
+        def scroll_end(self, **kwargs: Any) -> None:
+            self.follow_tail = True
+            super().scroll_end(**kwargs)
+
+        def follow_end_if_enabled(self, **kwargs: Any) -> None:
+            if self.follow_tail:
+                super().scroll_end(**kwargs)
+
+        def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+            self.follow_tail = False
+            super()._on_mouse_scroll_up(event)
+
+        def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+            super()._on_mouse_scroll_down(event)
+            self.call_after_refresh(self._update_follow_tail)
+
+        def _update_follow_tail(self) -> None:
+            self.follow_tail = self.is_vertical_scroll_end
 
 
     class PcrTextualApp(App[None]):
@@ -664,6 +710,10 @@ else:
             self.detail_revision = 0
             self.resume_history_request = 0
             self.resume_choices_request = 0
+            self.resume_choices_loaded = False
+            self.resume_choices_inflight: tuple[int, Path] | None = None
+            self.pending_resume_selector: str | None = None
+            self._resume_io_lock = threading.Lock()
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self._updating_controls = False
@@ -756,7 +806,7 @@ else:
                         yield Static("BEST AGENT", id="runner-best-agent-key", classes="runner-key")
                         yield Static("", id="runner-best-agent", classes="runner-value", markup=False)
                 with Vertical(id="detail-frame"):
-                    with VerticalScroll(id="detail-scroll"):
+                    with DetailScroll(id="detail-scroll"):
                         yield Static("", id="detail")
                 yield Static("", id="suggestions")
                 yield PromptEditor(
@@ -975,8 +1025,16 @@ else:
 
         @on(ResumeHistoryLoaded)
         def _on_resume_history_loaded(self, event: ResumeHistoryLoaded) -> None:
-            if event.request_id != self.resume_history_request or event.session_id != self.resume_session_id:
+            if event.request_id != self.resume_history_request:
                 return
+            if event.rejected:
+                self.status = event.error or f"Cannot resume session: {event.session_id}"
+                self._sync()
+                return
+
+            self.resume_session_id = event.session_id
+            self._reset_conversation_detail()
+            self.run_info_rows = self._base_info_rows()
             if event.error:
                 loaded_status = f"Resume history unavailable: {event.error}"
             else:
@@ -993,9 +1051,24 @@ else:
 
         @on(ResumeChoicesLoaded)
         def _on_resume_choices_loaded(self, event: ResumeChoicesLoaded) -> None:
+            if self.resume_choices_inflight == (event.request_id, event.workspace):
+                self.resume_choices_inflight = None
             if event.request_id != self.resume_choices_request or event.workspace != self.workspace:
                 return
+            if event.error:
+                selector = self.pending_resume_selector
+                self.pending_resume_selector = None
+                self.resume_choices_loaded = False
+                if selector is not None:
+                    self.status = f"Cannot load resume sessions: {event.error}"
+                    self._sync()
+                return
+            self.resume_choices_loaded = True
             self._apply_resume_choices(event.entries)
+            selector = self.pending_resume_selector
+            self.pending_resume_selector = None
+            if selector is not None:
+                self._handle_loaded_resume_selector(selector)
 
         def action_clear_view(self) -> None:
             if self.running:
@@ -1047,13 +1120,13 @@ else:
                 pass
 
         def _copy_active_text(self) -> bool:
-            selected_text = getattr(self.focused, "selected_text", "")
-            if isinstance(selected_text, str) and selected_text:
-                self.copy_to_clipboard(selected_text)
-                return True
             screen_selection = self.screen.get_selected_text()
             if screen_selection:
                 self.copy_to_clipboard(screen_selection)
+                return True
+            selected_text = getattr(self.focused, "selected_text", "")
+            if isinstance(selected_text, str) and selected_text:
+                self.copy_to_clipboard(selected_text)
                 return True
             if isinstance(self.focused, Input):
                 if self.focused.value:
@@ -1431,34 +1504,38 @@ else:
             return "✓", entry.text, "green"
 
         def _select_resume_session(self, session_id: str, rollout_path: str = "") -> None:
-            error = subagent_resume_error(get_codex_home(), session_id)
-            if error:
-                self.resume_session_id = ""
-                self.status = error
-                self.run_info_rows = self._base_info_rows()
-                self._sync()
-                return
-
-            self.resume_session_id = session_id
+            session_id = session_id.strip()
             self.resume_history_request += 1
             request_id = self.resume_history_request
-            self._reset_conversation_detail()
-            self.run_info_rows = self._base_info_rows()
             self.status = f"Loading resume session: {session_id}"
-            self._refresh_resume_control()
             self._sync()
 
             def target() -> None:
                 entries: list[CodexHistoryEntry] = []
                 load_error = ""
+                rejected = False
                 try:
-                    entries = load_codex_session_history(get_codex_home(), session_id, rollout_path)
+                    with self._resume_io_lock:
+                        load_error = subagent_resume_error(get_codex_home(), session_id) or ""
+                        rejected = bool(load_error)
+                        if not rejected:
+                            entries = load_codex_session_history(
+                                get_codex_home(),
+                                session_id,
+                                rollout_path,
+                            )
                 except Exception as exc:  # noqa: BLE001
                     load_error = str(exc)
                 try:
                     self.call_from_thread(
                         self.post_message,
-                        ResumeHistoryLoaded(request_id, session_id, entries, load_error),
+                        ResumeHistoryLoaded(
+                            request_id,
+                            session_id,
+                            entries,
+                            load_error,
+                            rejected,
+                        ),
                     )
                 except RuntimeError:
                     pass
@@ -1481,21 +1558,29 @@ else:
                         return
                 self.resume_session_id = ""
                 self.resume_history_request += 1
+                self.pending_resume_selector = None
                 self._reset_conversation_detail()
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = "Resume cleared"
                 self._sync()
                 return
-            self.resume_entries = list_resume_sessions(
-                self.workspace,
-                include_non_interactive=bool(getattr(self.args, "resume_include_non_interactive", True)),
-            )
-            self._apply_resume_choices(self.resume_entries)
-            if not args or args[0].lower() == "list":
+
+            selector = args[0] if args else "list"
+            needs_choices = selector.lower() in {"list", "latest"} or selector.isdigit()
+            if needs_choices and not self.resume_choices_loaded:
+                self.pending_resume_selector = selector
+                self.status = "Loading resume sessions"
+                self._refresh_resume_control()
+                self._sync()
+                return
+            self._handle_loaded_resume_selector(selector)
+
+        def _handle_loaded_resume_selector(self, selector: str) -> None:
+            if selector.lower() == "list":
                 self._show_resume_list()
                 return
-            selector = "1" if args[0].lower() == "latest" else args[0]
+            selector = "1" if selector.lower() == "latest" else selector
             chosen = None
             if selector.isdigit():
                 idx = int(selector)
@@ -1507,11 +1592,6 @@ else:
                         chosen = session
                         break
                 if chosen is None:
-                    error = subagent_resume_error(get_codex_home(), selector)
-                    if error:
-                        self.status = error
-                        self._sync()
-                        return
                     if not self._prepare_config_change("resume session"):
                         return
                     self._select_resume_session(selector)
@@ -1774,8 +1854,8 @@ else:
             frame.styles.border = ("round", border_style)
             frame.border_title = self._detail_title(pane) if detail_visible and pane is not None else ""
 
-            scroll = self.query_one("#detail-scroll", VerticalScroll)
-            should_follow_end = scroll.is_vertical_scroll_end
+            scroll = self.query_one("#detail-scroll", DetailScroll)
+            should_follow_end = scroll.follow_tail
             detail = self.query_one("#detail", Static)
             cache_key_before = self._detail_cache_key
             detail_renderable = self._detail_renderable()
@@ -1783,48 +1863,80 @@ else:
             if detail_changed:
                 detail.update(detail_renderable)
             if detail_visible and detail_changed and should_follow_end:
-                self.call_after_refresh(scroll.scroll_end, animate=False, immediate=True)
+                self.call_after_refresh(
+                    scroll.follow_end_if_enabled,
+                    animate=False,
+                    immediate=True,
+                )
             self.query_one("#state", Static).update(self._state_text())
 
         def _refresh_resume_control(self) -> None:
             if not self.is_running:
                 return
+            workspace = self.workspace
+            if self.resume_choices_inflight is not None:
+                _inflight_id, inflight_workspace = self.resume_choices_inflight
+                if inflight_workspace == workspace:
+                    return
             self.resume_choices_request += 1
             request_id = self.resume_choices_request
-            workspace = self.workspace
+            self.resume_choices_inflight = (request_id, workspace)
+            self.resume_choices_loaded = False
             include_non_interactive = bool(
                 getattr(self.args, "resume_include_non_interactive", True)
             )
 
             def target() -> None:
+                entries: list[Any] = []
+                error = ""
                 try:
-                    entries = list_resume_sessions(
-                        workspace,
-                        include_non_interactive=include_non_interactive,
-                    )
-                except Exception:  # noqa: BLE001
-                    entries = []
+                    with self._resume_io_lock:
+                        entries = list_resume_sessions(
+                            workspace,
+                            include_non_interactive=include_non_interactive,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
                 try:
                     self.call_from_thread(
                         self.post_message,
-                        ResumeChoicesLoaded(request_id, workspace, entries),
+                        ResumeChoicesLoaded(request_id, workspace, entries, error),
                     )
                 except RuntimeError:
                     pass
 
             threading.Thread(target=target, name="pcr-resume-choices", daemon=True).start()
 
+        def _set_select_control(
+            self,
+            control: Select,
+            value: Any,
+            options: list[tuple[Any, Any]] | None = None,
+        ) -> None:
+            # Select posts Changed from its reactive watcher. Prevent it at the
+            # control so delayed programmatic events cannot look like user input.
+            with control.prevent(Select.Changed):
+                if options is not None:
+                    control.set_options(options)
+                if control.value != value:
+                    control.value = value
+
         def _apply_resume_choices(self, entries: list[Any]) -> None:
             self.resume_entries = entries
-            self.resume_choices = resume_select_options(entries, self.resume_session_id)
+            choices = resume_select_options(entries, self.resume_session_id)
+            options_changed = choices != self.resume_choices
+            self.resume_choices = choices
             try:
                 control = self.query_one("#config-resume", Select)
             except Exception:
                 return
             self._updating_controls = True
             try:
-                control.set_options(self.resume_choices)
-                control.value = self.resume_session_id
+                self._set_select_control(
+                    control,
+                    self.resume_session_id,
+                    self.resume_choices if options_changed else None,
+                )
             finally:
                 self._updating_controls = False
 
@@ -1850,25 +1962,33 @@ else:
                 best_value.update(f"agent_{self.best_agent:03d}")
 
             current_model = str(getattr(self.args, "model", None) or "")
+            model_options = None
             if current_model not in {value for _label, value in self.model_choices}:
                 self.model_choices = codex_model_options(current_model)
-                self.query_one("#config-model", Select).set_options(self.model_choices)
+                model_options = self.model_choices
+            resume_options = None
             if self.resume_session_id not in {value for _label, value in self.resume_choices}:
                 self.resume_choices = resume_select_options(
                     self.resume_entries,
                     self.resume_session_id,
                 )
-                self.query_one("#config-resume", Select).set_options(self.resume_choices)
+                resume_options = self.resume_choices
 
+            execution_select = self.query_one("#config-execution", Select)
+            best_by_select = self.query_one("#config-best-by", Select)
+            model_select = self.query_one("#config-model", Select)
+            sync_back_select = self.query_one("#config-sync-back", Select)
+            keep_workspaces_select = self.query_one("#config-keep-workspaces", Select)
+            resume_select = self.query_one("#config-resume", Select)
             controls = [
                 self.query_one("#config-agents", Input),
                 self.query_one("#config-max-parallel", Input),
-                self.query_one("#config-execution", Select),
-                self.query_one("#config-best-by", Select),
-                self.query_one("#config-model", Select),
-                self.query_one("#config-sync-back", Select),
-                self.query_one("#config-keep-workspaces", Select),
-                self.query_one("#config-resume", Select),
+                execution_select,
+                best_by_select,
+                model_select,
+                sync_back_select,
+                keep_workspaces_select,
+                resume_select,
             ]
             self._updating_controls = True
             try:
@@ -1878,21 +1998,28 @@ else:
                 max_parallel_input = self.query_one("#config-max-parallel", Input)
                 if self.focused is not max_parallel_input:
                     max_parallel_input.value = rows.get("MAX_PARALLEL", "")
-                self.query_one("#config-execution", Select).value = rows.get(
-                    "EXECUTION",
-                    "parallel",
+                self._set_select_control(
+                    execution_select,
+                    rows.get("EXECUTION", "parallel"),
                 )
-                self.query_one("#config-best-by", Select).value = str(
-                    getattr(self.args, "best_by", "reasoning_tokens")
+                self._set_select_control(
+                    best_by_select,
+                    str(getattr(self.args, "best_by", "reasoning_tokens")),
                 )
-                self.query_one("#config-model", Select).value = current_model
-                self.query_one("#config-sync-back", Select).value = not bool(
-                    getattr(self.args, "no_sync_back", False)
+                self._set_select_control(model_select, current_model, model_options)
+                self._set_select_control(
+                    sync_back_select,
+                    not bool(getattr(self.args, "no_sync_back", False)),
                 )
-                self.query_one("#config-keep-workspaces", Select).value = bool(
-                    getattr(self.args, "keep_workspaces", False)
+                self._set_select_control(
+                    keep_workspaces_select,
+                    bool(getattr(self.args, "keep_workspaces", False)),
                 )
-                self.query_one("#config-resume", Select).value = self.resume_session_id
+                self._set_select_control(
+                    resume_select,
+                    self.resume_session_id,
+                    resume_options,
+                )
                 for control in controls:
                     control.disabled = self.running
             finally:
@@ -1969,20 +2096,20 @@ else:
             if key == self._detail_cache_key:
                 return self._detail_cache_renderable
 
-            table = Table.grid()
-            table.add_column()
             blocks = self._detail_blocks(pane)
             if not blocks:
                 self._detail_cache_key = key
                 self._detail_cache_renderable = ""
                 return ""
+            parts: list[str | tuple[str, str]] = []
             for idx, (prefix, block, style) in enumerate(blocks):
                 if idx:
-                    table.add_row("")
-                table.add_row(Text(self._format_prefixed_block(prefix, block), style=style))
+                    parts.append("\n\n")
+                parts.append((self._format_prefixed_block(prefix, block), style))
+            renderable = Content.assemble(*parts)
             self._detail_cache_key = key
-            self._detail_cache_renderable = table
-            return table
+            self._detail_cache_renderable = renderable
+            return renderable
 
         def _archive_agent_detail(self, pane: AgentPane) -> None:
             self.detail_history.extend(self._pane_detail_blocks(pane))

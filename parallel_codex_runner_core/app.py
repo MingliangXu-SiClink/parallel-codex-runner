@@ -99,6 +99,11 @@ from .workspace import cleanup_workspace_copies, copy_workspace, sync_best_works
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
+# Conda's SQLite build can deadlock inside the macOS VFS when separate Python
+# threads open or close databases concurrently. PCR's SQLite sections are
+# short, so serialize them process-wide and keep file/JSON work outside.
+_CODEX_SQLITE_LOCK = threading.RLock()
+
 
 def cancel_requested(cancel_event: Any = None) -> bool:
     return bool(cancel_event is not None and cancel_event.is_set())
@@ -347,18 +352,19 @@ def copy_sqlite_database(src: Path, dst: Path) -> None:
     if not src.exists():
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    src_conn: Optional[sqlite3.Connection] = None
-    dst_conn: Optional[sqlite3.Connection] = None
-    try:
-        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        dst_conn = sqlite3.connect(dst)
-        src_conn.backup(dst_conn)
-        dst_conn.commit()
-    finally:
-        if dst_conn is not None:
-            dst_conn.close()
-        if src_conn is not None:
-            src_conn.close()
+    with _CODEX_SQLITE_LOCK:
+        src_conn: Optional[sqlite3.Connection] = None
+        dst_conn: Optional[sqlite3.Connection] = None
+        try:
+            src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            dst_conn = sqlite3.connect(dst)
+            src_conn.backup(dst_conn)
+            dst_conn.commit()
+        finally:
+            if dst_conn is not None:
+                dst_conn.close()
+            if src_conn is not None:
+                src_conn.close()
 
 
 def relative_path_or_import_path(path: Path, root: Path) -> Path:
@@ -397,25 +403,26 @@ def prepare_agent_codex_home(
         isolated_rollout = agent_codex_home / relative_path_or_import_path(rollout_path, real_codex_home)
         copy_file_atomic(rollout_path, isolated_rollout)
 
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(agent_state_db, timeout=30)
-        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
-        assignments = []
-        params: List[Any] = []
-        if isolated_rollout is not None and "rollout_path" in columns:
-            assignments.append("rollout_path = ?")
-            params.append(str(isolated_rollout))
-        if "cwd" in columns:
-            assignments.append("cwd = ?")
-            params.append(str(agent_workspace))
-        if assignments:
-            params.append(resume_session_id)
-            conn.execute(f"UPDATE threads SET {', '.join(assignments)} WHERE id = ?", params)
-            conn.commit()
-    finally:
-        if conn is not None:
-            conn.close()
+    with _CODEX_SQLITE_LOCK:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(agent_state_db, timeout=30)
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
+            assignments = []
+            params: List[Any] = []
+            if isolated_rollout is not None and "rollout_path" in columns:
+                assignments.append("rollout_path = ?")
+                params.append(str(isolated_rollout))
+            if "cwd" in columns:
+                assignments.append("cwd = ?")
+                params.append(str(agent_workspace))
+            if assignments:
+                params.append(resume_session_id)
+                conn.execute(f"UPDATE threads SET {', '.join(assignments)} WHERE id = ?", params)
+                conn.commit()
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def compact_display_text(text: str, limit: int = 96) -> str:
@@ -511,12 +518,13 @@ def load_resume_sessions_from_state(
     if not state_db.exists():
         return []
 
+    conn: Optional[sqlite3.Connection] = None
+    _CODEX_SQLITE_LOCK.acquire()
     try:
-        conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return []
-
-    try:
+        try:
+            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return []
         conn.row_factory = sqlite3.Row
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
         if not {"id", "cwd"}.issubset(columns):
@@ -553,7 +561,11 @@ def load_resume_sessions_from_state(
     except sqlite3.Error:
         return []
     finally:
-        conn.close()
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            _CODEX_SQLITE_LOCK.release()
 
     sessions: List[ResumeSession] = []
     for row in rows:
@@ -985,6 +997,7 @@ def subagent_resume_error(codex_home: Path, session_id: str) -> Optional[str]:
     state_db = codex_home / "state_5.sqlite"
     if state_db.exists():
         conn: Optional[sqlite3.Connection] = None
+        _CODEX_SQLITE_LOCK.acquire()
         try:
             conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
@@ -1008,8 +1021,11 @@ def subagent_resume_error(codex_home: Path, session_id: str) -> Optional[str]:
         except sqlite3.Error:
             pass
         finally:
-            if conn is not None:
-                conn.close()
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                _CODEX_SQLITE_LOCK.release()
 
     rollout_path = find_rollout_path_for_session(codex_home, session_id)
     if rollout_path is None:
@@ -1129,6 +1145,7 @@ def promote_codex_session_to_workspace(
     if state_db.exists():
         promotion.state_path = str(state_db)
         conn: Optional[sqlite3.Connection] = None
+        _CODEX_SQLITE_LOCK.acquire()
         try:
             conn = sqlite3.connect(state_db, timeout=30)
             conn.row_factory = sqlite3.Row
@@ -1212,8 +1229,11 @@ def promote_codex_session_to_workspace(
         except sqlite3.Error as exc:
             append_promotion_error(promotion, f"sqlite update failed: {exc}")
         finally:
-            if conn is not None:
-                conn.close()
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                _CODEX_SQLITE_LOCK.release()
 
     rollout_path = Path(rollout_path_text).expanduser() if rollout_path_text else find_rollout_path_for_session(codex_home, session_id)
     if rollout_path is not None:
@@ -1269,6 +1289,7 @@ def import_codex_session_to_workspace(
         promotion.state_path = str(real_db)
         source_conn: Optional[sqlite3.Connection] = None
         real_conn: Optional[sqlite3.Connection] = None
+        _CODEX_SQLITE_LOCK.acquire()
         try:
             source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
             source_conn.row_factory = sqlite3.Row
@@ -1341,10 +1362,13 @@ def import_codex_session_to_workspace(
         except sqlite3.Error as exc:
             append_promotion_error(promotion, f"sqlite import failed: {exc}")
         finally:
-            if real_conn is not None:
-                real_conn.close()
-            if source_conn is not None:
-                source_conn.close()
+            try:
+                if real_conn is not None:
+                    real_conn.close()
+                if source_conn is not None:
+                    source_conn.close()
+            finally:
+                _CODEX_SQLITE_LOCK.release()
     elif source_db.exists() and not real_db.exists():
         append_promotion_error(promotion, f"real state_5.sqlite not found: {real_db}")
 

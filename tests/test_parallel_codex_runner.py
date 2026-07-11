@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -365,6 +366,36 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_programmatic_select_updates_do_not_dispatch_commands(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            session = app_core.ResumeSession(
+                session_id="session-1",
+                title="previous question",
+                cwd=str(Path.cwd()),
+                updated_at=1,
+            )
+            async with app.run_test() as pilot:
+                execution = app.query_one("#config-execution")
+                execution.focus()
+                with mock.patch.object(app, "_handle_execution") as handle_execution:
+                    app._set_select_control(execution, "serial")
+                    await pilot.pause()
+                handle_execution.assert_not_called()
+
+                resume = app.query_one("#config-resume")
+                resume.focus()
+                app.resume_session_id = "session-1"
+                with mock.patch.object(app, "_handle_resume") as handle_resume:
+                    for _ in range(20):
+                        app._apply_resume_choices([session])
+                    await pilot.pause()
+                handle_resume.assert_not_called()
+                self.assertEqual(resume.value, "session-1")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_command_output_appends_after_conversation(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args([]))
         app._sync = lambda: None
@@ -410,6 +441,36 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_selection_copies_rendered_content_before_prompt_selection(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(80, 30)) as pilot:
+                pane = app.agents[1]
+                pane.input_text = "detail question"
+                pane.final_text = "detail answer"
+                app._mark_detail_dirty(pane)
+                app._sync()
+                await pilot.pause()
+
+                prompt = app.query_one("#prompt")
+                prompt.text = "prompt text"
+                prompt.selection = ((0, 0), (0, 6))
+                prompt.focus()
+                copied: list[str] = []
+                app.copy_to_clipboard = copied.append
+
+                self.assertTrue(await pilot.double_click("#detail", offset=(3, 0)))
+                await pilot.pause()
+                prompt.action_copy()
+
+                self.assertEqual(len(copied), 1)
+                self.assertIn("detail question", copied[0])
+                self.assertIn("detail answer", copied[0])
+                self.assertNotEqual(copied[0], "prompt")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_copy_uses_pbcopy_on_macos(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args([]))
         with mock.patch.object(tui_textual.sys, "platform", "darwin"):
@@ -423,19 +484,118 @@ class TuiCommandTests(unittest.TestCase):
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_rejects_explicit_codex_subagent_resume(self) -> None:
-        app = tui_textual.PcrTextualApp(parse_args([]))
-        app._sync = lambda: None
-
-        with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
             with mock.patch.object(
                 tui_textual,
                 "subagent_resume_error",
                 return_value="Codex subagent cannot be resumed",
             ):
-                app._handle_resume(["child-thread"])
+                async with app.run_test() as pilot:
+                    app._handle_resume(["child-thread"])
+                    for _ in range(20):
+                        await pilot.pause()
+                        if app.status == "Codex subagent cannot be resumed":
+                            break
 
-        self.assertEqual(app.resume_session_id, "")
-        self.assertEqual(app.status, "Codex subagent cannot be resumed")
+            self.assertEqual(app.resume_session_id, "")
+            self.assertEqual(app.status, "Codex subagent cannot be resumed")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_selection_reuses_nonblocking_background_scan(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            session = app_core.ResumeSession(
+                session_id="session-1",
+                title="previous question",
+                cwd=str(Path.cwd()),
+                updated_at=1,
+                rollout_path="/tmp/session-1.jsonl",
+            )
+            scan_started = threading.Event()
+            release_scan = threading.Event()
+            calls: list[Path] = []
+
+            def slow_list(workspace: Path, **_kwargs: object) -> list[app_core.ResumeSession]:
+                calls.append(workspace)
+                scan_started.set()
+                release_scan.wait(2)
+                return [session]
+
+            with mock.patch.object(tui_textual, "list_resume_sessions", side_effect=slow_list):
+                with mock.patch.object(tui_textual, "subagent_resume_error", return_value=None):
+                    with mock.patch.object(tui_textual, "load_codex_session_history", return_value=[]):
+                        async with app.run_test() as pilot:
+                            app._refresh_resume_control()
+                            self.assertTrue(await asyncio.to_thread(scan_started.wait, 1))
+
+                            app._handle_resume(["1"])
+
+                            self.assertEqual(app.status, "Loading resume sessions")
+                            self.assertEqual(app.pending_resume_selector, "1")
+                            self.assertEqual(len(calls), 1)
+                            release_scan.set()
+                            for _ in range(30):
+                                await pilot.pause()
+                                if app.resume_session_id == "session-1":
+                                    break
+
+            self.assertEqual(app.resume_session_id, "session-1")
+            self.assertEqual(len(calls), 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_dropdown_loads_session_once_without_event_recursion(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            session = app_core.ResumeSession(
+                session_id="session-1",
+                title="previous question",
+                cwd=str(Path.cwd()),
+                updated_at=1,
+                rollout_path="/tmp/session-1.jsonl",
+            )
+            with mock.patch.object(
+                tui_textual,
+                "list_resume_sessions",
+                return_value=[session],
+            ) as list_sessions:
+                with mock.patch.object(
+                    tui_textual,
+                    "subagent_resume_error",
+                    return_value=None,
+                ) as validate_session:
+                    with mock.patch.object(
+                        tui_textual,
+                        "load_codex_session_history",
+                        return_value=[],
+                    ) as load_history:
+                        async with app.run_test() as pilot:
+                            app._refresh_resume_control()
+                            for _ in range(20):
+                                await pilot.pause()
+                                if app.resume_choices_loaded:
+                                    break
+
+                            resume = app.query_one("#config-resume")
+                            resume.focus()
+                            resume.value = "session-1"
+                            for _ in range(30):
+                                await pilot.pause()
+                                if app.resume_session_id == "session-1":
+                                    break
+                            for _ in range(10):
+                                await pilot.pause()
+
+            self.assertEqual(app.resume_session_id, "session-1")
+            list_sessions.assert_called_once()
+            validate_session.assert_called_once()
+            load_history.assert_called_once()
+
+        asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_resume_loads_previous_conversation_into_detail(self) -> None:
@@ -1059,6 +1219,37 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_status_during_run_does_not_trap_manual_detail_scroll(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(80, 40)) as pilot:
+                pane = app.agents[1]
+                pane.status = "running"
+                pane.output_lines = [f"line {idx}" for idx in range(120)]
+                app.running = True
+                app._mark_detail_dirty(pane)
+                app._sync()
+                scroll = app.query_one("#detail-scroll")
+                await pilot.pause()
+                scroll.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+
+                app._handle_command("/status")
+                scroll.scroll_up(animate=True)
+                self.assertFalse(scroll.follow_tail)
+
+                pane.output_lines.append("new live line")
+                app._mark_detail_dirty(pane)
+                app._sync()
+                await pilot.pause()
+                await pilot.pause()
+
+                self.assertFalse(scroll.follow_tail)
+                self.assertFalse(scroll.is_vertical_scroll_end)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_prompt_backspace_deletes_one_character(self) -> None:
         async def run() -> None:
             args = parse_args([])
@@ -1317,6 +1508,63 @@ class ResumeSessionTests(unittest.TestCase):
                 [(entry.category, entry.text) for entry in history],
                 [("user", "fallback question"), ("output", "fallback answer")],
             )
+
+    def test_codex_sqlite_access_is_serialized_across_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            conn = sqlite3.connect(root / "state_5.sqlite")
+            try:
+                conn.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, source TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    ("session-1", str(workspace), "cli"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_connect = sqlite3.connect
+            counter_lock = threading.Lock()
+            active = 0
+            max_active = 0
+            start = threading.Barrier(3)
+
+            def slow_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+                nonlocal active, max_active
+                with counter_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    time.sleep(0.05)
+                    return original_connect(*args, **kwargs)
+                finally:
+                    with counter_lock:
+                        active -= 1
+
+            def load_sessions() -> None:
+                start.wait()
+                app_core.load_resume_sessions_from_state(root, workspace, True)
+
+            def inspect_session() -> None:
+                start.wait()
+                app_core.subagent_resume_error(root, "session-1")
+
+            with mock.patch.object(app_core.sqlite3, "connect", side_effect=slow_connect):
+                first = threading.Thread(target=load_sessions)
+                second = threading.Thread(target=inspect_session)
+                first.start()
+                second.start()
+                start.wait()
+                first.join(2)
+                second.join(2)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(max_active, 1)
 
     def test_state_loader_filters_workspace_archived_and_non_interactive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
