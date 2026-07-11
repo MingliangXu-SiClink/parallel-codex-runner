@@ -47,8 +47,22 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 MAX_SUGGESTIONS = 8
 TIP_ROTATION_SECONDS = 10.0
-TIP_ICON_REFRESH_SECONDS = 0.25
-TIP_ICON_FRAMES: tuple[str, ...] = ("◐", "◓", "◑", "◒")
+TIP_ICON_REFRESH_SECONDS = 0.1
+TIP_ICON = "✦"
+TIP_ICON_COLORS: tuple[str, ...] = (
+    "#32404b",
+    "#3e5260",
+    "#4b6878",
+    "#5a7f91",
+    "#6b97aa",
+    "#7db0c2",
+    "#94c9d8",
+    "#7db0c2",
+    "#6b97aa",
+    "#5a7f91",
+    "#4b6878",
+    "#3e5260",
+)
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
     "输入框为空时，←/→ 可切换 Agent。",
@@ -2043,10 +2057,17 @@ else:
 
         @property
         def current_tip_icon(self) -> str:
-            return TIP_ICON_FRAMES[self.tip_icon_index]
+            return TIP_ICON
+
+        @property
+        def current_tip_icon_color(self) -> str:
+            return TIP_ICON_COLORS[self.tip_icon_index]
 
         def _tip_renderable(self) -> Content:
-            return Content.assemble((f"{self.current_tip_icon}  ", "bold cyan"), self.current_tip)
+            return Content.assemble(
+                (f"{self.current_tip_icon}  ", f"bold {self.current_tip_icon_color}"),
+                self.current_tip,
+            )
 
         def _refresh_tip(self) -> None:
             try:
@@ -2059,7 +2080,7 @@ else:
             self._refresh_tip()
 
         def _advance_tip_icon(self) -> None:
-            self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_FRAMES)
+            self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_COLORS)
             self._refresh_tip()
 
         def _sync(self) -> None:

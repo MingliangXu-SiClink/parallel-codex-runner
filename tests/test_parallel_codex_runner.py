@@ -467,9 +467,11 @@ class TuiCommandTests(unittest.TestCase):
                     prompt = app.query_one("#prompt")
                     first_tip = app.current_tip
                     first_icon = app.current_tip_icon
+                    first_icon_color = app.current_tip_icon_color
 
                     self.assertEqual(tui_textual.TIP_ROTATION_SECONDS, 10.0)
-                    self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.25)
+                    self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.1)
+                    self.assertEqual(len(tui_textual.TIP_ICON_COLORS), 12)
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -479,7 +481,8 @@ class TuiCommandTests(unittest.TestCase):
                     app._advance_tip_icon()
                     await pilot.pause()
 
-                    self.assertNotEqual(app.current_tip_icon, first_icon)
+                    self.assertEqual(app.current_tip_icon, first_icon)
+                    self.assertNotEqual(app.current_tip_icon_color, first_icon_color)
                     self.assertEqual(app.current_tip, first_tip)
                     self.assertIn(app.current_tip_icon, tips.content.plain)
 
