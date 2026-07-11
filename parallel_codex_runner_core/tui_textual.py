@@ -7,6 +7,9 @@ import json
 import logging
 import re
 import shlex
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,7 +66,7 @@ def build_help_text() -> str:
             'Enter normal text to run the same as: pcr "prompt"',
             "Most option commands apply to the next run.",
             "If a completed run is pending, PCR finalizes the selected agent before changing config.",
-            "Ctrl-C clears a non-empty prompt; Ctrl-C on an empty prompt exits.",
+            "Ctrl-C copies selected text; otherwise it clears a non-empty prompt or exits.",
         ]
     )
     return "\n".join(lines)
@@ -279,9 +282,9 @@ try:
     activate_textual()
     from textual import events, on
     from textual.app import App, ComposeResult
-    from textual.containers import Vertical, VerticalScroll
+    from textual.containers import Grid, Vertical, VerticalScroll
     from textual.message import Message
-    from textual.widgets import Static, TextArea
+    from textual.widgets import Input, Select, Static, TextArea
 except (ModuleNotFoundError, RuntimeError) as exc:
     _TEXTUAL_IMPORT_ERROR = exc
 
@@ -334,6 +337,48 @@ else:
     HELP_TEXT = build_help_text()
 
 
+    def codex_model_options(current_model: str | None) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = [("default", "")]
+        seen = {""}
+        cache_path = get_codex_home() / "models_cache.json"
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if isinstance(models, list):
+            for model in models:
+                if not isinstance(model, dict) or model.get("visibility") == "hide":
+                    continue
+                slug = str(model.get("slug") or "").strip()
+                if slug and slug not in seen:
+                    options.append((slug, slug))
+                    seen.add(slug)
+        current = str(current_model or "").strip()
+        if current and current not in seen:
+            options.append((current, current))
+        return options
+
+
+    def resume_select_options(
+        sessions: list[Any],
+        current_session_id: str,
+    ) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = [("NO", "")]
+        seen = {""}
+        for session in sessions:
+            session_id = str(getattr(session, "session_id", "") or "").strip()
+            if not session_id or session_id in seen:
+                continue
+            title = " ".join(str(getattr(session, "title", "") or "").split())
+            label = f"{title}  [{session_id}]" if title else session_id
+            options.append((label, session_id))
+            seen.add(session_id)
+        if current_session_id and current_session_id not in seen:
+            options.append((current_session_id, current_session_id))
+        return options
+
+
     @dataclass
     class AgentPane:
         idx: int
@@ -341,7 +386,6 @@ else:
         reasoning_tokens: int | None = None
         input_text: str = ""
         final_text: str = ""
-        command_text: str = ""
         result: dict[str, Any] | None = None
         lines: list[str] = field(default_factory=list)
         thought_lines: list[str] = field(default_factory=list)
@@ -382,6 +426,14 @@ else:
             self.error = error
 
 
+    class ResumeChoicesLoaded(Message):
+        def __init__(self, request_id: int, workspace: Path, entries: list[Any]) -> None:
+            super().__init__()
+            self.request_id = request_id
+            self.workspace = workspace
+            self.entries = entries
+
+
     class PromptSubmitted(Message):
         def __init__(self, value: str) -> None:
             super().__init__()
@@ -402,6 +454,9 @@ else:
                     setattr(self, "placeholder", placeholder)
 
         def action_copy(self) -> None:
+            if self.selected_text:
+                self.app.copy_to_clipboard(self.selected_text)
+                return
             action = getattr(self.app, "action_interrupt_or_exit", None)
             if callable(action):
                 action()
@@ -482,9 +537,56 @@ else:
             color: #8fb3ff;
             text-style: bold;
         }
-        #tree {
+        #runner-frame {
             height: auto;
             margin: 0 1;
+            padding: 0 1;
+            border: round cyan;
+            border-title-style: bold;
+            overflow: hidden;
+        }
+        #runner-grid {
+            height: auto;
+            grid-size: 2;
+            grid-columns: 18 1fr;
+            grid-rows: auto;
+            grid-gutter: 0 1;
+        }
+        .runner-key {
+            height: auto;
+            min-height: 1;
+            color: #e7ebf2;
+            text-style: bold;
+        }
+        .runner-value {
+            height: 1;
+            min-height: 1;
+            max-height: 1;
+            text-wrap: nowrap;
+            text-overflow: clip;
+        }
+        .runner-control {
+            height: 1;
+            min-height: 1;
+            border: none;
+            padding: 0;
+            background: #171d25;
+        }
+        .runner-control:focus {
+            background: #243448;
+            color: #ffffff;
+        }
+        #config-agents, #config-max-parallel {
+            width: 12;
+        }
+        #config-execution, #config-best-by {
+            width: 24;
+        }
+        #config-model {
+            width: 36;
+        }
+        #config-sync-back, #config-keep-workspaces {
+            width: 10;
         }
         #detail-frame {
             height: 1fr;
@@ -528,7 +630,8 @@ else:
         """
 
         BINDINGS = [
-            ("ctrl+c", "interrupt_or_exit", "Exit"),
+            ("ctrl+c", "interrupt_or_exit", "Copy/Clear/Exit"),
+            ("super+c", "copy_selection", "Copy"),
             ("ctrl+l", "clear_view", "Clear"),
         ]
 
@@ -540,6 +643,8 @@ else:
             self.num_agents = args.num_agents
             self.resume_session_id = (args.resume_session_id or "").strip()
             self.resume_entries = []
+            self.model_choices = codex_model_options(getattr(args, "model", None))
+            self.resume_choices = resume_select_options([], self.resume_session_id)
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.selected_agent = 1
             self.running = False
@@ -555,14 +660,101 @@ else:
             self.pending_run_root: Path | None = None
             self.pending_workspaces_root: Path | None = None
             self.detail_history: list[tuple[str, str, str]] = []
+            self.command_history: list[tuple[str, str, str]] = []
             self.detail_revision = 0
             self.resume_history_request = 0
+            self.resume_choices_request = 0
+            self.queued_prompt = ""
+            self.queued_agent: int | None = None
+            self._updating_controls = False
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
-                yield Static("", id="tree")
+                with Vertical(id="runner-frame"):
+                    with Grid(id="runner-grid"):
+                        yield Static("CONVERSATION", classes="runner-key")
+                        yield Static("", id="runner-conversation", classes="runner-value", markup=False)
+                        yield Static("WORKSPACE", classes="runner-key")
+                        yield Static("", id="runner-workspace", classes="runner-value", markup=False)
+                        yield Static("MODULE_DIR", classes="runner-key")
+                        yield Static("", id="runner-module-dir", classes="runner-value", markup=False)
+                        yield Static("RUN_ANCHOR", classes="runner-key")
+                        yield Static("", id="runner-run-anchor", classes="runner-value", markup=False)
+                        yield Static("RUNS_ROOT", classes="runner-key")
+                        yield Static("", id="runner-runs-root", classes="runner-value", markup=False)
+                        yield Static("AGENTS", classes="runner-key")
+                        yield Input(
+                            str(self.num_agents),
+                            id="config-agents",
+                            classes="runner-control",
+                            type="integer",
+                        )
+                        yield Static("EXECUTION", classes="runner-key")
+                        yield Select(
+                            [("parallel", "parallel"), ("serial", "serial")],
+                            value="serial" if getattr(self.args, "serial", False) else "parallel",
+                            allow_blank=False,
+                            compact=True,
+                            id="config-execution",
+                            classes="runner-control",
+                        )
+                        yield Static("MAX_PARALLEL", classes="runner-key")
+                        yield Input(
+                            str(dict(self._base_info_rows())["MAX_PARALLEL"]),
+                            id="config-max-parallel",
+                            classes="runner-control",
+                        )
+                        yield Static("BEST_BY", classes="runner-key")
+                        yield Select(
+                            [("reasoning_tokens", "reasoning_tokens"), ("duration", "duration")],
+                            value=str(getattr(self.args, "best_by", "reasoning_tokens")),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-best-by",
+                            classes="runner-control",
+                        )
+                        yield Static("MODEL", classes="runner-key")
+                        yield Select(
+                            self.model_choices,
+                            value=str(getattr(self.args, "model", None) or ""),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-model",
+                            classes="runner-control",
+                        )
+                        yield Static("CODEX_BIN", classes="runner-key")
+                        yield Static("", id="runner-codex-bin", classes="runner-value", markup=False)
+                        yield Static("SYNC_BACK", classes="runner-key")
+                        yield Select(
+                            [("YES", True), ("NO", False)],
+                            value=not bool(getattr(self.args, "no_sync_back", False)),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-sync-back",
+                            classes="runner-control",
+                        )
+                        yield Static("KEEP_WORKSPACES", classes="runner-key")
+                        yield Select(
+                            [("YES", True), ("NO", False)],
+                            value=bool(getattr(self.args, "keep_workspaces", False)),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-keep-workspaces",
+                            classes="runner-control",
+                        )
+                        yield Static("RESUME", classes="runner-key")
+                        yield Select(
+                            self.resume_choices,
+                            value=self.resume_session_id,
+                            allow_blank=False,
+                            compact=True,
+                            id="config-resume",
+                            classes="runner-control",
+                        )
+                        yield Static("BEST AGENT", id="runner-best-agent-key", classes="runner-key")
+                        yield Static("", id="runner-best-agent", classes="runner-value", markup=False)
                 with Vertical(id="detail-frame"):
                     with VerticalScroll(id="detail-scroll"):
                         yield Static("", id="detail")
@@ -577,7 +769,14 @@ else:
                 yield Static("", id="state")
 
         def on_mount(self) -> None:
+            self.query_one("#runner-frame", Vertical).border_title = "PARALLEL-CODEX-RUNNER"
             self.set_interval(0.25, self._tick)
+            if (
+                not self.is_headless
+                and not getattr(self.args, "resume", False)
+                and not self.resume_session_id
+            ):
+                self._refresh_resume_control()
             if getattr(self.args, "resume", False) and not self.resume_session_id:
                 self._handle_resume([])
             elif self.resume_session_id:
@@ -590,15 +789,18 @@ else:
         def _on_prompt(self, event: PromptSubmitted) -> None:
             prompt = self.query_one("#prompt", PromptEditor)
             value = event.value.strip()
-            prompt.clear()
-            self._update_suggestions("")
-            self._sync_prompt_height()
             if not value:
                 return
             if value.startswith("/"):
+                prompt.clear()
+                self._update_suggestions("")
+                self._sync_prompt_height()
                 self._handle_command(value)
             else:
-                self._start_run(value)
+                if self._start_run(value):
+                    prompt.clear()
+                    self._update_suggestions("")
+                    self._sync_prompt_height()
             prompt.focus()
 
         @on(TextArea.Changed)
@@ -611,10 +813,88 @@ else:
         def _on_switch(self, event: AgentSwitchRequested) -> None:
             self._switch_agent(event.delta)
 
+        @on(Input.Submitted, "#config-agents")
+        def _on_agents_submitted(self, event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._handle_numofagents([event.value.strip()])
+            self._updating_controls = True
+            try:
+                event.input.value = str(self.num_agents)
+            finally:
+                self._updating_controls = False
+
+        @on(Input.Submitted, "#config-max-parallel")
+        def _on_max_parallel_submitted(self, event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._handle_maxparallel([event.value.strip()])
+            self._updating_controls = True
+            try:
+                event.input.value = dict(self._tree_rows()).get("MAX_PARALLEL", "")
+            finally:
+                self._updating_controls = False
+
+        @on(Select.Changed, "#config-execution")
+        def _on_execution_selected(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            serial = str(event.value) == "serial"
+            current_serial = dict(self._tree_rows()).get("EXECUTION") == "serial"
+            if serial != current_serial:
+                self._handle_execution(serial=serial)
+
+        @on(Select.Changed, "#config-best-by")
+        def _on_best_by_selected(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            value = str(event.value)
+            if value != str(getattr(self.args, "best_by", "reasoning_tokens")):
+                self._handle_bestby([value])
+
+        @on(Select.Changed, "#config-model")
+        def _on_model_selected(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            value = str(event.value)
+            if value != str(getattr(self.args, "model", None) or ""):
+                self._handle_model([value or "clear"])
+
+        @on(Select.Changed, "#config-sync-back")
+        def _on_sync_back_toggled(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            current = not bool(getattr(self.args, "no_sync_back", False))
+            value = bool(event.value)
+            if value != current:
+                self._handle_syncback(["on" if value else "off"])
+
+        @on(Select.Changed, "#config-keep-workspaces")
+        def _on_keep_workspaces_toggled(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            current = bool(getattr(self.args, "keep_workspaces", False))
+            value = bool(event.value)
+            if value != current:
+                self._handle_keepworkspaces(["on" if value else "off"])
+
+        @on(Select.Changed, "#config-resume")
+        def _on_resume_selected(self, event: Select.Changed) -> None:
+            if self._updating_controls or not event.select.has_focus:
+                return
+            session_id = str(event.value)
+            if session_id == self.resume_session_id:
+                return
+            self._handle_resume([session_id] if session_id else ["clear"])
+
         async def _on_key(self, event: events.Key) -> None:
             if event.key in {"left", "right"}:
                 prompt = self.query_one("#prompt", PromptEditor)
-                if self.focused is not prompt and not prompt.text.strip():
+                if (
+                    self.focused is not prompt
+                    and not isinstance(self.focused, (Input, Select))
+                    and not prompt.text.strip()
+                ):
                     event.stop()
                     event.prevent_default()
                     self._switch_agent(-1 if event.key == "left" else 1)
@@ -671,17 +951,23 @@ else:
                     self.pending_workspaces_root = self.pending_run_root / "workspaces"
                 self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
                 if payload.get("cancelled"):
-                    self.status = "Cancelled"
-                    if self._cleanup_after_pending_run():
-                        self._clear_pending_run()
+                    if self.queued_prompt and self.queued_agent is not None:
+                        self._continue_queued_prompt()
+                    else:
+                        self.status = "Cancelled"
+                        if self._cleanup_after_pending_run():
+                            self._clear_pending_run()
                 else:
                     self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
             elif kind == "run_failed":
                 self.running = False
                 self.cancel_event = None
-                self.status = f"Run failed: {payload.get('message') or ''}"
-                if self._cleanup_after_pending_run():
-                    self._clear_pending_run()
+                if self.queued_prompt and self.queued_agent is not None:
+                    self._continue_queued_prompt()
+                else:
+                    self.status = f"Run failed: {payload.get('message') or ''}"
+                    if self._cleanup_after_pending_run():
+                        self._clear_pending_run()
             if kind not in {"agent_line", "agent_tokens", "agent_status"}:
                 self._sync()
             if kind in {"run_finished", "run_failed"} and self.exit_after_run and not self._has_pending_run():
@@ -705,6 +991,12 @@ else:
             self._mark_detail_dirty()
             self._sync()
 
+        @on(ResumeChoicesLoaded)
+        def _on_resume_choices_loaded(self, event: ResumeChoicesLoaded) -> None:
+            if event.request_id != self.resume_choices_request or event.workspace != self.workspace:
+                return
+            self._apply_resume_choices(event.entries)
+
         def action_clear_view(self) -> None:
             if self.running:
                 self.status = "Cannot clear while a run is active"
@@ -716,8 +1008,7 @@ else:
                         self._sync()
                         return
                 else:
-                    for pane in self.agents.values():
-                        pane.command_text = ""
+                    self.command_history.clear()
                     self._mark_detail_dirty()
                     self.status = "Cleared command view"
                     self._sync()
@@ -727,18 +1018,65 @@ else:
                 pane.reasoning_tokens = None
                 pane.input_text = ""
                 pane.final_text = ""
-                pane.command_text = ""
                 pane.result = None
                 pane.clear_detail()
             self.best_agent = None
             self.resume_history_request += 1
             self.detail_history.clear()
+            self.command_history.clear()
             self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self.status = "Ready"
             self._sync()
 
+        def copy_to_clipboard(self, text: str) -> None:
+            super().copy_to_clipboard(text)
+            if sys.platform != "darwin" or shutil.which("pbcopy") is None:
+                return
+            try:
+                subprocess.run(
+                    ["pbcopy"],
+                    input=text,
+                    text=True,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        def _copy_active_text(self) -> bool:
+            selected_text = getattr(self.focused, "selected_text", "")
+            if isinstance(selected_text, str) and selected_text:
+                self.copy_to_clipboard(selected_text)
+                return True
+            screen_selection = self.screen.get_selected_text()
+            if screen_selection:
+                self.copy_to_clipboard(screen_selection)
+                return True
+            if isinstance(self.focused, Input):
+                if self.focused.value:
+                    self.copy_to_clipboard(self.focused.value)
+                    return True
+            if isinstance(self.focused, Select):
+                value = self.focused.value
+                if isinstance(value, bool):
+                    text = "YES" if value else "NO"
+                elif value == "":
+                    text = "default" if self.focused.id == "config-model" else "NO"
+                else:
+                    text = str(value)
+                self.copy_to_clipboard(text)
+                return True
+            return False
+
+        def action_copy_selection(self) -> None:
+            self._copy_active_text()
+
         def action_interrupt_or_exit(self) -> None:
+            if self._copy_active_text():
+                return
             prompt = self.query_one("#prompt", PromptEditor)
             if prompt.text.strip():
                 prompt.clear()
@@ -750,6 +1088,8 @@ else:
 
         def _request_exit(self) -> None:
             if self.running:
+                self.queued_prompt = ""
+                self.queued_agent = None
                 self.exit_after_run = True
                 if self.cancel_event is not None:
                     self.cancel_event.set()
@@ -919,6 +1259,8 @@ else:
             if not self._prepare_config_change("max parallel"):
                 return
             self.args.max_parallel = value
+            if isinstance(value, int) and value > 1:
+                self.args.serial = False
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"maxparallel={value if value is not None else 'auto'}")
 
@@ -977,6 +1319,7 @@ else:
             self.resume_history_request += 1
             self._reset_conversation_detail()
             self.run_info_rows = self._base_info_rows()
+            self._refresh_resume_control()
             self._show_setting(f"workspace={absolute_path_for_display(workspace)}")
 
         def _handle_runsdir(self, args: list[str]) -> None:
@@ -1077,6 +1420,7 @@ else:
             self.selected_agent = min(self.selected_agent, self.num_agents)
             self.best_agent = None
             self.detail_history.clear()
+            self.command_history.clear()
             self._mark_detail_dirty()
 
         def _history_detail_block(self, entry: CodexHistoryEntry) -> tuple[str, str, str]:
@@ -1101,6 +1445,7 @@ else:
             self._reset_conversation_detail()
             self.run_info_rows = self._base_info_rows()
             self.status = f"Loading resume session: {session_id}"
+            self._refresh_resume_control()
             self._sync()
 
             def target() -> None:
@@ -1138,6 +1483,7 @@ else:
                 self.resume_history_request += 1
                 self._reset_conversation_detail()
                 self.run_info_rows = self._base_info_rows()
+                self._refresh_resume_control()
                 self.status = "Resume cleared"
                 self._sync()
                 return
@@ -1145,6 +1491,7 @@ else:
                 self.workspace,
                 include_non_interactive=bool(getattr(self.args, "resume_include_non_interactive", True)),
             )
+            self._apply_resume_choices(self.resume_entries)
             if not args or args[0].lower() == "list":
                 self._show_resume_list()
                 return
@@ -1187,18 +1534,17 @@ else:
         def _show_status(self) -> None:
             self._show_text(self._tree_text())
 
-        def _start_run(self, prompt: str) -> None:
+        def _start_run(self, prompt: str) -> bool:
             if self.running:
-                self.status = "A run is already active"
-                self._sync()
-                return
+                return self._queue_prompt_from_finished_agent(prompt)
             if self._has_pending_run() and (getattr(self.args, "no_sync_back", False) or self.best_agent is None):
                 if not self._discard_pending_run():
                     self._sync()
-                    return
+                    return False
             if self._has_pending_run() and not self._finalize_agent(self.selected_agent, archive_detail=True):
                 self._sync()
-                return
+                return False
+            self._archive_command_history()
             self.running = True
             self.exit_after_run = False
             self.cancel_event = threading.Event()
@@ -1236,6 +1582,56 @@ else:
                     logging.disable(previous_disable)
 
             threading.Thread(target=target, name="pcr-tui-runner", daemon=False).start()
+            return True
+
+        def _queue_prompt_from_finished_agent(self, prompt: str) -> bool:
+            if self.queued_prompt:
+                self.status = "Already stopping remaining agents"
+                self._sync()
+                return False
+            if getattr(self.args, "no_sync_back", False):
+                self.status = "Cannot continue a running agent while sync back is disabled"
+                self._sync()
+                return False
+            pane = self.agents.get(self.selected_agent)
+            result = pane.result if pane is not None else None
+            if not isinstance(result, dict) or result.get("status") != "success":
+                self.status = f"AGENT-{self.selected_agent:03d} has not finished successfully"
+                self._sync()
+                return False
+            self.queued_prompt = prompt
+            self.queued_agent = self.selected_agent
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            self.status = f"Stopping remaining agents; continuing from AGENT-{self.selected_agent:03d}"
+            self._sync()
+            return True
+
+        def _continue_queued_prompt(self) -> None:
+            prompt = self.queued_prompt
+            agent_idx = self.queued_agent
+            self.queued_prompt = ""
+            self.queued_agent = None
+            if not prompt or agent_idx is None:
+                return
+            if not self._finalize_agent(agent_idx, archive_detail=True):
+                try:
+                    editor = self.query_one("#prompt", PromptEditor)
+                    editor.text = prompt
+                    self._sync_prompt_height()
+                    editor.focus()
+                except Exception:
+                    pass
+                return
+            self._archive_command_history()
+            if not self._start_run(prompt):
+                try:
+                    editor = self.query_one("#prompt", PromptEditor)
+                    editor.text = prompt
+                    self._sync_prompt_height()
+                    editor.focus()
+                except Exception:
+                    pass
 
         def _post_progress(self, payload: dict[str, Any]) -> None:
             try:
@@ -1322,8 +1718,13 @@ else:
                     return False
                 if archive_detail and pane is not None:
                     self._archive_agent_detail(pane)
+                    pane.input_text = ""
+                    pane.final_text = ""
+                    pane.clear_detail()
+                    self._mark_detail_dirty(pane)
                 self._clear_pending_run()
                 self.run_info_rows = self._base_info_rows()
+                self._refresh_resume_control()
                 self.status = f"Continuing from AGENT-{idx:03d}"
                 return True
             except Exception as exc:  # noqa: BLE001
@@ -1331,9 +1732,10 @@ else:
                 return False
 
         def _show_text(self, text: str) -> None:
-            pane = self.agents.setdefault(self.selected_agent, AgentPane(self.selected_agent))
-            pane.command_text = text
-            self._mark_detail_dirty(pane)
+            text = text.strip()
+            if text:
+                self.command_history.append(("•", text, "yellow"))
+            self._mark_detail_dirty()
             self._sync()
 
         def _read_final_message(self, result: dict[str, Any]) -> str:
@@ -1349,11 +1751,21 @@ else:
         def _tick(self) -> None:
             if self.running and self.started_at is not None:
                 self.work_frame += 1
-                self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
+                if self.queued_prompt and self.queued_agent is not None:
+                    self.status = (
+                        f"Stopping remaining agents; continuing from "
+                        f"AGENT-{self.queued_agent:03d} {self._pulse()}"
+                    )
+                else:
+                    self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
                 self._sync()
 
         def _sync(self) -> None:
-            self.query_one("#tree", Static).update(self._tree_renderable())
+            try:
+                self.query_one("#runner-frame", Vertical)
+            except Exception:
+                return
+            self._sync_runner_panel()
             frame = self.query_one("#detail-frame", Vertical)
             pane = self.agents.get(self.selected_agent)
             detail_visible = self._has_detail_content(pane)
@@ -1373,6 +1785,118 @@ else:
             if detail_visible and detail_changed and should_follow_end:
                 self.call_after_refresh(scroll.scroll_end, animate=False, immediate=True)
             self.query_one("#state", Static).update(self._state_text())
+
+        def _refresh_resume_control(self) -> None:
+            if not self.is_running:
+                return
+            self.resume_choices_request += 1
+            request_id = self.resume_choices_request
+            workspace = self.workspace
+            include_non_interactive = bool(
+                getattr(self.args, "resume_include_non_interactive", True)
+            )
+
+            def target() -> None:
+                try:
+                    entries = list_resume_sessions(
+                        workspace,
+                        include_non_interactive=include_non_interactive,
+                    )
+                except Exception:  # noqa: BLE001
+                    entries = []
+                try:
+                    self.call_from_thread(
+                        self.post_message,
+                        ResumeChoicesLoaded(request_id, workspace, entries),
+                    )
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=target, name="pcr-resume-choices", daemon=True).start()
+
+        def _apply_resume_choices(self, entries: list[Any]) -> None:
+            self.resume_entries = entries
+            self.resume_choices = resume_select_options(entries, self.resume_session_id)
+            try:
+                control = self.query_one("#config-resume", Select)
+            except Exception:
+                return
+            self._updating_controls = True
+            try:
+                control.set_options(self.resume_choices)
+                control.value = self.resume_session_id
+            finally:
+                self._updating_controls = False
+
+        def _sync_runner_panel(self) -> None:
+            rows = dict(self._tree_rows())
+            static_rows = {
+                "CONVERSATION": "#runner-conversation",
+                "WORKSPACE": "#runner-workspace",
+                "MODULE_DIR": "#runner-module-dir",
+                "RUN_ANCHOR": "#runner-run-anchor",
+                "RUNS_ROOT": "#runner-runs-root",
+                "CODEX_BIN": "#runner-codex-bin",
+            }
+            for label, selector in static_rows.items():
+                self.query_one(selector, Static).update(rows.get(label, ""))
+
+            best_key = self.query_one("#runner-best-agent-key", Static)
+            best_value = self.query_one("#runner-best-agent", Static)
+            best_visible = self.best_agent is not None
+            best_key.display = best_visible
+            best_value.display = best_visible
+            if best_visible:
+                best_value.update(f"agent_{self.best_agent:03d}")
+
+            current_model = str(getattr(self.args, "model", None) or "")
+            if current_model not in {value for _label, value in self.model_choices}:
+                self.model_choices = codex_model_options(current_model)
+                self.query_one("#config-model", Select).set_options(self.model_choices)
+            if self.resume_session_id not in {value for _label, value in self.resume_choices}:
+                self.resume_choices = resume_select_options(
+                    self.resume_entries,
+                    self.resume_session_id,
+                )
+                self.query_one("#config-resume", Select).set_options(self.resume_choices)
+
+            controls = [
+                self.query_one("#config-agents", Input),
+                self.query_one("#config-max-parallel", Input),
+                self.query_one("#config-execution", Select),
+                self.query_one("#config-best-by", Select),
+                self.query_one("#config-model", Select),
+                self.query_one("#config-sync-back", Select),
+                self.query_one("#config-keep-workspaces", Select),
+                self.query_one("#config-resume", Select),
+            ]
+            self._updating_controls = True
+            try:
+                agents_input = self.query_one("#config-agents", Input)
+                if self.focused is not agents_input:
+                    agents_input.value = str(self.num_agents)
+                max_parallel_input = self.query_one("#config-max-parallel", Input)
+                if self.focused is not max_parallel_input:
+                    max_parallel_input.value = rows.get("MAX_PARALLEL", "")
+                self.query_one("#config-execution", Select).value = rows.get(
+                    "EXECUTION",
+                    "parallel",
+                )
+                self.query_one("#config-best-by", Select).value = str(
+                    getattr(self.args, "best_by", "reasoning_tokens")
+                )
+                self.query_one("#config-model", Select).value = current_model
+                self.query_one("#config-sync-back", Select).value = not bool(
+                    getattr(self.args, "no_sync_back", False)
+                )
+                self.query_one("#config-keep-workspaces", Select).value = bool(
+                    getattr(self.args, "keep_workspaces", False)
+                )
+                self.query_one("#config-resume", Select).value = self.resume_session_id
+                for control in controls:
+                    control.disabled = self.running
+            finally:
+                self._updating_controls = False
 
         def _tree_renderable(self) -> Panel:
             table = Table.grid(padding=(0, 2))
@@ -1430,8 +1954,6 @@ else:
             pane = self.agents.get(self.selected_agent)
             if pane is None:
                 return ""
-            if pane.command_text:
-                return self._format_prefixed_block(">", pane.command_text)
             blocks = self._detail_blocks(pane)
             if not blocks:
                 return ""
@@ -1446,11 +1968,6 @@ else:
             key = self._detail_cache_key_for(pane)
             if key == self._detail_cache_key:
                 return self._detail_cache_renderable
-            if pane.command_text:
-                renderable: object = Text(self._format_prefixed_block(">", pane.command_text), style="yellow")
-                self._detail_cache_key = key
-                self._detail_cache_renderable = renderable
-                return renderable
 
             table = Table.grid()
             table.add_column()
@@ -1471,6 +1988,12 @@ else:
             self.detail_history.extend(self._pane_detail_blocks(pane))
             self._mark_detail_dirty()
 
+        def _archive_command_history(self) -> None:
+            if self.command_history:
+                self.detail_history.extend(self.command_history)
+                self.command_history.clear()
+                self._mark_detail_dirty()
+
         def _mark_detail_dirty(self, pane: AgentPane | None = None) -> None:
             if pane is None:
                 self.detail_revision += 1
@@ -1485,10 +2008,10 @@ else:
             return (pane.idx, pane.revision, self.detail_revision, self._detail_content_width(), pulse)
 
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
-            return [*self.detail_history, *self._pane_detail_blocks(pane)]
+            return [*self.detail_history, *self._pane_detail_blocks(pane), *self.command_history]
 
         def _has_detail_content(self, pane: AgentPane | None) -> bool:
-            return pane is not None and (bool(pane.command_text) or bool(self._detail_blocks(pane)))
+            return pane is not None and bool(self._detail_blocks(pane))
 
         def _pane_detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
@@ -1552,13 +2075,16 @@ else:
             parts = [self.status]
             if summary := self._agent_summary():
                 parts.append(summary)
-            parts.extend(["Ctrl-C clear/exit", "←/→ switch"])
+            parts.extend(["Ctrl-C copy/clear/exit", "←/→ switch"])
             return " | ".join(parts)
 
         def _update_suggestions(self, value: str) -> None:
             suggestions = command_suggestions(value)
             self.suggestion_line_count = len(suggestions)
-            widget = self.query_one("#suggestions", Static)
+            try:
+                widget = self.query_one("#suggestions", Static)
+            except Exception:
+                return
             widget.update("\n".join(suggestions))
             widget.styles.height = min(self.suggestion_line_count, MAX_SUGGESTIONS)
 

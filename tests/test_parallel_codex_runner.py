@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import shutil
 import sqlite3
@@ -264,6 +263,28 @@ class RunOnceCleanupTests(unittest.TestCase):
 
 
 class TuiCommandTests(unittest.TestCase):
+    def test_tui_model_choices_use_visible_codex_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"slug": "gpt-visible", "visibility": "list"},
+                            {"slug": "gpt-hidden", "visibility": "hide"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
+                options = tui_textual.codex_model_options("gpt-custom")
+
+        self.assertIn(("default", ""), options)
+        self.assertIn(("gpt-visible", "gpt-visible"), options)
+        self.assertIn(("gpt-custom", "gpt-custom"), options)
+        self.assertNotIn(("gpt-hidden", "gpt-hidden"), options)
+
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
         slash_commands = "\n".join(command_suggestions("/"))
@@ -303,6 +324,102 @@ class TuiCommandTests(unittest.TestCase):
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertIsNone(app.args.model)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_config_controls_update_runner_settings(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    agents = app.query_one("#config-agents")
+                    agents.value = "3"
+                    agents.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertEqual(app.num_agents, 3)
+
+                    max_parallel = app.query_one("#config-max-parallel")
+                    max_parallel.value = "2"
+                    max_parallel.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertEqual(app.args.max_parallel, 2)
+
+                    for selector, value in (
+                        ("#config-execution", "serial"),
+                        ("#config-best-by", "duration"),
+                        ("#config-sync-back", False),
+                        ("#config-keep-workspaces", True),
+                    ):
+                        control = app.query_one(selector)
+                        control.focus()
+                        control.value = value
+                        await pilot.pause()
+
+                    self.assertTrue(app.args.serial)
+                    self.assertEqual(app.args.best_by, "duration")
+                    self.assertTrue(app.args.no_sync_back)
+                    self.assertTrue(app.args.keep_workspaces)
+                    self.assertGreaterEqual(len(app.command_history), 5)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_command_output_appends_after_conversation(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        app._sync = lambda: None
+        pane = app.agents[1]
+        pane.input_text = "existing question"
+        pane.final_text = "existing answer"
+
+        app._show_text("numofagents=5")
+        app._show_text("execution=parallel")
+
+        detail = app._detail_text()
+        self.assertLess(detail.index("existing question"), detail.index("existing answer"))
+        self.assertLess(detail.index("existing answer"), detail.index("numofagents=5"))
+        self.assertLess(detail.index("numofagents=5"), detail.index("execution=parallel"))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_copy_uses_selection_before_clear_or_exit(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    prompt = app.query_one("#prompt")
+                    prompt.text = "copy me"
+                    prompt.selection = ((0, 0), (0, 4))
+                    prompt.focus()
+                    copied: list[str] = []
+                    app.copy_to_clipboard = copied.append
+
+                    app.action_interrupt_or_exit()
+                    await pilot.pause()
+
+                    self.assertEqual(copied, ["copy"])
+                    self.assertEqual(prompt.text, "copy me")
+                    prompt.selection = ((0, 7), (0, 7))
+                    execution = app.query_one("#config-execution")
+                    execution.focus()
+                    await pilot.pause()
+                    app.action_interrupt_or_exit()
+                    self.assertEqual(copied, ["copy", "parallel"])
+                    self.assertTrue(app.query_one("#detail").allow_select)
+                    self.assertTrue(app.query_one("#runner-workspace").allow_select)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_copy_uses_pbcopy_on_macos(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        with mock.patch.object(tui_textual.sys, "platform", "darwin"):
+            with mock.patch.object(tui_textual.shutil, "which", return_value="/usr/bin/pbcopy"):
+                with mock.patch.object(tui_textual.subprocess, "run") as run_command:
+                    app.copy_to_clipboard("可复制文本")
+
+        self.assertEqual(app._clipboard, "可复制文本")
+        run_command.assert_called_once()
+        self.assertEqual(run_command.call_args.kwargs["input"], "可复制文本")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_rejects_explicit_codex_subagent_resume(self) -> None:
@@ -371,6 +488,30 @@ class TuiCommandTests(unittest.TestCase):
                                 self.assertIn("> previous question", detail)
                                 self.assertIn("✓ previous answer", detail)
                                 self.assertTrue(app.query_one("#detail-frame").display)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_control_dispatches_selected_session(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            session = app_core.ResumeSession(
+                session_id="session-1",
+                title="previous question",
+                cwd=str(Path.cwd()),
+                updated_at=1,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    app._apply_resume_choices([session])
+                    resume = app.query_one("#config-resume")
+                    resume.focus()
+                    await pilot.pause()
+                    with mock.patch.object(app, "_handle_resume") as handle_resume:
+                        resume.value = "session-1"
+                        await pilot.pause()
+
+                    handle_resume.assert_called_once_with(["session-1"])
 
         asyncio.run(run())
 
@@ -566,6 +707,58 @@ class TuiCommandTests(unittest.TestCase):
                 app._start_run("next question")
 
         finalize.assert_called_once_with(2, archive_detail=True)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_can_stop_remaining_agents_and_continue_from_finished_selection(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.running = True
+        app.cancel_event = threading.Event()
+        app.selected_agent = 2
+        app.agents[2].result = {"status": "success"}
+
+        app._start_run("follow-up question")
+
+        self.assertTrue(app.cancel_event.is_set())
+        self.assertEqual(app.queued_prompt, "follow-up question")
+        self.assertEqual(app.queued_agent, 2)
+
+        continued: list[str] = []
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+            with mock.patch.object(app, "_start_run", side_effect=continued.append):
+                app._on_runner_event(
+                    tui_textual.RunnerEvent(
+                        {
+                            "type": "run_finished",
+                            "run_root": "/tmp/pcr-test/run",
+                            "best_agent": None,
+                            "cancelled": True,
+                        }
+                    )
+                )
+
+        finalize.assert_called_once_with(2, archive_detail=True)
+        self.assertEqual(continued, ["follow-up question"])
+        self.assertEqual(app.queued_prompt, "")
+        self.assertIsNone(app.queued_agent)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_keeps_follow_up_text_when_selected_agent_is_still_running(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    app.running = True
+                    prompt = app.query_one("#prompt")
+                    prompt.text = "follow-up question"
+                    prompt.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    self.assertEqual(prompt.text, "follow-up question")
+                    self.assertIn("has not finished successfully", app.status)
+
+        asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_run_finished_does_not_auto_switch_to_best_agent(self) -> None:
@@ -777,24 +970,38 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_tree_title_is_uppercase_bold_and_height_matches_content(self) -> None:
+    def test_tui_runner_panel_has_title_and_editable_controls(self) -> None:
         async def run() -> None:
-            from rich.console import Console
-
             args = parse_args([])
             app = tui_textual.PcrTextualApp(args)
             async with app.run_test(size=(100, 40)) as pilot:
                 await pilot.pause()
-                tree = app.query_one("#tree")
-                panel = app._tree_renderable()
-                console = Console(width=tree.size.width, record=True, file=io.StringIO())
-                console.print(panel)
+                panel = app.query_one("#runner-frame")
 
-                self.assertEqual(panel.title.plain, "PARALLEL-CODEX-RUNNER")
-                self.assertEqual(str(panel.title.style), "bold")
-                self.assertEqual(tree.size.height, len(console.export_text().splitlines()))
+                self.assertEqual(panel.border_title, "PARALLEL-CODEX-RUNNER")
+                self.assertTrue(panel.styles.border_title_style.bold)
+                self.assertEqual(app.query_one("#config-agents").value, "5")
+                self.assertEqual(app.query_one("#config-max-parallel").value, "5")
+                self.assertEqual(app.query_one("#config-execution").value, "parallel")
+                self.assertEqual(app.query_one("#config-best-by").value, "reasoning_tokens")
                 self.assertNotIn("METADATA", [label for label, _value in app._tree_rows()])
                 self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_runner_panel_does_not_hide_detail_in_narrow_terminal(self) -> None:
+        async def run() -> None:
+            args = parse_args([])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test(size=(80, 30)) as pilot:
+                app.agents[1].input_text = "hello"
+                app._mark_detail_dirty(app.agents[1])
+                app._sync()
+                await pilot.pause()
+
+                self.assertGreater(app.query_one("#detail-frame").size.height, 0)
+                self.assertGreaterEqual(app.query_one("#prompt").region.height, 3)
 
         asyncio.run(run())
 
