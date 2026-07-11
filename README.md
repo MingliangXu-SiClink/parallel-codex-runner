@@ -32,7 +32,7 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 - **Delete-aware sync**: if the winning agent deletes a file, the original workspace loses it too.
 - **Simple selection**: choose the winner by observed reasoning tokens or runtime.
 - **Resume support**: continue from an existing Codex session and promote the winning session back.
-- **Small core**: Textual powers the TUI; the runner logic stays in plain Python modules.
+- **Hackable TUI stack**: Textual 8.2.8 is vendored in the repository, including local CJK and grapheme-aware editor fixes.
 
 ## Installation
 
@@ -41,7 +41,7 @@ Requirements:
 - Python 3.10+
 - Codex CLI available as `codex`
 - Git for the best workspace-copy path
-- `textual` and `rich`, installed automatically by this package
+- Textual's runtime dependencies, installed automatically by this package; Textual itself is vendored
 
 Install from a checkout:
 
@@ -265,6 +265,7 @@ Interactive slash commands:
 | `parallel_codex_runner_core/tui_textual.py` | Interactive Textual TUI |
 | `parallel_codex_runner_core/paths.py` | Path and run-directory helpers |
 | `parallel_codex_runner_core/models.py` | Dataclasses shared across modules |
+| `vendor/textual/` | Vendored Textual 8.2.8 source, upstream tests/docs, license, and PCR Unicode patches |
 | `tests/` | Regression tests |
 
 ## Development
@@ -272,11 +273,12 @@ Interactive slash commands:
 ```bash
 python3 -m py_compile parallel_codex_runner.py
 python3 -m unittest discover
+PYTHONPATH=vendor/textual/src python3 -m pytest -m 'not syntax' vendor/textual/tests/input vendor/textual/tests/text_area
 python3 parallel_codex_runner.py --help
 ```
 
-The project intentionally stays small: a compatibility CLI wrapper, a focused core package, and one test file.
+See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pinned upstream revision and local patch inventory.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Vendored Textual retains its upstream [MIT license](vendor/textual/LICENSE).

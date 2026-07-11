@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._vendor import activate_textual
+
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
     ("/status", "show current run configuration"),
@@ -274,16 +276,21 @@ def same_display_message(left: str, right: str) -> bool:
 
 
 try:
+    activate_textual()
     from textual import events, on
     from textual.app import App, ComposeResult
     from textual.containers import Vertical, VerticalScroll
     from textual.message import Message
     from textual.widgets import Static, TextArea
-except ModuleNotFoundError as exc:
+except (ModuleNotFoundError, RuntimeError) as exc:
     _TEXTUAL_IMPORT_ERROR = exc
 
-    def run_textual_tui(_args: argparse.Namespace, _exc: ModuleNotFoundError = _TEXTUAL_IMPORT_ERROR) -> int:
-        raise SystemExit("交互式 TUI 需要 textual：请运行 python3 -m pip install -e . 重新安装本项目依赖。") from _exc
+    def run_textual_tui(
+        _args: argparse.Namespace, _exc: Exception = _TEXTUAL_IMPORT_ERROR
+    ) -> int:
+        raise SystemExit(
+            "交互式 TUI 无法加载项目内置 Textual：请运行 python3 -m pip install -e . 重新安装。"
+        ) from _exc
 
 else:
     from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, normalize_best_by, promote_best_codex_session_to_workspace, run_once

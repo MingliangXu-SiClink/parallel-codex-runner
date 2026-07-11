@@ -10,8 +10,12 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "rich",
-    "textual>=8.2.8",
+    "markdown-it-py[linkify]>=2.1.0",
+    "mdit-py-plugins",
+    "platformdirs>=3.6.0,<5",
+    "pygments>=2.19.2,<3.0.0",
+    "rich>=14.2.0",
+    "typing-extensions>=4.4.0,<5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -26,4 +30,22 @@ pcr = "parallel_codex_runner:main"
 
 [tool.setuptools]
 py-modules = ["parallel_codex_runner"]
-packages = ["parallel_codex_runner_core"]
+packages = [
+    "parallel_codex_runner_core",
+    "parallel_codex_runner_core._vendor",
+    "parallel_codex_runner_core._vendor.textual",
+    "parallel_codex_runner_core._vendor.textual.css",
+    "parallel_codex_runner_core._vendor.textual.demo",
+    "parallel_codex_runner_core._vendor.textual.document",
+    "parallel_codex_runner_core._vendor.textual.drivers",
+    "parallel_codex_runner_core._vendor.textual.layouts",
+    "parallel_codex_runner_core._vendor.textual.renderables",
+    "parallel_codex_runner_core._vendor.textual.widgets",
+]
+package-dir = { "parallel_codex_runner_core._vendor.textual" = "vendor/textual/src/textual" }
+include-package-data = true
+
+[tool.setuptools.package-data]
+"parallel_codex_runner_core._vendor" = ["TEXTUAL_LICENSE"]
+"parallel_codex_runner_core._vendor.textual" = ["py.typed", "tree-sitter/highlights/*.scm"]
+"parallel_codex_runner_core._vendor.textual.widgets" = ["*.pyi"]
