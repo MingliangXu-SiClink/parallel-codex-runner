@@ -290,11 +290,25 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(command_suggestions("hello"), [])
         slash_commands = "\n".join(command_suggestions("/"))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
-        self.assertIn("/model <name|clear>", slash_commands)
+        self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
-        self.assertIn("/keepworkspaces <on|off>", slash_commands)
-        self.assertIn("/resumeinclude <on|off>", slash_commands)
-        self.assertGreater(len(command_suggestions("/")), 10)
+        self.assertIn(
+            "/keepworkspaces <on|off>",
+            "\n".join(command_suggestions("/keep")),
+        )
+        self.assertIn(
+            "/resumeinclude <on|off>",
+            "\n".join(command_suggestions("/resumeinclude")),
+        )
+        self.assertEqual(len(command_suggestions("/")), tui_textual.MAX_SUGGESTIONS)
+
+        descriptions = "\n".join(
+            description for _command, description in tui_textual.TEXTUAL_COMMANDS
+        )
+        self.assertNotIn("same as", descriptions.lower())
+        self.assertIn("limit how many agents may run concurrently", descriptions)
+        self.assertIn("set the workspace PCR operates on", descriptions)
+        self.assertNotIn("same as", tui_textual.build_help_text().lower())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_config_commands_update_cli_equivalents(self) -> None:
@@ -1146,6 +1160,45 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertEqual(app.query_one("#config-best-by").value, "reasoning_tokens")
                 self.assertNotIn("METADATA", [label for label, _value in app._tree_rows()])
                 self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])
+                self.assertNotIn("MODULE_DIR", [label for label, _value in app._tree_rows()])
+                self.assertNotIn("RUN_ANCHOR", [label for label, _value in app._tree_rows()])
+                self.assertEqual(len(app.query("#runner-module-dir")), 0)
+                self.assertEqual(len(app.query("#runner-run-anchor")), 0)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_routes_typing_to_prompt_except_runner_inputs(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(100, 40)) as pilot:
+                prompt = app.query_one("#prompt")
+                app.screen.set_focus(None)
+                await pilot.press("你")
+                await pilot.pause()
+
+                self.assertEqual(prompt.text, "你")
+                self.assertIs(app.focused, prompt)
+
+                agents = app.query_one("#config-agents")
+                agents.value = ""
+                agents.focus()
+                await pilot.press("7")
+                await pilot.pause()
+
+                self.assertEqual(agents.value, "7")
+                self.assertEqual(prompt.text, "你")
+
+                app.agents[1].input_text = "clickable detail"
+                app._mark_detail_dirty(app.agents[1])
+                app._sync()
+                await pilot.pause()
+                self.assertTrue(await pilot.click("#detail", offset=(3, 0)))
+                await pilot.press("好")
+                await pilot.pause()
+
+                self.assertEqual(prompt.text, "你好")
+                self.assertIs(app.focused, prompt)
 
         asyncio.run(run())
 

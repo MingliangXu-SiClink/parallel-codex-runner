@@ -22,27 +22,30 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
     ("/status", "show current run configuration"),
     ("/config", "show current run configuration"),
-    ("/numofagents <n>", "same as -n / --num-agents"),
-    ("/maxparallel <n|auto>", "same as --max-parallel"),
-    ("/serial", "same as --serial"),
-    ("/parallel", "clear --serial"),
-    ("/bestby <duration|reasoning_tokens>", "same as --best-by"),
-    ("/model <name|clear>", "same as --model"),
-    ("/workspace <path>", "same as --workspace"),
-    ("/runsdir <path|clear>", "same as --runs-dir"),
-    ("/codexbin <path>", "same as --codex-bin"),
-    ("/syncback <on|off>", "toggle --no-sync-back"),
-    ("/keepworkspaces <on|off>", "toggle --keep-workspaces"),
-    ("/promptfile <path>", "same as --prompt-file, then run"),
-    ("/resumeinclude <on|off>", "toggle --resume-include-non-interactive"),
+    ("/numofagents <n>", "set the number of agents for the next run"),
+    ("/maxparallel <n|auto>", "limit how many agents may run concurrently"),
+    ("/serial", "run agents one at a time"),
+    ("/parallel", "run agents concurrently"),
+    (
+        "/bestby <duration|reasoning_tokens>",
+        "choose how the best successful agent is selected",
+    ),
+    ("/model <name|clear>", "set or clear the Codex model for the next run"),
+    ("/workspace <path>", "set the workspace PCR operates on"),
+    ("/runsdir <path|clear>", "set or reset the directory used for run data"),
+    ("/codexbin <path>", "set the Codex executable"),
+    ("/syncback <on|off>", "enable or disable syncing the selected result back"),
+    ("/keepworkspaces <on|off>", "keep or clean up agent workspaces after a run"),
+    ("/promptfile <path>", "read a prompt file and start a run"),
+    ("/resumeinclude <on|off>", "include or exclude non-interactive resume sessions"),
     ("/resume", "show resumable Codex sessions"),
-    ("/resume <n|session>", "same as --resume-session-id"),
+    ("/resume <n|session>", "load a session by list number or session ID"),
     ("/resume latest", "load latest session"),
     ("/resume clear", "start without resume"),
-    ("/clear", "clear the current view"),
-    ("/exit", "quit"),
+    ("/clear", "clear the current Detail view when safe"),
+    ("/exit", "stop active agents, clean up, and quit"),
 )
-MAX_SUGGESTIONS = 24
+MAX_SUGGESTIONS = 8
 
 
 def command_suggestions(value: str) -> list[str]:
@@ -63,7 +66,7 @@ def build_help_text() -> str:
     lines.extend(
         [
             "",
-            'Enter normal text to run the same as: pcr "prompt"',
+            "Enter normal text to start a parallel Codex run.",
             "Most option commands apply to the next run.",
             "If a completed run is pending, PCR finalizes the selected agent before changing config.",
             "Ctrl-C copies selected text; otherwise it clears a non-empty prompt or exits.",
@@ -720,6 +723,55 @@ else:
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
 
+        def _is_runner_control(self, node: Any) -> bool:
+            while node is not None:
+                if isinstance(node, (Input, Select)) and node.has_class("runner-control"):
+                    return True
+                node = node.parent
+            return False
+
+        async def on_event(self, event: events.Event) -> None:
+            if isinstance(event, events.MouseDown) and not event.is_forwarded:
+                try:
+                    clicked_widget, _offset = self.screen.get_widget_and_offset_at(
+                        event.x,
+                        event.y,
+                    )
+                    prompt = self.query_one("#prompt", PromptEditor)
+                except Exception:
+                    pass
+                else:
+                    if not self._is_runner_control(clicked_widget):
+                        prompt.focus()
+
+            is_text_input = (
+                isinstance(event, events.Key) and event.is_printable
+            ) or isinstance(event, events.Paste)
+            if (
+                is_text_input
+                and not event.is_forwarded
+                and not self._is_runner_control(self.focused)
+            ):
+                try:
+                    prompt = self.query_one("#prompt", PromptEditor)
+                except Exception:
+                    pass
+                else:
+                    if self.focused is not prompt:
+                        prompt.focus()
+                        insert = event.character if isinstance(event, events.Key) else event.text
+                        if insert:
+                            result = prompt.replace(
+                                insert,
+                                *prompt.selection,
+                                maintain_selection_offset=False,
+                            )
+                            prompt.move_cursor(result.end_location)
+                        event.stop()
+                        event.prevent_default()
+                        return
+            await super().on_event(event)
+
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
                 with Vertical(id="runner-frame"):
@@ -728,10 +780,6 @@ else:
                         yield Static("", id="runner-conversation", classes="runner-value", markup=False)
                         yield Static("WORKSPACE", classes="runner-key")
                         yield Static("", id="runner-workspace", classes="runner-value", markup=False)
-                        yield Static("MODULE_DIR", classes="runner-key")
-                        yield Static("", id="runner-module-dir", classes="runner-value", markup=False)
-                        yield Static("RUN_ANCHOR", classes="runner-key")
-                        yield Static("", id="runner-run-anchor", classes="runner-value", markup=False)
                         yield Static("RUNS_ROOT", classes="runner-key")
                         yield Static("", id="runner-runs-root", classes="runner-value", markup=False)
                         yield Static("AGENTS", classes="runner-key")
@@ -1945,8 +1993,6 @@ else:
             static_rows = {
                 "CONVERSATION": "#runner-conversation",
                 "WORKSPACE": "#runner-workspace",
-                "MODULE_DIR": "#runner-module-dir",
-                "RUN_ANCHOR": "#runner-run-anchor",
                 "RUNS_ROOT": "#runner-runs-root",
                 "CODEX_BIN": "#runner-codex-bin",
             }
@@ -2048,7 +2094,7 @@ else:
             return rows
 
         def _visible_info_rows(self, rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
-            hidden = {"METADATA", "WORKSPACE COPIES"}
+            hidden = {"MODULE_DIR", "RUN_ANCHOR", "METADATA", "WORKSPACE COPIES"}
             return [(label, value) for label, value in rows if label not in hidden]
 
         def _base_info_rows(self) -> list[tuple[str, str]]:
@@ -2063,8 +2109,6 @@ else:
             run_base = choose_run_base(run_anchor, self.workspace, getattr(self.args, "runs_dir", None))
             return [
                 ("WORKSPACE", absolute_path_for_display(self.workspace)),
-                ("MODULE_DIR", absolute_path_for_display(module_dir)),
-                ("RUN_ANCHOR", absolute_path_for_display(run_anchor)),
                 ("RUNS_ROOT", f"pending under {absolute_path_for_display(run_base)}"),
                 ("AGENTS", str(self.num_agents)),
                 ("EXECUTION", execution),
