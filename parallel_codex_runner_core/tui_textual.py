@@ -293,8 +293,17 @@ except (ModuleNotFoundError, RuntimeError) as exc:
         ) from _exc
 
 else:
-    from .app import get_codex_home, infer_codex_thread_id_for_result, list_resume_sessions, normalize_best_by, promote_best_codex_session_to_workspace, run_once, subagent_resume_error
-    from .models import AgentResult
+    from .app import (
+        get_codex_home,
+        infer_codex_thread_id_for_result,
+        list_resume_sessions,
+        load_codex_session_history,
+        normalize_best_by,
+        promote_best_codex_session_to_workspace,
+        run_once,
+        subagent_resume_error,
+    )
+    from .models import AgentResult, CodexHistoryEntry
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import cleanup_workspace_copies, sync_best_workspace_back
     from rich.cells import cell_len
@@ -356,6 +365,21 @@ else:
         def __init__(self, payload: dict[str, Any]) -> None:
             super().__init__()
             self.payload = payload
+
+
+    class ResumeHistoryLoaded(Message):
+        def __init__(
+            self,
+            request_id: int,
+            session_id: str,
+            entries: list[CodexHistoryEntry],
+            error: str = "",
+        ) -> None:
+            super().__init__()
+            self.request_id = request_id
+            self.session_id = session_id
+            self.entries = entries
+            self.error = error
 
 
     class PromptSubmitted(Message):
@@ -532,6 +556,7 @@ else:
             self.pending_workspaces_root: Path | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.detail_revision = 0
+            self.resume_history_request = 0
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
 
@@ -555,6 +580,8 @@ else:
             self.set_interval(0.25, self._tick)
             if getattr(self.args, "resume", False) and not self.resume_session_id:
                 self._handle_resume([])
+            elif self.resume_session_id:
+                self._select_resume_session(self.resume_session_id)
             else:
                 self._sync()
             self.query_one("#prompt", PromptEditor).focus()
@@ -660,6 +687,24 @@ else:
             if kind in {"run_finished", "run_failed"} and self.exit_after_run and not self._has_pending_run():
                 self.exit()
 
+        @on(ResumeHistoryLoaded)
+        def _on_resume_history_loaded(self, event: ResumeHistoryLoaded) -> None:
+            if event.request_id != self.resume_history_request or event.session_id != self.resume_session_id:
+                return
+            if event.error:
+                loaded_status = f"Resume history unavailable: {event.error}"
+            else:
+                self.detail_history = [self._history_detail_block(entry) for entry in event.entries]
+                loaded_status = (
+                    f"Resume session loaded: {event.session_id}"
+                    if event.entries
+                    else f"Resume session loaded without readable history: {event.session_id}"
+                )
+            if not self.running and not self._has_pending_run():
+                self.status = loaded_status
+            self._mark_detail_dirty()
+            self._sync()
+
         def action_clear_view(self) -> None:
             if self.running:
                 self.status = "Cannot clear while a run is active"
@@ -686,6 +731,7 @@ else:
                 pane.result = None
                 pane.clear_detail()
             self.best_agent = None
+            self.resume_history_request += 1
             self.detail_history.clear()
             self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
@@ -928,6 +974,8 @@ else:
             self.workspace = workspace
             self.args.workspace = str(workspace)
             self.resume_session_id = ""
+            self.resume_history_request += 1
+            self._reset_conversation_detail()
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"workspace={absolute_path_for_display(workspace)}")
 
@@ -1024,6 +1072,54 @@ else:
             self.args.resume_include_non_interactive = value
             self._show_setting(f"resumeinclude={'on' if value else 'off'}")
 
+        def _reset_conversation_detail(self) -> None:
+            self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
+            self.selected_agent = min(self.selected_agent, self.num_agents)
+            self.best_agent = None
+            self.detail_history.clear()
+            self._mark_detail_dirty()
+
+        def _history_detail_block(self, entry: CodexHistoryEntry) -> tuple[str, str, str]:
+            if entry.category == "user":
+                return ">", entry.text, "cyan"
+            if entry.category == "thought":
+                return "·", entry.text, "dim white"
+            return "✓", entry.text, "green"
+
+        def _select_resume_session(self, session_id: str, rollout_path: str = "") -> None:
+            error = subagent_resume_error(get_codex_home(), session_id)
+            if error:
+                self.resume_session_id = ""
+                self.status = error
+                self.run_info_rows = self._base_info_rows()
+                self._sync()
+                return
+
+            self.resume_session_id = session_id
+            self.resume_history_request += 1
+            request_id = self.resume_history_request
+            self._reset_conversation_detail()
+            self.run_info_rows = self._base_info_rows()
+            self.status = f"Loading resume session: {session_id}"
+            self._sync()
+
+            def target() -> None:
+                entries: list[CodexHistoryEntry] = []
+                load_error = ""
+                try:
+                    entries = load_codex_session_history(get_codex_home(), session_id, rollout_path)
+                except Exception as exc:  # noqa: BLE001
+                    load_error = str(exc)
+                try:
+                    self.call_from_thread(
+                        self.post_message,
+                        ResumeHistoryLoaded(request_id, session_id, entries, load_error),
+                    )
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=target, name="pcr-resume-history", daemon=True).start()
+
         def _handle_resume(self, args: list[str]) -> None:
             if self.running:
                 self.status = "Cannot change resume session while running"
@@ -1039,6 +1135,8 @@ else:
                         self._sync()
                         return
                 self.resume_session_id = ""
+                self.resume_history_request += 1
+                self._reset_conversation_detail()
                 self.run_info_rows = self._base_info_rows()
                 self.status = "Resume cleared"
                 self._sync()
@@ -1067,19 +1165,17 @@ else:
                         self.status = error
                         self._sync()
                         return
-                    self.resume_session_id = selector
-                    self.run_info_rows = self._base_info_rows()
-                    self.status = f"Resume session set: {selector}"
-                    self._sync()
+                    if not self._prepare_config_change("resume session"):
+                        return
+                    self._select_resume_session(selector)
                     return
             if chosen is None:
                 self.status = "No resumable session found"
                 self._sync()
                 return
-            self.resume_session_id = chosen.session_id
-            self.run_info_rows = self._base_info_rows()
-            self.status = f"Resume session set: {chosen.session_id}"
-            self._sync()
+            if not self._prepare_config_change("resume session"):
+                return
+            self._select_resume_session(chosen.session_id, chosen.rollout_path)
 
         def _show_resume_list(self) -> None:
             lines = ["Recent sessions:", "Use /resume <number> or /resume <session_id> to load one.", ""]

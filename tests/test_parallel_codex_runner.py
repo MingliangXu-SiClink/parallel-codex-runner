@@ -24,6 +24,7 @@ from parallel_codex_runner import (
     create_unique_run_root,
     extract_codex_thread_id_from_json,
     import_codex_session_to_workspace,
+    load_codex_session_history,
     load_resume_sessions_from_state,
     parse_args,
     prepare_agent_codex_home,
@@ -318,6 +319,60 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(app.resume_session_id, "")
         self.assertEqual(app.status, "Codex subagent cannot be resumed")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_loads_previous_conversation_into_detail(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                rollout = root / "sessions" / "rollout-session-1.jsonl"
+                workspace.mkdir()
+                rollout.parent.mkdir()
+                records = [
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": "session-1", "cwd": str(workspace)},
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "previous question"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "agent_message", "message": "previous answer"},
+                    },
+                ]
+                rollout.write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
+                args = parse_args(["--workspace", str(workspace)])
+                app = tui_textual.PcrTextualApp(args)
+                session = app_core.ResumeSession(
+                    session_id="session-1",
+                    title="previous question",
+                    cwd=str(workspace),
+                    updated_at=1,
+                    rollout_path=str(rollout),
+                )
+
+                with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[session]):
+                    with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
+                        with mock.patch.object(tui_textual, "subagent_resume_error", return_value=None):
+                            async with app.run_test() as pilot:
+                                app._handle_resume(["1"])
+                                for _ in range(20):
+                                    await pilot.pause()
+                                    if "previous answer" in app._detail_text():
+                                        break
+
+                                detail = app._detail_text()
+                                self.assertIn("> previous question", detail)
+                                self.assertIn("✓ previous answer", detail)
+                                self.assertTrue(app.query_one("#detail-frame").display)
+
+        asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_path_and_promptfile_commands(self) -> None:
@@ -949,6 +1004,112 @@ class ResumeSessionTests(unittest.TestCase):
             extract_codex_thread_id_from_json({"type": "thread.started", "thread_id": "019f-test"}),
             "019f-test",
         )
+
+    def test_load_codex_session_history_prefers_clean_events_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "sessions" / "rollout-session-1.jsonl"
+            rollout.parent.mkdir()
+            records = [
+                {"type": "session_meta", "payload": {"id": "session-1", "cwd": "/workspace"}},
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "turn-1"},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "<environment_context>hidden</environment_context>"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "previous question"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "previous question"},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "checked the project\n\n<!-- -->"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_reasoning", "text": "checked the project\n\n<!-- -->"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "previous answer"},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "previous answer"}],
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            history = load_codex_session_history(root, "session-1", rollout)
+
+            self.assertEqual(
+                [(entry.category, entry.text) for entry in history],
+                [
+                    ("user", "previous question"),
+                    ("thought", "checked the project"),
+                    ("output", "previous answer"),
+                ],
+            )
+
+    def test_load_codex_session_history_falls_back_to_response_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-session-1.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "session-1"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "fallback question"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback answer"}],
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            history = load_codex_session_history(root, "session-1", rollout)
+
+            self.assertEqual(
+                [(entry.category, entry.text) for entry in history],
+                [("user", "fallback question"), ("output", "fallback answer")],
+            )
 
     def test_state_loader_filters_workspace_archived_and_non_interactive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

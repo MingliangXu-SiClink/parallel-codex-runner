@@ -55,6 +55,12 @@ class ResumeSession:
     tokens_used: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class CodexHistoryEntry:
+    category: str
+    text: str
+
+
 @dataclass
 class CodexSessionPromotion:
     session_id: str

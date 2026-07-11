@@ -80,7 +80,13 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
-from .models import AgentResult, AgentState, CodexSessionPromotion, ResumeSession
+from .models import (
+    AgentResult,
+    AgentState,
+    CodexHistoryEntry,
+    CodexSessionPromotion,
+    ResumeSession,
+)
 from .paths import (
     absolute_path_for_display,
     choose_run_base,
@@ -836,6 +842,142 @@ def find_rollout_path_for_session(codex_home: Path, session_id: str) -> Optional
         except OSError:
             continue
     return None
+
+
+_INTERNAL_HISTORY_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<apps_instructions>",
+    "<collaboration_mode>",
+    "<environment_context>",
+    "<permissions instructions>",
+    "<recommended_plugins>",
+    "<skills_instructions>",
+)
+
+
+def codex_history_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(text for item in value if (text := codex_history_text(item)))
+    if isinstance(value, dict):
+        for key in ("message", "text", "input_text", "output_text", "content", "summary", "reasoning"):
+            text = codex_history_text(value.get(key))
+            if text:
+                return text
+    return ""
+
+
+def is_internal_codex_history_message(text: str) -> bool:
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in _INTERNAL_HISTORY_PREFIXES)
+
+
+def clean_codex_history_text(category: str, text: str) -> str:
+    if category != "thought":
+        return text.strip()
+    return "\n".join(line for line in text.splitlines() if line.strip() != "<!-- -->").strip()
+
+
+def load_codex_session_history(
+    codex_home: Path,
+    session_id: str,
+    rollout_path: str | Path | None = None,
+) -> List[CodexHistoryEntry]:
+    """Load the readable conversation from one Codex rollout JSONL file."""
+    path = Path(rollout_path).expanduser() if rollout_path else None
+    if path is None or not path.is_file():
+        path = find_rollout_path_for_session(codex_home, session_id)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(f"Codex rollout not found for session {session_id}")
+
+    candidates: List[Tuple[int, str, str, CodexHistoryEntry]] = []
+    current_turn_id = ""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line_number, line in enumerate(f):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            obj_type = str(obj.get("type") or "")
+            payload_type = str(payload.get("type") or "")
+            if obj_type == "event_msg" and payload_type == "task_started":
+                current_turn_id = str(payload.get("turn_id") or "")
+                continue
+            category = ""
+            source = ""
+            text = ""
+            if obj_type == "session_meta":
+                rollout_session_id = session_meta_thread_id(payload)
+                if rollout_session_id and rollout_session_id != session_id:
+                    raise ValueError(
+                        f"Codex rollout session mismatch: expected {session_id}, found {rollout_session_id}"
+                    )
+                continue
+            if obj_type == "event_msg":
+                source = "event"
+                if payload_type == "user_message":
+                    category = "user"
+                    text = codex_history_text(payload.get("message"))
+                elif payload_type == "agent_reasoning":
+                    category = "thought"
+                    text = codex_history_text(
+                        payload.get("message") or payload.get("text") or payload.get("reasoning")
+                    )
+                elif payload_type == "agent_message":
+                    category = "output"
+                    text = codex_history_text(payload.get("message"))
+            elif obj_type == "response_item":
+                source = "response"
+                if payload_type == "message":
+                    role = str(payload.get("role") or "")
+                    if role == "user":
+                        category = "user"
+                    elif role == "assistant":
+                        category = "output"
+                    text = codex_history_text(payload.get("content"))
+                elif payload_type == "reasoning":
+                    category = "thought"
+                    text = codex_history_text(payload.get("summary"))
+
+            text = clean_codex_history_text(category, text)
+            if not category or not text:
+                continue
+            if category == "user" and is_internal_codex_history_message(text):
+                continue
+            metadata = payload.get("internal_chat_message_metadata_passthrough")
+            turn_id = str(metadata.get("turn_id") or "") if isinstance(metadata, dict) else ""
+            candidates.append(
+                (line_number, source, turn_id or current_turn_id, CodexHistoryEntry(category, text))
+            )
+
+    history: List[Tuple[str, str, CodexHistoryEntry]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for _line_number, source, turn_id, entry in sorted(candidates, key=lambda item: item[0]):
+        entry_key = (turn_id, entry.category, entry.text)
+        if entry_key in seen:
+            continue
+        seen.add(entry_key)
+        if history and history[-1][2].category == entry.category:
+            previous_source, previous_turn_id, previous = history[-1]
+            same_turn = bool(turn_id and previous_turn_id and turn_id == previous_turn_id)
+            if previous.text == entry.text and (same_turn or source != previous_source):
+                continue
+            if same_turn:
+                history[-1] = (
+                    previous_source,
+                    previous_turn_id,
+                    CodexHistoryEntry(entry.category, f"{previous.text}\n{entry.text}"),
+                )
+                continue
+        history.append((source, turn_id, entry))
+    return [entry for _source, _turn_id, entry in history]
 
 
 def subagent_resume_error(codex_home: Path, session_id: str) -> Optional[str]:
