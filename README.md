@@ -82,6 +82,8 @@ fix the failing tests
 
 Use left/right to switch between agent panes while a run is active.
 
+After a run completes, run-setting changes such as agent count, execution mode, and model apply to the next run and do not select a candidate. Submitting the next prompt, exiting, or switching workspace/resume context finalizes the currently displayed successful agent. `best_by` remains a recommendation rather than an automatic TUI selection.
+
 Run the default five candidates in the current directory:
 
 ```bash

@@ -533,6 +533,182 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIsNone(app.args.model)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_next_run_config_does_not_finalize_completed_selection(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "5"]))
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_workspace = app.workspace
+        app.pending_no_sync_back = False
+        app.pending_keep_workspaces = False
+        app.best_agent = 5
+        app.selected_agent = 4
+        completed_agents = app.agents
+
+        with mock.patch.object(app, "_finalize_agent") as finalize:
+            with mock.patch.object(app, "_discard_pending_run") as discard:
+                app._handle_command("/numofagents 2")
+                app._handle_command("/maxparallel 1")
+                app._handle_command("/bestby duration")
+                app._handle_command("/model gpt-5")
+                app._handle_command("/syncback off")
+                app._handle_command("/keepworkspaces on")
+
+        finalize.assert_not_called()
+        discard.assert_not_called()
+        self.assertIs(app.agents, completed_agents)
+        self.assertEqual(app.selected_agent, 4)
+        self.assertEqual(app.best_agent, 5)
+        self.assertEqual(app.num_agents, 2)
+        self.assertTrue(app._has_pending_run())
+        self.assertFalse(app._pending_sync_disabled())
+        self.assertFalse(app._pending_keep_enabled())
+        self.assertTrue(app.args.no_sync_back)
+        self.assertTrue(app.args.keep_workspaces)
+        with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
+            self.assertTrue(app._cleanup_after_pending_run())
+        cleanup.assert_called_once_with(app.workspace, app.pending_workspaces_root)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_exit_finalizes_displayed_agent_after_next_config_change(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "5"]))
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.best_agent = 5
+        app.selected_agent = 3
+        app.agents[3].result = {"status": "success"}
+        app._handle_syncback(["off"])
+
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+            with mock.patch.object(app, "exit") as exit_app:
+                app._request_exit()
+
+        finalize.assert_called_once_with(
+            3,
+            require_resume=False,
+            archive_detail=False,
+        )
+        exit_app.assert_called_once_with()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_exit_does_not_fallback_when_displayed_agent_failed(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "5"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.best_agent = 5
+        app.selected_agent = 3
+        app.agents[3].result = {"status": "failed"}
+        app.agents[5].result = {"status": "success"}
+
+        with mock.patch.object(app, "_finalize_agent", return_value=False) as finalize:
+            with mock.patch.object(app, "exit") as exit_app:
+                app._request_exit()
+
+        finalize.assert_called_once_with(
+            3,
+            require_resume=False,
+            archive_detail=False,
+        )
+        exit_app.assert_not_called()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_exit_discards_run_when_no_agent_succeeded(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+
+        with mock.patch.object(app, "_discard_pending_run", return_value=True) as discard:
+            with mock.patch.object(app, "exit") as exit_app:
+                app._request_exit()
+
+        discard.assert_called_once_with()
+        exit_app.assert_called_once_with()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_workspace_change_finalizes_displayed_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_workspace = root / "current"
+            next_workspace = root / "next"
+            current_workspace.mkdir()
+            next_workspace.mkdir()
+            app = tui_textual.PcrTextualApp(
+                parse_args(["--workspace", str(current_workspace), "-n", "5"])
+            )
+            app._sync = lambda: None
+            app._show_text = lambda _text: None
+            app.pending_workspaces_root = root / "run" / "workspaces"
+            app.pending_workspace = current_workspace.resolve()
+            app.pending_no_sync_back = False
+            app.best_agent = 5
+            app.selected_agent = 3
+            app.agents[3].result = {"status": "success"}
+
+            def finalize_selected(*_args: object, **_kwargs: object) -> bool:
+                app._clear_pending_run()
+                return True
+
+            with mock.patch.object(
+                app,
+                "_finalize_agent",
+                side_effect=finalize_selected,
+            ) as finalize:
+                app._handle_workspace([str(next_workspace)])
+
+        finalize.assert_called_once_with(
+            3,
+            require_resume=False,
+            archive_detail=True,
+        )
+        self.assertEqual(app.workspace, next_workspace.resolve())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_change_finalizes_displayed_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "5"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.best_agent = 5
+        app.selected_agent = 3
+        app.agents[3].result = {"status": "success"}
+        app.resume_choices_loaded = True
+        app.resume_entries = [
+            app_core.ResumeSession(
+                session_id="session-next",
+                title="next conversation",
+                cwd=str(app.workspace),
+                updated_at=1,
+                rollout_path="/tmp/session-next.jsonl",
+            )
+        ]
+
+        def finalize_selected(*_args: object, **_kwargs: object) -> bool:
+            app._clear_pending_run()
+            return True
+
+        with mock.patch.object(
+            app,
+            "_finalize_agent",
+            side_effect=finalize_selected,
+        ) as finalize:
+            with mock.patch.object(app, "_select_resume_session") as select_resume:
+                app._handle_resume(["1"])
+
+        finalize.assert_called_once_with(
+            3,
+            require_resume=False,
+            archive_detail=True,
+        )
+        select_resume.assert_called_once_with(
+            "session-next",
+            "/tmp/session-next.jsonl",
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_kill_stops_only_selected_agent(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
         app._sync = lambda: None
@@ -1536,16 +1712,22 @@ class TuiCommandTests(unittest.TestCase):
         args = parse_args([])
         app = tui_textual.PcrTextualApp(args)
         app._sync = lambda: None
+        app._show_text = lambda _text: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
         app.best_agent = 5
-        app.selected_agent = 2
+        app.selected_agent = 4
+        app._handle_numofagents(["2"])
+        app._handle_syncback(["off"])
 
         with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
             with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
                 thread_cls.return_value.start.return_value = None
                 app._start_run("next question")
 
-        finalize.assert_called_once_with(2, archive_detail=True)
+        finalize.assert_called_once_with(4, archive_detail=True)
+        self.assertEqual(len(app.agents), 2)
+        self.assertEqual(app.selected_agent, 2)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_can_stop_remaining_agents_and_continue_from_finished_selection(self) -> None:
@@ -1645,7 +1827,7 @@ class TuiCommandTests(unittest.TestCase):
             app = tui_textual.PcrTextualApp(args)
             app._sync = lambda: None
             app.pending_workspaces_root = root / "run" / "workspaces"
-            app.best_agent = 2
+            app.best_agent = 5
             app.selected_agent = 2
             app.resume_session_id = "old-session"
             app.agents[2].result = {

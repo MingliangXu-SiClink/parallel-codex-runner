@@ -72,7 +72,8 @@ TUI_TIPS: tuple[str, ...] = (
     "使用 /resume 可载入之前的 Codex 对话。",
     "后续提问会从当前显示的已完成 Agent 继续。",
     "某个 Agent 完成后，即可从该 Agent 继续提问。",
-    "运行前可直接修改上方配置项。",
+    "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
+    "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
@@ -754,6 +755,9 @@ else:
             self.run_info_rows = self._base_info_rows()
             self.pending_run_root: Path | None = None
             self.pending_workspaces_root: Path | None = None
+            self.pending_workspace: Path | None = None
+            self.pending_no_sync_back: bool | None = None
+            self.pending_keep_workspaces: bool | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.command_history: list[tuple[str, str, str]] = []
             self.detail_revision = 0
@@ -1206,7 +1210,8 @@ else:
             await super()._on_key(event)
 
         def _switch_agent(self, delta: int) -> None:
-            self.selected_agent = min(self.num_agents, max(1, self.selected_agent + delta))
+            last_agent = max(self.agents, default=self.num_agents)
+            self.selected_agent = min(last_agent, max(1, self.selected_agent + delta))
             self._sync()
 
         def _agent_kill_requested(self, idx: int) -> bool:
@@ -1446,22 +1451,9 @@ else:
                 self.status = "Stopping and cleaning up"
                 self._sync()
                 return
-            if self._has_pending_run():
-                if getattr(self.args, "no_sync_back", False):
-                    if not self._cleanup_after_pending_run():
-                        self._sync()
-                        return
-                    self._clear_pending_run()
-                    self.exit()
-                    return
-                if self.best_agent is not None and not self._finalize_agent(self.best_agent, require_resume=False):
-                    self._sync()
-                    return
-                if self.best_agent is None:
-                    if not self._cleanup_after_pending_run():
-                        self._sync()
-                        return
-                    self._clear_pending_run()
+            if not self._finalize_displayed_pending(require_resume=False):
+                self._sync()
+                return
             self.exit()
 
         def _handle_command(self, raw: str) -> None:
@@ -1592,15 +1584,37 @@ else:
                 self.status = f"Cannot change {label} while running"
                 self._sync()
                 return False
-            if self._has_pending_run():
-                if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
-                    if not self._discard_pending_run():
-                        self._sync()
-                        return False
-                elif not self._finalize_agent(self.selected_agent, archive_detail=True):
-                    self._sync()
-                    return False
             return True
+
+        def _prepare_context_change(self, label: str) -> bool:
+            if self.running:
+                self.status = f"Cannot change {label} while running"
+                self._sync()
+                return False
+            if self._finalize_displayed_pending(require_resume=False, archive_detail=True):
+                return True
+            self._sync()
+            return False
+
+        def _finalize_displayed_pending(
+            self,
+            require_resume: bool = True,
+            archive_detail: bool = False,
+        ) -> bool:
+            if not self._has_pending_run():
+                return True
+            if self._pending_sync_disabled():
+                return self._discard_pending_run()
+            if not any(
+                isinstance(pane.result, dict) and pane.result.get("status") == "success"
+                for pane in self.agents.values()
+            ):
+                return self._discard_pending_run()
+            return self._finalize_agent(
+                self.selected_agent,
+                require_resume=require_resume,
+                archive_detail=archive_detail,
+            )
 
         def _show_setting(self, text: str) -> None:
             self.status = text
@@ -1634,12 +1648,14 @@ else:
                 return
             if not self._prepare_config_change("agent count"):
                 return
+            preserve_completed_run = self._has_pending_run()
             self.num_agents = value
             self.args.num_agents = value
-            self.selected_agent = min(self.selected_agent, value)
-            self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
-            self.best_agent = None
-            self._mark_detail_dirty()
+            if not preserve_completed_run:
+                self.selected_agent = min(self.selected_agent, value)
+                self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
+                self.best_agent = None
+                self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"Next run will use {value} agents")
 
@@ -1717,7 +1733,7 @@ else:
                 self.status = f"Workspace not found: {workspace}"
                 self._sync()
                 return
-            if not self._prepare_config_change("workspace"):
+            if not self._prepare_context_change("workspace"):
                 return
             self.workspace = workspace
             self.args.workspace = str(workspace)
@@ -1881,14 +1897,12 @@ else:
                 self._sync()
                 return
             if args and args[0].lower() in {"clear", "new"}:
-                if self._has_pending_run():
-                    if getattr(self.args, "no_sync_back", False) or self.best_agent is None:
-                        if not self._discard_pending_run():
-                            self._sync()
-                            return
-                    elif not self._finalize_agent(self.selected_agent, require_resume=False, archive_detail=True):
-                        self._sync()
-                        return
+                if not self._finalize_displayed_pending(
+                    require_resume=False,
+                    archive_detail=True,
+                ):
+                    self._sync()
+                    return
                 self.resume_session_id = ""
                 self.resume_history_request += 1
                 self.pending_resume_selector = None
@@ -1925,7 +1939,7 @@ else:
                         chosen = session
                         break
                 if chosen is None:
-                    if not self._prepare_config_change("resume session"):
+                    if not self._prepare_context_change("resume session"):
                         return
                     self._select_resume_session(selector)
                     return
@@ -1933,7 +1947,7 @@ else:
                 self.status = "No resumable session found"
                 self._sync()
                 return
-            if not self._prepare_config_change("resume session"):
+            if not self._prepare_context_change("resume session"):
                 return
             self._select_resume_session(chosen.session_id, chosen.rollout_path)
 
@@ -1953,7 +1967,7 @@ else:
             if not self._commit_runner_inputs():
                 self._sync()
                 return False
-            if self._has_pending_run() and (getattr(self.args, "no_sync_back", False) or self.best_agent is None):
+            if self._has_pending_run() and (self._pending_sync_disabled() or self.best_agent is None):
                 if not self._discard_pending_run():
                     self._sync()
                     return False
@@ -1966,6 +1980,9 @@ else:
             self.cancel_event = threading.Event()
             self.best_agent = None
             self.started_at = time.monotonic()
+            self.pending_workspace = self.workspace
+            self.pending_no_sync_back = bool(getattr(self.args, "no_sync_back", False))
+            self.pending_keep_workspaces = bool(getattr(self.args, "keep_workspaces", False))
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.agent_cancel_events = {
                 idx: threading.Event() for idx in range(1, self.num_agents + 1)
@@ -2080,6 +2097,22 @@ else:
         def _clear_pending_run(self) -> None:
             self.pending_run_root = None
             self.pending_workspaces_root = None
+            self.pending_workspace = None
+            self.pending_no_sync_back = None
+            self.pending_keep_workspaces = None
+
+        def _pending_sync_disabled(self) -> bool:
+            if self.pending_no_sync_back is not None:
+                return self.pending_no_sync_back
+            return bool(getattr(self.args, "no_sync_back", False))
+
+        def _pending_keep_enabled(self) -> bool:
+            if self.pending_keep_workspaces is not None:
+                return self.pending_keep_workspaces
+            return bool(getattr(self.args, "keep_workspaces", False))
+
+        def _pending_workspace_path(self) -> Path:
+            return self.pending_workspace or self.workspace
 
         def _discard_pending_run(self) -> bool:
             if not self._cleanup_after_pending_run():
@@ -2090,15 +2123,16 @@ else:
             return True
 
         def _cleanup_after_pending_run(self) -> bool:
-            if getattr(self.args, "keep_workspaces", False):
+            if self._pending_keep_enabled():
                 return True
             root = self.pending_workspaces_root
             if root is None:
                 return True
+            workspace = self._pending_workspace_path()
             try:
-                if is_relative_to(root, self.workspace):
+                if is_relative_to(root, workspace):
                     raise RuntimeError(f"refusing to delete workspace-owned path: {root}")
-                cleanup_workspace_copies(self.workspace, root)
+                cleanup_workspace_copies(workspace, root)
                 return True
             except Exception as exc:  # noqa: BLE001
                 self.status = f"Cleanup failed: {exc}"
@@ -2131,6 +2165,7 @@ else:
             if result.status != "success":
                 self.status = f"AGENT-{idx:03d} is not successful"
                 return False
+            workspace = self._pending_workspace_path()
             try:
                 if require_resume and not result.codex_thread_id:
                     source_codex_home = Path(result.codex_home).expanduser().resolve() if result.codex_home else get_codex_home()
@@ -2139,11 +2174,11 @@ else:
                         self.status = f"AGENT-{idx:03d} has no resumable session"
                         return False
 
-                sync_best_workspace_back(Path(result.workspace_dir), self.workspace)
+                sync_best_workspace_back(Path(result.workspace_dir), workspace)
 
                 promotion = None
                 try:
-                    promotion = promote_best_codex_session_to_workspace(result, self.workspace)
+                    promotion = promote_best_codex_session_to_workspace(result, workspace)
                 except Exception:
                     if require_resume:
                         raise
