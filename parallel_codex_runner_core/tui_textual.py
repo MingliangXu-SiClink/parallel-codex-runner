@@ -171,29 +171,45 @@ def format_reasoning_tokens_title(
     counts: Any,
     completed: bool,
 ) -> str:
-    if value is None:
-        return ""
-    label = f"reasoning_tokens={value}"
     normalized = normalize_reasoning_token_counts(counts)
     if not normalized:
-        return label
+        return "" if value is None else f"reasoning_tokens={value}"
+
+    # Codex's cumulative value includes resumed history, while these increments
+    # describe this run. Derive the title total from the same increment set.
+    run_total = sum(delta * count for delta, count in normalized.items())
+    label = f"reasoning_tokens={run_total}"
+    ranked = sorted(
+        normalized.items(),
+        key=lambda item: (-(item[0] * item[1]), -item[0]),
+    )
+    visible = ranked[:4]
+    other_count = sum(count for _delta, count in ranked[4:])
     if not completed:
-        values = ", ".join(
-            f"{delta}={count}" for delta, count in sorted(normalized.items())
-        )
-        return f"{label}({values})"
+        values = [f"{delta}:{count}" for delta, count in visible]
+        if other_count:
+            values.append(f"other:{other_count}")
+        return f"{label}({', '.join(values)})"
 
     total = sum(normalized.values())
     values = []
-    for delta, count in sorted(normalized.items()):
+    for delta, count in visible:
         percentage = count * 100 / total
         percentage_text = (
             str(int(percentage))
             if percentage.is_integer()
             else f"{percentage:.1f}".rstrip("0").rstrip(".")
         )
-        values.append(f"{delta}={percentage_text}%")
-    values.append(f"total {total}")
+        values.append(f"{delta}:{percentage_text}%")
+    values.append(f"total:{total}")
+    if other_count:
+        percentage = other_count * 100 / total
+        percentage_text = (
+            str(int(percentage))
+            if percentage.is_integer()
+            else f"{percentage:.1f}".rstrip("0").rstrip(".")
+        )
+        values.append(f"other:{percentage_text}%")
     return f"{label}({', '.join(values)})"
 
 

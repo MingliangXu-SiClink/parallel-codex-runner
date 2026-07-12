@@ -2525,7 +2525,7 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(
             app._detail_title(pane),
-            "AGENT-001, reasoning_tokens=571497(516=2, 1024=4), ←/→ switch",
+            "AGENT-001, reasoning_tokens=5128(1024:4, 516:2), ←/→ switch",
         )
 
         pane.result = {"seconds": 1.0}
@@ -2534,7 +2534,7 @@ class TuiCommandTests(unittest.TestCase):
             app._detail_title(pane),
             (
                 "AGENT-001, seconds=1.00s, "
-                "reasoning_tokens=571497(516=25%, 1024=25%, 1204=50%, total 8), "
+                "reasoning_tokens=7896(1204:50%, 1024:25%, 516:25%, total:8), "
                 "←/→ switch"
             ),
         )
@@ -2841,7 +2841,7 @@ class ReasoningTokenTests(unittest.TestCase):
                 {516: 1, 1024: 4},
                 completed=False,
             ),
-            "reasoning_tokens=571497(516=1, 1024=4)",
+            "reasoning_tokens=4612(1024:4, 516:1)",
         )
         self.assertEqual(
             tui_textual.format_reasoning_tokens_title(
@@ -2849,7 +2849,30 @@ class ReasoningTokenTests(unittest.TestCase):
                 {516: 2, 1024: 2, 1204: 4},
                 completed=True,
             ),
-            "reasoning_tokens=571497(516=25%, 1024=25%, 1204=50%, total 8)",
+            "reasoning_tokens=7896(1204:50%, 1024:25%, 516:25%, total:8)",
+        )
+
+    def test_reasoning_title_ranks_contribution_and_keeps_other_last(self) -> None:
+        counts = {10: 1, 50: 4, 100: 2, 200: 1, 300: 1, 400: 2}
+
+        self.assertEqual(
+            tui_textual.format_reasoning_tokens_title(
+                591235,
+                counts,
+                completed=False,
+            ),
+            "reasoning_tokens=1710(400:2, 300:1, 200:1, 100:2, other:5)",
+        )
+        self.assertEqual(
+            tui_textual.format_reasoning_tokens_title(
+                591235,
+                counts,
+                completed=True,
+            ),
+            (
+                "reasoning_tokens=1710(400:18.2%, 300:9.1%, 200:9.1%, "
+                "100:18.2%, total:11, other:45.5%)"
+            ),
         )
 
 
