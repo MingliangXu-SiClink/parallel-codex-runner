@@ -203,7 +203,6 @@ def format_reasoning_tokens_title(
             else f"{percentage:.1f}".rstrip("0").rstrip(".")
         )
         values.append(f"{delta}:{percentage_text}%")
-    values.append(f"total:{total}")
     if other_count:
         percentage = other_count * 100 / total
         percentage_text = (
@@ -212,6 +211,7 @@ def format_reasoning_tokens_title(
             else f"{percentage:.1f}".rstrip("0").rstrip(".")
         )
         values.append(f"other:{percentage_text}%")
+    values.append(f"total:{total}")
     return f"{label}({', '.join(values)})"
 
 

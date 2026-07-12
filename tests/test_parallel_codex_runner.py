@@ -3017,7 +3017,7 @@ class ReasoningTokenTests(unittest.TestCase):
             "reasoning_tokens=7896(1204:50%, 1024:25%, 516:25%, total:8)",
         )
 
-    def test_reasoning_title_ranks_contribution_and_keeps_other_last(self) -> None:
+    def test_reasoning_title_ranks_contribution_and_keeps_total_last(self) -> None:
         counts = {10: 1, 50: 4, 100: 2, 200: 1, 300: 1, 400: 2}
 
         self.assertEqual(
@@ -3036,7 +3036,7 @@ class ReasoningTokenTests(unittest.TestCase):
             ),
             (
                 "reasoning_tokens=1710(400:18.2%, 300:9.1%, 200:9.1%, "
-                "100:18.2%, total:11, other:45.5%)"
+                "100:18.2%, other:45.5%, total:11)"
             ),
         )
 
