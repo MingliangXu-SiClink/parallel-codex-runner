@@ -148,25 +148,22 @@ def text_value(value: Any) -> str:
     return ""
 
 
-def compact_output_line(line: str, max_chars: int = 1000) -> str:
-    if len(line) <= max_chars:
-        return line
-    keep = max(1, (max_chars - 5) // 2)
-    return f"{line[:keep].rstrip()} ... {line[-keep:].lstrip()}"
-
-
-def compact_command_output(output: str) -> str:
-    lines = output.rstrip().splitlines()
-    if len(lines) <= 3:
-        return "\n".join(compact_output_line(line) for line in lines)
-    return "\n".join([compact_output_line(lines[0]), compact_output_line(lines[1]), "...", compact_output_line(lines[-1])])
-
-
-def command_status_suffix(status: str, exit_code: Any) -> str:
+def command_completion_line(status: str, exit_code: Any) -> str:
     if exit_code is not None:
-        return f" [exit {exit_code}]"
-    if status and status != "in_progress":
-        return f" [{status}]"
+        try:
+            succeeded = int(exit_code) == 0
+        except (TypeError, ValueError):
+            succeeded = str(exit_code).strip() == "0"
+        return f"{'✓' if succeeded else '✗'} exit {exit_code}"
+    normalized = status.strip().casefold().replace("-", "_")
+    if normalized in {"completed", "complete", "success", "succeeded"}:
+        return "✓ done"
+    if normalized in {"failed", "failure", "error"}:
+        return "✗ failed"
+    if normalized in {"cancelled", "canceled"}:
+        return "× cancelled"
+    if normalized and normalized not in {"in_progress", "running", "started"}:
+        return f"· {status.strip()}"
     return ""
 
 
@@ -235,16 +232,11 @@ def display_line_parts_from_json(payload: dict[str, Any]) -> tuple[str, str]:
         item = value_at(payload, "payload", "item")
     if isinstance(item, dict) and item.get("type") == "command_execution":
         command = text_value(item.get("command"))
-        output = text_value(item.get("aggregated_output"))
         status = text_value(item.get("status"))
         exit_code = item.get("exit_code")
-        if output:
-            header = f"$ {command}" if command else "$ command"
-            header += command_status_suffix(status, exit_code)
-            return "activity", f"{header}\n{compact_command_output(output)}"
-        if command:
-            suffix = command_status_suffix(status, exit_code)
-            return "activity", f"$ {command}{suffix}"
+        header = f"$ {command}" if command else "$ command"
+        completion = command_completion_line(status, exit_code)
+        return "activity", f"{header}\n{completion}" if completion else header
 
     text_paths = [
         ("message",),
@@ -432,6 +424,11 @@ else:
             if not text:
                 return
             bucket = self.thought_lines if category == "thought" else self.output_lines if category == "output" else self.lines
+            if bucket is self.lines and "\n" in text:
+                for index in range(len(bucket) - 1, -1, -1):
+                    if text.startswith(f"{bucket[index]}\n"):
+                        bucket[index] = text
+                        return
             bucket.append(text)
 
         def clear_detail(self) -> None:

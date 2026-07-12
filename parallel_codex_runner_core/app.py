@@ -1473,22 +1473,7 @@ def compact_token_values(values: Iterable[int], limit: int = 16) -> List[int]:
     return seen[: limit - 1] + [seen[-1]]
 
 
-def compact_progress_text_line(line: str, max_chars: int = 1000) -> str:
-    if len(line) <= max_chars:
-        return line
-    keep = max(1, (max_chars - 5) // 2)
-    return f"{line[:keep].rstrip()} ... {line[-keep:].lstrip()}"
-
-
-def compact_command_output_for_progress(output: str) -> str:
-    lines = output.rstrip().splitlines()
-    if not lines:
-        return ""
-    display_lines = lines if len(lines) <= 3 else [lines[0], lines[1], "...", lines[-1]]
-    return "\n".join(compact_progress_text_line(line) if line != "..." else line for line in display_lines)
-
-
-def compact_agent_line_for_progress(text: str, obj: Any = None) -> str:
+def agent_line_for_progress(text: str, obj: Any = None) -> str:
     if obj is None:
         try:
             obj = json.loads(text)
@@ -1503,9 +1488,8 @@ def compact_agent_line_for_progress(text: str, obj: Any = None) -> str:
         if isinstance(payload, dict):
             item = payload.get("item")
     if isinstance(item, dict) and item.get("type") == "command_execution":
-        output = item.get("aggregated_output")
-        if isinstance(output, str) and output:
-            item["aggregated_output"] = compact_command_output_for_progress(output)
+        for key in ("aggregated_output", "output", "stdout", "stderr"):
+            item.pop(key, None)
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     return text
 
@@ -1541,7 +1525,7 @@ async def stream_to_log(
             except json.JSONDecodeError:
                 pass
             if progress_callback is not None:
-                progress_text = compact_agent_line_for_progress(text, obj) if is_json else text
+                progress_text = agent_line_for_progress(text, obj) if is_json else text
                 progress_callback({"type": "agent_line", "idx": state.idx, "stream": stream_name, "text": progress_text})
             if not is_json:
                 continue

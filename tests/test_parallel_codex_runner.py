@@ -1281,7 +1281,7 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(display_line_from_output(json.dumps({"type": "agent_message", "text": long_text})), long_text)
 
-    def test_display_line_shows_command_execution_from_stdout_log(self) -> None:
+    def test_display_line_shows_command_and_completion_without_output(self) -> None:
         started = {
             "type": "item.started",
             "item": {
@@ -1305,10 +1305,10 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(display_line_parts_from_output(json.dumps(started)), ("activity", "$ /bin/zsh -lc 'pytest -q'"))
         self.assertEqual(
             display_line_parts_from_output(json.dumps(completed)),
-            ("activity", "$ /bin/zsh -lc 'pytest -q' [exit 0]\none\ntwo"),
+            ("activity", "$ /bin/zsh -lc 'pytest -q'\n✓ exit 0"),
         )
 
-    def test_display_line_compacts_long_command_output(self) -> None:
+    def test_display_line_ignores_long_command_output(self) -> None:
         completed = {
             "type": "item.completed",
             "item": {
@@ -1322,10 +1322,10 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(
             display_line_parts_from_output(json.dumps(completed)),
-            ("activity", "$ /bin/zsh -lc 'pytest -q' [exit 0]\none\ntwo\n...\nfive"),
+            ("activity", "$ /bin/zsh -lc 'pytest -q'\n✓ exit 0"),
         )
 
-    def test_display_line_compacts_very_long_command_output_line(self) -> None:
+    def test_display_line_shows_failed_command_without_output(self) -> None:
         long_line = "a" * 3000
         completed = {
             "type": "item.completed",
@@ -1341,9 +1341,47 @@ class TuiCommandTests(unittest.TestCase):
         category, text = display_line_parts_from_output(json.dumps(completed))
 
         self.assertEqual(category, "activity")
-        self.assertIn("$ python big.py [exit 1]", text)
-        self.assertLess(len(text), len(long_line))
-        self.assertIn(" ... ", text)
+        self.assertEqual(text, "$ python big.py\n✗ exit 1")
+        self.assertNotIn(long_line, text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_keeps_agent_messages_and_merges_command_completion(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        command = "python - <<'PY'\nprint('hello')\nPY"
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "I will inspect the project."}},
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution", "command": command, "status": "in_progress"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": command,
+                    "aggregated_output": "many\ncommand\noutput\nlines\n",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "The implementation is here."}},
+        ]
+
+        for event in events:
+            app._on_runner_event(
+                tui_textual.RunnerEvent(
+                    {"type": "agent_line", "idx": 1, "text": json.dumps(event)}
+                )
+            )
+
+        self.assertEqual(
+            pane.output_lines,
+            ["I will inspect the project.", "The implementation is here."],
+        )
+        self.assertEqual(pane.lines, [f"$ {command}\n✓ exit 0"])
+        self.assertNotIn("many", "\n".join(pane.lines))
+        self.assertNotIn("output", "\n".join(pane.lines))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
@@ -1870,7 +1908,31 @@ class StreamLogTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_stream_to_log_sends_compact_command_output_to_progress(self) -> None:
+    def test_stream_to_log_preserves_full_agent_message_for_tui(self) -> None:
+        async def run() -> None:
+            message = "正在检查项目。\n" + ("完整的 Codex 对话内容。" * 300)
+            raw = {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": message},
+            }
+            raw_line = json.dumps(raw, ensure_ascii=False).encode() + b"\n"
+            reader = asyncio.StreamReader(limit=8)
+            reader.feed_data(raw_line)
+            reader.feed_eof()
+            events = []
+            state = AgentState(idx=1)
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = Path(tmp) / "stdout.log"
+                await stream_to_log(reader, log_path, state, "stdout", events.append)
+
+            line_events = [event for event in events if event["type"] == "agent_line"]
+            self.assertEqual(len(line_events), 1)
+            self.assertEqual(line_events[0]["text"], raw_line.decode().strip())
+            self.assertEqual(display_line_from_output(line_events[0]["text"]), message)
+
+        asyncio.run(run())
+
+    def test_stream_to_log_strips_command_output_from_tui_progress(self) -> None:
         async def run() -> None:
             raw = {
                 "type": "item.completed",
@@ -1896,11 +1958,12 @@ class StreamLogTests(unittest.TestCase):
 
             line_events = [event for event in events if event["type"] == "agent_line"]
             self.assertEqual(len(line_events), 1)
-            compact_text = line_events[0]["text"]
-            self.assertLess(len(compact_text), len(raw_line.decode()))
+            progress_text = line_events[0]["text"]
+            self.assertLess(len(progress_text), len(raw_line.decode()))
+            self.assertNotIn("aggregated_output", progress_text)
             self.assertEqual(
-                display_line_parts_from_output(compact_text),
-                ("activity", "$ pytest -q [exit 0]\none\ntwo\n...\nfive"),
+                display_line_parts_from_output(progress_text),
+                ("activity", "$ pytest -q\n✓ exit 0"),
             )
 
         asyncio.run(run())
