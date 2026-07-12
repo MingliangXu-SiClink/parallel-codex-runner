@@ -490,10 +490,6 @@ else:
             self.delta = delta
 
 
-    class DetailSelectionCompleted(Message):
-        pass
-
-
     class PromptEditor(TextArea):
         def __init__(self, *args: Any, placeholder: str = "", **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -603,15 +599,6 @@ else:
 
         def _update_follow_tail(self) -> None:
             self.follow_tail = self.is_vertical_scroll_end
-
-        async def _on_mouse_up(self, event: events.MouseUp) -> None:
-            await super()._on_mouse_up(event)
-            self.post_message(DetailSelectionCompleted())
-
-        async def _on_click(self, event: events.Click) -> None:
-            await super()._on_click(event)
-            self.post_message(DetailSelectionCompleted())
-
 
     class PcrTextualApp(App[None]):
         CSS = """
@@ -785,6 +772,8 @@ else:
             }
             self._mouse_down_in_runner_control = False
             self._last_screen_selection = ""
+            self._sync_deferred_for_selection = False
+            self._tip_refresh_deferred_for_selection = False
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
 
@@ -802,7 +791,54 @@ else:
                 node = node.parent
             return False
 
+        @staticmethod
+        def _is_node_within(node: Any, ancestor: Any) -> bool:
+            while node is not None:
+                if node is ancestor:
+                    return True
+                node = node.parent
+            return False
+
+        def _release_stale_mouse_capture(self, clicked_widget: Any) -> None:
+            captured = self.mouse_captured
+            if captured is not None and not self._is_node_within(clicked_widget, captured):
+                # A fresh press outside the captured widget means its previous
+                # mouse-up was lost (for example, outside the terminal window).
+                # Leaving capture active prevents Screen from starting any
+                # subsequent text selection.
+                self.capture_mouse(None)
+
+        def _selection_drag_active(self) -> bool:
+            try:
+                return bool(self.screen._selecting)
+            except Exception:
+                return False
+
+        def _clear_screen_selection_for_interaction(self) -> None:
+            try:
+                if self.screen.selections:
+                    self.screen.clear_selection()
+            except Exception:
+                return
+            self._last_screen_selection = ""
+            self._flush_selection_deferred_updates()
+
+        def _flush_selection_deferred_updates(self) -> None:
+            if self._selection_drag_active():
+                return
+            refresh_tip = self._tip_refresh_deferred_for_selection
+            sync = self._sync_deferred_for_selection
+            self._tip_refresh_deferred_for_selection = False
+            self._sync_deferred_for_selection = False
+            if refresh_tip:
+                self._refresh_tip()
+            if sync:
+                self._sync()
+
         async def on_event(self, event: events.Event) -> None:
+            if isinstance(event, events.AppBlur) and self.mouse_captured is not None:
+                self.capture_mouse(None)
+
             if isinstance(event, events.MouseDown) and not event.is_forwarded:
                 try:
                     clicked_widget, _offset = self.screen.get_widget_and_offset_at(
@@ -812,11 +848,17 @@ else:
                 except Exception:
                     self._mouse_down_in_runner_control = False
                 else:
+                    self._release_stale_mouse_capture(clicked_widget)
                     self._mouse_down_in_runner_control = self._is_runner_control(clicked_widget)
                     if not self._is_detail_widget(clicked_widget):
                         self._last_screen_selection = ""
-            elif isinstance(event, events.MouseUp) and not event.is_forwarded:
-                self.call_after_refresh(self._complete_pointer_selection)
+
+            if (
+                isinstance(event, events.Key)
+                and not event.is_forwarded
+                and event.key not in {"ctrl+c", "super+c"}
+            ):
+                self._clear_screen_selection_for_interaction()
 
             is_text_input = (
                 isinstance(event, events.Key) and event.is_printable
@@ -847,9 +889,16 @@ else:
                         return
             await super().on_event(event)
 
-        @on(DetailSelectionCompleted)
-        def _on_detail_selection_completed(self, _event: DetailSelectionCompleted) -> None:
+        @on(events.TextSelected)
+        def _on_screen_text_selected(self, _event: events.TextSelected) -> None:
             self._complete_pointer_selection()
+
+        @on(events.Click)
+        def _on_screen_multi_click(self, event: events.Click) -> None:
+            if event.chain >= 2:
+                # Double/triple click selection is applied by Widget._on_click,
+                # after Screen has already emitted TextSelected for mouse-up.
+                self.call_after_refresh(self._complete_pointer_selection)
 
         def _complete_pointer_selection(self) -> None:
             selected = self.screen.get_selected_text() or ""
@@ -857,10 +906,12 @@ else:
                 if selected != self._last_screen_selection:
                     self.copy_to_clipboard(selected)
                 self._last_screen_selection = selected
+                self._flush_selection_deferred_updates()
                 return
             self._last_screen_selection = ""
             if not self._mouse_down_in_runner_control:
                 self.query_one("#prompt", PromptEditor).focus()
+            self._flush_selection_deferred_updates()
 
         def compose(self) -> ComposeResult:
             with Vertical(id="root"):
@@ -1305,21 +1356,25 @@ else:
             self._sync()
 
         def copy_to_clipboard(self, text: str) -> None:
+            if sys.platform == "darwin" and shutil.which("pbcopy") is not None:
+                # Textual's fallback emits the entire payload as OSC 52. Large,
+                # accumulated Detail histories can saturate the terminal writer
+                # and make the UI appear to stop accepting mouse selection.
+                self._clipboard = text
+                try:
+                    subprocess.run(
+                        ["pbcopy"],
+                        input=text,
+                        text=True,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                    return
+                except (OSError, subprocess.SubprocessError):
+                    return
             super().copy_to_clipboard(text)
-            if sys.platform != "darwin" or shutil.which("pbcopy") is None:
-                return
-            try:
-                subprocess.run(
-                    ["pbcopy"],
-                    input=text,
-                    text=True,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
 
         def _copy_active_text(self) -> bool:
             if self._last_screen_selection:
@@ -2101,10 +2156,14 @@ else:
             )
 
         def _refresh_tip(self) -> None:
+            if self._selection_drag_active():
+                self._tip_refresh_deferred_for_selection = True
+                return
             try:
                 self.query_one("#tips", Static).update(self._tip_renderable(), layout=False)
             except Exception:
                 return
+            self._tip_refresh_deferred_for_selection = False
 
         def _advance_tip(self) -> None:
             self.tip_index = (self.tip_index + 1) % len(TUI_TIPS)
@@ -2115,10 +2174,14 @@ else:
             self._refresh_tip()
 
         def _sync(self) -> None:
+            if self._selection_drag_active():
+                self._sync_deferred_for_selection = True
+                return
             try:
                 self.query_one("#runner-frame", Vertical)
             except Exception:
                 return
+            self._sync_deferred_for_selection = False
             self._sync_runner_panel()
             frame = self.query_one("#detail-frame", Vertical)
             pane = self.agents.get(self.selected_agent)

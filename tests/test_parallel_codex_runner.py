@@ -904,6 +904,93 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_runner_text_selection_uses_global_copy_handler(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(100, 30)) as pilot:
+                copied: list[str] = []
+                app.copy_to_clipboard = copied.append
+                workspace_text = app.query_one("#runner-workspace").content
+
+                self.assertTrue(await pilot.double_click("#runner-workspace", offset=(3, 0)))
+                await pilot.pause()
+
+                self.assertIn(str(workspace_text), app.screen.get_selected_text() or "")
+                self.assertIn(str(workspace_text), copied)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_selection_drag_defers_rendering_until_mouse_up(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(80, 30)) as pilot:
+                pane = app.agents[1]
+                pane.input_text = "stable selection"
+                pane.final_text = "initial answer"
+                app._mark_detail_dirty(pane)
+                app._sync()
+                await pilot.pause()
+
+                app.copy_to_clipboard = lambda _text: None
+                self.assertTrue(await pilot.mouse_down("#detail", offset=(3, 0)))
+                self.assertTrue(await pilot.hover("#detail", offset=(16, 2)))
+                selected = app.screen.get_selected_text()
+                self.assertIn("stable selection", selected or "")
+                self.assertTrue(app.screen._selecting)
+
+                detail = app.query_one("#detail")
+                tips = app.query_one("#tips")
+                displayed_tip = tips.content.plain
+                pane.append("new live output", "output")
+                app._mark_detail_dirty(pane)
+                app._advance_tip()
+                app._advance_tip_icon()
+                app._sync()
+                await pilot.pause()
+
+                self.assertEqual(app.screen.get_selected_text(), selected)
+                self.assertNotIn("new live output", detail.content.plain)
+                self.assertEqual(tips.content.plain, displayed_tip)
+                self.assertTrue(app._sync_deferred_for_selection)
+                self.assertTrue(app._tip_refresh_deferred_for_selection)
+
+                self.assertTrue(await pilot.mouse_up("#detail", offset=(16, 2)))
+                await pilot.pause()
+
+                self.assertFalse(app.screen._selecting)
+                self.assertIn("new live output", detail.content.plain)
+                self.assertIn(app.current_tip, tips.content.plain)
+                self.assertFalse(app._sync_deferred_for_selection)
+                self.assertFalse(app._tip_refresh_deferred_for_selection)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_fresh_click_releases_stale_mouse_capture(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test() as pilot:
+                prompt = app.query_one("#prompt")
+                runner_value = app.query_one("#runner-workspace")
+                prompt.capture_mouse()
+                await pilot.pause()
+                self.assertIs(app.mouse_captured, prompt)
+
+                app.post_message(tui_textual.events.AppBlur())
+                await pilot.pause()
+                self.assertIsNone(app.mouse_captured)
+
+                prompt.capture_mouse()
+                await pilot.pause()
+                app._release_stale_mouse_capture(runner_value)
+                await pilot.pause()
+
+                self.assertIsNone(app.mouse_captured)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_copy_uses_pbcopy_on_macos(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args([]))
         with mock.patch.object(tui_textual.sys, "platform", "darwin"):
@@ -914,6 +1001,34 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app._clipboard, "可复制文本")
         run_command.assert_called_once()
         self.assertEqual(run_command.call_args.kwargs["input"], "可复制文本")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_macos_copy_does_not_emit_duplicate_osc52_payload(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        with mock.patch.object(tui_textual.sys, "platform", "darwin"):
+            with mock.patch.object(tui_textual.shutil, "which", return_value="/usr/bin/pbcopy"):
+                with mock.patch.object(tui_textual.subprocess, "run"):
+                    with mock.patch.object(tui_textual.App, "copy_to_clipboard") as fallback:
+                        app.copy_to_clipboard("large accumulated detail")
+
+        fallback.assert_not_called()
+        self.assertEqual(app._clipboard, "large accumulated detail")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_macos_copy_failure_does_not_flood_terminal_with_osc52(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        with mock.patch.object(tui_textual.sys, "platform", "darwin"):
+            with mock.patch.object(tui_textual.shutil, "which", return_value="/usr/bin/pbcopy"):
+                with mock.patch.object(
+                    tui_textual.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired("pbcopy", 2),
+                ):
+                    with mock.patch.object(tui_textual.App, "copy_to_clipboard") as fallback:
+                        app.copy_to_clipboard("large accumulated detail")
+
+        fallback.assert_not_called()
+        self.assertEqual(app._clipboard, "large accumulated detail")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_rejects_explicit_codex_subagent_resume(self) -> None:
