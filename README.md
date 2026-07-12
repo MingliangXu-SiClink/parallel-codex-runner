@@ -232,8 +232,9 @@ Interactive slash commands:
 
 | Command | Description |
 | --- | --- |
-| `/help` | Show TUI commands and their CLI equivalents |
+| `/help` | Show all TUI commands |
 | `/status` or `/config` | Show current run configuration |
+| `/kill [agent]` | Stop a running agent; queued agents continue normally |
 | `/numofagents <n>` | Set agent count for the next run |
 | `/maxparallel <n\|auto>` | Set or clear `--max-parallel` |
 | `/serial` | Run one agent at a time |

@@ -22,6 +22,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
     ("/status", "show current run configuration"),
     ("/config", "show current run configuration"),
+    ("/kill [agent]", "stop a running agent while queued agents continue normally"),
     ("/numofagents <n>", "set the number of agents for the next run"),
     ("/maxparallel <n|auto>", "limit how many agents may run concurrently"),
     ("/serial", "run agents one at a time"),
@@ -45,7 +46,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the current Detail view when safe"),
     ("/exit", "stop active agents, clean up, and quit"),
 )
-MAX_SUGGESTIONS = 8
+MAX_SUGGESTIONS = 9
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
 TIP_ICON = "✦"
@@ -75,7 +76,8 @@ TUI_TIPS: tuple[str, ...] = (
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
-    "注意本项目默认以Codex Full Access 权限运行。"
+    "注意本项目默认以Codex Full Access 权限运行。",
+    "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常接替。",
 )
 
 
@@ -746,6 +748,7 @@ else:
             self.work_frame = 0
             self.exit_after_run = False
             self.cancel_event: threading.Event | None = None
+            self.agent_cancel_events: dict[int, threading.Event] = {}
             self.runner_thread: threading.Thread | None = None
             self._shutdown_cleanup_started = False
             self.run_info_rows = self._base_info_rows()
@@ -1206,6 +1209,10 @@ else:
             self.selected_agent = min(self.num_agents, max(1, self.selected_agent + delta))
             self._sync()
 
+        def _agent_kill_requested(self, idx: int) -> bool:
+            event = self.agent_cancel_events.get(idx)
+            return bool(event is not None and event.is_set())
+
         @on(RunnerEvent)
         def _on_runner_event(self, event: RunnerEvent) -> None:
             payload = event.payload
@@ -1219,16 +1226,21 @@ else:
                     self._remember_run_paths(run_rows)
                     self.run_info_rows = self._visible_info_rows(run_rows)
             elif kind == "agent_status" and pane is not None:
-                pane.status = str(payload.get("status") or pane.status)
+                pane.status = (
+                    "stopping"
+                    if self._agent_kill_requested(idx)
+                    else str(payload.get("status") or pane.status)
+                )
                 self._mark_detail_dirty(pane)
             elif kind == "agent_started" and pane is not None:
-                pane.status = "running"
+                pane.status = "stopping" if self._agent_kill_requested(idx) else "running"
                 self._mark_detail_dirty(pane)
             elif kind == "agent_tokens" and pane is not None:
                 value = payload.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
             elif kind == "agent_line" and pane is not None:
-                pane.status = "running"
+                if not self._agent_kill_requested(idx):
+                    pane.status = "running"
                 category, text = display_line_parts_from_output(str(payload.get("text") or ""))
                 pane.append(text, category)
                 self._mark_detail_dirty(pane)
@@ -1238,7 +1250,7 @@ else:
                 pane.status = str(result.get("status") or "finished")
                 value = result.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
-                final_text = self._read_final_message(result)
+                final_text = self._read_final_message(result) if pane.status == "success" else ""
                 if final_text:
                     pane.final_text = final_text
                 self._mark_detail_dirty(pane)
@@ -1475,6 +1487,9 @@ else:
             if name == "/clear":
                 self.action_clear_view()
                 return
+            if name in {"/kill", "/killagent", "/kill-agent"}:
+                self._handle_kill(args)
+                return
             if name in {"/numofagents", "/agents"}:
                 self._handle_numofagents(args)
                 return
@@ -1518,6 +1533,58 @@ else:
                 self._handle_resume(args)
                 return
             self.status = f"Unknown command: {name}"
+            self._sync()
+
+        def _handle_kill(self, args: list[str]) -> None:
+            if len(args) > 1:
+                self.status = "Usage: /kill [agent]"
+                self._sync()
+                return
+            if not self.running:
+                self.status = "No active run"
+                self._sync()
+                return
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.status = "The run is already stopping"
+                self._sync()
+                return
+
+            idx = self.selected_agent
+            if args:
+                match = re.fullmatch(r"(?:agent[-_])?(\d+)", args[0].strip(), re.IGNORECASE)
+                if match is None:
+                    self.status = "Usage: /kill [agent]"
+                    self._sync()
+                    return
+                idx = int(match.group(1))
+            pane = self.agents.get(idx)
+            if pane is None:
+                self.status = f"Unknown agent: {idx}"
+                self._sync()
+                return
+            if pane.result is not None:
+                self.status = f"AGENT-{idx:03d} has already finished"
+                self._sync()
+                return
+
+            agent_cancel_event = self.agent_cancel_events.get(idx)
+            if agent_cancel_event is None:
+                self.status = f"AGENT-{idx:03d} cannot be stopped in this run"
+                self._sync()
+                return
+            if agent_cancel_event.is_set():
+                self.status = f"AGENT-{idx:03d} is already stopping"
+                self._sync()
+                return
+            if pane.status != "running":
+                self.status = f"AGENT-{idx:03d} is not running; queued agents will start normally"
+                self._sync()
+                return
+
+            agent_cancel_event.set()
+            pane.status = "stopping"
+            self.status = f"Stopping AGENT-{idx:03d}; other agents continue"
+            self._mark_detail_dirty(pane)
             self._sync()
 
         def _prepare_config_change(self, label: str) -> bool:
@@ -1900,6 +1967,9 @@ else:
             self.best_agent = None
             self.started_at = time.monotonic()
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
+            self.agent_cancel_events = {
+                idx: threading.Event() for idx in range(1, self.num_agents + 1)
+            }
             for pane in self.agents.values():
                 pane.input_text = prompt
             self.selected_agent = min(self.selected_agent, self.num_agents)
@@ -1919,6 +1989,7 @@ else:
             run_args.no_sync_back = True
             run_args.keep_workspaces = True
             run_args.cancel_event = self.cancel_event
+            run_args.agent_cancel_events = self.agent_cancel_events
 
             def target() -> None:
                 previous_disable = logging.root.manager.disable
@@ -2521,6 +2592,8 @@ else:
         def _detail_title(self, pane: AgentPane) -> str:
             title = f"AGENT-{pane.idx:03d}"
             parts = []
+            if pane.status in {"stopping", "killed"}:
+                parts.append(pane.status)
             if isinstance(pane.result, dict):
                 seconds = format_seconds(pane.result.get("seconds"))
                 if seconds:

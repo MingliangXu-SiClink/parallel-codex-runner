@@ -438,6 +438,7 @@ class TuiCommandTests(unittest.TestCase):
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
         slash_commands = "\n".join(command_suggestions("/"))
+        self.assertIn("/kill [agent]", "\n".join(command_suggestions("/k")))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
@@ -474,6 +475,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(tui_textual.TIP_ROTATION_SECONDS, 10.0)
                     self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.1)
                     self.assertEqual(len(tui_textual.TIP_ICON_COLORS), 12)
+                    self.assertTrue(any("/kill" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -529,6 +531,93 @@ class TuiCommandTests(unittest.TestCase):
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertIsNone(app.args.model)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_kill_stops_only_selected_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.running = True
+        app.cancel_event = threading.Event()
+        app.agent_cancel_events = {
+            idx: threading.Event() for idx in range(1, 4)
+        }
+        app.selected_agent = 2
+        app.agents[2].status = "running"
+
+        app._handle_command("/kill")
+
+        self.assertFalse(app.cancel_event.is_set())
+        self.assertFalse(app.agent_cancel_events[1].is_set())
+        self.assertTrue(app.agent_cancel_events[2].is_set())
+        self.assertFalse(app.agent_cancel_events[3].is_set())
+        self.assertEqual(app.agents[2].status, "stopping")
+        self.assertEqual(app.status, "Stopping AGENT-002; other agents continue")
+
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {"type": "agent_status", "idx": 2, "status": "copying"}
+            )
+        )
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {"type": "agent_line", "idx": 2, "text": "agent_message:last useful line"}
+            )
+        )
+        self.assertEqual(app.agents[2].status, "stopping")
+        self.assertEqual(app.agents[2].output_lines, ["last useful line"])
+
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {
+                    "type": "agent_finished",
+                    "idx": 2,
+                    "result": {"status": "killed", "reasoning_tokens": 12},
+                }
+            )
+        )
+        self.assertEqual(app.agents[2].status, "killed")
+        self.assertIn("killed", app._detail_title(app.agents[2]))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_kill_accepts_agent_selector_and_rejects_finished_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.running = True
+        app.cancel_event = threading.Event()
+        app.agent_cancel_events = {
+            idx: threading.Event() for idx in range(1, 4)
+        }
+        app.agents[1].result = {"status": "success"}
+        app.agents[3].status = "running"
+
+        app._handle_command("/kill agent-003")
+        self.assertTrue(app.agent_cancel_events[3].is_set())
+        self.assertEqual(app.agents[3].status, "stopping")
+
+        app._handle_command("/kill 1")
+        self.assertFalse(app.agent_cancel_events[1].is_set())
+        self.assertEqual(app.status, "AGENT-001 has already finished")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_kill_rejects_queued_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.running = True
+        app.cancel_event = threading.Event()
+        app.agent_cancel_events = {
+            idx: threading.Event() for idx in range(1, 3)
+        }
+        app.selected_agent = 2
+        app.agents[2].status = "queued"
+
+        app._handle_command("/kill")
+
+        self.assertFalse(app.agent_cancel_events[2].is_set())
+        self.assertEqual(app.agents[2].status, "queued")
+        self.assertEqual(
+            app.status,
+            "AGENT-002 is not running; queued agents will start normally",
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_config_controls_update_runner_settings(self) -> None:
@@ -636,6 +725,10 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(captured_args[0].max_parallel, 2)
                     self.assertEqual(captured_args[0].best_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
+                    self.assertEqual(
+                        set(captured_args[0].agent_cancel_events),
+                        {1, 2, 3, 4},
+                    )
                     app.running = False
 
         asyncio.run(run())
@@ -2026,6 +2119,152 @@ class AgentCancelTests(unittest.TestCase):
 
             self.assertEqual(result.status, "cancelled")
             self.assertLess(result.seconds, 3)
+
+        asyncio.run(run())
+
+    def test_run_one_agent_can_be_killed_without_cancelling_run(self) -> None:
+        async def run() -> None:
+            cancel_event = threading.Event()
+            agent_cancel_event = threading.Event()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+
+                async def kill_soon() -> None:
+                    await asyncio.sleep(0.1)
+                    agent_cancel_event.set()
+
+                killer = asyncio.create_task(kill_soon())
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=meta,
+                    codex_home=codex_home,
+                    prompt="",
+                    command=[sys.executable, "-c", "import time; time.sleep(10)"],
+                    cancel_event=cancel_event,
+                    agent_cancel_event=agent_cancel_event,
+                )
+                await killer
+
+            self.assertEqual(result.status, "killed")
+            self.assertFalse(cancel_event.is_set())
+            self.assertLess(result.seconds, 3)
+
+        asyncio.run(run())
+
+    def test_run_all_agents_keeps_other_agents_running_after_kill(self) -> None:
+        async def run() -> None:
+            cancel_event = threading.Event()
+            agent_cancel_events = {
+                1: threading.Event(),
+                2: threading.Event(),
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspaces = root / "workspaces"
+                meta = root / "meta"
+                codex_homes = {
+                    1: root / "codex_home_1",
+                    2: root / "codex_home_2",
+                }
+                for idx in (1, 2):
+                    (workspaces / f"agent_{idx:03d}").mkdir(parents=True)
+                    codex_homes[idx].mkdir()
+
+                async def kill_first_agent() -> None:
+                    await asyncio.sleep(0.1)
+                    agent_cancel_events[1].set()
+
+                killer = asyncio.create_task(kill_first_agent())
+                events: list[dict[str, object]] = []
+                results = await app_core.run_all_agents(
+                    n=2,
+                    workspaces_root=workspaces,
+                    meta_root=meta,
+                    prompt="",
+                    command_by_agent={
+                        1: [sys.executable, "-c", "import time; time.sleep(10)"],
+                        2: [sys.executable, "-c", "print('finished')"],
+                    },
+                    codex_home_by_agent=codex_homes,
+                    max_parallel=2,
+                    progress_callback=events.append,
+                    cancel_event=cancel_event,
+                    agent_cancel_events=agent_cancel_events,
+                )
+                await killer
+
+            statuses = {result.idx: result.status for result in results}
+            self.assertEqual(statuses, {1: "killed", 2: "success"})
+            self.assertFalse(cancel_event.is_set())
+            finished = {
+                int(event["idx"]): event["result"]["status"]
+                for event in events
+                if event.get("type") == "agent_finished"
+            }
+            self.assertEqual(finished, {1: "killed", 2: "success"})
+
+        asyncio.run(run())
+
+    def test_run_all_agents_starts_queued_agent_after_running_agent_is_killed(self) -> None:
+        async def run() -> None:
+            agent_cancel_events = {
+                1: threading.Event(),
+                2: threading.Event(),
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspaces = root / "workspaces"
+                meta = root / "meta"
+                codex_homes = {
+                    1: root / "codex_home_1",
+                    2: root / "codex_home_2",
+                }
+                for idx in (1, 2):
+                    (workspaces / f"agent_{idx:03d}").mkdir(parents=True)
+                    codex_homes[idx].mkdir()
+
+                events: list[dict[str, object]] = []
+
+                def record_event(event: dict[str, object]) -> None:
+                    events.append(event)
+                    if (
+                        event.get("type") == "agent_status"
+                        and event.get("status") == "queued"
+                        and event.get("idx") == 2
+                    ):
+                        agent_cancel_events[2].set()
+                    if event.get("type") == "agent_started" and event.get("idx") == 1:
+                        agent_cancel_events[1].set()
+
+                results = await app_core.run_all_agents(
+                    n=2,
+                    workspaces_root=workspaces,
+                    meta_root=meta,
+                    prompt="",
+                    command_by_agent={
+                        1: [sys.executable, "-c", "import time; time.sleep(10)"],
+                        2: [sys.executable, "-c", "print('finished')"],
+                    },
+                    codex_home_by_agent=codex_homes,
+                    max_parallel=1,
+                    progress_callback=record_event,
+                    agent_cancel_events=agent_cancel_events,
+                )
+
+            self.assertEqual(
+                {result.idx: result.status for result in results},
+                {1: "killed", 2: "success"},
+            )
+            self.assertEqual(
+                [event.get("idx") for event in events if event.get("type") == "agent_started"],
+                [1, 2],
+            )
 
         asyncio.run(run())
 

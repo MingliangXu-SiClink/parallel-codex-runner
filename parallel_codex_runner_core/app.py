@@ -109,6 +109,17 @@ def cancel_requested(cancel_event: Any = None) -> bool:
     return bool(cancel_event is not None and cancel_event.is_set())
 
 
+def requested_agent_stop_status(
+    cancel_event: Any = None,
+    agent_cancel_event: Any = None,
+) -> Optional[str]:
+    if cancel_requested(cancel_event):
+        return "cancelled"
+    if cancel_requested(agent_cancel_event):
+        return "killed"
+    return None
+
+
 def install_cancel_signal_handlers(cancel_event: Any) -> Callable[[], None]:
     if threading.current_thread() is not threading.main_thread():
         return lambda: None
@@ -1611,6 +1622,7 @@ async def run_one_agent(
     command: List[str],
     progress_callback: ProgressCallback = None,
     cancel_event: Any = None,
+    agent_cancel_event: Any = None,
 ) -> AgentResult:
     meta_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = meta_dir / "stdout.log"
@@ -1644,9 +1656,10 @@ async def run_one_agent(
     stderr_task: Optional[asyncio.Task[None]] = None
 
     try:
-        if cancel_requested(cancel_event):
-            status = "cancelled"
-            raise RuntimeError("__pcr_cancelled_before_start__")
+        requested_status = requested_agent_stop_status(cancel_event, agent_cancel_event)
+        if requested_status is not None:
+            status = requested_status
+            raise RuntimeError("__pcr_stopped_before_start__")
         if progress_callback is not None:
             progress_callback({"type": "agent_started", "idx": idx})
         env = os.environ.copy()
@@ -1677,8 +1690,9 @@ async def run_one_agent(
             proc.stdin.close()
 
         while True:
-            if cancel_requested(cancel_event):
-                status = "cancelled"
+            requested_status = requested_agent_stop_status(cancel_event, agent_cancel_event)
+            if requested_status is not None:
+                status = requested_status
                 returncode = await terminate_process(proc)
                 break
             try:
@@ -1687,14 +1701,16 @@ async def run_one_agent(
             except asyncio.TimeoutError:
                 continue
         await asyncio.gather(stdout_task, stderr_task)
-        if status != "cancelled":
-            status = "success" if returncode == 0 else "failed"
+        if status not in {"cancelled", "killed"}:
+            status = requested_agent_stop_status(cancel_event, agent_cancel_event) or (
+                "success" if returncode == 0 else "failed"
+            )
     except asyncio.CancelledError:
         status = "cancelled"
         error = None
         returncode = await terminate_process(proc)
     except Exception as exc:  # noqa: BLE001
-        if status == "cancelled":
+        if status in {"cancelled", "killed"}:
             error = None
         else:
             returncode = await terminate_process(proc)
@@ -1743,12 +1759,15 @@ async def run_all_agents(
     max_parallel: int,
     progress_callback: ProgressCallback = None,
     cancel_event: Any = None,
+    agent_cancel_events: Optional[Dict[int, Any]] = None,
 ) -> List[AgentResult]:
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
 
     async def run_limited(idx: int) -> AgentResult:
-        async with semaphore:
+        agent_cancel_event = (agent_cancel_events or {}).get(idx)
+
+        async def execute() -> AgentResult:
             return await run_one_agent(
                 idx=idx,
                 agent_workspace=workspaces_root / f"agent_{idx:03d}",
@@ -1758,7 +1777,28 @@ async def run_all_agents(
                 command=command_by_agent[idx],
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
+                agent_cancel_event=agent_cancel_event,
             )
+
+        if progress_callback is not None:
+            progress_callback({"type": "agent_status", "idx": idx, "status": "queued"})
+        while True:
+            if cancel_requested(cancel_event):
+                return await execute()
+            try:
+                await asyncio.wait_for(semaphore.acquire(), timeout=0.1)
+                break
+            except asyncio.TimeoutError:
+                continue
+        try:
+            # An individual kill applies only to a process that is already
+            # running. Ignore stale requests made while this agent was queued.
+            clear_agent_cancel = getattr(agent_cancel_event, "clear", None)
+            if callable(clear_agent_cancel):
+                clear_agent_cancel()
+            return await execute()
+        finally:
+            semaphore.release()
 
     tasks = [asyncio.create_task(run_limited(idx)) for idx in range(1, n + 1)]
 
@@ -2146,6 +2186,12 @@ def run_once(
     max_parallel = min(max_parallel, args.num_agents)
     external_cancel_event = getattr(args, "cancel_event", None)
     cancel_event = external_cancel_event or threading.Event()
+    configured_agent_cancel_events = getattr(args, "agent_cancel_events", None)
+    agent_cancel_events: Dict[int, Any] = (
+        configured_agent_cancel_events
+        if isinstance(configured_agent_cancel_events, dict)
+        else {}
+    )
     restore_cancel_signals: Callable[[], None] = lambda: None
 
     def log(level: str, message: str, *values: Any) -> None:
@@ -2370,6 +2416,7 @@ def run_once(
                 max_parallel,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
+                agent_cancel_events=agent_cancel_events,
             )
         )
     except BaseException:
