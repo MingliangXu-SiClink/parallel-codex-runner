@@ -151,6 +151,52 @@ def format_seconds(value: Any) -> str:
     return f"{seconds:.2f}s"
 
 
+def normalize_reasoning_token_counts(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[int, int] = {}
+    for raw_delta, raw_count in value.items():
+        try:
+            delta = int(raw_delta)
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if delta > 0 and count > 0:
+            normalized[delta] = normalized.get(delta, 0) + count
+    return normalized
+
+
+def format_reasoning_tokens_title(
+    value: int | None,
+    counts: Any,
+    completed: bool,
+) -> str:
+    if value is None:
+        return ""
+    label = f"reasoning_tokens={value}"
+    normalized = normalize_reasoning_token_counts(counts)
+    if not normalized:
+        return label
+    if not completed:
+        values = ", ".join(
+            f"{delta}={count}" for delta, count in sorted(normalized.items())
+        )
+        return f"{label}({values})"
+
+    total = sum(normalized.values())
+    values = []
+    for delta, count in sorted(normalized.items()):
+        percentage = count * 100 / total
+        percentage_text = (
+            str(int(percentage))
+            if percentage.is_integer()
+            else f"{percentage:.1f}".rstrip("0").rstrip(".")
+        )
+        values.append(f"{delta}={percentage_text}%")
+    values.append(f"total {total}")
+    return f"{label}({', '.join(values)})"
+
+
 def value_at(payload: dict[str, Any], *path: str) -> Any:
     current: Any = payload
     for key in path:
@@ -495,6 +541,7 @@ else:
         status: str = "idle"
         rejected: bool = False
         reasoning_tokens: int | None = None
+        reasoning_token_counts: dict[int, int] = field(default_factory=dict)
         input_text: str = ""
         final_text: str = ""
         result: dict[str, Any] | None = None
@@ -1399,6 +1446,10 @@ else:
             elif kind == "agent_tokens" and pane is not None:
                 value = payload.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
+                if "reasoning_token_counts" in payload:
+                    pane.reasoning_token_counts = normalize_reasoning_token_counts(
+                        payload.get("reasoning_token_counts")
+                    )
             elif kind == "agent_line" and pane is not None:
                 if not self._agent_kill_requested(idx):
                     pane.status = "running"
@@ -1416,6 +1467,10 @@ else:
                 pane.diff_error = ""
                 value = result.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
+                if "reasoning_token_counts" in result:
+                    pane.reasoning_token_counts = normalize_reasoning_token_counts(
+                        result.get("reasoning_token_counts")
+                    )
                 final_text = self._read_final_message(result) if pane.status == "success" else ""
                 if final_text:
                     pane.final_text = final_text
@@ -1572,6 +1627,7 @@ else:
                 pane.status = "idle"
                 pane.rejected = False
                 pane.reasoning_tokens = None
+                pane.reasoning_token_counts.clear()
                 pane.input_text = ""
                 pane.final_text = ""
                 pane.result = None
@@ -2464,6 +2520,7 @@ else:
             pane.status = "queued"
             pane.rejected = False
             pane.reasoning_tokens = None
+            pane.reasoning_token_counts.clear()
             pane.input_text = self.pending_prompt
             pane.final_text = ""
             pane.result = None
@@ -3417,7 +3474,13 @@ else:
                 if seconds:
                     parts.append(f"seconds={seconds}")
             if pane.reasoning_tokens is not None:
-                parts.append(f"reasoning_tokens={pane.reasoning_tokens}")
+                parts.append(
+                    format_reasoning_tokens_title(
+                        pane.reasoning_tokens,
+                        pane.reasoning_token_counts,
+                        completed=isinstance(pane.result, dict),
+                    )
+                )
             if pane.idx == self.best_agent:
                 parts.append("best")
             parts.append("←/→ switch")

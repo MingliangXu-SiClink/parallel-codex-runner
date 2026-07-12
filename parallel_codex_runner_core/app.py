@@ -77,7 +77,7 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
 from .models import (
@@ -1489,6 +1489,224 @@ def compact_token_values(values: Iterable[int], limit: int = 16) -> List[int]:
     return seen[: limit - 1] + [seen[-1]]
 
 
+def extract_reasoning_total_from_rollout_event(obj: Any) -> Optional[int]:
+    if not isinstance(obj, dict) or obj.get("type") != "event_msg":
+        return None
+    payload = obj.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    usage = info.get("total_token_usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("reasoning_output_tokens")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def iter_jsonl_lines_reverse(
+    path: Path,
+    end_offset: Optional[int] = None,
+    chunk_size: int = 65536,
+) -> Iterator[bytes]:
+    try:
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            position = file.tell()
+            if end_offset is not None:
+                position = min(position, max(0, end_offset))
+            remainder = b""
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                file.seek(position)
+                parts = (file.read(read_size) + remainder).split(b"\n")
+                remainder = parts[0]
+                for line in reversed(parts[1:]):
+                    if line:
+                        yield line
+            if remainder:
+                yield remainder
+    except OSError:
+        return
+
+
+def last_reasoning_total_from_rollout(path: Path, end_offset: Optional[int] = None) -> Optional[int]:
+    for raw_line in iter_jsonl_lines_reverse(path, end_offset=end_offset):
+        if b'"token_count"' not in raw_line or b'"reasoning_output_tokens"' not in raw_line:
+            continue
+        try:
+            obj = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        total = extract_reasoning_total_from_rollout_event(obj)
+        if total is not None:
+            return total
+    return None
+
+
+def reasoning_token_progress_event(state: AgentState) -> Dict[str, Any]:
+    return {
+        "type": "agent_tokens",
+        "idx": state.idx,
+        "reasoning_tokens": state.reasoning_tokens,
+        "reasoning_token_counts": dict(sorted(state.reasoning_token_counts.items())),
+    }
+
+
+class ReasoningRolloutMonitor:
+    """Incrementally tails one isolated Codex rollout without rescanning its history."""
+
+    def __init__(
+        self,
+        codex_home: Path,
+        state: AgentState,
+        progress_callback: ProgressCallback = None,
+    ) -> None:
+        self.codex_home = codex_home
+        self.state = state
+        self.progress_callback = progress_callback
+        self.path: Optional[Path] = None
+        self.offset = 0
+        self._thread_path_checked_for: Optional[str] = None
+        self._initial_sizes = self._snapshot_rollouts()
+        if self._initial_sizes:
+            newest = max(self._initial_sizes, key=self._rollout_mtime)
+            self._attach(newest)
+
+    @property
+    def sessions_root(self) -> Path:
+        return self.codex_home / "sessions"
+
+    def _rollout_mtime(self, path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    def _snapshot_rollouts(self) -> Dict[Path, int]:
+        if not self.sessions_root.exists():
+            return {}
+        snapshot: Dict[Path, int] = {}
+        try:
+            paths = self.sessions_root.rglob("*.jsonl")
+            for path in paths:
+                try:
+                    snapshot[path.resolve()] = path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return snapshot
+
+    def _attach(self, path: Path) -> None:
+        try:
+            normalized = path.resolve()
+        except OSError:
+            normalized = path
+        initial_size = self._initial_sizes.get(normalized)
+        self.path = normalized
+        if initial_size is None:
+            self.offset = 0
+            self.state.seed_reasoning_total(0)
+            return
+        self.offset = initial_size
+        baseline = last_reasoning_total_from_rollout(normalized, end_offset=initial_size)
+        self.state.seed_reasoning_total(baseline if baseline is not None else 0)
+
+    def _discover_rollout(self) -> Optional[Path]:
+        if self.state.codex_thread_id:
+            path = find_rollout_path_for_session(self.codex_home, self.state.codex_thread_id)
+            if path is not None:
+                return path
+        if not self.sessions_root.exists():
+            return None
+        candidates: List[Path] = []
+        try:
+            for path in self.sessions_root.rglob("*.jsonl"):
+                try:
+                    path.stat()
+                except OSError:
+                    continue
+                candidates.append(path)
+        except OSError:
+            return None
+        return max(candidates, key=self._rollout_mtime) if candidates else None
+
+    def _ensure_rollout(self) -> None:
+        thread_id = self.state.codex_thread_id
+        if thread_id and thread_id != self._thread_path_checked_for:
+            self._thread_path_checked_for = thread_id
+            path = find_rollout_path_for_session(self.codex_home, thread_id)
+            if path is not None:
+                try:
+                    normalized = path.resolve()
+                except OSError:
+                    normalized = path
+                if normalized != self.path:
+                    self._attach(normalized)
+                    return
+        if self.path is None or not self.path.exists():
+            path = self._discover_rollout()
+            if path is not None:
+                self._attach(path)
+
+    def poll(self, final: bool = False) -> bool:
+        self._ensure_rollout()
+        if self.path is None:
+            return False
+        try:
+            size = self.path.stat().st_size
+            if size < self.offset:
+                self.offset = 0
+                self.state.seed_reasoning_total(0)
+            if size <= self.offset:
+                return False
+            with self.path.open("rb") as file:
+                file.seek(self.offset)
+                appended = file.read(size - self.offset)
+        except OSError:
+            return False
+
+        if final:
+            consumed = appended
+        else:
+            newline = appended.rfind(b"\n")
+            if newline < 0:
+                return False
+            consumed = appended[: newline + 1]
+        self.offset += len(consumed)
+
+        changed = False
+        for raw_line in consumed.splitlines():
+            if (
+                b'"token_count"' not in raw_line
+                or b'"total_token_usage"' not in raw_line
+                or b'"reasoning_output_tokens"' not in raw_line
+            ):
+                continue
+            try:
+                obj = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            total = extract_reasoning_total_from_rollout_event(obj)
+            if total is not None:
+                changed = self.state.observe_reasoning_total(total) or changed
+
+        if changed and self.progress_callback is not None:
+            self.progress_callback(reasoning_token_progress_event(self.state))
+        return changed
+
+
 def agent_line_for_progress(text: str, obj: Any = None) -> str:
     if obj is None:
         try:
@@ -1551,9 +1769,10 @@ async def stream_to_log(
                 state.codex_thread_id = thread_id
             vals = extract_reasoning_tokens_from_json(obj)
             if vals:
-                state.reasoning_values.extend(vals)
+                for value in vals:
+                    state.record_reasoning_total(value)
                 if progress_callback is not None:
-                    progress_callback({"type": "agent_tokens", "idx": state.idx, "reasoning_tokens": state.reasoning_tokens})
+                    progress_callback(reasoning_token_progress_event(state))
 
 
 async def iter_stream_lines(reader: asyncio.StreamReader, chunk_size: int = 65536) -> AsyncIterator[bytes]:
@@ -1652,6 +1871,7 @@ async def run_one_agent(
     )
 
     state = AgentState(idx=idx)
+    rollout_monitor = ReasoningRolloutMonitor(codex_home, state, progress_callback)
     started = time.perf_counter()
     returncode: Optional[int] = None
     status = "failed"
@@ -1694,7 +1914,12 @@ async def run_one_agent(
         finally:
             proc.stdin.close()
 
+        next_rollout_poll = 0.0
         while True:
+            now = time.monotonic()
+            if now >= next_rollout_poll:
+                rollout_monitor.poll()
+                next_rollout_poll = now + 0.5
             requested_status = requested_agent_stop_status(cancel_event, agent_cancel_event)
             if requested_status is not None:
                 status = requested_status
@@ -1726,6 +1951,7 @@ async def run_one_agent(
         tasks = [task for task in (stdout_task, stderr_task) if task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        rollout_monitor.poll(final=True)
         scrub_codex_home_support_entries(codex_home)
 
     seconds = time.perf_counter() - started
@@ -1744,6 +1970,7 @@ async def run_one_agent(
         codex_thread_id=state.codex_thread_id,
         reasoning_tokens=state.reasoning_tokens,
         reasoning_token_values=compact_token_values(state.reasoning_values),
+        reasoning_token_counts=dict(sorted(state.reasoning_token_counts.items())),
         error=error,
         stdout_tail=safe_tail(stdout_log),
         stderr_tail=safe_tail(stderr_log),
@@ -2111,10 +2338,15 @@ def write_run_files(
 
     token_lines = []
     for r in sorted(results, key=lambda x: x.idx):
+        increments = ",".join(
+            f"{delta}:{count}"
+            for delta, count in sorted(r.reasoning_token_counts.items())
+        )
         token_lines.append(
             f"agent_{r.idx:03d}\tstatus={r.status}\tseconds={r.seconds:.2f}\t"
             f"reasoning_tokens={r.reasoning_tokens if r.reasoning_tokens is not None else 'N/A'}\t"
-            f"values={','.join(map(str, r.reasoning_token_values)) if r.reasoning_token_values else 'N/A'}"
+            f"values={','.join(map(str, r.reasoning_token_values)) if r.reasoning_token_values else 'N/A'}\t"
+            f"increments={increments or 'N/A'}"
         )
     (run_root / "reasoning_tokens.tsv").write_text("\n".join(token_lines) + "\n", encoding="utf-8")
 

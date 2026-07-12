@@ -2517,6 +2517,29 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_title_shows_live_counts_and_completed_distribution(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        pane.reasoning_tokens = 571497
+        pane.reasoning_token_counts = {516: 2, 1024: 4}
+
+        self.assertEqual(
+            app._detail_title(pane),
+            "AGENT-001, reasoning_tokens=571497(516=2, 1024=4), ←/→ switch",
+        )
+
+        pane.result = {"seconds": 1.0}
+        pane.reasoning_token_counts = {516: 2, 1024: 2, 1204: 4}
+        self.assertEqual(
+            app._detail_title(pane),
+            (
+                "AGENT-001, seconds=1.00s, "
+                "reasoning_tokens=571497(516=25%, 1024=25%, 1204=50%, total 8), "
+                "←/→ switch"
+            ),
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_runner_panel_has_title_and_editable_controls(self) -> None:
         async def run() -> None:
             args = parse_args([])
@@ -2691,6 +2714,143 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertEqual(prompt.text, "ab")
 
         asyncio.run(run())
+
+
+class ReasoningTokenTests(unittest.TestCase):
+    @staticmethod
+    def rollout_line(total: int) -> str:
+        return json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "reasoning_output_tokens": total,
+                        },
+                        "last_token_usage": {
+                            "reasoning_output_tokens": 999999,
+                        },
+                    },
+                },
+            }
+        )
+
+    def test_agent_state_counts_positive_reasoning_increments(self) -> None:
+        state = AgentState(idx=1)
+        state.seed_reasoning_total(500)
+
+        for total in (1016, 2040, 2040, 2556, 3580):
+            state.observe_reasoning_total(total)
+
+        self.assertEqual(state.reasoning_tokens, 3580)
+        self.assertEqual(state.reasoning_token_counts, {516: 2, 1024: 2})
+
+    def test_rollout_monitor_uses_resume_baseline_and_waits_for_complete_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex_home"
+            rollout = codex_home / "sessions" / "2026" / "07" / "12" / "rollout-session.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(self.rollout_line(500) + "\n", encoding="utf-8")
+            state = AgentState(idx=3)
+            events = []
+            monitor = app_core.ReasoningRolloutMonitor(codex_home, state, events.append)
+
+            with rollout.open("a", encoding="utf-8") as file:
+                file.write(self.rollout_line(1016) + "\n")
+                file.write(self.rollout_line(2040) + "\n")
+                file.write(self.rollout_line(2556))
+
+            self.assertTrue(monitor.poll())
+            self.assertEqual(state.reasoning_token_counts, {516: 1, 1024: 1})
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[-1]["reasoning_token_counts"], {516: 1, 1024: 1})
+
+            with rollout.open("a", encoding="utf-8") as file:
+                file.write("\n" + self.rollout_line(3580) + "\n")
+
+            self.assertTrue(monitor.poll())
+            self.assertEqual(state.reasoning_tokens, 3580)
+            self.assertEqual(state.reasoning_token_counts, {516: 2, 1024: 2})
+            self.assertEqual(events[-1]["reasoning_token_counts"], {516: 2, 1024: 2})
+
+    def test_agent_result_normalizes_serialized_reasoning_counts(self) -> None:
+        result = AgentResult(
+            idx=1,
+            workspace_dir="",
+            meta_dir="",
+            codex_home="",
+            stdout_log="",
+            stderr_log="",
+            final_message="",
+            command=[],
+            returncode=0,
+            status="success",
+            seconds=1.0,
+            reasoning_token_counts={"516": 2, "1024": 4},
+        )
+
+        self.assertEqual(result.reasoning_token_counts, {516: 2, 1024: 4})
+
+    def test_run_one_agent_persists_rollout_increment_counts(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+                rollout_text = "\n".join(
+                    self.rollout_line(total) for total in (516, 1540, 2056)
+                ) + "\n"
+                script = (
+                    "import json, os\n"
+                    "from pathlib import Path\n"
+                    "rollout = Path(os.environ['CODEX_HOME']) / 'sessions' / '2026' / '07' / '12' / 'rollout-session-test.jsonl'\n"
+                    "rollout.parent.mkdir(parents=True, exist_ok=True)\n"
+                    f"rollout.write_text({rollout_text!r}, encoding='utf-8')\n"
+                    "print(json.dumps({'type': 'thread.started', 'thread_id': 'session-test'}), flush=True)\n"
+                )
+                events = []
+
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=meta,
+                    codex_home=codex_home,
+                    prompt="test",
+                    command=[sys.executable, "-c", script],
+                    progress_callback=events.append,
+                )
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual(result.reasoning_tokens, 2056)
+                self.assertEqual(result.reasoning_token_counts, {516: 2, 1024: 1})
+                token_events = [event for event in events if event["type"] == "agent_tokens"]
+                self.assertEqual(token_events[-1]["reasoning_token_counts"], {516: 2, 1024: 1})
+                persisted = json.loads((meta / "status.json").read_text(encoding="utf-8"))
+                self.assertEqual(persisted["reasoning_token_counts"], {"516": 2, "1024": 1})
+
+        asyncio.run(run())
+
+    def test_reasoning_title_formats_live_counts_and_final_percentages(self) -> None:
+        self.assertEqual(
+            tui_textual.format_reasoning_tokens_title(
+                571497,
+                {516: 1, 1024: 4},
+                completed=False,
+            ),
+            "reasoning_tokens=571497(516=1, 1024=4)",
+        )
+        self.assertEqual(
+            tui_textual.format_reasoning_tokens_title(
+                571497,
+                {516: 2, 1024: 2, 1204: 4},
+                completed=True,
+            ),
+            "reasoning_tokens=571497(516=25%, 1024=25%, 1204=50%, total 8)",
+        )
 
 
 class StreamLogTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -20,9 +20,23 @@ class AgentResult:
     codex_thread_id: Optional[str] = None
     reasoning_tokens: Optional[int] = None
     reasoning_token_values: List[int] = field(default_factory=list)
+    reasoning_token_counts: Dict[int, int] = field(default_factory=dict)
     error: Optional[str] = None
     stdout_tail: str = ""
     stderr_tail: str = ""
+
+    def __post_init__(self) -> None:
+        normalized: Dict[int, int] = {}
+        source = self.reasoning_token_counts if isinstance(self.reasoning_token_counts, dict) else {}
+        for raw_delta, raw_count in source.items():
+            try:
+                delta = int(raw_delta)
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if delta > 0 and count > 0:
+                normalized[delta] = normalized.get(delta, 0) + count
+        self.reasoning_token_counts = normalized
 
 
 @dataclass
@@ -30,15 +44,43 @@ class AgentState:
     idx: int
     codex_thread_id: Optional[str] = None
     reasoning_values: List[int] = field(default_factory=list)
+    reasoning_token_counts: Dict[int, int] = field(default_factory=dict)
+    reasoning_last_total: Optional[int] = None
     json_events: int = 0
     stdout_lines: int = 0
     stderr_lines: int = 0
 
+    def seed_reasoning_total(self, total: int) -> None:
+        if isinstance(total, bool) or total < 0:
+            return
+        self.reasoning_last_total = total
+
+    def record_reasoning_total(self, total: int) -> None:
+        if isinstance(total, bool) or total < 0:
+            return
+        if not self.reasoning_values or self.reasoning_values[-1] != total:
+            self.reasoning_values.append(total)
+
+    def observe_reasoning_total(self, total: int) -> bool:
+        if isinstance(total, bool) or total < 0:
+            return False
+        previous = self.reasoning_last_total
+        self.reasoning_last_total = total
+        self.record_reasoning_total(total)
+        delta = total - (previous if previous is not None else 0)
+        if delta <= 0:
+            return False
+        self.reasoning_token_counts[delta] = self.reasoning_token_counts.get(delta, 0) + 1
+        return True
+
     @property
     def reasoning_tokens(self) -> Optional[int]:
-        if not self.reasoning_values:
+        candidates = list(self.reasoning_values)
+        if self.reasoning_last_total is not None:
+            candidates.append(self.reasoning_last_total)
+        if not candidates:
             return None
-        return max(self.reasoning_values)
+        return max(candidates)
 
 
 @dataclass
