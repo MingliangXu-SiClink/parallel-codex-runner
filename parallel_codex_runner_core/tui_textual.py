@@ -86,7 +86,6 @@ RECOMMEND_BORDER_COLORS: tuple[str, ...] = (
     "#d946ef",
     "#ff5fa2",
 )
-RECOMMEND_RAIL_COLOR = "#47d98a"
 RECOMMEND_TITLE_BACKGROUND = "#123326"
 COMMAND_SPINNER_FRAMES: tuple[str, ...] = (
     "⠋",
@@ -114,7 +113,7 @@ TUI_TIPS: tuple[str, ...] = (
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
-    "输入 /retry 可重跑失败或被终止的 Agent，/more 3 可追加候选。",
+    "输入 /retry 可重跑失败或被终止的 Agent，/more 3 可追加 3 个候选 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
     "TUI 不在前台时，首个成功和全部完成会触发终端铃声。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
@@ -472,8 +471,10 @@ try:
     activate_textual()
     from textual import events, on
     from textual.app import App, ComposeResult
+    from textual.color import Color
     from textual.content import Content
     from textual.containers import Grid, Vertical, VerticalScroll
+    from textual.geometry import Region
     from textual.message import Message
     from textual.widgets import Input, Select, Static, TextArea
 except (ModuleNotFoundError, RuntimeError) as exc:
@@ -838,6 +839,82 @@ else:
         def _update_follow_tail(self) -> None:
             self.follow_tail = self.is_vertical_scroll_end
 
+    class RainbowDetailFrame(Vertical):
+        """Update border colors without invalidating the Detail viewport."""
+
+        BORDER_EDGES = ("top", "right", "bottom", "left")
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.rainbow_active = False
+
+        def set_rainbow_colors(
+            self,
+            top: str,
+            right: str,
+            bottom: str,
+            left: str,
+            edge: str | None = None,
+        ) -> None:
+            colors = {
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "left": left,
+            }
+            edges = self.BORDER_EDGES if edge is None else (edge,)
+            if any(name not in colors for name in edges):
+                raise ValueError(f"unknown border edge: {edge}")
+
+            styles = self.styles
+            dirty_edges: list[str] = []
+            for name in edges:
+                color = Color.parse(colors[name])
+                changed = styles.set_rule(
+                    f"border_{name}",
+                    ("round", color),
+                )
+                if name == "top":
+                    changed = styles.set_rule("border_title_color", color) or changed
+                if changed:
+                    dirty_edges.append(name)
+            if not dirty_edges:
+                return
+
+            regions = tuple(
+                region
+                for name in dirty_edges
+                if (region := self._border_content_region(name)) is not None
+            )
+            if regions:
+                self.refresh(*regions)
+            else:
+                self.refresh()
+
+        def _border_content_region(self, edge: str) -> Region | None:
+            """Return one border strip in content coordinates for Widget.refresh."""
+            width, height = self.outer_size
+            if width <= 0 or height <= 0:
+                return None
+            offset_x, offset_y = self.content_offset
+            if edge == "top":
+                return Region(-offset_x, -offset_y, width, 1)
+            if edge == "bottom":
+                return Region(-offset_x, height - 1 - offset_y, width, 1)
+            middle_height = max(0, height - 2)
+            if not middle_height:
+                return None
+            if edge == "left":
+                return Region(-offset_x, 1 - offset_y, 1, middle_height)
+            if edge == "right":
+                return Region(
+                    width - 1 - offset_x,
+                    1 - offset_y,
+                    1,
+                    middle_height,
+                )
+            raise ValueError(f"unknown border edge: {edge}")
+
     class PcrTextualApp(App[None]):
         CSS = """
         Screen {
@@ -909,7 +986,7 @@ else:
             height: 1fr;
             margin: 0 1;
             border: round cyan;
-            border-title-align: center;
+            border-title-align: left;
             border-title-color: #c8edf5;
             border-title-background: #101216;
             border-title-style: bold;
@@ -920,7 +997,6 @@ else:
         #detail {
             width: 100%;
             padding: 0 1;
-            border-left: thick #101216;
         }
         #suggestions {
             height: 0;
@@ -1007,6 +1083,7 @@ else:
             self.tip_index = 0
             self.tip_icon_index = 0
             self.recommend_border_frame = 0
+            self.recommend_border_edge_index = 0
             self.work_frame = 0
             self.exit_after_run = False
             self.cancel_event: threading.Event | None = None
@@ -1135,8 +1212,6 @@ else:
                 self._refresh_tip()
             if sync:
                 self._sync()
-            if refresh_recommend_border:
-                self._refresh_recommend_border()
 
         async def on_event(self, event: events.Event) -> None:
             if isinstance(event, events.AppBlur):
@@ -1312,7 +1387,7 @@ else:
                         )
                         yield Static("RECOMMENDED AGENT", id="runner-recommended-agent-key", classes="runner-key")
                         yield Static("", id="runner-recommended-agent", classes="runner-value", markup=False)
-                with Vertical(id="detail-frame"):
+                with RainbowDetailFrame(id="detail-frame"):
                     with DetailScroll(id="detail-scroll"):
                         yield Static("", id="detail")
                 yield Static("", id="suggestions")
@@ -3361,26 +3436,38 @@ else:
                 and self._has_detail_content(pane)
             )
 
-        def _recommend_border_colors(self) -> tuple[str, str, str, str]:
+        def _recommend_border_colors(
+            self,
+            palette_frame: int | None = None,
+        ) -> tuple[str, str, str, str]:
             size = len(RECOMMEND_BORDER_COLORS)
             offsets = (0, size // 4, size // 2, (size * 3) // 4)
+            palette_frame = (
+                self.recommend_border_frame
+                if palette_frame is None
+                else palette_frame
+            )
             return tuple(
                 RECOMMEND_BORDER_COLORS[
-                    (self.recommend_border_frame + offset) % size
+                    (palette_frame + offset) % size
                 ]
                 for offset in offsets
             )
 
-        def _apply_recommend_border_colors(self, frame: Vertical) -> None:
-            top, right, bottom, left = self._recommend_border_colors()
-            with self.batch_update():
-                frame.styles.border_top = ("round", top)
-                frame.styles.border_right = ("round", right)
-                frame.styles.border_bottom = ("round", bottom)
-                frame.styles.border_left = ("round", left)
-                frame.styles.border_title_color = top
+        def _apply_recommend_border_colors(
+            self,
+            frame: RainbowDetailFrame,
+            edge: str | None = None,
+            palette_frame: int | None = None,
+        ) -> None:
+            top, right, bottom, left = self._recommend_border_colors(palette_frame)
+            frame.set_rainbow_colors(top, right, bottom, left, edge=edge)
 
-        def _refresh_recommend_border(self) -> None:
+        def _refresh_recommend_border(
+            self,
+            edge: str,
+            palette_frame: int,
+        ) -> None:
             if self._selection_drag_active() or self._screen_selection_active():
                 self._recommend_border_deferred_for_selection = True
                 return
@@ -3388,11 +3475,15 @@ else:
                 self._recommend_border_deferred_for_selection = False
                 return
             try:
-                frame = self.query_one("#detail-frame", Vertical)
+                frame = self.query_one("#detail-frame", RainbowDetailFrame)
             except Exception:
                 return
             self._recommend_border_deferred_for_selection = False
-            self._apply_recommend_border_colors(frame)
+            self._apply_recommend_border_colors(
+                frame,
+                edge=edge,
+                palette_frame=palette_frame,
+            )
 
         def _advance_recommend_border(self) -> None:
             if not self.app_in_foreground or not self._selected_agent_is_recommended():
@@ -3400,14 +3491,22 @@ else:
             if self._selection_drag_active() or self._screen_selection_active():
                 self._recommend_border_deferred_for_selection = True
                 return
-            self.recommend_border_frame = (
+            palette_frame = (
                 self.recommend_border_frame + 1
             ) % len(RECOMMEND_BORDER_COLORS)
-            self._refresh_recommend_border()
+            edge = RainbowDetailFrame.BORDER_EDGES[
+                self.recommend_border_edge_index
+            ]
+            self.recommend_border_edge_index = (
+                self.recommend_border_edge_index + 1
+            ) % len(RainbowDetailFrame.BORDER_EDGES)
+            self._refresh_recommend_border(edge, palette_frame)
+            if self.recommend_border_edge_index == 0:
+                self.recommend_border_frame = palette_frame
 
         def _style_detail_frame(
             self,
-            frame: Vertical,
+            frame: RainbowDetailFrame,
             pane: AgentPane | None,
             detail_visible: bool,
         ) -> None:
@@ -3416,16 +3515,16 @@ else:
                 and pane is not None
                 and pane.idx == self.recommended_agent
             )
-            detail = self.query_one("#detail", Static)
             if recommended:
-                self._apply_recommend_border_colors(frame)
+                if not frame.rainbow_active:
+                    self._apply_recommend_border_colors(frame)
+                    frame.rainbow_active = True
                 frame.styles.border_title_background = RECOMMEND_TITLE_BACKGROUND
-                detail.styles.border_left = ("thick", RECOMMEND_RAIL_COLOR)
                 return
+            frame.rainbow_active = False
             frame.styles.border = ("round", "cyan")
             frame.styles.border_title_color = "#c8edf5"
             frame.styles.border_title_background = "#101216"
-            detail.styles.border_left = ("thick", "#101216")
 
         def _sync(self) -> None:
             if self._selection_drag_active():
@@ -3437,7 +3536,7 @@ else:
                 return
             self._sync_deferred_for_selection = False
             self._sync_runner_panel()
-            frame = self.query_one("#detail-frame", Vertical)
+            frame = self.query_one("#detail-frame", RainbowDetailFrame)
             pane = self.agents.get(self.selected_agent)
             detail_visible = self._has_detail_content(pane)
             frame.display = detail_visible

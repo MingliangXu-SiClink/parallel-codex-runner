@@ -2915,49 +2915,108 @@ class TuiCommandTests(unittest.TestCase):
             app.agents[1].input_text = "recommended"
             app.agents[2].input_text = "other"
             app.recommended_agent = 1
-            async with app.run_test(size=(100, 36)):
-                app._sync()
-                frame = app.query_one("#detail-frame")
-                detail = app.query_one("#detail")
-                rainbow = (
-                    frame.styles.border_top,
-                    frame.styles.border_right,
-                    frame.styles.border_bottom,
-                    frame.styles.border_left,
-                )
+            with mock.patch.object(
+                tui_textual,
+                "RECOMMEND_BORDER_REFRESH_SECONDS",
+                3600,
+            ):
+                async with app.run_test(size=(100, 36)):
+                    app._sync()
+                    frame = app.query_one("#detail-frame")
+                    detail = app.query_one("#detail")
+                    rainbow = (
+                        frame.styles.border_top,
+                        frame.styles.border_right,
+                        frame.styles.border_bottom,
+                        frame.styles.border_left,
+                    )
 
-                self.assertTrue(frame.border_title.startswith("★ AGENT-001"))
-                self.assertEqual(frame.styles.border_title_align, "center")
-                self.assertTrue(frame.styles.border_title_style.bold)
-                self.assertEqual(len({str(edge[1]) for edge in rainbow}), 4)
-                recommended_rail = detail.styles.border_left
-                self.assertEqual(recommended_rail[0], "thick")
+                    self.assertTrue(frame.border_title.startswith("★ AGENT-001"))
+                    self.assertEqual(frame.styles.border_title_align, "left")
+                    self.assertTrue(frame.styles.border_title_style.bold)
+                    self.assertEqual(len({str(edge[1]) for edge in rainbow}), 4)
+                    self.assertEqual(detail.styles.border_left[0], "")
 
-                previous_top = frame.styles.border_top
-                app._advance_recommend_border()
-                self.assertNotEqual(frame.styles.border_top, previous_top)
+                    app.recommend_border_frame = 0
+                    app.recommend_border_edge_index = 0
+                    app._apply_recommend_border_colors(frame)
+                    expected_colors = app._recommend_border_colors(1)
+                    edge_names = frame.BORDER_EDGES
+                    for edge_index, edge_name in enumerate(edge_names):
+                        before = tuple(
+                            getattr(frame.styles, f"border_{name}")
+                            for name in edge_names
+                        )
+                        frame._dirty_regions.clear()
+                        frame._repaint_regions.clear()
+                        app._advance_recommend_border()
+                        after = tuple(
+                            getattr(frame.styles, f"border_{name}")
+                            for name in edge_names
+                        )
+                        self.assertEqual(
+                            str(after[edge_index][1]),
+                            str(tui_textual.Color.parse(expected_colors[edge_index])),
+                        )
+                        for unchanged_index in range(len(edge_names)):
+                            if unchanged_index != edge_index:
+                                self.assertEqual(
+                                    after[unchanged_index],
+                                    before[unchanged_index],
+                                )
+                        dirty_regions = tuple(frame._repaint_regions)
+                        self.assertEqual(len(dirty_regions), 1)
+                        if edge_name in {"top", "bottom"}:
+                            self.assertEqual(
+                                dirty_regions[0].width,
+                                frame.outer_size.width,
+                            )
+                            self.assertEqual(dirty_regions[0].height, 1)
+                        else:
+                            self.assertEqual(dirty_regions[0].width, 1)
+                            self.assertEqual(
+                                dirty_regions[0].height,
+                                frame.outer_size.height - 2,
+                            )
+                        self.assertLess(
+                            dirty_regions[0].area,
+                            frame.outer_size.area,
+                        )
 
-                paused_top = frame.styles.border_top
-                with mock.patch.object(
-                    app,
-                    "_screen_selection_active",
-                    return_value=True,
-                ):
-                    app._advance_recommend_border()
-                self.assertEqual(frame.styles.border_top, paused_top)
-                self.assertTrue(app._recommend_border_deferred_for_selection)
+                    self.assertEqual(app.recommend_border_frame, 1)
+                    self.assertEqual(app.recommend_border_edge_index, 0)
+                    paused_edges = tuple(
+                        getattr(frame.styles, f"border_{name}")
+                        for name in edge_names
+                    )
+                    with mock.patch.object(
+                        app,
+                        "_screen_selection_active",
+                        return_value=True,
+                    ):
+                        app._advance_recommend_border()
+                    self.assertEqual(
+                        tuple(
+                            getattr(frame.styles, f"border_{name}")
+                            for name in edge_names
+                        ),
+                        paused_edges,
+                    )
+                    self.assertTrue(app._recommend_border_deferred_for_selection)
+                    app._flush_selection_deferred_updates()
+                    self.assertFalse(app._recommend_border_deferred_for_selection)
 
-                app.selected_agent = 2
-                app._sync()
-                normal = (
-                    frame.styles.border_top,
-                    frame.styles.border_right,
-                    frame.styles.border_bottom,
-                    frame.styles.border_left,
-                )
-                self.assertFalse(frame.border_title.startswith("★"))
-                self.assertEqual(len({str(edge[1]) for edge in normal}), 1)
-                self.assertNotEqual(detail.styles.border_left, recommended_rail)
+                    app.selected_agent = 2
+                    app._sync()
+                    normal = (
+                        frame.styles.border_top,
+                        frame.styles.border_right,
+                        frame.styles.border_bottom,
+                        frame.styles.border_left,
+                    )
+                    self.assertFalse(frame.border_title.startswith("★"))
+                    self.assertEqual(len({str(edge[1]) for edge in normal}), 1)
+                    self.assertEqual(detail.styles.border_left[0], "")
 
         asyncio.run(run())
 
