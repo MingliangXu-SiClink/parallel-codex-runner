@@ -1979,7 +1979,9 @@ class TuiCommandTests(unittest.TestCase):
             app = tui_textual.PcrTextualApp(args)
             app._sync = lambda: None
             app._show_text = lambda _text: None
-            app._start_run = prompts.append
+            app._start_run = (
+                lambda prompt, record_history=False: prompts.append(prompt) or True
+            )
 
             app._handle_command(f"/workspace {workspace}")
             app._handle_command(f"/runsdir {root / 'runs'}")

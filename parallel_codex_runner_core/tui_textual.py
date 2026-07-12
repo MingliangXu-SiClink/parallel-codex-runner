@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._vendor import activate_textual
+from .prompt_history import PromptHistoryNavigator, PromptHistoryStore
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
@@ -101,6 +102,7 @@ TUI_TIPS: tuple[str, ...] = (
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
     "注意本项目默认以Codex Full Access 权限运行。",
     "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常接替。",
+    "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
 )
 
 
@@ -692,6 +694,12 @@ else:
             self.value = value
 
 
+    class PromptHistoryRequested(Message):
+        def __init__(self, direction: int) -> None:
+            super().__init__()
+            self.direction = direction
+
+
     class AgentSwitchRequested(Message):
         def __init__(self, delta: int) -> None:
             super().__init__()
@@ -733,6 +741,17 @@ else:
                 else:
                     self.action_cursor_right()
                 return
+            if event.key in {"up", "down"}:
+                row = self.cursor_location[0]
+                last_row = max(0, self.text.count("\n"))
+                at_boundary = row == 0 if event.key == "up" else row >= last_row
+                if at_boundary and self.selection.is_empty:
+                    event.stop()
+                    event.prevent_default()
+                    self.post_message(
+                        PromptHistoryRequested(-1 if event.key == "up" else 1)
+                    )
+                    return
             if event.key in {"shift+enter", "ctrl+j"}:
                 event.stop()
                 event.prevent_default()
@@ -967,12 +986,25 @@ else:
             self.pending_no_sync_back: bool | None = None
             self.pending_keep_workspaces: bool | None = None
             self.pending_prompt = ""
+            self.pending_prompt_records_history = False
             self.pending_execution_args: argparse.Namespace | None = None
             self.candidate_batches: list[CandidateBatch] = []
             self.active_batch_indices: set[int] = set()
             self.pending_accept_agent: int | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.command_history: list[tuple[str, str, str]] = []
+            self.prompt_history_store = PromptHistoryStore()
+            self.prompt_history_context = self.prompt_history_store.context_key(
+                self.workspace,
+                self.resume_session_id,
+            )
+            self.prompt_history_drafts: dict[tuple[str, str], str] = {
+                self.prompt_history_context: ""
+            }
+            self.prompt_history_navigator = PromptHistoryNavigator(
+                self.prompt_history_store.entries(*self.prompt_history_context)
+            )
+            self._prompt_history_programmatic_values: list[str] = []
             self.detail_revision = 0
             self.resume_history_request = 0
             self.resume_choices_request = 0
@@ -982,6 +1014,7 @@ else:
             self._resume_io_lock = threading.Lock()
             self.queued_prompt = ""
             self.queued_agent: int | None = None
+            self.queued_prompt_records_history = False
             self._updating_controls = False
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
@@ -1250,6 +1283,83 @@ else:
                 self._sync()
             self.query_one("#prompt", PromptEditor).focus()
 
+        def _current_prompt_history_context(self) -> tuple[str, str]:
+            return self.prompt_history_store.context_key(
+                self.workspace,
+                self.resume_session_id,
+            )
+
+        def _save_prompt_history_draft(self) -> None:
+            self.prompt_history_drafts[self.prompt_history_context] = (
+                self.prompt_history_navigator.draft
+            )
+
+        def _replace_prompt_text(self, text: str) -> None:
+            try:
+                prompt = self.query_one("#prompt", PromptEditor)
+            except Exception:
+                return
+            if prompt.text != text:
+                self._prompt_history_programmatic_values.append(text)
+                prompt.text = text
+            lines = text.split("\n")
+            prompt.move_cursor((len(lines) - 1, len(lines[-1])))
+            self._update_suggestions(text)
+            self._sync_prompt_height()
+            prompt.focus()
+
+        def _clear_prompt_draft(self) -> None:
+            self.prompt_history_navigator.note_edit("")
+            self.prompt_history_drafts[self.prompt_history_context] = ""
+            self._replace_prompt_text("")
+
+        def _load_prompt_history_context(self, draft: str | None = None) -> None:
+            self._save_prompt_history_draft()
+            context = self._current_prompt_history_context()
+            if draft is None:
+                draft = self.prompt_history_drafts.get(context, "")
+            self.prompt_history_context = context
+            self.prompt_history_drafts[context] = draft
+            self.prompt_history_navigator.reset(
+                self.prompt_history_store.entries(*context),
+                draft,
+            )
+            self._replace_prompt_text(draft)
+
+        def _submit_task_prompt(self, prompt: str) -> bool:
+            actual_context = self._current_prompt_history_context()
+            if actual_context != self.prompt_history_context:
+                self._load_prompt_history_context()
+            submitted_from_context = self.prompt_history_context
+            if not self._start_run(prompt, record_history=True):
+                return False
+            self.prompt_history_drafts[submitted_from_context] = ""
+            self._load_prompt_history_context(draft="")
+            return True
+
+        def _record_started_prompt(self, prompt: str) -> None:
+            context = self._current_prompt_history_context()
+            self.prompt_history_store.append(*context, prompt)
+            if context == self.prompt_history_context:
+                draft = self.prompt_history_navigator.draft
+                self.prompt_history_navigator.reset(
+                    self.prompt_history_store.entries(*context),
+                    draft,
+                )
+
+        def _associate_pending_prompt_with_context(
+            self,
+            context: tuple[str, str],
+        ) -> None:
+            prompt = self.pending_prompt
+            if not prompt:
+                return
+            self.prompt_history_store.append(
+                *context,
+                prompt,
+                deduplicate_last=True,
+            )
+
         @on(PromptSubmitted)
         def _on_prompt(self, event: PromptSubmitted) -> None:
             prompt = self.query_one("#prompt", PromptEditor)
@@ -1257,22 +1367,38 @@ else:
             if not value:
                 return
             if value.startswith("/"):
-                prompt.clear()
-                self._update_suggestions("")
-                self._sync_prompt_height()
+                self._clear_prompt_draft()
                 self._handle_command(value)
             else:
-                if self._start_run(value):
-                    prompt.clear()
-                    self._update_suggestions("")
-                    self._sync_prompt_height()
+                self._submit_task_prompt(value)
             prompt.focus()
 
         @on(TextArea.Changed)
         def _on_text_changed(self, event: TextArea.Changed) -> None:
             if event.text_area.id == "prompt":
+                text = event.text_area.text
+                try:
+                    expected_index = self._prompt_history_programmatic_values.index(text)
+                except ValueError:
+                    self._prompt_history_programmatic_values.clear()
+                    self.prompt_history_navigator.note_edit(text)
+                    self.prompt_history_drafts[self.prompt_history_context] = text
+                else:
+                    del self._prompt_history_programmatic_values[: expected_index + 1]
                 self._update_suggestions(event.text_area.text)
                 self._sync_prompt_height()
+
+        @on(PromptHistoryRequested)
+        def _on_prompt_history_requested(self, event: PromptHistoryRequested) -> None:
+            context = self._current_prompt_history_context()
+            if context != self.prompt_history_context:
+                self._load_prompt_history_context()
+            prompt = self.query_one("#prompt", PromptEditor)
+            text = self.prompt_history_navigator.navigate(
+                event.direction,
+                prompt.text,
+            )
+            self._replace_prompt_text(text)
 
         @on(AgentSwitchRequested)
         def _on_switch(self, event: AgentSwitchRequested) -> None:
@@ -1586,6 +1712,7 @@ else:
                 return
 
             self.resume_session_id = event.session_id
+            self._load_prompt_history_context()
             self._reset_conversation_detail()
             self.run_info_rows = self._base_info_rows()
             if event.error:
@@ -1722,10 +1849,7 @@ else:
                 return
             prompt = self.query_one("#prompt", PromptEditor)
             if prompt.text.strip():
-                prompt.clear()
-                self._update_suggestions("")
-                self._sync_prompt_height()
-                prompt.focus()
+                self._clear_prompt_draft()
             else:
                 self._request_exit()
 
@@ -1733,6 +1857,7 @@ else:
             if self.running:
                 self.queued_prompt = ""
                 self.queued_agent = None
+                self.queued_prompt_records_history = False
                 self.pending_accept_agent = None
                 self._discard_queued_candidate_batches()
                 self.exit_after_run = True
@@ -1855,6 +1980,7 @@ else:
                 self.pending_accept_agent = self.selected_agent
                 self.queued_prompt = ""
                 self.queued_agent = None
+                self.queued_prompt_records_history = False
                 self._discard_queued_candidate_batches()
                 if self.cancel_event is not None:
                     self.cancel_event.set()
@@ -2227,6 +2353,7 @@ else:
             self.workspace = workspace
             self.args.workspace = str(workspace)
             self.resume_session_id = ""
+            self._load_prompt_history_context()
             self.resume_history_request += 1
             self._reset_conversation_detail()
             self.run_info_rows = self._base_info_rows()
@@ -2309,7 +2436,7 @@ else:
                 self.status = "Prompt file is empty"
                 self._sync()
                 return
-            self._start_run(prompt)
+            self._submit_task_prompt(prompt)
 
         def _handle_resumeinclude(self, args: list[str]) -> None:
             current = bool(getattr(self.args, "resume_include_non_interactive", True))
@@ -2393,6 +2520,7 @@ else:
                     self._sync()
                     return
                 self.resume_session_id = ""
+                self._load_prompt_history_context()
                 self.resume_history_request += 1
                 self.pending_resume_selector = None
                 self._reset_conversation_detail()
@@ -2647,9 +2775,12 @@ else:
             if self._cleanup_after_pending_run():
                 self._clear_pending_run()
 
-        def _start_run(self, prompt: str) -> bool:
+        def _start_run(self, prompt: str, record_history: bool = False) -> bool:
             if self.running:
-                return self._queue_prompt_from_finished_agent(prompt)
+                return self._queue_prompt_from_finished_agent(
+                    prompt,
+                    record_history=record_history,
+                )
             if not self._commit_runner_inputs():
                 self._sync()
                 return False
@@ -2687,6 +2818,7 @@ else:
             self.pending_no_sync_back = bool(getattr(self.args, "no_sync_back", False))
             self.pending_keep_workspaces = bool(getattr(self.args, "keep_workspaces", False))
             self.pending_prompt = prompt
+            self.pending_prompt_records_history = record_history
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.agent_cancel_events = {
                 idx: threading.Event() for idx in range(1, self.num_agents + 1)
@@ -2729,9 +2861,15 @@ else:
 
             self.runner_thread = threading.Thread(target=target, name="pcr-tui-runner", daemon=False)
             self.runner_thread.start()
+            if record_history:
+                self._record_started_prompt(prompt)
             return True
 
-        def _queue_prompt_from_finished_agent(self, prompt: str) -> bool:
+        def _queue_prompt_from_finished_agent(
+            self,
+            prompt: str,
+            record_history: bool = False,
+        ) -> bool:
             if self.queued_prompt:
                 self.status = "Already stopping remaining agents"
                 self._sync()
@@ -2748,6 +2886,7 @@ else:
                 return False
             self.queued_prompt = prompt
             self.queued_agent = self.selected_agent
+            self.queued_prompt_records_history = record_history
             self.pending_accept_agent = None
             self._discard_queued_candidate_batches()
             if self.cancel_event is not None:
@@ -2759,8 +2898,10 @@ else:
         def _continue_queued_prompt(self) -> None:
             prompt = self.queued_prompt
             agent_idx = self.queued_agent
+            record_history = self.queued_prompt_records_history
             self.queued_prompt = ""
             self.queued_agent = None
+            self.queued_prompt_records_history = False
             if not prompt or agent_idx is None:
                 return
             if not self._finalize_agent(agent_idx, archive_detail=True):
@@ -2773,7 +2914,12 @@ else:
                     pass
                 return
             self._archive_command_history()
-            if not self._start_run(prompt):
+            started = (
+                self._start_run(prompt, record_history=True)
+                if record_history
+                else self._start_run(prompt)
+            )
+            if not started:
                 try:
                     editor = self.query_one("#prompt", PromptEditor)
                     editor.text = prompt
@@ -2812,6 +2958,7 @@ else:
             self.pending_no_sync_back = None
             self.pending_keep_workspaces = None
             self.pending_prompt = ""
+            self.pending_prompt_records_history = False
             self.pending_execution_args = None
             self.active_batch_indices.clear()
             self.pending_accept_agent = None
@@ -2907,8 +3054,18 @@ else:
                         return False
                 if result.codex_thread_id:
                     result_data["codex_thread_id"] = result.codex_thread_id
+                    next_context = self.prompt_history_store.context_key(
+                        self.workspace,
+                        result.codex_thread_id,
+                    )
+                    if (
+                        self.pending_prompt_records_history
+                        and next_context != self.prompt_history_context
+                    ):
+                        self._associate_pending_prompt_with_context(next_context)
                     if require_resume:
                         self.resume_session_id = result.codex_thread_id
+                        self._load_prompt_history_context()
                 if not self._cleanup_after_pending_run():
                     return False
                 if archive_detail and pane is not None:

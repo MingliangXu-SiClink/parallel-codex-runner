@@ -3,4 +3,5 @@ from .codex_cli import *  # noqa: F401,F403
 from .diffing import *  # noqa: F401,F403
 from .models import *  # noqa: F401,F403
 from .paths import *  # noqa: F401,F403
+from .prompt_history import *  # noqa: F401,F403
 from .workspace import *  # noqa: F401,F403

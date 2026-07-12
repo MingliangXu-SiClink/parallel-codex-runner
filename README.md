@@ -90,6 +90,8 @@ fix the failing tests
 
 Use left/right to switch between agent panes while a run is active.
 
+Use up/down in the prompt editor to browse persistent input history for the active workspace and Codex session. An edited recalled prompt becomes the current draft; multiline prompts retain normal vertical cursor movement until the first or last logical line.
+
 After a run completes, run-setting changes such as agent count, execution mode, and model apply to the next run and do not select a candidate. Submitting the next prompt, exiting, or switching workspace/resume context finalizes the currently displayed successful agent. `best_by` remains a recommendation rather than an automatic TUI selection.
 
 Use `/diff` to review the displayed agent's complete workspace patch. `/reject` removes it from the `best_by` recommendation, while `/accept` finalizes it immediately. Failed or killed agents can be rerun with `/retry`, and `/more <n>` appends fresh candidates for the same question using that run's original settings.
@@ -282,6 +284,7 @@ Interactive slash commands:
 | `parallel_codex_runner_core/codex_cli.py` | Codex CLI capability detection and command construction |
 | `parallel_codex_runner_core/workspace.py` | Workspace copy, `git worktree`, cleanup, and sync-back logic |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive Textual TUI |
+| `parallel_codex_runner_core/prompt_history.py` | Persistent workspace/session prompt history and draft navigation |
 | `parallel_codex_runner_core/diffing.py` | Delete-aware full workspace diff generation |
 | `parallel_codex_runner_core/paths.py` | Path and run-directory helpers |
 | `parallel_codex_runner_core/models.py` | Dataclasses shared across modules |
