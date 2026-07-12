@@ -762,6 +762,8 @@ else:
             self.work_frame = 0
             self.exit_after_run = False
             self.cancel_event: threading.Event | None = None
+            self.runner_thread: threading.Thread | None = None
+            self._shutdown_cleanup_started = False
             self.run_info_rows = self._base_info_rows()
             self.pending_run_root: Path | None = None
             self.pending_workspaces_root: Path | None = None
@@ -1353,6 +1355,11 @@ else:
         def action_copy_selection(self) -> None:
             self._copy_active_text()
 
+        async def action_quit(self) -> None:
+            # Textual's priority Ctrl-Q binding calls this action. Keep it on
+            # PCR's cancellation/finalization path instead of exiting directly.
+            self._request_exit()
+
         def action_interrupt_or_exit(self) -> None:
             if self._copy_active_text():
                 return
@@ -1872,7 +1879,8 @@ else:
                 finally:
                     logging.disable(previous_disable)
 
-            threading.Thread(target=target, name="pcr-tui-runner", daemon=False).start()
+            self.runner_thread = threading.Thread(target=target, name="pcr-tui-runner", daemon=False)
+            self.runner_thread.start()
             return True
 
         def _queue_prompt_from_finished_agent(self, prompt: str) -> bool:
@@ -1925,6 +1933,12 @@ else:
                     pass
 
         def _post_progress(self, payload: dict[str, Any]) -> None:
+            if payload.get("type") == "run_prepared":
+                rows = payload.get("rows")
+                if isinstance(rows, list):
+                    self._remember_run_paths(
+                        [(str(key), str(value)) for key, value in rows if isinstance(key, str)]
+                    )
             try:
                 self.call_from_thread(self.post_message, RunnerEvent(payload))
             except RuntimeError:
@@ -1966,6 +1980,23 @@ else:
             except Exception as exc:  # noqa: BLE001
                 self.status = f"Cleanup failed: {exc}"
                 return False
+
+        def _shutdown_runner_and_cleanup(self) -> None:
+            """Stop an active runner and remove copies after the UI loop exits."""
+            if self._shutdown_cleanup_started:
+                return
+            self._shutdown_cleanup_started = True
+
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            if self.runner_thread is not None and self.runner_thread.is_alive():
+                self.runner_thread.join()
+            self.running = False
+
+            if self._has_pending_run():
+                if not self._cleanup_after_pending_run():
+                    raise RuntimeError(self.status)
+                self._clear_pending_run()
 
         def _finalize_agent(self, idx: int, require_resume: bool = True, archive_detail: bool = False) -> bool:
             pane = self.agents.get(idx)
@@ -2494,5 +2525,8 @@ else:
 
     def run_textual_tui(args: argparse.Namespace) -> int:
         app = PcrTextualApp(args)
-        app.run()
+        try:
+            app.run()
+        finally:
+            app._shutdown_runner_and_cleanup()
         return 0

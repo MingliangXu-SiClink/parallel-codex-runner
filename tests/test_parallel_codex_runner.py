@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import json
+import os
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -712,6 +714,133 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(app.query_one("#runner-workspace").allow_select)
 
         asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_ctrl_q_uses_pcr_cleanup_path(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+            app.args.no_sync_back = True
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                with mock.patch.object(app, "_cleanup_after_pending_run", return_value=True) as cleanup:
+                    async with app.run_test() as pilot:
+                        await pilot.press("ctrl+q")
+                        await pilot.pause()
+
+            cleanup.assert_called_once_with()
+            self.assertFalse(app._has_pending_run())
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_ctrl_q_cancels_active_run_before_exit(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        app.running = True
+        app.cancel_event = threading.Event()
+        app._sync = lambda: None
+        with mock.patch.object(app, "exit") as exit_app:
+            asyncio.run(app.action_quit())
+
+        self.assertTrue(app.cancel_event.is_set())
+        self.assertTrue(app.exit_after_run)
+        exit_app.assert_not_called()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_shutdown_waits_for_runner_and_cleans_pending_workspaces(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.cancel_event = threading.Event()
+        runner_started = threading.Event()
+
+        def runner() -> None:
+            runner_started.set()
+            app.cancel_event.wait(2)
+
+        app.runner_thread = threading.Thread(target=runner, daemon=False)
+        app.runner_thread.start()
+        self.assertTrue(runner_started.wait(1))
+
+        with mock.patch.object(app, "_cleanup_after_pending_run", return_value=True) as cleanup:
+            app._shutdown_runner_and_cleanup()
+
+        self.assertTrue(app.cancel_event.is_set())
+        self.assertFalse(app.runner_thread.is_alive())
+        cleanup.assert_called_once_with()
+        self.assertFalse(app._has_pending_run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_runner_records_cleanup_path_even_after_ui_stops(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        run_root = Path("/tmp/pcr-test/run")
+        with mock.patch.object(app, "call_from_thread", side_effect=RuntimeError("UI stopped")):
+            app._post_progress(
+                {
+                    "type": "run_prepared",
+                    "rows": [
+                        ["RUNS_ROOT", str(run_root)],
+                        ["WORKSPACE COPIES", str(run_root / "workspaces")],
+                    ],
+                }
+            )
+
+        self.assertEqual(app.pending_run_root, run_root)
+        self.assertEqual(app.pending_workspaces_root, run_root / "workspaces")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_tui_shutdown_removes_registered_git_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            run_base = root / "runs"
+            workspaces_root = run_base / "workspaces"
+            candidate = workspaces_root / "agent_001"
+            workspace.mkdir()
+            subprocess.run(
+                ["git", "-c", "init.defaultBranch=main", "init"],
+                cwd=workspace,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=workspace, check=True, stdout=subprocess.PIPE)
+            copy_workspace(workspace, candidate, run_base)
+
+            args = parse_args(["--workspace", str(workspace)])
+            app = tui_textual.PcrTextualApp(args)
+            app.pending_workspaces_root = workspaces_root
+            app._shutdown_runner_and_cleanup()
+
+            listed = subprocess.run(
+                ["git", "-C", str(workspace), "worktree", "list", "--porcelain"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout
+            self.assertNotIn(str(candidate), listed)
+            self.assertFalse(workspaces_root.exists())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_shutdown_respects_keep_workspaces(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["--keep-workspaces"]))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
+            app._shutdown_runner_and_cleanup()
+
+        cleanup.assert_not_called()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_run_textual_tui_cleans_up_when_textual_run_raises(self) -> None:
+        app = mock.Mock()
+        app.run.side_effect = RuntimeError("TUI failed")
+        with mock.patch.object(tui_textual, "PcrTextualApp", return_value=app):
+            with self.assertRaisesRegex(RuntimeError, "TUI failed"):
+                tui_textual.run_textual_tui(parse_args([]))
+
+        app._shutdown_runner_and_cleanup.assert_called_once_with()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_detail_selection_copies_rendered_content_before_prompt_selection(self) -> None:
@@ -1716,6 +1845,67 @@ class AgentCancelTests(unittest.TestCase):
                     cancel_event=cancel_event,
                 )
                 await canceller
+
+            self.assertEqual(result.status, "cancelled")
+            self.assertLess(result.seconds, 3)
+
+        asyncio.run(run())
+
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation requires POSIX")
+    def test_run_one_agent_stops_descendant_processes_on_cancel(self) -> None:
+        async def run() -> None:
+            cancel_event = threading.Event()
+            child_pid = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                pid_file = root / "child.pid"
+                workspace.mkdir()
+                codex_home.mkdir()
+                script = (
+                    "import pathlib, subprocess, sys, time; "
+                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                    f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid)); "
+                    "time.sleep(30)"
+                )
+
+                async def cancel_after_child_starts() -> None:
+                    for _ in range(100):
+                        if pid_file.exists():
+                            cancel_event.set()
+                            return
+                        await asyncio.sleep(0.02)
+                    self.fail("descendant process did not start")
+
+                canceller = asyncio.create_task(cancel_after_child_starts())
+                try:
+                    result = await run_one_agent(
+                        idx=1,
+                        agent_workspace=workspace,
+                        meta_dir=meta,
+                        codex_home=codex_home,
+                        prompt="",
+                        command=[sys.executable, "-c", script],
+                        cancel_event=cancel_event,
+                    )
+                    await canceller
+                    child_pid = int(pid_file.read_text(encoding="utf-8"))
+                    for _ in range(50):
+                        try:
+                            os.kill(child_pid, 0)
+                        except ProcessLookupError:
+                            break
+                        await asyncio.sleep(0.02)
+                    else:
+                        self.fail("descendant process survived cancellation")
+                finally:
+                    if child_pid:
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
 
             self.assertEqual(result.status, "cancelled")
             self.assertLess(result.seconds, 3)

@@ -1577,6 +1577,26 @@ async def iter_stream_lines(reader: asyncio.StreamReader, chunk_size: int = 6553
 async def terminate_process(proc: Optional[asyncio.subprocess.Process], timeout: float = 2.0) -> Optional[int]:
     if proc is None:
         return None
+
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return proc.returncode
+        try:
+            returncode = proc.returncode
+            if returncode is None:
+                returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            returncode = None
+        try:
+            # The group leader may exit before descendants which still hold the
+            # stdout/stderr pipes open. Force the rest of the group down too.
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return await proc.wait() if returncode is None else returncode
+
     if proc.returncode is not None:
         return proc.returncode
     try:
@@ -1647,6 +1667,9 @@ async def run_one_agent(
             progress_callback({"type": "agent_started", "idx": idx})
         env = os.environ.copy()
         env["CODEX_HOME"] = str(codex_home)
+        process_options: Dict[str, Any] = {}
+        if os.name == "posix":
+            process_options["start_new_session"] = True
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(agent_workspace),
@@ -1654,6 +1677,7 @@ async def run_one_agent(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_options,
         )
 
         stdout_task = asyncio.create_task(stream_to_log(proc.stdout, stdout_log, state, "stdout", progress_callback))
