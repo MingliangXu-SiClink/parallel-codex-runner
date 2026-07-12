@@ -35,7 +35,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/serial", "run agents one at a time"),
     ("/parallel", "run agents concurrently"),
     (
-        "/bestby <duration|reasoning_tokens>",
+        "/recommendby <duration|reasoning_tokens>",
         "choose how successful agents are recommended",
     ),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
@@ -73,6 +73,21 @@ TIP_ICON_COLORS: tuple[str, ...] = (
     "#4b6878",
     "#3e5260",
 )
+RECOMMEND_BORDER_REFRESH_SECONDS = 0.18
+RECOMMEND_BORDER_COLORS: tuple[str, ...] = (
+    "#ff5f6d",
+    "#ff8a4c",
+    "#ffd166",
+    "#67d17c",
+    "#2dd4bf",
+    "#38bdf8",
+    "#5b8def",
+    "#8b5cf6",
+    "#d946ef",
+    "#ff5fa2",
+)
+RECOMMEND_RAIL_COLOR = "#47d98a"
+RECOMMEND_TITLE_BACKGROUND = "#123326"
 COMMAND_SPINNER_FRAMES: tuple[str, ...] = (
     "⠋",
     "⠙",
@@ -95,6 +110,7 @@ TUI_TIPS: tuple[str, ...] = (
     "某个 Agent 完成后，即可从该 Agent 继续提问。",
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
     "EFFORT 会随 MODEL 更新可选等级，auto 会选择兼容的推理等级。",
+    "带 ★ 和彩虹边框的 Agent 是当前推荐结果。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
@@ -476,7 +492,7 @@ else:
         infer_codex_thread_id_for_result,
         list_resume_sessions,
         load_codex_session_history,
-        normalize_best_by,
+        normalize_recommend_by,
         promote_best_codex_session_to_workspace,
         run_additional_agents,
         run_once,
@@ -880,7 +896,7 @@ else:
         #config-agents, #config-max-parallel {
             width: 12;
         }
-        #config-execution, #config-best-by, #config-effort {
+        #config-execution, #config-recommend-by, #config-effort {
             width: 24;
         }
         #config-model {
@@ -893,6 +909,10 @@ else:
             height: 1fr;
             margin: 0 1;
             border: round cyan;
+            border-title-align: center;
+            border-title-color: #c8edf5;
+            border-title-background: #101216;
+            border-title-style: bold;
         }
         #detail-scroll {
             height: 1fr;
@@ -900,6 +920,7 @@ else:
         #detail {
             width: 100%;
             padding: 0 1;
+            border-left: thick #101216;
         }
         #suggestions {
             height: 0;
@@ -979,12 +1000,13 @@ else:
             self.selected_agent = 1
             self.running = False
             self.status = "Ready"
-            self.best_agent: int | None = None
+            self.recommended_agent: int | None = None
             self.started_at: float | None = None
             self.prompt_height = 3
             self.suggestion_line_count = 0
             self.tip_index = 0
             self.tip_icon_index = 0
+            self.recommend_border_frame = 0
             self.work_frame = 0
             self.exit_after_run = False
             self.cancel_event: threading.Event | None = None
@@ -1036,6 +1058,7 @@ else:
             self._last_screen_selection = ""
             self._sync_deferred_for_selection = False
             self._tip_refresh_deferred_for_selection = False
+            self._recommend_border_deferred_for_selection = False
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
             self.app_in_foreground = True
@@ -1078,6 +1101,14 @@ else:
             except Exception:
                 return False
 
+        def _screen_selection_active(self) -> bool:
+            try:
+                if not self.screen.selections:
+                    return False
+                return bool(self.screen.get_selected_text())
+            except Exception:
+                return False
+
         def _clear_screen_selection_for_interaction(self) -> None:
             try:
                 if self.screen.selections:
@@ -1092,12 +1123,20 @@ else:
                 return
             refresh_tip = self._tip_refresh_deferred_for_selection
             sync = self._sync_deferred_for_selection
+            refresh_recommend_border = (
+                self._recommend_border_deferred_for_selection
+                and not self._screen_selection_active()
+            )
             self._tip_refresh_deferred_for_selection = False
             self._sync_deferred_for_selection = False
+            if refresh_recommend_border:
+                self._recommend_border_deferred_for_selection = False
             if refresh_tip:
                 self._refresh_tip()
             if sync:
                 self._sync()
+            if refresh_recommend_border:
+                self._refresh_recommend_border()
 
         async def on_event(self, event: events.Event) -> None:
             if isinstance(event, events.AppBlur):
@@ -1213,13 +1252,15 @@ else:
                             id="config-max-parallel",
                             classes="runner-control",
                         )
-                        yield Static("BEST_BY", classes="runner-key")
+                        yield Static("RECOMMEND_BY", classes="runner-key")
                         yield Select(
                             [("reasoning_tokens", "reasoning_tokens"), ("duration", "duration")],
-                            value=str(getattr(self.args, "best_by", "reasoning_tokens")),
+                            value=str(
+                                getattr(self.args, "recommend_by", "reasoning_tokens")
+                            ),
                             allow_blank=False,
                             compact=True,
-                            id="config-best-by",
+                            id="config-recommend-by",
                             classes="runner-control",
                         )
                         yield Static("MODEL", classes="runner-key")
@@ -1269,8 +1310,8 @@ else:
                             id="config-resume",
                             classes="runner-control",
                         )
-                        yield Static("BEST AGENT", id="runner-best-agent-key", classes="runner-key")
-                        yield Static("", id="runner-best-agent", classes="runner-value", markup=False)
+                        yield Static("RECOMMENDED AGENT", id="runner-recommended-agent-key", classes="runner-key")
+                        yield Static("", id="runner-recommended-agent", classes="runner-value", markup=False)
                 with Vertical(id="detail-frame"):
                     with DetailScroll(id="detail-scroll"):
                         yield Static("", id="detail")
@@ -1290,6 +1331,10 @@ else:
             self.set_interval(0.25, self._tick)
             self.set_interval(TIP_ROTATION_SECONDS, self._advance_tip)
             self.set_interval(TIP_ICON_REFRESH_SECONDS, self._advance_tip_icon)
+            self.set_interval(
+                RECOMMEND_BORDER_REFRESH_SECONDS,
+                self._advance_recommend_border,
+            )
             if (
                 not self.is_headless
                 and not getattr(self.args, "resume", False)
@@ -1517,13 +1562,15 @@ else:
             if serial != current_serial:
                 self._handle_execution(serial=serial)
 
-        @on(Select.Changed, "#config-best-by")
-        def _on_best_by_selected(self, event: Select.Changed) -> None:
+        @on(Select.Changed, "#config-recommend-by")
+        def _on_recommend_by_selected(self, event: Select.Changed) -> None:
             if self._updating_controls:
                 return
             value = str(event.value)
-            if value != str(getattr(self.args, "best_by", "reasoning_tokens")):
-                self._handle_bestby([value])
+            if value != str(
+                getattr(self.args, "recommend_by", "reasoning_tokens")
+            ):
+                self._handle_recommendby([value])
 
         @on(Select.Changed, "#config-model")
         def _on_model_selected(self, event: Select.Changed) -> None:
@@ -1791,7 +1838,7 @@ else:
                 self._sync()
                 return
             if self._has_pending_run():
-                if self.best_agent is None:
+                if self.recommended_agent is None:
                     if not self._discard_pending_run():
                         self._sync()
                         return
@@ -1810,7 +1857,7 @@ else:
                 pane.final_text = ""
                 pane.result = None
                 pane.clear_detail()
-            self.best_agent = None
+            self.recommended_agent = None
             self.resume_history_request += 1
             self.detail_history.clear()
             self.command_history.clear()
@@ -1967,8 +2014,8 @@ else:
             if name == "/parallel":
                 self._handle_execution(serial=False)
                 return
-            if name in {"/bestby", "/best-by", "/candidateby", "/candidate-by"}:
-                self._handle_bestby(args)
+            if name in {"/recommendby", "/recommend-by"}:
+                self._handle_recommendby(args)
                 return
             if name == "/model":
                 self._handle_model(args)
@@ -2052,7 +2099,7 @@ else:
                 self._sync()
                 return
             pane.rejected = True
-            if not self.running or self.best_agent is not None:
+            if not self.running or self.recommended_agent is not None:
                 self._recompute_recommendation()
             self.status = f"AGENT-{pane.idx:03d} excluded from recommendations"
             self._mark_detail_dirty(pane)
@@ -2315,7 +2362,7 @@ else:
             if not preserve_completed_run:
                 self.selected_agent = min(self.selected_agent, value)
                 self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
-                self.best_agent = None
+                self.recommended_agent = None
                 self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"Next run will use {value} agents")
@@ -2356,21 +2403,23 @@ else:
             self.run_info_rows = self._base_info_rows()
             self._show_setting("execution=serial" if serial else "execution=parallel")
 
-        def _handle_bestby(self, args: list[str]) -> None:
+        def _handle_recommendby(self, args: list[str]) -> None:
             if not args:
-                self._show_setting(f"bestby={getattr(self.args, 'best_by', 'reasoning_tokens')}")
+                self._show_setting(
+                    f"recommendby={getattr(self.args, 'recommend_by', 'reasoning_tokens')}"
+                )
                 return
             try:
-                value = normalize_best_by(args[0])
+                value = normalize_recommend_by(args[0])
             except argparse.ArgumentTypeError as exc:
                 self.status = str(exc)
                 self._sync()
                 return
             if not self._prepare_config_change("selection strategy"):
                 return
-            self.args.best_by = value
+            self.args.recommend_by = value
             self.run_info_rows = self._base_info_rows()
-            self._show_setting(f"bestby={value}")
+            self._show_setting(f"recommendby={value}")
 
         def _resume_model_for_effort(self) -> str | None:
             if self.resume_session_id:
@@ -2583,7 +2632,7 @@ else:
         def _reset_conversation_detail(self) -> None:
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.selected_agent = min(self.selected_agent, self.num_agents)
-            self.best_agent = None
+            self.recommended_agent = None
             self.detail_history.clear()
             self.command_history.clear()
             self._mark_detail_dirty()
@@ -2706,10 +2755,18 @@ else:
         def _show_status(self) -> None:
             self._show_text(self._tree_text())
 
-        def _pending_best_by(self) -> str:
+        def _pending_recommend_by(self) -> str:
             if self.pending_execution_args is not None:
-                return str(getattr(self.pending_execution_args, "best_by", "reasoning_tokens"))
-            return str(getattr(self.args, "best_by", "reasoning_tokens"))
+                return str(
+                    getattr(
+                        self.pending_execution_args,
+                        "recommend_by",
+                        "reasoning_tokens",
+                    )
+                )
+            return str(
+                getattr(self.args, "recommend_by", "reasoning_tokens")
+            )
 
         def _recompute_recommendation(self, fallback: int | None = None) -> None:
             candidates: list[AgentResult] = []
@@ -2727,22 +2784,24 @@ else:
                     continue
             recommendation = select_best_result(
                 candidates,
-                self._pending_best_by(),
+                self._pending_recommend_by(),
                 warn_missing_tokens=False,
             )
             if recommendation is not None:
-                self.best_agent = recommendation.idx
+                self.recommended_agent = recommendation.idx
             elif saw_success:
-                self.best_agent = None
+                self.recommended_agent = None
             elif fallback is not None:
                 pane = self.agents.get(fallback)
-                self.best_agent = None if pane is not None and pane.rejected else fallback
+                self.recommended_agent = (
+                    None if pane is not None and pane.rejected else fallback
+                )
             else:
-                self.best_agent = None
+                self.recommended_agent = None
 
         def _completed_status(self) -> str:
-            if self.best_agent is not None:
-                return f"Done: agent_{self.best_agent:03d}"
+            if self.recommended_agent is not None:
+                return f"Done: agent_{self.recommended_agent:03d}"
             if any(
                 isinstance(pane.result, dict) and pane.result.get("status") == "success"
                 for pane in self.agents.values()
@@ -2927,7 +2986,7 @@ else:
             if self._has_pending_run() and (
                 self._pending_sync_disabled()
                 or (
-                    self.best_agent is None
+                    self.recommended_agent is None
                     and not any(
                         isinstance(pane.result, dict)
                         and pane.result.get("status") == "success"
@@ -2951,7 +3010,7 @@ else:
             self.candidate_batches.clear()
             self.active_batch_indices.clear()
             self.cancel_event = threading.Event()
-            self.best_agent = None
+            self.recommended_agent = None
             self.started_at = time.monotonic()
             self.first_success_seen = False
             self.pending_workspace = self.workspace
@@ -3121,7 +3180,7 @@ else:
             if not self._cleanup_after_pending_run():
                 return False
             self._clear_pending_run()
-            self.best_agent = None
+            self.recommended_agent = None
             self.run_info_rows = self._base_info_rows()
             return True
 
@@ -3294,6 +3353,80 @@ else:
             self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_COLORS)
             self._refresh_tip()
 
+        def _selected_agent_is_recommended(self) -> bool:
+            pane = self.agents.get(self.selected_agent)
+            return bool(
+                pane is not None
+                and pane.idx == self.recommended_agent
+                and self._has_detail_content(pane)
+            )
+
+        def _recommend_border_colors(self) -> tuple[str, str, str, str]:
+            size = len(RECOMMEND_BORDER_COLORS)
+            offsets = (0, size // 4, size // 2, (size * 3) // 4)
+            return tuple(
+                RECOMMEND_BORDER_COLORS[
+                    (self.recommend_border_frame + offset) % size
+                ]
+                for offset in offsets
+            )
+
+        def _apply_recommend_border_colors(self, frame: Vertical) -> None:
+            top, right, bottom, left = self._recommend_border_colors()
+            with self.batch_update():
+                frame.styles.border_top = ("round", top)
+                frame.styles.border_right = ("round", right)
+                frame.styles.border_bottom = ("round", bottom)
+                frame.styles.border_left = ("round", left)
+                frame.styles.border_title_color = top
+
+        def _refresh_recommend_border(self) -> None:
+            if self._selection_drag_active() or self._screen_selection_active():
+                self._recommend_border_deferred_for_selection = True
+                return
+            if not self._selected_agent_is_recommended():
+                self._recommend_border_deferred_for_selection = False
+                return
+            try:
+                frame = self.query_one("#detail-frame", Vertical)
+            except Exception:
+                return
+            self._recommend_border_deferred_for_selection = False
+            self._apply_recommend_border_colors(frame)
+
+        def _advance_recommend_border(self) -> None:
+            if not self.app_in_foreground or not self._selected_agent_is_recommended():
+                return
+            if self._selection_drag_active() or self._screen_selection_active():
+                self._recommend_border_deferred_for_selection = True
+                return
+            self.recommend_border_frame = (
+                self.recommend_border_frame + 1
+            ) % len(RECOMMEND_BORDER_COLORS)
+            self._refresh_recommend_border()
+
+        def _style_detail_frame(
+            self,
+            frame: Vertical,
+            pane: AgentPane | None,
+            detail_visible: bool,
+        ) -> None:
+            recommended = bool(
+                detail_visible
+                and pane is not None
+                and pane.idx == self.recommended_agent
+            )
+            detail = self.query_one("#detail", Static)
+            if recommended:
+                self._apply_recommend_border_colors(frame)
+                frame.styles.border_title_background = RECOMMEND_TITLE_BACKGROUND
+                detail.styles.border_left = ("thick", RECOMMEND_RAIL_COLOR)
+                return
+            frame.styles.border = ("round", "cyan")
+            frame.styles.border_title_color = "#c8edf5"
+            frame.styles.border_title_background = "#101216"
+            detail.styles.border_left = ("thick", "#101216")
+
         def _sync(self) -> None:
             if self._selection_drag_active():
                 self._sync_deferred_for_selection = True
@@ -3308,8 +3441,7 @@ else:
             pane = self.agents.get(self.selected_agent)
             detail_visible = self._has_detail_content(pane)
             frame.display = detail_visible
-            border_style = "green" if pane is not None and pane.idx == self.best_agent else "cyan"
-            frame.styles.border = ("round", border_style)
+            self._style_detail_frame(frame, pane, detail_visible)
             frame.border_title = self._detail_title(pane) if detail_visible and pane is not None else ""
 
             scroll = self.query_one("#detail-scroll", DetailScroll)
@@ -3410,13 +3542,13 @@ else:
             for label, selector in static_rows.items():
                 self.query_one(selector, Static).update(rows.get(label, ""))
 
-            best_key = self.query_one("#runner-best-agent-key", Static)
-            best_value = self.query_one("#runner-best-agent", Static)
-            best_visible = self.best_agent is not None
-            best_key.display = best_visible
-            best_value.display = best_visible
-            if best_visible:
-                best_value.update(f"agent_{self.best_agent:03d}")
+            recommended_key = self.query_one("#runner-recommended-agent-key", Static)
+            recommended_value = self.query_one("#runner-recommended-agent", Static)
+            recommended_visible = self.recommended_agent is not None
+            recommended_key.display = recommended_visible
+            recommended_value.display = recommended_visible
+            if recommended_visible:
+                recommended_value.update(f"agent_{self.recommended_agent:03d}")
 
             current_model = str(getattr(self.args, "model", None) or "")
             model_options = None
@@ -3438,7 +3570,7 @@ else:
                 resume_options = self.resume_choices
 
             execution_select = self.query_one("#config-execution", Select)
-            best_by_select = self.query_one("#config-best-by", Select)
+            recommend_by_select = self.query_one("#config-recommend-by", Select)
             model_select = self.query_one("#config-model", Select)
             effort_select = self.query_one("#config-effort", Select)
             sync_back_select = self.query_one("#config-sync-back", Select)
@@ -3448,7 +3580,7 @@ else:
                 self.query_one("#config-agents", Input),
                 self.query_one("#config-max-parallel", Input),
                 execution_select,
-                best_by_select,
+                recommend_by_select,
                 model_select,
                 effort_select,
                 sync_back_select,
@@ -3472,8 +3604,14 @@ else:
                     rows.get("EXECUTION", "parallel"),
                 )
                 self._set_select_control(
-                    best_by_select,
-                    str(getattr(self.args, "best_by", "reasoning_tokens")),
+                    recommend_by_select,
+                    str(
+                        getattr(
+                            self.args,
+                            "recommend_by",
+                            "reasoning_tokens",
+                        )
+                    ),
                 )
                 self._set_select_control(model_select, current_model, model_options)
                 self._set_select_control(
@@ -3517,8 +3655,10 @@ else:
                 ("CONVERSATION", self.status),
                 *self.run_info_rows,
             ]
-            if self.best_agent is not None:
-                rows.append(("BEST AGENT", f"agent_{self.best_agent:03d}"))
+            if self.recommended_agent is not None:
+                rows.append(
+                    ("RECOMMENDED AGENT", f"agent_{self.recommended_agent:03d}")
+                )
             return rows
 
         def _visible_info_rows(self, rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -3541,7 +3681,16 @@ else:
                 ("AGENTS", str(self.num_agents)),
                 ("EXECUTION", execution),
                 ("MAX_PARALLEL", str(max_parallel)),
-                ("BEST_BY", str(getattr(self.args, "best_by", "reasoning_tokens"))),
+                (
+                    "RECOMMEND_BY",
+                    str(
+                        getattr(
+                            self.args,
+                            "recommend_by",
+                            "reasoning_tokens",
+                        )
+                    ),
+                ),
                 ("MODEL", str(getattr(self.args, "model", None) or "default")),
                 (
                     "EFFORT",
@@ -3796,7 +3945,8 @@ else:
                     parts.append((line, "white"))
 
         def _detail_title(self, pane: AgentPane) -> str:
-            title = f"AGENT-{pane.idx:03d}"
+            recommended = pane.idx == self.recommended_agent
+            title = f"{'★ ' if recommended else ''}AGENT-{pane.idx:03d}"
             parts = []
             if pane.status in {"stopping", "killed"}:
                 parts.append(pane.status)
@@ -3816,8 +3966,6 @@ else:
                         completed=isinstance(pane.result, dict),
                     )
                 )
-            if pane.idx == self.best_agent:
-                parts.append("best")
             parts.append("←/→ switch")
             return f"{title}, {', '.join(parts)}"
 

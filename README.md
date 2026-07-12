@@ -77,7 +77,7 @@ Inside the TUI:
 ```text
 /numofagents 8
 /maxparallel 4
-/bestby duration
+/recommendby duration
 /diff
 /reject
 /retry
@@ -90,11 +90,13 @@ fix the failing tests
 
 Use left/right to switch between agent panes while a run is active.
 
+The recommended Agent is marked with `★`, a green content rail, and an animated rainbow Detail border.
+
 Use up/down in the prompt editor to browse persistent input history for the active workspace and Codex session. An edited recalled prompt becomes the current draft; multiline prompts retain normal vertical cursor movement until the first or last logical line.
 
-After a run completes, run-setting changes such as agent count, execution mode, and model apply to the next run and do not select a candidate. Submitting the next prompt, exiting, or switching workspace/resume context finalizes the currently displayed successful agent. `best_by` remains a recommendation rather than an automatic TUI selection.
+After a run completes, run-setting changes such as agent count, execution mode, and model apply to the next run and do not select a candidate. Submitting the next prompt, exiting, or switching workspace/resume context finalizes the currently displayed successful agent. `recommend_by` controls the recommendation rather than automatically selecting a TUI branch.
 
-Use `/diff` to review the displayed agent's complete workspace patch. `/reject` removes it from the `best_by` recommendation, while `/accept` finalizes it immediately. Failed or killed agents can be rerun with `/retry`, and `/more <n>` appends fresh candidates for the same question using that run's original settings.
+Use `/diff` to review the displayed agent's complete workspace patch. `/reject` removes it from the `recommend_by` recommendation, while `/accept` finalizes it immediately. Failed or killed agents can be rerun with `/retry`, and `/more <n>` appends fresh candidates for the same question using that run's original settings.
 
 Run the default five candidates in the current directory:
 
@@ -166,13 +168,13 @@ It does not merge candidates. One candidate wins.
 By default, the runner chooses the successful candidate with the highest observed reasoning-token value:
 
 ```bash
-pcr "fix a tricky bug" --best-by reasoning_tokens
+pcr "fix a tricky bug" --recommend-by reasoning_tokens
 ```
 
 You can instead choose the longest successful run:
 
 ```bash
-pcr "explore possible fixes" --best-by duration
+pcr "explore possible fixes" --recommend-by duration
 ```
 
 Both are heuristics. Review the final diff before committing.
@@ -231,7 +233,7 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 | `-n, --num-agents` | Number of candidates, default `5` |
 | `--max-parallel` | Maximum concurrent Codex processes |
 | `--serial` | Run one candidate at a time |
-| `--best-by, --candidate-by` | Selection strategy: `reasoning_tokens` or `duration` |
+| `--recommend-by` | Recommendation strategy: `reasoning_tokens` or `duration` |
 | `--prompt-file` | Read prompt from a UTF-8 file |
 | `--workspace` | Target workspace, default current directory |
 | `--runs-dir` | Directory for run records; must be outside the workspace |
@@ -251,7 +253,7 @@ Interactive slash commands:
 | `/help` | Show all TUI commands |
 | `/status` or `/config` | Show current run configuration |
 | `/accept` | Immediately finalize the displayed successful agent |
-| `/reject` | Exclude the displayed agent from `best_by` recommendations |
+| `/reject` | Exclude the displayed agent from `recommend_by` recommendations |
 | `/retry [agent]` | Rerun a failed or killed agent in a fresh candidate workspace |
 | `/more <n>` | Add candidates for the current question |
 | `/diff` | Toggle the displayed agent's complete workspace diff |
@@ -260,7 +262,7 @@ Interactive slash commands:
 | `/maxparallel <n\|auto>` | Set or clear `--max-parallel` |
 | `/serial` | Run one agent at a time |
 | `/parallel` | Clear serial mode |
-| `/bestby <duration\|reasoning_tokens>` | Set `--best-by` |
+| `/recommendby <duration\|reasoning_tokens>` | Set `--recommend-by` |
 | `/model <name\|clear>` | Set or clear `--model` |
 | `/effort <auto\|level>` | Select a reasoning effort supported by the current model |
 | `/workspace <path>` | Set `--workspace` |

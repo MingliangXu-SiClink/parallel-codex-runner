@@ -18,7 +18,7 @@ Command examples:
     python3 parallel_codex_runner.py --resume "continue the previous task"
 
     # Select the longest successful run instead of selecting by reasoning tokens.
-    python3 parallel_codex_runner.py "fix the failing tests" -n 20 --best-by duration
+    python3 parallel_codex_runner.py "fix the failing tests" -n 20 --recommend-by duration
 
     # Run against another workspace with a long prompt file.
     python3 parallel_codex_runner.py --prompt-file /tmp/prompt.txt -n 20 --workspace /path/to/project
@@ -2100,7 +2100,7 @@ async def run_all_agents(
 # -----------------------------------------------------------------------------
 
 
-BEST_BY_ALIASES = {
+RECOMMEND_BY_ALIASES = {
     "duration": "duration",
     "seconds": "duration",
     "time": "duration",
@@ -2118,12 +2118,12 @@ BEST_BY_ALIASES = {
 }
 
 
-def normalize_best_by(value: str) -> str:
+def normalize_recommend_by(value: str) -> str:
     key = value.strip().lower()
     try:
-        return BEST_BY_ALIASES[key]
+        return RECOMMEND_BY_ALIASES[key]
     except KeyError as exc:
-        choices = ", ".join(sorted(BEST_BY_ALIASES))
+        choices = ", ".join(sorted(RECOMMEND_BY_ALIASES))
         raise argparse.ArgumentTypeError(f"不支持的候选选择策略：{value!r}。可用值：{choices}") from exc
 
 
@@ -2133,14 +2133,14 @@ def reasoning_score(result: AgentResult) -> int:
 
 def select_best_result(
     successes: List[AgentResult],
-    best_by: str,
+    recommend_by: str,
     *,
     warn_missing_tokens: bool = True,
 ) -> Optional[AgentResult]:
     if not successes:
         return None
 
-    if best_by == "reasoning_tokens":
+    if recommend_by == "reasoning_tokens":
         with_tokens = [r for r in successes if r.reasoning_tokens is not None]
         if not with_tokens:
             if warn_missing_tokens:
@@ -2151,8 +2151,8 @@ def select_best_result(
     return max(successes, key=lambda r: (r.seconds, reasoning_score(r), -r.idx))
 
 
-def result_sort_key(result: AgentResult, best_by: str) -> Tuple[bool, float, int, int]:
-    if best_by == "reasoning_tokens":
+def result_sort_key(result: AgentResult, recommend_by: str) -> Tuple[bool, float, int, int]:
+    if recommend_by == "reasoning_tokens":
         return (
             result.status != "success",
             -float(reasoning_score(result)),
@@ -2176,13 +2176,13 @@ def make_summary_table(
     results: List[AgentResult],
     run_root: Path,
     best: Optional[AgentResult],
-    best_by: str,
+    recommend_by: str,
 ) -> Any:
-    rows = sorted(results, key=lambda r: result_sort_key(r, best_by))
+    rows = sorted(results, key=lambda r: result_sort_key(r, recommend_by))
     best_idx = best.idx if best is not None else None
     if HAS_RICH:
         table = Table(
-            title=f"Codex parallel run summary (best_by={best_by})",
+            title=f"Codex parallel run summary (recommend_by={recommend_by})",
             show_header=True,
             header_style="bold cyan",
             show_lines=False,
@@ -2211,7 +2211,7 @@ def make_summary_table(
             )
         return table
 
-    lines = [f"Codex parallel run summary (best_by={best_by})"]
+    lines = [f"Codex parallel run summary (recommend_by={recommend_by})"]
     lines.append("rank best agent status ret seconds rtok_max rtok_values workspace")
     for rank, r in enumerate(rows, 1):
         rtok = "-" if r.reasoning_tokens is None else str(r.reasoning_tokens)
@@ -2252,21 +2252,21 @@ def print_summary(
     workspace: Path,
     run_root: Path,
     best: Optional[AgentResult],
-    best_by: str,
+    recommend_by: str,
     synced: bool,
     codex_session_promotion: Optional[CodexSessionPromotion] = None,
 ) -> None:
     success_count = sum(1 for r in results if r.status == "success")
     if HAS_RICH:
         assert console is not None
-        console.print(make_summary_table(results, run_root, best, best_by))
+        console.print(make_summary_table(results, run_root, best, recommend_by))
         if best is not None:
             selected = Table.grid(padding=(0, 2))
             selected.add_column(style="bold")
             selected.add_column()
             selected.add_row("runs_root", absolute_path_for_display(run_root))
             selected.add_row("success", f"{success_count}/{len(results)}")
-            selected.add_row("BEST_BY", best_by)
+            selected.add_row("RECOMMEND_BY", recommend_by)
             selected.add_row("BEST_AGENT", f"[bold green]agent_{best.idx:03d}[/bold green]")
             selected.add_row("BEST_SECONDS", f"{best.seconds:.2f}")
             selected.add_row("BEST_REASONING_TOKENS", str(best.reasoning_tokens if best.reasoning_tokens is not None else "N/A"))
@@ -2281,7 +2281,7 @@ def print_summary(
                 Panel(
                     f"runs_root = {absolute_path_for_display(run_root)}\n"
                     f"success = 0/{len(results)}\n"
-                    f"BEST_BY = {best_by}\n"
+                    f"RECOMMEND_BY = {recommend_by}\n"
                     f"BEST_AGENT = \n"
                     f"NO_SUCCESSFUL_RUN = 1\n"
                     f"workspace was not modified",
@@ -2290,10 +2290,10 @@ def print_summary(
                 )
             )
     else:
-        print(make_summary_table(results, run_root, best, best_by))
+        print(make_summary_table(results, run_root, best, recommend_by))
         print(f"runs_root={run_root}")
         print(f"success={success_count}/{len(results)}")
-        print(f"BEST_BY={best_by}")
+        print(f"RECOMMEND_BY={recommend_by}")
         if best is not None:
             print(f"BEST_AGENT=agent_{best.idx:03d}")
             print(f"BEST_SECONDS={best.seconds:.2f}")
@@ -2318,7 +2318,7 @@ def write_run_files(
     prompt: str,
     results: List[AgentResult],
     best: Optional[AgentResult],
-    best_by: str,
+    recommend_by: str,
     synced: bool,
     workspaces_deleted: bool,
     resume_session: Optional[ResumeSession] = None,
@@ -2330,7 +2330,7 @@ def write_run_files(
         "workspace": str(workspace),
         "success": sum(1 for r in results if r.status == "success"),
         "total": len(results),
-        "best_by": best_by,
+        "recommend_by": recommend_by,
         "best_agent": f"agent_{best.idx:03d}" if best else None,
         "best": asdict(best) if best else None,
         "resume_session": asdict(resume_session) if resume_session else None,
@@ -2387,13 +2387,16 @@ def refresh_run_result_files(
     workspace: Path,
     prompt: str,
     new_results: Sequence[AgentResult],
-    best_by: str,
+    recommend_by: str,
 ) -> None:
     recorded = _load_recorded_results(run_root)
     for result in new_results:
         recorded[result.idx] = result
     results = list(recorded.values())
-    best = select_best_result([result for result in results if result.status == "success"], best_by)
+    best = select_best_result(
+        [result for result in results if result.status == "success"],
+        recommend_by,
+    )
 
     summary: Dict[str, Any] = {}
     try:
@@ -2422,7 +2425,7 @@ def refresh_run_result_files(
         prompt=prompt,
         results=results,
         best=best,
-        best_by=best_by,
+        recommend_by=recommend_by,
         synced=bool(summary.get("synced_back_to_workspace")),
         workspaces_deleted=False,
         resume_session=resume_session,
@@ -2553,7 +2556,7 @@ def run_additional_agents(
         workspace=workspace,
         prompt=prompt,
         new_results=results,
-        best_by=args.best_by,
+        recommend_by=args.recommend_by,
     )
     return results
 
@@ -2582,10 +2585,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--serial", action="store_true", help="Run agents one at a time, equivalent to --max-parallel 1.")
     parser.add_argument(
-        "--best-by",
-        "--candidate-by",
-        dest="best_by",
-        type=normalize_best_by,
+        "--recommend-by",
+        dest="recommend_by",
+        type=normalize_recommend_by,
         default="reasoning_tokens",
         metavar="{duration,reasoning_tokens}",
         help="Final candidate selection strategy: duration chooses longest successful run; reasoning_tokens chooses max observed reasoning tokens.",
@@ -2708,7 +2710,7 @@ def run_once(
                     ["AGENTS", str(args.num_agents)],
                     ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
                     ["MAX_PARALLEL", str(max_parallel)],
-                    ["BEST_BY", args.best_by],
+                    ["RECOMMEND_BY", args.recommend_by],
                     ["MODEL", args.model or "default"],
                     ["EFFORT", effective_effort or "default"],
                     ["RESUME", resume_session_id or "NO"],
@@ -2744,7 +2746,7 @@ def run_once(
         overview.add_row("AGENTS", str(args.num_agents))
         overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
         overview.add_row("MAX_PARALLEL", str(max_parallel))
-        overview.add_row("BEST_BY", args.best_by)
+        overview.add_row("RECOMMEND_BY", args.recommend_by)
         overview.add_row("MODEL", args.model or "default")
         overview.add_row("EFFORT", effective_effort or "default")
         overview.add_row("RESUME", resume_session_id or "NO")
@@ -2765,7 +2767,7 @@ def run_once(
         log("info", "agents = {}", args.num_agents)
         log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
         log("info", "max_parallel = {}", max_parallel)
-        log("info", "best_by = {}", args.best_by)
+        log("info", "recommend_by = {}", args.recommend_by)
         log("info", "model = {}", args.model or "default")
         log("info", "effort = {}", effective_effort or "default")
         log("info", "resume = {}", resume_session_id or "NO")
@@ -2917,7 +2919,7 @@ def run_once(
 
     cancelled = cancel_requested(cancel_event)
     successes = [] if cancelled else [r for r in results if r.status == "success"]
-    best = select_best_result(successes, args.best_by)
+    best = select_best_result(successes, args.recommend_by)
 
     synced = False
     codex_session_promotion: Optional[CodexSessionPromotion] = None
@@ -2957,7 +2959,7 @@ def run_once(
         prompt,
         results,
         best,
-        args.best_by,
+        args.recommend_by,
         synced,
         workspaces_deleted,
         resume_session,
@@ -2975,7 +2977,15 @@ def run_once(
             }
         )
     if print_output:
-        print_summary(results, workspace, run_root, best, args.best_by, synced, codex_session_promotion)
+        print_summary(
+            results,
+            workspace,
+            run_root,
+            best,
+            args.recommend_by,
+            synced,
+            codex_session_promotion,
+        )
 
     restore_cancel_signals()
     return 130 if cancelled else (0 if best is not None else 2)

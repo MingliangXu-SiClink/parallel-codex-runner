@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import io
 import json
 import os
 import signal
@@ -639,6 +640,14 @@ class ArgParseTests(unittest.TestCase):
 
         self.assertEqual(args.effort, "xhigh")
 
+    def test_recommend_by_replaces_best_by_without_an_alias(self) -> None:
+        args = parse_args(["fix tests", "--recommend-by", "duration"])
+
+        self.assertEqual(args.recommend_by, "duration")
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["fix tests", "--best-by", "duration"])
+
 
 class ReasoningEffortTests(unittest.TestCase):
     def test_auto_effort_falls_back_to_model_default_when_config_is_unsupported(self) -> None:
@@ -713,7 +722,7 @@ class AdditionalAgentTests(unittest.TestCase):
             codex_home.mkdir()
             (workspace / "base.txt").write_text("baseline", encoding="utf-8")
             args = parse_args(
-                ["prompt", "--workspace", str(workspace), "--best-by", "duration"]
+                ["prompt", "--workspace", str(workspace), "--recommend-by", "duration"]
             )
             command = [
                 sys.executable,
@@ -767,6 +776,8 @@ class AdditionalAgentTests(unittest.TestCase):
             self.assertFalse((run_root / "workspaces" / "agent_003" / "stale.txt").exists())
             self.assertTrue(any((run_root / "retry_history" / "agent_003").iterdir()))
             summary = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["recommend_by"], "duration")
+            self.assertNotIn("best_by", summary)
             self.assertEqual([result["idx"] for result in summary["results"]], [3, 4])
             started = [event["idx"] for event in events if event.get("type") == "agent_started"]
             self.assertEqual(started, [3, 4, 3])
@@ -892,7 +903,8 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/effort <auto|level>", "\n".join(command_suggestions("/effort")))
-        self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
+        self.assertIn("/recommendby <duration|reasoning_tokens>", slash_commands)
+        self.assertEqual(command_suggestions("/bestby"), [])
         self.assertIn(
             "/keepworkspaces <on|off>",
             "\n".join(command_suggestions("/keep")),
@@ -962,7 +974,7 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/numofagents 4")
         app._handle_command("/maxparallel 2")
         app._handle_command("/serial")
-        app._handle_command("/bestby duration")
+        app._handle_command("/recommendby duration")
         app._handle_command("/model gpt-5")
         app._handle_command("/effort high")
         app._handle_command("/syncback off")
@@ -973,7 +985,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.args.num_agents, 4)
         self.assertEqual(app.args.max_parallel, 2)
         self.assertTrue(app.args.serial)
-        self.assertEqual(app.args.best_by, "duration")
+        self.assertEqual(app.args.recommend_by, "duration")
         self.assertEqual(app.args.model, "gpt-5")
         self.assertEqual(app.args.effort, "high")
         self.assertTrue(app.args.no_sync_back)
@@ -1079,7 +1091,7 @@ class TuiCommandTests(unittest.TestCase):
         app.pending_workspace = app.workspace
         app.pending_no_sync_back = False
         app.pending_keep_workspaces = False
-        app.best_agent = 5
+        app.recommended_agent = 5
         app.selected_agent = 4
         completed_agents = app.agents
 
@@ -1087,7 +1099,7 @@ class TuiCommandTests(unittest.TestCase):
             with mock.patch.object(app, "_discard_pending_run") as discard:
                 app._handle_command("/numofagents 2")
                 app._handle_command("/maxparallel 1")
-                app._handle_command("/bestby duration")
+                app._handle_command("/recommendby duration")
                 app._handle_command("/model gpt-5")
                 app._handle_command("/syncback off")
                 app._handle_command("/keepworkspaces on")
@@ -1096,7 +1108,7 @@ class TuiCommandTests(unittest.TestCase):
         discard.assert_not_called()
         self.assertIs(app.agents, completed_agents)
         self.assertEqual(app.selected_agent, 4)
-        self.assertEqual(app.best_agent, 5)
+        self.assertEqual(app.recommended_agent, 5)
         self.assertEqual(app.num_agents, 2)
         self.assertTrue(app._has_pending_run())
         self.assertFalse(app._pending_sync_disabled())
@@ -1114,7 +1126,7 @@ class TuiCommandTests(unittest.TestCase):
         app._show_text = lambda _text: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
         app.pending_no_sync_back = False
-        app.best_agent = 5
+        app.recommended_agent = 5
         app.selected_agent = 3
         app.agents[3].result = {"status": "success"}
         app._handle_syncback(["off"])
@@ -1136,7 +1148,7 @@ class TuiCommandTests(unittest.TestCase):
         app._sync = lambda: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
         app.pending_no_sync_back = False
-        app.best_agent = 5
+        app.recommended_agent = 5
         app.selected_agent = 3
         app.agents[3].result = {"status": "failed"}
         app.agents[5].result = {"status": "success"}
@@ -1230,7 +1242,7 @@ class TuiCommandTests(unittest.TestCase):
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
         app._sync = lambda: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
-        app.pending_execution_args = argparse.Namespace(best_by="reasoning_tokens")
+        app.pending_execution_args = argparse.Namespace(recommend_by="reasoning_tokens")
         app.agents[1].result = make_agent_result_data(
             1,
             Path("/tmp/agent-1"),
@@ -1242,13 +1254,13 @@ class TuiCommandTests(unittest.TestCase):
             reasoning_tokens=50,
         )
         app._recompute_recommendation()
-        self.assertEqual(app.best_agent, 1)
+        self.assertEqual(app.recommended_agent, 1)
 
         app.selected_agent = 1
         app._handle_command("/reject")
 
         self.assertTrue(app.agents[1].rejected)
-        self.assertEqual(app.best_agent, 2)
+        self.assertEqual(app.recommended_agent, 2)
         self.assertIn("rejected", app._detail_title(app.agents[1]))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -1257,7 +1269,7 @@ class TuiCommandTests(unittest.TestCase):
         app._sync = lambda: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
         app.pending_no_sync_back = False
-        app.best_agent = None
+        app.recommended_agent = None
         app.selected_agent = 1
         app.agents[1].rejected = True
         app.agents[1].result = make_agent_result_data(1, Path("/tmp/agent-1"))
@@ -1407,7 +1419,7 @@ class TuiCommandTests(unittest.TestCase):
         app._sync = lambda: None
         app.running = True
         app.app_in_foreground = False
-        app.pending_execution_args = argparse.Namespace(best_by="reasoning_tokens")
+        app.pending_execution_args = argparse.Namespace(recommend_by="reasoning_tokens")
         with mock.patch.object(app, "bell") as bell:
             for idx in (1, 2):
                 app._on_runner_event(
@@ -1463,7 +1475,7 @@ class TuiCommandTests(unittest.TestCase):
             app.pending_workspaces_root = root / "run" / "workspaces"
             app.pending_workspace = current_workspace.resolve()
             app.pending_no_sync_back = False
-            app.best_agent = 5
+            app.recommended_agent = 5
             app.selected_agent = 3
             app.agents[3].result = {"status": "success"}
 
@@ -1491,7 +1503,7 @@ class TuiCommandTests(unittest.TestCase):
         app._sync = lambda: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
         app.pending_no_sync_back = False
-        app.best_agent = 5
+        app.recommended_agent = 5
         app.selected_agent = 3
         app.agents[3].result = {"status": "success"}
         app.resume_choices_loaded = True
@@ -1637,7 +1649,7 @@ class TuiCommandTests(unittest.TestCase):
 
                     for selector, value in (
                         ("#config-execution", "serial"),
-                        ("#config-best-by", "duration"),
+                        ("#config-recommend-by", "duration"),
                         ("#config-sync-back", False),
                         ("#config-keep-workspaces", True),
                     ):
@@ -1660,7 +1672,7 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.pause()
 
                     self.assertTrue(app.args.serial)
-                    self.assertEqual(app.args.best_by, "duration")
+                    self.assertEqual(app.args.recommend_by, "duration")
                     self.assertEqual(app.args.model, "gpt-test")
                     self.assertEqual(app.args.effort, "high")
                     self.assertTrue(app.args.no_sync_back)
@@ -1694,8 +1706,8 @@ class TuiCommandTests(unittest.TestCase):
 
                     self.assertEqual(app.args.max_parallel, 2)
 
-                    best_by = app.query_one("#config-best-by")
-                    best_by.value = "duration"
+                    recommend_by = app.query_one("#config-recommend-by")
+                    recommend_by.value = "duration"
                     model = app.query_one("#config-model")
                     app._set_select_control(
                         model,
@@ -1723,7 +1735,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(len(app.agents), 4)
                     self.assertEqual(captured_args[0].num_agents, 4)
                     self.assertEqual(captured_args[0].max_parallel, 2)
-                    self.assertEqual(captured_args[0].best_by, "duration")
+                    self.assertEqual(captured_args[0].recommend_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
                     self.assertEqual(
                         set(captured_args[0].agent_cancel_events),
@@ -2591,14 +2603,14 @@ class TuiCommandTests(unittest.TestCase):
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_start_run_continues_from_selected_agent_not_best_agent(self) -> None:
+    def test_tui_start_run_continues_from_selected_not_recommended_agent(self) -> None:
         args = parse_args([])
         app = tui_textual.PcrTextualApp(args)
         app._sync = lambda: None
         app._show_text = lambda _text: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
         app.pending_no_sync_back = False
-        app.best_agent = 5
+        app.recommended_agent = 5
         app.selected_agent = 4
         app._handle_numofagents(["2"])
         app._handle_syncback(["off"])
@@ -2665,7 +2677,7 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_run_finished_does_not_auto_switch_to_best_agent(self) -> None:
+    def test_tui_run_finished_does_not_auto_switch_to_recommended_agent(self) -> None:
         args = parse_args(["-n", "5"])
         app = tui_textual.PcrTextualApp(args)
         app._sync = lambda: None
@@ -2674,7 +2686,7 @@ class TuiCommandTests(unittest.TestCase):
         app._on_runner_event(tui_textual.RunnerEvent({"type": "run_finished", "run_root": "/tmp/pcr-test/run", "best_agent": 5}))
 
         self.assertEqual(app.selected_agent, 2)
-        self.assertEqual(app.best_agent, 5)
+        self.assertEqual(app.recommended_agent, 5)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_start_run_discards_no_success_pending_run(self) -> None:
@@ -2682,7 +2694,7 @@ class TuiCommandTests(unittest.TestCase):
         app = tui_textual.PcrTextualApp(args)
         app._sync = lambda: None
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
-        app.best_agent = None
+        app.recommended_agent = None
 
         def discard_side_effect() -> bool:
             app._clear_pending_run()
@@ -2710,7 +2722,7 @@ class TuiCommandTests(unittest.TestCase):
             app = tui_textual.PcrTextualApp(args)
             app._sync = lambda: None
             app.pending_workspaces_root = root / "run" / "workspaces"
-            app.best_agent = 5
+            app.recommended_agent = 5
             app.selected_agent = 2
             app.resume_session_id = "old-session"
             app.agents[2].result = {
@@ -2897,6 +2909,59 @@ class TuiCommandTests(unittest.TestCase):
         )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_recommended_detail_uses_animated_rainbow_border(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            app.agents[1].input_text = "recommended"
+            app.agents[2].input_text = "other"
+            app.recommended_agent = 1
+            async with app.run_test(size=(100, 36)):
+                app._sync()
+                frame = app.query_one("#detail-frame")
+                detail = app.query_one("#detail")
+                rainbow = (
+                    frame.styles.border_top,
+                    frame.styles.border_right,
+                    frame.styles.border_bottom,
+                    frame.styles.border_left,
+                )
+
+                self.assertTrue(frame.border_title.startswith("★ AGENT-001"))
+                self.assertEqual(frame.styles.border_title_align, "center")
+                self.assertTrue(frame.styles.border_title_style.bold)
+                self.assertEqual(len({str(edge[1]) for edge in rainbow}), 4)
+                recommended_rail = detail.styles.border_left
+                self.assertEqual(recommended_rail[0], "thick")
+
+                previous_top = frame.styles.border_top
+                app._advance_recommend_border()
+                self.assertNotEqual(frame.styles.border_top, previous_top)
+
+                paused_top = frame.styles.border_top
+                with mock.patch.object(
+                    app,
+                    "_screen_selection_active",
+                    return_value=True,
+                ):
+                    app._advance_recommend_border()
+                self.assertEqual(frame.styles.border_top, paused_top)
+                self.assertTrue(app._recommend_border_deferred_for_selection)
+
+                app.selected_agent = 2
+                app._sync()
+                normal = (
+                    frame.styles.border_top,
+                    frame.styles.border_right,
+                    frame.styles.border_bottom,
+                    frame.styles.border_left,
+                )
+                self.assertFalse(frame.border_title.startswith("★"))
+                self.assertEqual(len({str(edge[1]) for edge in normal}), 1)
+                self.assertNotEqual(detail.styles.border_left, recommended_rail)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_runner_panel_has_title_and_editable_controls(self) -> None:
         async def run() -> None:
             args = parse_args([])
@@ -2910,8 +2975,14 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertEqual(app.query_one("#config-agents").value, "5")
                 self.assertEqual(app.query_one("#config-max-parallel").value, "5")
                 self.assertEqual(app.query_one("#config-execution").value, "parallel")
-                self.assertEqual(app.query_one("#config-best-by").value, "reasoning_tokens")
-                self.assertNotIn("METADATA", [label for label, _value in app._tree_rows()])
+                self.assertEqual(
+                    app.query_one("#config-recommend-by").value,
+                    "reasoning_tokens",
+                )
+                labels = [label for label, _value in app._tree_rows()]
+                self.assertIn("RECOMMEND_BY", labels)
+                self.assertNotIn("BEST_BY", labels)
+                self.assertNotIn("METADATA", labels)
                 self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])
                 self.assertNotIn("MODULE_DIR", [label for label, _value in app._tree_rows()])
                 self.assertNotIn("RUN_ANCHOR", [label for label, _value in app._tree_rows()])
