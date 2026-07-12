@@ -15,6 +15,7 @@ dependencies = [
     "platformdirs>=3.6.0,<5",
     "pygments>=2.19.2,<3.0.0",
     "rich>=14.2.0",
+    "tomli>=2.0.1; python_version < '3.11'",
     "typing-extensions>=4.4.0,<5.0.0",
 ]
 

@@ -1,5 +1,6 @@
 from .app import *  # noqa: F401,F403
 from .codex_cli import *  # noqa: F401,F403
+from .codex_models import *  # noqa: F401,F403
 from .diffing import *  # noqa: F401,F403
 from .models import *  # noqa: F401,F403
 from .paths import *  # noqa: F401,F403

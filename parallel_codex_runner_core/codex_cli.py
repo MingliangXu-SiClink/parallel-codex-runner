@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -58,6 +59,7 @@ def build_codex_command(
     help_text: str,
     final_message_path: Path,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     resume_session_id: Optional[str] = None,
 ) -> Tuple[List[str], Dict[str, bool]]:
     cmd: List[str] = [codex_bin, "exec"]
@@ -81,6 +83,26 @@ def build_codex_command(
             cmd.extend([model_flag, model])
         else:
             _warn("当前 Codex CLI help 中未检测到 --model；忽略 --model {}", model)
+
+    config_flag = (
+        "--config"
+        if flag_supported(help_text, "--config")
+        else "-c"
+        if short_flag_supported(help_text, "-c")
+        else None
+    )
+    caps["effort"] = config_flag is not None
+    if effort:
+        if caps["effort"]:
+            assert config_flag is not None
+            cmd.extend(
+                [config_flag, f"model_reasoning_effort={json.dumps(effort)}"]
+            )
+        else:
+            _warn(
+                "当前 Codex CLI help 中未检测到 --config；忽略 --effort {}",
+                effort,
+            )
 
     caps["dangerously_bypass"] = flag_supported(help_text, "--dangerously-bypass-approvals-and-sandbox")
     caps["sandbox"] = flag_supported(help_text, "--sandbox")

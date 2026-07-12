@@ -237,6 +237,7 @@ Candidate workspaces are deleted after a normal synced run. Use `--keep-workspac
 | `--runs-dir` | Directory for run records; must be outside the workspace |
 | `--codex-bin` | Codex executable, default `codex` |
 | `--model` | Optional Codex model name |
+| `--effort` | Optional reasoning effort, validated against the selected model |
 | `--resume` | Choose a resumable Codex session interactively |
 | `--resume-session-id` | Resume a specific Codex session id |
 | `--resume-include-non-interactive` | Include `codex exec` sessions in the resume picker |
@@ -261,6 +262,7 @@ Interactive slash commands:
 | `/parallel` | Clear serial mode |
 | `/bestby <duration\|reasoning_tokens>` | Set `--best-by` |
 | `/model <name\|clear>` | Set or clear `--model` |
+| `/effort <auto\|level>` | Select a reasoning effort supported by the current model |
 | `/workspace <path>` | Set `--workspace` |
 | `/runsdir <path\|clear>` | Set or clear `--runs-dir` |
 | `/codexbin <path>` | Set `--codex-bin` |
@@ -282,6 +284,7 @@ Interactive slash commands:
 | `parallel_codex_runner.py` | Compatibility wrapper for `python3 parallel_codex_runner.py` and old imports |
 | `parallel_codex_runner_core/app.py` | CLI orchestration, agent execution, summaries, and session promotion flow |
 | `parallel_codex_runner_core/codex_cli.py` | Codex CLI capability detection and command construction |
+| `parallel_codex_runner_core/codex_models.py` | Model capability cache and compatible reasoning-effort selection |
 | `parallel_codex_runner_core/workspace.py` | Workspace copy, `git worktree`, cleanup, and sync-back logic |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive Textual TUI |
 | `parallel_codex_runner_core/prompt_history.py` | Persistent workspace/session prompt history and draft navigation |

@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
+from .codex_models import CodexModelRegistry
 from .models import (
     AgentResult,
     AgentState,
@@ -264,6 +265,18 @@ def read_prompt(args: argparse.Namespace) -> str:
 def get_codex_home() -> Path:
     value = os.environ.get("CODEX_HOME")
     return Path(value).expanduser().resolve() if value else (Path.home() / ".codex").resolve()
+
+
+def resolve_codex_reasoning_effort(
+    model: Optional[str],
+    effort: Optional[str],
+    codex_home: Optional[Path] = None,
+) -> Optional[str]:
+    registry = CodexModelRegistry.load(codex_home or get_codex_home())
+    try:
+        return registry.resolve_effort(model, effort)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def is_codex_state_entry(name: str) -> bool:
@@ -2459,6 +2472,11 @@ def run_additional_agents(
         else read_codex_exec_help(args.codex_bin)
     )
     real_codex_home = get_codex_home()
+    effective_effort = resolve_codex_reasoning_effort(
+        getattr(args, "model", None),
+        getattr(args, "effort", None),
+        real_codex_home,
+    )
     command_by_agent: Dict[int, List[str]] = {}
     codex_home_by_agent: Dict[int, Path] = {}
     prepared: List[int] = []
@@ -2492,6 +2510,7 @@ def run_additional_agents(
                 help_text,
                 agent_meta_dir / "final_message.md",
                 model=args.model,
+                effort=effective_effort,
                 resume_session_id=resume_session_id,
             )
             command_by_agent[idx] = command
@@ -2577,6 +2596,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--codex-bin", type=str, default="codex", help="Codex CLI executable.")
     parser.add_argument("--model", type=str, default=None, help="Optional Codex model name if your CLI supports --model.")
     parser.add_argument(
+        "--effort",
+        type=str,
+        default=None,
+        help="Optional model reasoning effort. Supported values are validated against the Codex model cache.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Show Codex resume sessions for this workspace and run agents with the selected session.",
@@ -2604,6 +2629,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-parallel 必须大于 0。")
     if args.serial and args.max_parallel not in (None, 1):
         raise SystemExit("--serial 不能和 --max-parallel > 1 同时使用。")
+    effort = str(getattr(args, "effort", None) or "").strip().lower()
+    args.effort = (
+        None
+        if effort in {"", "auto", "clear", "default", "none"}
+        else effort
+    )
+    resume_requested = bool(
+        getattr(args, "resume", False)
+        or getattr(args, "resume_session_id", None)
+    )
+    if args.effort and (getattr(args, "model", None) or not resume_requested):
+        resolve_codex_reasoning_effort(
+            getattr(args, "model", None),
+            args.effort,
+        )
 
 
 def should_start_tui(args: argparse.Namespace) -> bool:
@@ -2638,6 +2678,11 @@ def run_once(
 
     resume_session = resolve_resume_session(args, workspace)
     resume_session_id = resume_session.session_id if resume_session else None
+    effort_model = args.model or (resume_session.model if resume_session else None)
+    effective_effort = resolve_codex_reasoning_effort(
+        effort_model,
+        getattr(args, "effort", None),
+    )
 
     module_dir = Path(__file__).resolve().parent
     run_anchor = default_run_anchor(module_dir, workspace)
@@ -2664,6 +2709,8 @@ def run_once(
                     ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
                     ["MAX_PARALLEL", str(max_parallel)],
                     ["BEST_BY", args.best_by],
+                    ["MODEL", args.model or "default"],
+                    ["EFFORT", effective_effort or "default"],
                     ["RESUME", resume_session_id or "NO"],
                     ["METADATA", absolute_path_for_display(meta_root)],
                     ["WORKSPACE COPIES", absolute_path_for_display(workspaces_root)],
@@ -2698,6 +2745,8 @@ def run_once(
         overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
         overview.add_row("MAX_PARALLEL", str(max_parallel))
         overview.add_row("BEST_BY", args.best_by)
+        overview.add_row("MODEL", args.model or "default")
+        overview.add_row("EFFORT", effective_effort or "default")
         overview.add_row("RESUME", resume_session_id or "NO")
         overview.add_row("METADATA", absolute_path_for_display(meta_root))
         overview.add_row("WORKSPACE COPIES", absolute_path_for_display(workspaces_root))
@@ -2717,6 +2766,8 @@ def run_once(
         log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
         log("info", "max_parallel = {}", max_parallel)
         log("info", "best_by = {}", args.best_by)
+        log("info", "model = {}", args.model or "default")
+        log("info", "effort = {}", effective_effort or "default")
         log("info", "resume = {}", resume_session_id or "NO")
 
     help_text = read_codex_exec_resume_help(args.codex_bin) if resume_session_id else read_codex_exec_help(args.codex_bin)
@@ -2770,6 +2821,7 @@ def run_once(
                         help_text,
                         final_message_path,
                         model=args.model,
+                        effort=effective_effort,
                         resume_session_id=resume_session_id,
                     )
                     command_by_agent[idx] = cmd
@@ -2794,6 +2846,7 @@ def run_once(
                     help_text,
                     final_message_path,
                     model=args.model,
+                    effort=effective_effort,
                     resume_session_id=resume_session_id,
                 )
                 command_by_agent[idx] = cmd

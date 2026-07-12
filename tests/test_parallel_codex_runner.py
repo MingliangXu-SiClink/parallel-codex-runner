@@ -18,6 +18,8 @@ from pathlib import Path
 import parallel_codex_runner_core.tui_textual as tui_textual
 import parallel_codex_runner_core.app as app_core
 import parallel_codex_runner_core.workspace as workspace_core
+from parallel_codex_runner_core.codex_models import CodexModelInfo, CodexModelRegistry
+from parallel_codex_runner_core.diffing import build_workspace_diff_text
 from parallel_codex_runner import (
     AgentResult,
     AgentState,
@@ -39,7 +41,6 @@ from parallel_codex_runner import (
     sync_back_with_python,
 )
 from parallel_codex_runner_core.tui_textual import command_suggestions, display_line_from_output, display_line_parts_from_output
-from parallel_codex_runner_core.diffing import build_workspace_diff_text
 
 
 def make_agent_result_data(
@@ -589,6 +590,18 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("-m", cmd)
         self.assertNotIn("--model", cmd)
 
+    def test_effort_uses_codex_config_override(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            effort="xhigh",
+        )
+
+        self.assertTrue(caps["effort"])
+        self.assertIn("--config", cmd)
+        self.assertIn('model_reasoning_effort="xhigh"', cmd)
+
     def test_resume_command_uses_exec_resume_session_id_and_stdin_prompt(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
@@ -620,6 +633,49 @@ class ArgParseTests(unittest.TestCase):
         args = parse_args(["fix tests"])
 
         self.assertEqual(args.num_agents, 5)
+
+    def test_effort_option_is_available_to_cli_runs(self) -> None:
+        args = parse_args(["fix tests", "--effort", "xhigh"])
+
+        self.assertEqual(args.effort, "xhigh")
+
+
+class ReasoningEffortTests(unittest.TestCase):
+    def test_auto_effort_falls_back_to_model_default_when_config_is_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.toml").write_text(
+                'model = "gpt-wide"\nmodel_reasoning_effort = "max"\n',
+                encoding="utf-8",
+            )
+            (root / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-narrow",
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                    {"effort": "high"},
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            resolved = app_core.resolve_codex_reasoning_effort(
+                "gpt-narrow",
+                None,
+                root,
+            )
+
+            self.assertEqual(resolved, "medium")
+            with self.assertRaisesRegex(SystemExit, "not supported"):
+                app_core.resolve_codex_reasoning_effort("gpt-narrow", "max", root)
 
 
 class RunOnceCleanupTests(unittest.TestCase):
@@ -779,6 +835,51 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn(("gpt-custom", "gpt-custom"), options)
         self.assertNotIn(("gpt-hidden", "gpt-hidden"), options)
 
+    def test_tui_effort_choices_follow_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.toml").write_text(
+                'model = "gpt-wide"\nmodel_reasoning_effort = "max"\n',
+                encoding="utf-8",
+            )
+            (root / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-wide",
+                                "visibility": "list",
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                    {"effort": "max"},
+                                ],
+                            },
+                            {
+                                "slug": "gpt-narrow",
+                                "visibility": "list",
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                    {"effort": "high"},
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
+                wide = tui_textual.codex_effort_options("gpt-wide", None)
+                narrow = tui_textual.codex_effort_options("gpt-narrow", None)
+
+        self.assertEqual(wide[0], ("auto (max)", ""))
+        self.assertIn(("max", "max"), wide)
+        self.assertEqual(narrow[0], ("auto (medium)", ""))
+        self.assertNotIn(("max", "max"), narrow)
+
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
         slash_commands = "\n".join(command_suggestions("/"))
@@ -790,6 +891,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/diff", "\n".join(command_suggestions("/d")))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
+        self.assertIn("/effort <auto|level>", "\n".join(command_suggestions("/effort")))
         self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
         self.assertIn(
             "/keepworkspaces <on|off>",
@@ -862,6 +964,7 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/serial")
         app._handle_command("/bestby duration")
         app._handle_command("/model gpt-5")
+        app._handle_command("/effort high")
         app._handle_command("/syncback off")
         app._handle_command("/keepworkspaces on")
         app._handle_command("/resumeinclude off")
@@ -872,6 +975,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertTrue(app.args.serial)
         self.assertEqual(app.args.best_by, "duration")
         self.assertEqual(app.args.model, "gpt-5")
+        self.assertEqual(app.args.effort, "high")
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
         self.assertFalse(app.args.resume_include_non_interactive)
@@ -879,9 +983,92 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/parallel")
         app._handle_command("/maxparallel auto")
         app._handle_command("/model clear")
+        app._handle_command("/effort auto")
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertIsNone(app.args.model)
+        self.assertIsNone(app.args.effort)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_model_change_resets_an_unsupported_effort_to_auto(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.toml").write_text(
+                'model = "gpt-wide"\nmodel_reasoning_effort = "max"\n',
+                encoding="utf-8",
+            )
+            (root / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-wide",
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "medium"},
+                                    {"effort": "max"},
+                                ],
+                            },
+                            {
+                                "slug": "gpt-narrow",
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(["--model", "gpt-wide", "--effort", "max"])
+            with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
+                app = tui_textual.PcrTextualApp(args)
+            app._sync = lambda: None
+            app._show_text = lambda _text: None
+
+            app._handle_command("/model gpt-narrow")
+
+        self.assertEqual(app.args.model, "gpt-narrow")
+        self.assertIsNone(app.args.effort)
+        self.assertEqual(dict(app._base_info_rows())["EFFORT"], "auto (medium)")
+        self.assertNotIn(
+            ("max", "max"),
+            app.model_registry.effort_options("gpt-narrow", app.args.effort),
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_model_select_refreshes_effort_select_options(self) -> None:
+        async def run() -> None:
+            args = parse_args(["--model", "gpt-wide", "--effort", "max"])
+            app = tui_textual.PcrTextualApp(args)
+            app.model_registry = CodexModelRegistry(
+                models={
+                    "gpt-wide": CodexModelInfo(
+                        "gpt-wide", "medium", ("medium", "max")
+                    ),
+                    "gpt-narrow": CodexModelInfo(
+                        "gpt-narrow", "medium", ("low", "medium")
+                    ),
+                }
+            )
+            app.model_choices = app.model_registry.model_options(args.model)
+            app.effort_choices = app.model_registry.effort_options(
+                args.model, args.effort
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    model = app.query_one("#config-model")
+                    model.value = "gpt-narrow"
+                    await pilot.pause()
+                    effort = app.query_one("#config-effort")
+
+                    self.assertIsNone(app.args.effort)
+                    self.assertIn("medium", effort._legal_values)
+                    self.assertNotIn("max", effort._legal_values)
+
+        asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_next_run_config_does_not_finalize_completed_selection(self) -> None:
@@ -1468,12 +1655,17 @@ class TuiCommandTests(unittest.TestCase):
                     model.value = "gpt-test"
                     await pilot.pause()
 
+                    effort = app.query_one("#config-effort")
+                    effort.value = "high"
+                    await pilot.pause()
+
                     self.assertTrue(app.args.serial)
                     self.assertEqual(app.args.best_by, "duration")
                     self.assertEqual(app.args.model, "gpt-test")
+                    self.assertEqual(app.args.effort, "high")
                     self.assertTrue(app.args.no_sync_back)
                     self.assertTrue(app.args.keep_workspaces)
-                    self.assertGreaterEqual(len(app.command_history), 5)
+                    self.assertGreaterEqual(len(app.command_history), 6)
 
         asyncio.run(run())
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._vendor import activate_textual
+from .codex_models import CodexModelRegistry
 from .prompt_history import PromptHistoryNavigator, PromptHistoryStore
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -38,6 +39,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
         "choose how successful agents are recommended",
     ),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
+    ("/effort <auto|level>", "set a model-supported reasoning effort for the next run"),
     ("/workspace <path>", "set the workspace PCR operates on"),
     ("/runsdir <path|clear>", "set or reset the directory used for run data"),
     ("/codexbin <path>", "set the Codex executable"),
@@ -53,6 +55,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit", "stop active agents, clean up, and quit"),
 )
 MAX_SUGGESTIONS = 14
+UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
 TIP_ICON = "✦"
@@ -91,6 +94,7 @@ TUI_TIPS: tuple[str, ...] = (
     "后续提问会从当前显示的已完成 Agent 继续。",
     "某个 Agent 完成后，即可从该 Agent 继续提问。",
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
+    "EFFORT 会随 MODEL 更新可选等级，auto 会选择兼容的推理等级。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
@@ -101,7 +105,7 @@ TUI_TIPS: tuple[str, ...] = (
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
     "注意本项目默认以Codex Full Access 权限运行。",
-    "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常接替。",
+    "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常加入队列。",
     "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
 )
 
@@ -512,26 +516,17 @@ else:
 
 
     def codex_model_options(current_model: str | None) -> list[tuple[str, str]]:
-        options: list[tuple[str, str]] = [("default", "")]
-        seen = {""}
-        cache_path = get_codex_home() / "models_cache.json"
-        try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-        models = payload.get("models") if isinstance(payload, dict) else None
-        if isinstance(models, list):
-            for model in models:
-                if not isinstance(model, dict) or model.get("visibility") == "hide":
-                    continue
-                slug = str(model.get("slug") or "").strip()
-                if slug and slug not in seen:
-                    options.append((slug, slug))
-                    seen.add(slug)
-        current = str(current_model or "").strip()
-        if current and current not in seen:
-            options.append((current, current))
-        return options
+        return CodexModelRegistry.load(get_codex_home()).model_options(current_model)
+
+
+    def codex_effort_options(
+        model: str | None,
+        current_effort: str | None,
+    ) -> list[tuple[str, str]]:
+        return CodexModelRegistry.load(get_codex_home()).effort_options(
+            model,
+            current_effort,
+        )
 
 
     def resume_select_options(
@@ -885,7 +880,7 @@ else:
         #config-agents, #config-max-parallel {
             width: 12;
         }
-        #config-execution, #config-best-by {
+        #config-execution, #config-best-by, #config-effort {
             width: 24;
         }
         #config-model {
@@ -961,7 +956,24 @@ else:
             self.num_agents = args.num_agents
             self.resume_session_id = (args.resume_session_id or "").strip()
             self.resume_entries = []
-            self.model_choices = codex_model_options(getattr(args, "model", None))
+            self.model_registry = CodexModelRegistry.load(get_codex_home())
+            resume_model_pending = bool(
+                (getattr(args, "resume", False) or self.resume_session_id)
+                and not getattr(args, "model", None)
+            )
+            if not resume_model_pending and not self.model_registry.effort_is_supported(
+                getattr(args, "model", None), getattr(args, "effort", None)
+            ):
+                self.args.effort = None
+            self.model_choices = self.model_registry.model_options(
+                getattr(args, "model", None)
+            )
+            self.effort_choices = self.model_registry.effort_options(
+                UNKNOWN_RESUME_MODEL
+                if resume_model_pending
+                else getattr(args, "model", None),
+                getattr(args, "effort", None),
+            )
             self.resume_choices = resume_select_options([], self.resume_session_id)
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.selected_agent = 1
@@ -1217,6 +1229,15 @@ else:
                             allow_blank=False,
                             compact=True,
                             id="config-model",
+                            classes="runner-control",
+                        )
+                        yield Static("EFFORT", classes="runner-key")
+                        yield Select(
+                            self.effort_choices,
+                            value=str(getattr(self.args, "effort", None) or ""),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-effort",
                             classes="runner-control",
                         )
                         yield Static("CODEX_BIN", classes="runner-key")
@@ -1512,6 +1533,14 @@ else:
             if value != str(getattr(self.args, "model", None) or ""):
                 self._handle_model([value or "clear"])
 
+        @on(Select.Changed, "#config-effort")
+        def _on_effort_selected(self, event: Select.Changed) -> None:
+            if self._updating_controls:
+                return
+            value = str(event.value)
+            if value != str(getattr(self.args, "effort", None) or ""):
+                self._handle_effort([value or "auto"])
+
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
             if self._updating_controls:
@@ -1575,6 +1604,11 @@ else:
                     run_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
                     self._remember_run_paths(run_rows)
                     self.run_info_rows = self._visible_info_rows(run_rows)
+                    prepared_effort = dict(run_rows).get("EFFORT", "")
+                    if self.pending_execution_args is not None and prepared_effort:
+                        self.pending_execution_args.effort = (
+                            None if prepared_effort == "default" else prepared_effort
+                        )
             elif kind == "agent_status" and pane is not None:
                 pane.status = (
                     "stopping"
@@ -1714,6 +1748,7 @@ else:
             self.resume_session_id = event.session_id
             self._load_prompt_history_context()
             self._reset_conversation_detail()
+            self._refresh_effort_for_context()
             self.run_info_rows = self._base_info_rows()
             if event.error:
                 loaded_status = f"Resume history unavailable: {event.error}"
@@ -1829,7 +1864,15 @@ else:
                 if isinstance(value, bool):
                     text = "YES" if value else "NO"
                 elif value == "":
-                    text = "default" if self.focused.id == "config-model" else "NO"
+                    if self.focused.id == "config-model":
+                        text = "default"
+                    elif self.focused.id == "config-effort":
+                        text = self.model_registry.effort_display(
+                            self._model_for_effort(),
+                            None,
+                        )
+                    else:
+                        text = "NO"
                 else:
                     text = str(value)
                 self.copy_to_clipboard(text)
@@ -1929,6 +1972,9 @@ else:
                 return
             if name == "/model":
                 self._handle_model(args)
+                return
+            if name == "/effort":
+                self._handle_effort(args)
                 return
             if name == "/workspace":
                 self._handle_workspace(args)
@@ -2326,6 +2372,52 @@ else:
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"bestby={value}")
 
+        def _resume_model_for_effort(self) -> str | None:
+            if self.resume_session_id:
+                for session in self.resume_entries:
+                    if str(getattr(session, "session_id", "")) == self.resume_session_id:
+                        resumed_model = str(getattr(session, "model", "") or "").strip()
+                        if resumed_model:
+                            return resumed_model
+            return None
+
+        def _model_for_effort(self) -> str | None:
+            configured = str(getattr(self.args, "model", None) or "").strip()
+            return configured or self._resume_model_for_effort()
+
+        def _effort_model_is_known(self) -> bool:
+            return bool(
+                getattr(self.args, "model", None)
+                or not self.resume_session_id
+                or self._resume_model_for_effort()
+            )
+
+        def _effort_options_for_context(self) -> list[tuple[str, str]]:
+            model = (
+                self._model_for_effort()
+                if self._effort_model_is_known()
+                else UNKNOWN_RESUME_MODEL
+            )
+            return self.model_registry.effort_options(
+                model,
+                getattr(self.args, "effort", None),
+            )
+
+        def _coerce_effort_for_model(self) -> bool:
+            if not self._effort_model_is_known():
+                return False
+            current = getattr(self.args, "effort", None)
+            if self.model_registry.effort_is_supported(
+                self._model_for_effort(),
+                current,
+            ):
+                return False
+            self.args.effort = None
+            return True
+
+        def _refresh_effort_for_context(self) -> bool:
+            return self._coerce_effort_for_model()
+
         def _handle_model(self, args: list[str]) -> None:
             if not args:
                 self._show_setting(f"model={getattr(self.args, 'model', None) or 'default'}")
@@ -2336,8 +2428,43 @@ else:
             if not self._prepare_config_change("model"):
                 return
             self.args.model = value
+            effort_reset = self._refresh_effort_for_context()
             self.run_info_rows = self._base_info_rows()
-            self._show_setting(f"model={value or 'default'}")
+            setting = f"model={value or 'default'}"
+            if effort_reset:
+                setting += (
+                    f"; effort={self.model_registry.effort_display(self._model_for_effort(), None)}"
+                )
+            self._show_setting(setting)
+
+        def _handle_effort(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"effort={self.model_registry.effort_display(self._model_for_effort(), getattr(self.args, 'effort', None))}"
+                )
+                return
+            if len(args) != 1:
+                self.status = "Usage: /effort <auto|level>"
+                self._sync()
+                return
+            if not self._prepare_config_change("effort"):
+                return
+            requested = args[0].strip().lower()
+            value = None if requested in {"auto", "clear", "default", "none"} else requested
+            if self._effort_model_is_known():
+                try:
+                    self.model_registry.validate_effort(
+                        self._model_for_effort(), value
+                    )
+                except ValueError as exc:
+                    self.status = str(exc)
+                    self._sync()
+                    return
+            self.args.effort = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(
+                f"effort={self.model_registry.effort_display(self._model_for_effort(), value)}"
+            )
 
         def _handle_workspace(self, args: list[str]) -> None:
             if not args:
@@ -2524,6 +2651,7 @@ else:
                 self.resume_history_request += 1
                 self.pending_resume_selector = None
                 self._reset_conversation_detail()
+                self._refresh_effort_for_context()
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = "Resume cleared"
@@ -2784,6 +2912,18 @@ else:
             if not self._commit_runner_inputs():
                 self._sync()
                 return False
+            if self._effort_model_is_known():
+                try:
+                    effective_effort = self.model_registry.resolve_effort(
+                        self._model_for_effort(),
+                        getattr(self.args, "effort", None),
+                    )
+                except ValueError as exc:
+                    self.status = str(exc)
+                    self._sync()
+                    return False
+            else:
+                effective_effort = getattr(self.args, "effort", None)
             if self._has_pending_run() and (
                 self._pending_sync_disabled()
                 or (
@@ -2838,6 +2978,7 @@ else:
             run_args.max_parallel = min(run_args.max_parallel or self.num_agents, self.num_agents)
             run_args.resume = False
             run_args.resume_session_id = self.resume_session_id or None
+            run_args.effort = effective_effort
             # The TUI owns selection, sync-back, and cleanup after run_once returns.
             run_args.no_sync_back = True
             run_args.keep_workspaces = True
@@ -3240,6 +3381,7 @@ else:
 
         def _apply_resume_choices(self, entries: list[Any]) -> None:
             self.resume_entries = entries
+            self._refresh_effort_for_context()
             choices = resume_select_options(entries, self.resume_session_id)
             options_changed = choices != self.resume_choices
             self.resume_choices = choices
@@ -3279,8 +3421,14 @@ else:
             current_model = str(getattr(self.args, "model", None) or "")
             model_options = None
             if current_model not in {value for _label, value in self.model_choices}:
-                self.model_choices = codex_model_options(current_model)
+                self.model_choices = self.model_registry.model_options(current_model)
                 model_options = self.model_choices
+            current_effort = str(getattr(self.args, "effort", None) or "")
+            desired_effort_choices = self._effort_options_for_context()
+            effort_options = None
+            if desired_effort_choices != self.effort_choices:
+                self.effort_choices = desired_effort_choices
+                effort_options = self.effort_choices
             resume_options = None
             if self.resume_session_id not in {value for _label, value in self.resume_choices}:
                 self.resume_choices = resume_select_options(
@@ -3292,6 +3440,7 @@ else:
             execution_select = self.query_one("#config-execution", Select)
             best_by_select = self.query_one("#config-best-by", Select)
             model_select = self.query_one("#config-model", Select)
+            effort_select = self.query_one("#config-effort", Select)
             sync_back_select = self.query_one("#config-sync-back", Select)
             keep_workspaces_select = self.query_one("#config-keep-workspaces", Select)
             resume_select = self.query_one("#config-resume", Select)
@@ -3301,6 +3450,7 @@ else:
                 execution_select,
                 best_by_select,
                 model_select,
+                effort_select,
                 sync_back_select,
                 keep_workspaces_select,
                 resume_select,
@@ -3326,6 +3476,11 @@ else:
                     str(getattr(self.args, "best_by", "reasoning_tokens")),
                 )
                 self._set_select_control(model_select, current_model, model_options)
+                self._set_select_control(
+                    effort_select,
+                    current_effort,
+                    effort_options,
+                )
                 self._set_select_control(
                     sync_back_select,
                     not bool(getattr(self.args, "no_sync_back", False)),
@@ -3388,6 +3543,13 @@ else:
                 ("MAX_PARALLEL", str(max_parallel)),
                 ("BEST_BY", str(getattr(self.args, "best_by", "reasoning_tokens"))),
                 ("MODEL", str(getattr(self.args, "model", None) or "default")),
+                (
+                    "EFFORT",
+                    self.model_registry.effort_display(
+                        self._model_for_effort(),
+                        getattr(self.args, "effort", None),
+                    ),
+                ),
                 ("CODEX_BIN", str(getattr(self.args, "codex_bin", "codex"))),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
