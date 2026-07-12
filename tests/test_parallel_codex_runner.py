@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import asdict
 from unittest import mock
 from pathlib import Path
 
@@ -38,6 +39,75 @@ from parallel_codex_runner import (
     sync_back_with_python,
 )
 from parallel_codex_runner_core.tui_textual import command_suggestions, display_line_from_output, display_line_parts_from_output
+from parallel_codex_runner_core.diffing import build_workspace_diff_text
+
+
+def make_agent_result_data(
+    idx: int,
+    workspace: Path,
+    *,
+    status: str = "success",
+    seconds: float = 1.0,
+    reasoning_tokens: int | None = 10,
+) -> dict[str, object]:
+    return asdict(
+        AgentResult(
+            idx=idx,
+            workspace_dir=str(workspace),
+            meta_dir=str(workspace.parent / f"meta_{idx}"),
+            codex_home=str(workspace.parent / f"codex_home_{idx}"),
+            stdout_log="",
+            stderr_log="",
+            final_message="",
+            command=[],
+            returncode=0 if status == "success" else 1,
+            status=status,
+            seconds=seconds,
+            codex_thread_id=f"session-{idx}" if status == "success" else None,
+            reasoning_tokens=reasoning_tokens,
+        )
+    )
+
+
+class WorkspaceDiffTests(unittest.TestCase):
+    def test_workspace_diff_shows_added_modified_deleted_and_full_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline"
+            candidate = root / "candidate"
+            baseline.mkdir()
+            candidate.mkdir()
+            (baseline / "modified.txt").write_text("before\nsecond\n", encoding="utf-8")
+            (candidate / "modified.txt").write_text("after\nsecond\nthird\n", encoding="utf-8")
+            (baseline / "deleted.txt").write_text("removed\n", encoding="utf-8")
+            (candidate / "added.txt").write_text("新增内容\n", encoding="utf-8")
+            (baseline / "deleted-empty.txt").touch()
+            (candidate / "added-empty.txt").touch()
+            (baseline / "no-newline.txt").write_text("before", encoding="utf-8")
+            (candidate / "no-newline.txt").write_text("after", encoding="utf-8")
+            (baseline / ".git").mkdir()
+            (candidate / ".git").write_text("gitdir: ignored", encoding="utf-8")
+
+            diff = build_workspace_diff_text(baseline, candidate)
+
+        self.assertIn("A  added.txt", diff)
+        self.assertIn("A  added-empty.txt", diff)
+        self.assertIn("D  deleted.txt", diff)
+        self.assertIn("D  deleted-empty.txt", diff)
+        self.assertIn("M  modified.txt", diff)
+        self.assertIn("new file mode 100644", diff)
+        self.assertIn("deleted file mode 100644", diff)
+        self.assertIn("-before\n\\ No newline at end of file", diff)
+        self.assertIn("+after\n\\ No newline at end of file", diff)
+        self.assertIn("+新增内容", diff)
+        self.assertIn("--- /dev/null\n+++ b/added.txt", diff)
+        self.assertIn("--- a/deleted.txt\n+++ /dev/null", diff)
+        self.assertIn("-removed", diff)
+        self.assertIn("-before", diff)
+        self.assertIn("+after", diff)
+        self.assertIn("+third", diff)
+        self.assertNotIn("gitdir", diff)
+
 
 
 class SyncBackTests(unittest.TestCase):
@@ -412,6 +482,117 @@ class RunOnceCleanupTests(unittest.TestCase):
             self.assertFalse(any(path.exists() for path in runs.glob("*/workspaces")))
 
 
+class AdditionalAgentTests(unittest.TestCase):
+    def test_additional_agents_use_global_indices_and_retry_fresh_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            run_root = root / "run"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            run_root.mkdir()
+            codex_home.mkdir()
+            (workspace / "base.txt").write_text("baseline", encoding="utf-8")
+            args = parse_args(
+                ["prompt", "--workspace", str(workspace), "--best-by", "duration"]
+            )
+            command = [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path('ran.txt').write_text(sys.stdin.read())",
+            ]
+            events: list[dict[str, object]] = []
+
+            with mock.patch.object(app_core, "get_codex_home", return_value=codex_home):
+                with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec"):
+                    with mock.patch.object(
+                        app_core,
+                        "build_codex_command",
+                        return_value=(command, {}),
+                    ):
+                        results = app_core.run_additional_agents(
+                            args=args,
+                            prompt="current question",
+                            agent_indices=[3, 4],
+                            run_root=run_root,
+                            workspace=workspace,
+                            progress_callback=events.append,
+                            cancel_event=threading.Event(),
+                            agent_cancel_events={3: threading.Event(), 4: threading.Event()},
+                        )
+
+                        (run_root / "workspaces" / "agent_003" / "stale.txt").write_text(
+                            "must disappear",
+                            encoding="utf-8",
+                        )
+
+                        retry_results = app_core.run_additional_agents(
+                            args=args,
+                            prompt="current question",
+                            agent_indices=[3],
+                            run_root=run_root,
+                            workspace=workspace,
+                            retry_indices={3},
+                            progress_callback=events.append,
+                            cancel_event=threading.Event(),
+                            agent_cancel_events={3: threading.Event()},
+                        )
+
+            self.assertEqual({result.idx for result in results}, {3, 4})
+            self.assertTrue(all(result.status == "success" for result in results))
+            self.assertEqual([result.idx for result in retry_results], [3])
+            self.assertEqual(
+                (run_root / "workspaces" / "agent_003" / "ran.txt").read_text(encoding="utf-8"),
+                "current question",
+            )
+            self.assertFalse((run_root / "workspaces" / "agent_003" / "stale.txt").exists())
+            self.assertTrue(any((run_root / "retry_history" / "agent_003").iterdir()))
+            summary = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual([result["idx"] for result in summary["results"]], [3, 4])
+            started = [event["idx"] for event in events if event.get("type") == "agent_started"]
+            self.assertEqual(started, [3, 4, 3])
+
+    def test_additional_agents_scrub_codex_support_after_execution_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            run_root = root / "run"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            run_root.mkdir()
+            codex_home.mkdir()
+            args = parse_args(["prompt", "--workspace", str(workspace)])
+
+            def fail_async_run(coroutine: object) -> None:
+                coroutine.close()
+                raise RuntimeError("execution failed")
+
+            with mock.patch.object(app_core, "get_codex_home", return_value=codex_home):
+                with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec"):
+                    with mock.patch.object(
+                        app_core,
+                        "build_codex_command",
+                        return_value=([sys.executable, "-c", "pass"], {}),
+                    ):
+                        with mock.patch.object(app_core.asyncio, "run", side_effect=fail_async_run):
+                            with mock.patch.object(
+                                app_core,
+                                "scrub_codex_home_support_entries",
+                            ) as scrub:
+                                with self.assertRaisesRegex(RuntimeError, "execution failed"):
+                                    app_core.run_additional_agents(
+                                        args=args,
+                                        prompt="current question",
+                                        agent_indices=[3],
+                                        run_root=run_root,
+                                        workspace=workspace,
+                                    )
+
+            scrub.assert_called_with(
+                run_root.resolve() / "meta" / "agent_003" / "codex_home"
+            )
+
+
 class TuiCommandTests(unittest.TestCase):
     def test_tui_model_choices_use_visible_codex_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,6 +620,11 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(command_suggestions("hello"), [])
         slash_commands = "\n".join(command_suggestions("/"))
         self.assertIn("/kill [agent]", "\n".join(command_suggestions("/k")))
+        self.assertIn("/accept", "\n".join(command_suggestions("/a")))
+        self.assertIn("/reject", "\n".join(command_suggestions("/rej")))
+        self.assertIn("/retry [agent]", "\n".join(command_suggestions("/ret")))
+        self.assertIn("/more <n>", "\n".join(command_suggestions("/mo")))
+        self.assertIn("/diff", "\n".join(command_suggestions("/d")))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/bestby <duration|reasoning_tokens>", slash_commands)
@@ -476,6 +662,8 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(tui_textual.TIP_ICON_REFRESH_SECONDS, 0.1)
                     self.assertEqual(len(tui_textual.TIP_ICON_COLORS), 12)
                     self.assertTrue(any("/kill" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("/accept" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("/diff" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -627,6 +815,287 @@ class TuiCommandTests(unittest.TestCase):
 
         discard.assert_called_once_with()
         exit_app.assert_called_once_with()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_accept_finalizes_displayed_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.selected_agent = 2
+        app.agents[2].result = make_agent_result_data(2, Path("/tmp/agent-2"))
+
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+            app._handle_command("/accept")
+
+        finalize.assert_called_once_with(2, archive_detail=True)
+        self.assertEqual(app.status, "Accepted AGENT-002")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_accept_stops_active_run_before_finalizing(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.running = True
+        app.cancel_event = threading.Event()
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.selected_agent = 2
+        app.agents[2].result = make_agent_result_data(2, Path("/tmp/agent-2"))
+
+        app._handle_command("/accept")
+
+        self.assertTrue(app.cancel_event.is_set())
+        self.assertEqual(app.pending_accept_agent, 2)
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+            app._on_runner_event(
+                tui_textual.RunnerEvent(
+                    {
+                        "type": "run_finished",
+                        "run_root": "/tmp/pcr-test/run",
+                        "cancelled": True,
+                    }
+                )
+            )
+
+        finalize.assert_called_once_with(2, archive_detail=True)
+        self.assertIsNone(app.pending_accept_agent)
+        self.assertEqual(app.status, "Accepted AGENT-002")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_accept_respects_no_sync_back(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1", "--no-sync-back"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = True
+        app.agents[1].result = make_agent_result_data(1, Path("/tmp/agent-1"))
+
+        with mock.patch.object(app, "_finalize_agent") as finalize:
+            app._handle_command("/accept")
+
+        finalize.assert_not_called()
+        self.assertEqual(app.status, "Cannot accept while sync back is disabled")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_reject_excludes_agent_from_recommendation(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_execution_args = argparse.Namespace(best_by="reasoning_tokens")
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+            reasoning_tokens=100,
+        )
+        app.agents[2].result = make_agent_result_data(
+            2,
+            Path("/tmp/agent-2"),
+            reasoning_tokens=50,
+        )
+        app._recompute_recommendation()
+        self.assertEqual(app.best_agent, 1)
+
+        app.selected_agent = 1
+        app._handle_command("/reject")
+
+        self.assertTrue(app.agents[1].rejected)
+        self.assertEqual(app.best_agent, 2)
+        self.assertIn("rejected", app._detail_title(app.agents[1]))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_still_uses_rejected_displayed_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.best_agent = None
+        app.selected_agent = 1
+        app.agents[1].rejected = True
+        app.agents[1].result = make_agent_result_data(1, Path("/tmp/agent-1"))
+
+        with mock.patch.object(app, "_commit_runner_inputs", return_value=True):
+            with mock.patch.object(app, "_discard_pending_run") as discard:
+                with mock.patch.object(app, "_finalize_agent", return_value=False) as finalize:
+                    self.assertFalse(app._start_run("follow up"))
+
+        discard.assert_not_called()
+        finalize.assert_called_once_with(1, archive_detail=True)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_more_preserves_auto_parallel_setting(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+
+        with mock.patch.object(app, "_commit_runner_inputs", return_value=True):
+            with mock.patch.object(tui_textual.threading, "Thread"):
+                self.assertTrue(app._start_run("current question"))
+
+        self.assertIsNone(app.pending_execution_args.max_parallel)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_retry_and_more_queue_candidates_for_current_question(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
+        app._sync = lambda: None
+        app.running = True
+        app.pending_prompt = "current question"
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.agents[2].result = make_agent_result_data(
+            2,
+            Path("/tmp/agent-2"),
+            status="killed",
+        )
+        app.selected_agent = 2
+
+        app._handle_command("/retry")
+        app._handle_command("/more 3")
+
+        self.assertEqual(app.candidate_batches[0].indices, [2])
+        self.assertEqual(app.candidate_batches[0].retry_indices, {2})
+        self.assertEqual(app.candidate_batches[1].indices, [4, 5, 6])
+        self.assertEqual(app.agents[2].status, "retry queued")
+        self.assertEqual(
+            [app.agents[idx].input_text for idx in (4, 5, 6)],
+            ["current question"] * 3,
+        )
+
+        app.selected_agent = 6
+        app._clear_pending_run()
+        self.assertNotIn(4, app.agents)
+        self.assertNotIn(5, app.agents)
+        self.assertNotIn(6, app.agents)
+        self.assertEqual(app.agents[2].status, "killed")
+        self.assertEqual(app.selected_agent, 3)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_launches_queued_candidate_batch_with_original_run_settings(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2", "--model", "original-model"]))
+        app._sync = lambda: None
+        app.pending_prompt = "current question"
+        app.pending_run_root = Path("/tmp/pcr-test/run")
+        app.pending_workspaces_root = app.pending_run_root / "workspaces"
+        app.pending_workspace = Path("/tmp/pcr-test/workspace")
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.agents[3] = tui_textual.AgentPane(
+            idx=3,
+            status="queued",
+            input_text="current question",
+        )
+        app.candidate_batches.append(tui_textual.CandidateBatch([3]))
+        events: list[dict[str, object]] = []
+        app._post_progress = events.append
+
+        with mock.patch.object(tui_textual, "run_additional_agents", return_value=[]) as run_more:
+            with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                self.assertTrue(app._launch_next_candidate_batch())
+                thread_cls.call_args.kwargs["target"]()
+
+        run_more.assert_called_once()
+        call = run_more.call_args.kwargs
+        self.assertEqual(call["agent_indices"], [3])
+        self.assertEqual(call["prompt"], "current question")
+        self.assertEqual(call["args"].model, "original-model")
+        self.assertEqual(events[-1]["type"], "candidate_batch_finished")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_diff_view_loads_and_toggles_full_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline"
+            candidate = root / "candidate"
+            baseline.mkdir()
+            candidate.mkdir()
+            (baseline / "file.txt").write_text("before\n", encoding="utf-8")
+            (candidate / "file.txt").write_text("after\n", encoding="utf-8")
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+            app._sync = lambda: None
+            app.pending_workspace = baseline
+            app.pending_workspaces_root = root / "workspaces"
+            app.agents[1].result = make_agent_result_data(1, candidate)
+            messages: list[object] = []
+            app.call_from_thread = lambda _callback, message: messages.append(message)
+
+            with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                app._handle_command("/diff")
+                thread_cls.call_args.kwargs["target"]()
+            app._on_agent_diff_loaded(messages[0])
+
+            self.assertTrue(app.agents[1].show_diff)
+            self.assertIn("-before", app._detail_text())
+            self.assertIn("+after", app._detail_text())
+            self.assertIn("diff", app._detail_title(app.agents[1]))
+            self.assertEqual(
+                app._diff_renderable(app.agents[1]).plain,
+                app.agents[1].diff_text,
+            )
+
+            app._handle_command("/diff")
+            self.assertFalse(app.agents[1].show_diff)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_diff_ignores_result_after_view_is_closed(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        app.pending_workspace = Path("/tmp/baseline")
+        app.pending_workspaces_root = Path("/tmp/run/workspaces")
+        app.agents[1].result = make_agent_result_data(1, Path("/tmp/candidate"))
+
+        with mock.patch.object(tui_textual.threading, "Thread"):
+            app._handle_command("/diff")
+        request_id = app.agents[1].diff_request
+        app._handle_command("/diff")
+        app._on_agent_diff_loaded(
+            tui_textual.AgentDiffLoaded(1, request_id, "stale patch")
+        )
+
+        self.assertFalse(app.agents[1].show_diff)
+        self.assertFalse(app.agents[1].diff_loading)
+        self.assertEqual(app.agents[1].diff_text, "")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_rings_for_first_success_and_all_complete_only_in_background(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.running = True
+        app.app_in_foreground = False
+        app.pending_execution_args = argparse.Namespace(best_by="reasoning_tokens")
+        with mock.patch.object(app, "bell") as bell:
+            for idx in (1, 2):
+                app._on_runner_event(
+                    tui_textual.RunnerEvent(
+                        {
+                            "type": "agent_finished",
+                            "idx": idx,
+                            "result": make_agent_result_data(idx, Path(f"/tmp/agent-{idx}")),
+                        }
+                    )
+                )
+            app._on_runner_event(
+                tui_textual.RunnerEvent(
+                    {
+                        "type": "run_finished",
+                        "run_root": "/tmp/pcr-test/run",
+                        "best_agent": 1,
+                        "cancelled": False,
+                    }
+                )
+            )
+
+        self.assertEqual(bell.call_count, 2)
+
+        foreground_app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        foreground_app._sync = lambda: None
+        foreground_app.app_in_foreground = True
+        with mock.patch.object(foreground_app, "bell") as foreground_bell:
+            foreground_app._on_runner_event(
+                tui_textual.RunnerEvent(
+                    {
+                        "type": "agent_finished",
+                        "idx": 1,
+                        "result": make_agent_result_data(1, Path("/tmp/foreground-agent")),
+                    }
+                )
+            )
+        foreground_bell.assert_not_called()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_workspace_change_finalizes_displayed_agent(self) -> None:
@@ -1249,6 +1718,11 @@ class TuiCommandTests(unittest.TestCase):
                 app.post_message(tui_textual.events.AppBlur())
                 await pilot.pause()
                 self.assertIsNone(app.mouse_captured)
+                self.assertFalse(app.app_in_foreground)
+
+                app.post_message(tui_textual.events.AppFocus())
+                await pilot.pause()
+                self.assertTrue(app.app_in_foreground)
 
                 prompt.capture_mouse()
                 await pilot.pause()

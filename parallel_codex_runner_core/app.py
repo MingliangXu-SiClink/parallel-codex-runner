@@ -95,7 +95,12 @@ from .paths import (
     is_relative_to,
     safe_tail,
 )
-from .workspace import cleanup_workspace_copies, copy_workspace, sync_best_workspace_back
+from .workspace import (
+    cleanup_workspace_copy,
+    cleanup_workspace_copies,
+    copy_workspace,
+    sync_best_workspace_back,
+)
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
@@ -1760,9 +1765,11 @@ async def run_all_agents(
     progress_callback: ProgressCallback = None,
     cancel_event: Any = None,
     agent_cancel_events: Optional[Dict[int, Any]] = None,
+    agent_indices: Optional[Sequence[int]] = None,
 ) -> List[AgentResult]:
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
+    indices = list(agent_indices) if agent_indices is not None else list(range(1, n + 1))
 
     async def run_limited(idx: int) -> AgentResult:
         agent_cancel_event = (agent_cancel_events or {}).get(idx)
@@ -1800,7 +1807,8 @@ async def run_all_agents(
         finally:
             semaphore.release()
 
-    tasks = [asyncio.create_task(run_limited(idx)) for idx in range(1, n + 1)]
+    tasks = [asyncio.create_task(run_limited(idx)) for idx in indices]
+    total = len(tasks)
 
     if HAS_RICH and progress_callback is None:
         assert Progress is not None
@@ -1813,7 +1821,7 @@ async def run_all_agents(
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task_id = progress.add_task(f"codex agents max_parallel={max_parallel}", total=n)
+            task_id = progress.add_task(f"codex agents max_parallel={max_parallel}", total=total)
             for finished in asyncio.as_completed(tasks):
                 res = await finished
                 results.append(res)
@@ -1824,7 +1832,7 @@ async def run_all_agents(
                     description=f"agent_{res.idx:03d} {res.status} rtok={token_text}",
                 )
     elif HAS_TQDM and progress_callback is None:
-        with tqdm(total=n, desc="codex agents", unit="agent") as bar:
+        with tqdm(total=total, desc="codex agents", unit="agent") as bar:
             for finished in asyncio.as_completed(tasks):
                 res = await finished
                 results.append(res)
@@ -1839,7 +1847,7 @@ async def run_all_agents(
                 logger.info(
                     "completed {}/{}: agent_{:03d} {} {:.2f}s",
                     len(results),
-                    n,
+                    total,
                     res.idx,
                     res.status,
                     res.seconds,
@@ -1883,14 +1891,20 @@ def reasoning_score(result: AgentResult) -> int:
     return result.reasoning_tokens if result.reasoning_tokens is not None else -1
 
 
-def select_best_result(successes: List[AgentResult], best_by: str) -> Optional[AgentResult]:
+def select_best_result(
+    successes: List[AgentResult],
+    best_by: str,
+    *,
+    warn_missing_tokens: bool = True,
+) -> Optional[AgentResult]:
     if not successes:
         return None
 
     if best_by == "reasoning_tokens":
         with_tokens = [r for r in successes if r.reasoning_tokens is not None]
         if not with_tokens:
-            logger.warning("所有成功 agent 的 reasoning_tokens 都是 N/A；回退为按最长时长选择。")
+            if warn_missing_tokens:
+                logger.warning("所有成功 agent 的 reasoning_tokens 都是 N/A；回退为按最长时长选择。")
             return max(successes, key=lambda r: (r.seconds, -r.idx))
         return max(successes, key=lambda r: (reasoning_score(r), r.seconds, -r.idx))
 
@@ -2103,6 +2117,194 @@ def write_run_files(
             f"values={','.join(map(str, r.reasoning_token_values)) if r.reasoning_token_values else 'N/A'}"
         )
     (run_root / "reasoning_tokens.tsv").write_text("\n".join(token_lines) + "\n", encoding="utf-8")
+
+
+def _load_recorded_results(run_root: Path) -> Dict[int, AgentResult]:
+    summary_path = run_root / "summary.json"
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    results: Dict[int, AgentResult] = {}
+    for value in payload.get("results", []) if isinstance(payload, dict) else []:
+        if not isinstance(value, dict):
+            continue
+        try:
+            result = AgentResult(**value)
+        except (TypeError, ValueError):
+            continue
+        results[result.idx] = result
+    return results
+
+
+def refresh_run_result_files(
+    run_root: Path,
+    workspace: Path,
+    prompt: str,
+    new_results: Sequence[AgentResult],
+    best_by: str,
+) -> None:
+    recorded = _load_recorded_results(run_root)
+    for result in new_results:
+        recorded[result.idx] = result
+    results = list(recorded.values())
+    best = select_best_result([result for result in results if result.status == "success"], best_by)
+
+    summary: Dict[str, Any] = {}
+    try:
+        value = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            summary = value
+    except (OSError, ValueError):
+        pass
+
+    resume_session = None
+    if isinstance(summary.get("resume_session"), dict):
+        try:
+            resume_session = ResumeSession(**summary["resume_session"])
+        except TypeError:
+            resume_session = None
+    promotion = None
+    if isinstance(summary.get("codex_session_promotion"), dict):
+        try:
+            promotion = CodexSessionPromotion(**summary["codex_session_promotion"])
+        except TypeError:
+            promotion = None
+
+    write_run_files(
+        run_root=run_root,
+        workspace=workspace,
+        prompt=prompt,
+        results=results,
+        best=best,
+        best_by=best_by,
+        synced=bool(summary.get("synced_back_to_workspace")),
+        workspaces_deleted=False,
+        resume_session=resume_session,
+        codex_session_promotion=promotion,
+    )
+
+
+def _archive_retry_metadata(run_root: Path, meta_dir: Path, idx: int) -> None:
+    if not meta_dir.exists():
+        return
+    scrub_codex_home_support_entries(meta_dir / "codex_home")
+    retry_root = run_root / "retry_history" / f"agent_{idx:03d}"
+    retry_root.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    shutil.move(str(meta_dir), str(retry_root / stamp))
+
+
+def run_additional_agents(
+    args: argparse.Namespace,
+    prompt: str,
+    agent_indices: Sequence[int],
+    run_root: Path,
+    workspace: Path,
+    resume_session_id: Optional[str] = None,
+    retry_indices: Optional[Set[int]] = None,
+    progress_callback: ProgressCallback = None,
+    cancel_event: Any = None,
+    agent_cancel_events: Optional[Dict[int, Any]] = None,
+) -> List[AgentResult]:
+    indices = list(dict.fromkeys(int(idx) for idx in agent_indices))
+    if not indices or any(idx <= 0 for idx in indices):
+        raise ValueError("agent indices must contain positive integers")
+
+    run_root = run_root.expanduser().resolve()
+    workspace = workspace.expanduser().resolve()
+    workspaces_root = run_root / "workspaces"
+    meta_root = run_root / "meta"
+    if is_relative_to(run_root, workspace):
+        raise RuntimeError(f"run root must be outside workspace: {run_root}")
+    workspaces_root.mkdir(parents=True, exist_ok=True)
+    meta_root.mkdir(parents=True, exist_ok=True)
+
+    retries = set(retry_indices or set())
+    help_text = (
+        read_codex_exec_resume_help(args.codex_bin)
+        if resume_session_id
+        else read_codex_exec_help(args.codex_bin)
+    )
+    real_codex_home = get_codex_home()
+    command_by_agent: Dict[int, List[str]] = {}
+    codex_home_by_agent: Dict[int, Path] = {}
+    prepared: List[int] = []
+    touched: List[int] = []
+
+    try:
+        for idx in indices:
+            if cancel_requested(cancel_event):
+                break
+            agent_workspace = workspaces_root / f"agent_{idx:03d}"
+            agent_meta_dir = meta_root / f"agent_{idx:03d}"
+            if idx in retries:
+                cleanup_workspace_copy(workspace, agent_workspace)
+                _archive_retry_metadata(run_root, agent_meta_dir, idx)
+            elif agent_workspace.exists() or agent_workspace.is_symlink():
+                raise FileExistsError(f"agent workspace already exists: {agent_workspace}")
+            touched.append(idx)
+
+            if progress_callback is not None:
+                progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
+            copy_workspace(workspace, agent_workspace, run_base=run_root.parent)
+            agent_codex_home = agent_meta_dir / "codex_home"
+            prepare_agent_codex_home(
+                real_codex_home,
+                agent_codex_home,
+                agent_workspace,
+                resume_session_id,
+            )
+            command, _caps = build_codex_command(
+                args.codex_bin,
+                help_text,
+                agent_meta_dir / "final_message.md",
+                model=args.model,
+                resume_session_id=resume_session_id,
+            )
+            command_by_agent[idx] = command
+            codex_home_by_agent[idx] = agent_codex_home
+            prepared.append(idx)
+    except BaseException:
+        for idx in touched:
+            scrub_codex_home_support_entries(meta_root / f"agent_{idx:03d}" / "codex_home")
+            cleanup_workspace_copy(workspace, workspaces_root / f"agent_{idx:03d}")
+        raise
+
+    if cancel_requested(cancel_event) or not prepared:
+        for idx in prepared:
+            scrub_codex_home_support_entries(codex_home_by_agent[idx])
+        return []
+
+    max_parallel = 1 if args.serial else (args.max_parallel or len(prepared))
+    max_parallel = min(max_parallel, len(prepared))
+    try:
+        results = asyncio.run(
+            run_all_agents(
+                n=len(prepared),
+                workspaces_root=workspaces_root,
+                meta_root=meta_root,
+                prompt=prompt,
+                command_by_agent=command_by_agent,
+                codex_home_by_agent=codex_home_by_agent,
+                max_parallel=max_parallel,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                agent_cancel_events=agent_cancel_events,
+                agent_indices=prepared,
+            )
+        )
+    finally:
+        for idx in prepared:
+            scrub_codex_home_support_entries(codex_home_by_agent[idx])
+    refresh_run_result_files(
+        run_root=run_root,
+        workspace=workspace,
+        prompt=prompt,
+        new_results=results,
+        best_by=args.best_by,
+    )
+    return results
 
 
 # -----------------------------------------------------------------------------

@@ -32,6 +32,9 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 - **Delete-aware sync**: if the winning agent deletes a file, the original workspace loses it too.
 - **Simple selection**: choose the winner by observed reasoning tokens or runtime.
 - **Resume support**: continue from an existing Codex session and promote the winning session back.
+- **Candidate controls**: accept, reject, retry, or add more candidates without leaving the TUI.
+- **Workspace diff review**: inspect every added, modified, and deleted file before accepting an agent.
+- **Background bells**: receive a terminal bell on the first success and when all candidates finish while the TUI is unfocused.
 - **Hackable TUI stack**: Textual 8.2.8 is vendored in the repository, including local CJK and grapheme-aware editor fixes.
 
 ## Installation
@@ -75,6 +78,11 @@ Inside the TUI:
 /numofagents 8
 /maxparallel 4
 /bestby duration
+/diff
+/reject
+/retry
+/more 3
+/accept
 /resume
 /resume 1
 fix the failing tests
@@ -83,6 +91,8 @@ fix the failing tests
 Use left/right to switch between agent panes while a run is active.
 
 After a run completes, run-setting changes such as agent count, execution mode, and model apply to the next run and do not select a candidate. Submitting the next prompt, exiting, or switching workspace/resume context finalizes the currently displayed successful agent. `best_by` remains a recommendation rather than an automatic TUI selection.
+
+Use `/diff` to review the displayed agent's complete workspace patch. `/reject` removes it from the `best_by` recommendation, while `/accept` finalizes it immediately. Failed or killed agents can be rerun with `/retry`, and `/more <n>` appends fresh candidates for the same question using that run's original settings.
 
 Run the default five candidates in the current directory:
 
@@ -199,6 +209,7 @@ Each run writes metadata under `.codex_parallel_runs/<timestamp>/`.
 | `meta/agent_*/stderr.log` | Candidate stderr |
 | `meta/agent_*/final_message.md` | Candidate final response |
 | `meta/agent_*/codex_home/` | Candidate Codex state needed for resume; copied auth/config support files are scrubbed after execution |
+| `retry_history/agent_*/` | Metadata and logs from superseded retry attempts |
 
 Candidate workspaces are deleted after a normal synced run. Use `--keep-workspaces` to keep them.
 
@@ -236,6 +247,11 @@ Interactive slash commands:
 | --- | --- |
 | `/help` | Show all TUI commands |
 | `/status` or `/config` | Show current run configuration |
+| `/accept` | Immediately finalize the displayed successful agent |
+| `/reject` | Exclude the displayed agent from `best_by` recommendations |
+| `/retry [agent]` | Rerun a failed or killed agent in a fresh candidate workspace |
+| `/more <n>` | Add candidates for the current question |
+| `/diff` | Toggle the displayed agent's complete workspace diff |
 | `/kill [agent]` | Stop a running agent; queued agents continue normally |
 | `/numofagents <n>` | Set agent count for the next run |
 | `/maxparallel <n\|auto>` | Set or clear `--max-parallel` |
@@ -266,6 +282,7 @@ Interactive slash commands:
 | `parallel_codex_runner_core/codex_cli.py` | Codex CLI capability detection and command construction |
 | `parallel_codex_runner_core/workspace.py` | Workspace copy, `git worktree`, cleanup, and sync-back logic |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive Textual TUI |
+| `parallel_codex_runner_core/diffing.py` | Delete-aware full workspace diff generation |
 | `parallel_codex_runner_core/paths.py` | Path and run-directory helpers |
 | `parallel_codex_runner_core/models.py` | Dataclasses shared across modules |
 | `vendor/textual/` | Vendored Textual 8.2.8 source, upstream tests/docs, license, and PCR Unicode patches |

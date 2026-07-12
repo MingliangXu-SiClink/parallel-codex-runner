@@ -22,6 +22,11 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
     ("/status", "show current run configuration"),
     ("/config", "show current run configuration"),
+    ("/accept", "finalize the currently displayed successful agent"),
+    ("/reject", "exclude the currently displayed agent from recommendations"),
+    ("/retry [agent]", "rerun a failed or killed agent on a fresh workspace"),
+    ("/more <n>", "add more candidates for the current question"),
+    ("/diff", "toggle the full workspace diff for the current agent"),
     ("/kill [agent]", "stop a running agent while queued agents continue normally"),
     ("/numofagents <n>", "set the number of agents for the next run"),
     ("/maxparallel <n|auto>", "limit how many agents may run concurrently"),
@@ -29,7 +34,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/parallel", "run agents concurrently"),
     (
         "/bestby <duration|reasoning_tokens>",
-        "choose how the best successful agent is selected",
+        "choose how successful agents are recommended",
     ),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
     ("/workspace <path>", "set the workspace PCR operates on"),
@@ -46,7 +51,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the current Detail view when safe"),
     ("/exit", "stop active agents, clean up, and quit"),
 )
-MAX_SUGGESTIONS = 9
+MAX_SUGGESTIONS = 14
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
 TIP_ICON = "✦"
@@ -74,6 +79,11 @@ TUI_TIPS: tuple[str, ...] = (
     "某个 Agent 完成后，即可从该 Agent 继续提问。",
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
+    "输入 /accept 可立即采用当前 Agent。",
+    "输入 /reject 可将当前 Agent 排除在推荐范围外。",
+    "输入 /retry 可重跑失败或被终止的 Agent，/more 3 可追加候选。",
+    "输入 /diff 可切换当前 Agent 的完整文件差异。",
+    "TUI 不在前台时，首个成功和全部完成会触发终端铃声。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
@@ -101,8 +111,8 @@ def build_help_text() -> str:
         [
             "",
             "Enter normal text to start a parallel Codex run.",
-            "Most option commands apply to the next run.",
-            "If a completed run is pending, PCR finalizes the selected agent before changing config.",
+            "Run-setting commands apply to the next run without selecting an agent.",
+            "Accept, follow-up, exit, workspace, and resume actions use the displayed agent.",
             "Ctrl-C copies selected text; otherwise it clears a non-empty prompt or exits.",
         ]
     )
@@ -333,9 +343,12 @@ else:
         load_codex_session_history,
         normalize_best_by,
         promote_best_codex_session_to_workspace,
+        run_additional_agents,
         run_once,
+        select_best_result,
         subagent_resume_error,
     )
+    from .diffing import build_workspace_diff_text
     from .models import AgentResult, CodexHistoryEntry
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import cleanup_workspace_copies, sync_best_workspace_back
@@ -413,13 +426,20 @@ else:
     class AgentPane:
         idx: int
         status: str = "idle"
+        rejected: bool = False
         reasoning_tokens: int | None = None
         input_text: str = ""
         final_text: str = ""
         result: dict[str, Any] | None = None
+        attempt_history: list[tuple[str, str, str]] = field(default_factory=list)
         lines: list[str] = field(default_factory=list)
         thought_lines: list[str] = field(default_factory=list)
         output_lines: list[str] = field(default_factory=list)
+        show_diff: bool = False
+        diff_loading: bool = False
+        diff_text: str = ""
+        diff_error: str = ""
+        diff_request: int = 0
         revision: int = 0
 
         def append(self, text: str, category: str = "activity") -> None:
@@ -435,9 +455,21 @@ else:
             bucket.append(text)
 
         def clear_detail(self) -> None:
+            self.diff_request += 1
+            self.attempt_history.clear()
             self.lines.clear()
             self.thought_lines.clear()
             self.output_lines.clear()
+            self.show_diff = False
+            self.diff_loading = False
+            self.diff_text = ""
+            self.diff_error = ""
+
+
+    @dataclass
+    class CandidateBatch:
+        indices: list[int]
+        retry_indices: set[int] = field(default_factory=set)
 
 
     class RunnerEvent(Message):
@@ -475,6 +507,21 @@ else:
             self.request_id = request_id
             self.workspace = workspace
             self.entries = entries
+            self.error = error
+
+
+    class AgentDiffLoaded(Message):
+        def __init__(
+            self,
+            idx: int,
+            request_id: int,
+            text: str = "",
+            error: str = "",
+        ) -> None:
+            super().__init__()
+            self.idx = idx
+            self.request_id = request_id
+            self.text = text
             self.error = error
 
 
@@ -758,6 +805,11 @@ else:
             self.pending_workspace: Path | None = None
             self.pending_no_sync_back: bool | None = None
             self.pending_keep_workspaces: bool | None = None
+            self.pending_prompt = ""
+            self.pending_execution_args: argparse.Namespace | None = None
+            self.candidate_batches: list[CandidateBatch] = []
+            self.active_batch_indices: set[int] = set()
+            self.pending_accept_agent: int | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.command_history: list[tuple[str, str, str]] = []
             self.detail_revision = 0
@@ -780,6 +832,8 @@ else:
             self._tip_refresh_deferred_for_selection = False
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
+            self.app_in_foreground = True
+            self.first_success_seen = False
 
         def _is_runner_control(self, node: Any) -> bool:
             while node is not None:
@@ -840,8 +894,12 @@ else:
                 self._sync()
 
         async def on_event(self, event: events.Event) -> None:
-            if isinstance(event, events.AppBlur) and self.mouse_captured is not None:
-                self.capture_mouse(None)
+            if isinstance(event, events.AppBlur):
+                self.app_in_foreground = False
+                if self.mouse_captured is not None:
+                    self.capture_mouse(None)
+            elif isinstance(event, events.AppFocus):
+                self.app_in_foreground = True
 
             if isinstance(event, events.MouseDown) and not event.is_forwarded:
                 try:
@@ -1253,42 +1311,101 @@ else:
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 pane.result = result
                 pane.status = str(result.get("status") or "finished")
+                pane.diff_request += 1
+                pane.show_diff = False
+                pane.diff_loading = False
+                pane.diff_text = ""
+                pane.diff_error = ""
                 value = result.get("reasoning_tokens")
                 pane.reasoning_tokens = int(value) if isinstance(value, int) else pane.reasoning_tokens
                 final_text = self._read_final_message(result) if pane.status == "success" else ""
                 if final_text:
                     pane.final_text = final_text
+                if pane.status == "success" and not self.first_success_seen:
+                    self.first_success_seen = True
+                    self._ring_if_background()
                 self._mark_detail_dirty(pane)
             elif kind == "run_finished":
                 self.running = False
                 self.cancel_event = None
+                self.active_batch_indices.clear()
                 run_root = payload.get("run_root")
                 if isinstance(run_root, str) and run_root:
                     self.pending_run_root = Path(run_root)
                     self.pending_workspaces_root = self.pending_run_root / "workspaces"
-                self.best_agent = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
                 if payload.get("cancelled"):
-                    if self.queued_prompt and self.queued_agent is not None:
-                        self._continue_queued_prompt()
-                    else:
-                        self.status = "Cancelled"
-                        if self._cleanup_after_pending_run():
-                            self._clear_pending_run()
+                    self._finish_cancelled_runner()
                 else:
-                    self.status = f"Done: agent_{self.best_agent:03d}" if self.best_agent else "No successful agent"
+                    fallback = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
+                    self._recompute_recommendation(fallback)
+                    if not self._launch_next_candidate_batch():
+                        self.status = self._completed_status()
+                        self._ring_if_background()
             elif kind == "run_failed":
                 self.running = False
                 self.cancel_event = None
-                if self.queued_prompt and self.queued_agent is not None:
-                    self._continue_queued_prompt()
+                self.active_batch_indices.clear()
+                if self.pending_accept_agent is not None or (
+                    self.queued_prompt and self.queued_agent is not None
+                ):
+                    self._finish_cancelled_runner()
                 else:
                     self.status = f"Run failed: {payload.get('message') or ''}"
                     if self._cleanup_after_pending_run():
                         self._clear_pending_run()
+            elif kind == "candidate_batch_finished":
+                self.running = False
+                self.cancel_event = None
+                self.active_batch_indices.clear()
+                if payload.get("cancelled"):
+                    self._finish_cancelled_runner()
+                else:
+                    self._recompute_recommendation()
+                    if not self._launch_next_candidate_batch():
+                        self.status = self._completed_status()
+                        self._ring_if_background()
+            elif kind == "candidate_batch_failed":
+                self.running = False
+                self.cancel_event = None
+                for active_idx in self.active_batch_indices:
+                    active_pane = self.agents.get(active_idx)
+                    if active_pane is not None and active_pane.result is None:
+                        active_pane.status = "error"
+                        self._mark_detail_dirty(active_pane)
+                self.active_batch_indices.clear()
+                if self.exit_after_run or self.pending_accept_agent is not None or (
+                    self.queued_prompt and self.queued_agent is not None
+                ):
+                    self._finish_cancelled_runner()
+                elif not self._launch_next_candidate_batch():
+                    self._recompute_recommendation()
+                    self.status = f"Additional candidates failed: {payload.get('message') or ''}"
+                    self._ring_if_background()
             if kind not in {"agent_line", "agent_tokens", "agent_status"}:
                 self._sync()
-            if kind in {"run_finished", "run_failed"} and self.exit_after_run and not self._has_pending_run():
+            if kind in {
+                "run_finished",
+                "run_failed",
+                "candidate_batch_finished",
+                "candidate_batch_failed",
+            } and self.exit_after_run and not self._has_pending_run():
                 self.exit()
+
+        @on(AgentDiffLoaded)
+        def _on_agent_diff_loaded(self, event: AgentDiffLoaded) -> None:
+            pane = self.agents.get(event.idx)
+            if pane is None or pane.diff_request != event.request_id:
+                return
+            pane.diff_loading = False
+            pane.diff_text = event.text
+            pane.diff_error = event.error
+            self.status = (
+                f"Cannot load AGENT-{event.idx:03d} diff: {event.error}"
+                if event.error
+                else f"Showing AGENT-{event.idx:03d} diff"
+            )
+            self._mark_detail_dirty(pane)
+            self._sync()
 
         @on(ResumeHistoryLoaded)
         def _on_resume_history_loaded(self, event: ResumeHistoryLoaded) -> None:
@@ -1355,6 +1472,7 @@ else:
                     return
             for pane in self.agents.values():
                 pane.status = "idle"
+                pane.rejected = False
                 pane.reasoning_tokens = None
                 pane.input_text = ""
                 pane.final_text = ""
@@ -1445,6 +1563,8 @@ else:
             if self.running:
                 self.queued_prompt = ""
                 self.queued_agent = None
+                self.pending_accept_agent = None
+                self._discard_queued_candidate_batches()
                 self.exit_after_run = True
                 if self.cancel_event is not None:
                     self.cancel_event.set()
@@ -1478,6 +1598,21 @@ else:
                 return
             if name == "/clear":
                 self.action_clear_view()
+                return
+            if name == "/accept":
+                self._handle_accept(args)
+                return
+            if name == "/reject":
+                self._handle_reject(args)
+                return
+            if name == "/retry":
+                self._handle_retry(args)
+                return
+            if name == "/more":
+                self._handle_more(args)
+                return
+            if name == "/diff":
+                self._handle_diff(args)
                 return
             if name in {"/kill", "/killagent", "/kill-agent"}:
                 self._handle_kill(args)
@@ -1526,6 +1661,190 @@ else:
                 return
             self.status = f"Unknown command: {name}"
             self._sync()
+
+        def _handle_accept(self, args: list[str]) -> None:
+            if args:
+                self.status = "Usage: /accept"
+                self._sync()
+                return
+            pane = self.agents.get(self.selected_agent)
+            result = pane.result if pane is not None else None
+            if not self._has_pending_run() or not isinstance(result, dict):
+                self.status = "No finished agent is available to accept"
+                self._sync()
+                return
+            if result.get("status") != "success":
+                self.status = f"AGENT-{self.selected_agent:03d} is not successful"
+                self._sync()
+                return
+            if self._pending_sync_disabled():
+                self.status = "Cannot accept while sync back is disabled"
+                self._sync()
+                return
+            if self.running:
+                self.pending_accept_agent = self.selected_agent
+                self.queued_prompt = ""
+                self.queued_agent = None
+                self._discard_queued_candidate_batches()
+                if self.cancel_event is not None:
+                    self.cancel_event.set()
+                self.status = f"Stopping remaining agents; accepting AGENT-{self.selected_agent:03d}"
+                self._sync()
+                return
+            if self._finalize_agent(self.selected_agent, archive_detail=True):
+                self.status = f"Accepted AGENT-{self.selected_agent:03d}"
+            self._sync()
+
+        def _handle_reject(self, args: list[str]) -> None:
+            if args:
+                self.status = "Usage: /reject"
+                self._sync()
+                return
+            pane = self.agents.get(self.selected_agent)
+            if pane is None:
+                self.status = f"Unknown agent: {self.selected_agent}"
+                self._sync()
+                return
+            if pane.rejected:
+                self.status = f"AGENT-{pane.idx:03d} is already excluded from recommendations"
+                self._sync()
+                return
+            pane.rejected = True
+            if not self.running or self.best_agent is not None:
+                self._recompute_recommendation()
+            self.status = f"AGENT-{pane.idx:03d} excluded from recommendations"
+            self._mark_detail_dirty(pane)
+            self._sync()
+
+        def _handle_retry(self, args: list[str]) -> None:
+            if len(args) > 1:
+                self.status = "Usage: /retry [agent]"
+                self._sync()
+                return
+            idx = self.selected_agent
+            if args:
+                match = re.fullmatch(r"(?:agent[-_])?(\d+)", args[0].strip(), re.IGNORECASE)
+                if match is None:
+                    self.status = "Usage: /retry [agent]"
+                    self._sync()
+                    return
+                idx = int(match.group(1))
+            pane = self.agents.get(idx)
+            result = pane.result if pane is not None else None
+            if pane is None:
+                self.status = f"Unknown agent: {idx}"
+                self._sync()
+                return
+            if self._agent_has_pending_batch(idx):
+                self.status = f"AGENT-{idx:03d} is already running or queued"
+                self._sync()
+                return
+            result_status = result.get("status") if isinstance(result, dict) else pane.status
+            if result_status not in {"failed", "error", "killed"}:
+                self.status = f"AGENT-{idx:03d} is not failed or killed"
+                self._sync()
+                return
+            if not self._can_extend_current_run():
+                self.status = "No current question is available to retry"
+                self._sync()
+                return
+            self.candidate_batches.append(CandidateBatch([idx], {idx}))
+            pane.status = "retry queued"
+            self._mark_detail_dirty(pane)
+            if self.running:
+                self.status = f"Retry queued for AGENT-{idx:03d}"
+                self._sync()
+            else:
+                self._launch_next_candidate_batch()
+
+        def _handle_more(self, args: list[str]) -> None:
+            if len(args) != 1:
+                self.status = "Usage: /more <positive integer>"
+                self._sync()
+                return
+            try:
+                count = int(args[0])
+            except ValueError:
+                count = 0
+            if count <= 0:
+                self.status = "Usage: /more <positive integer>"
+                self._sync()
+                return
+            if not self._can_extend_current_run():
+                self.status = "No current question is available for more candidates"
+                self._sync()
+                return
+
+            start = max(self.agents, default=0) + 1
+            indices = list(range(start, start + count))
+            for idx in indices:
+                self.agents[idx] = AgentPane(
+                    idx=idx,
+                    status="queued",
+                    input_text=self.pending_prompt,
+                )
+                self.agent_cancel_events[idx] = threading.Event()
+            self.candidate_batches.append(CandidateBatch(indices))
+            self._mark_detail_dirty()
+            if self.running:
+                self.status = f"Queued {count} additional candidates"
+                self._sync()
+            else:
+                self._launch_next_candidate_batch()
+
+        def _handle_diff(self, args: list[str]) -> None:
+            if args and args != ["refresh"]:
+                self.status = "Usage: /diff [refresh]"
+                self._sync()
+                return
+            pane = self.agents.get(self.selected_agent)
+            if pane is None:
+                self.status = f"Unknown agent: {self.selected_agent}"
+                self._sync()
+                return
+            if pane.show_diff and not args:
+                pane.diff_request += 1
+                pane.show_diff = False
+                pane.diff_loading = False
+                self.status = f"Showing AGENT-{pane.idx:03d} conversation"
+                self._mark_detail_dirty(pane)
+                self._sync()
+                return
+            result = pane.result if isinstance(pane.result, dict) else {}
+            workspace_dir = result.get("workspace_dir")
+            if not isinstance(workspace_dir, str) or not workspace_dir:
+                self.status = f"AGENT-{pane.idx:03d} diff is available after it finishes"
+                self._sync()
+                return
+
+            pane.diff_request += 1
+            request_id = pane.diff_request
+            pane.show_diff = True
+            pane.diff_loading = True
+            pane.diff_text = ""
+            pane.diff_error = ""
+            baseline = self._pending_workspace_path()
+            candidate = Path(workspace_dir)
+            self.status = f"Loading AGENT-{pane.idx:03d} diff"
+            self._mark_detail_dirty(pane)
+            self._sync()
+
+            def target() -> None:
+                text = ""
+                error = ""
+                try:
+                    text = build_workspace_diff_text(baseline, candidate)
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                try:
+                    self.call_from_thread(
+                        self.post_message,
+                        AgentDiffLoaded(pane.idx, request_id, text, error),
+                    )
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=target, name=f"pcr-diff-{pane.idx:03d}", daemon=True).start()
 
         def _handle_kill(self, args: list[str]) -> None:
             if len(args) > 1:
@@ -1961,28 +2280,241 @@ else:
         def _show_status(self) -> None:
             self._show_text(self._tree_text())
 
+        def _pending_best_by(self) -> str:
+            if self.pending_execution_args is not None:
+                return str(getattr(self.pending_execution_args, "best_by", "reasoning_tokens"))
+            return str(getattr(self.args, "best_by", "reasoning_tokens"))
+
+        def _recompute_recommendation(self, fallback: int | None = None) -> None:
+            candidates: list[AgentResult] = []
+            saw_success = False
+            for pane in self.agents.values():
+                result = pane.result
+                if not isinstance(result, dict) or result.get("status") != "success":
+                    continue
+                saw_success = True
+                if pane.rejected:
+                    continue
+                try:
+                    candidates.append(AgentResult(**result))
+                except (TypeError, ValueError):
+                    continue
+            recommendation = select_best_result(
+                candidates,
+                self._pending_best_by(),
+                warn_missing_tokens=False,
+            )
+            if recommendation is not None:
+                self.best_agent = recommendation.idx
+            elif saw_success:
+                self.best_agent = None
+            elif fallback is not None:
+                pane = self.agents.get(fallback)
+                self.best_agent = None if pane is not None and pane.rejected else fallback
+            else:
+                self.best_agent = None
+
+        def _completed_status(self) -> str:
+            if self.best_agent is not None:
+                return f"Done: agent_{self.best_agent:03d}"
+            if any(
+                isinstance(pane.result, dict) and pane.result.get("status") == "success"
+                for pane in self.agents.values()
+            ):
+                return "Done: all successful agents are rejected"
+            return "No successful agent"
+
+        def _ring_if_background(self) -> None:
+            if self.app_in_foreground:
+                return
+            with contextlib.suppress(Exception):
+                self.bell()
+
+        def _can_extend_current_run(self) -> bool:
+            return bool(
+                self.pending_prompt
+                and self.pending_execution_args is not None
+                and (self.running or self._has_pending_run())
+            )
+
+        def _agent_has_pending_batch(self, idx: int) -> bool:
+            return idx in self.active_batch_indices or any(
+                idx in batch.indices for batch in self.candidate_batches
+            )
+
+        def _discard_queued_candidate_batches(self) -> None:
+            for batch in self.candidate_batches:
+                for idx in batch.indices:
+                    if idx in batch.retry_indices:
+                        pane = self.agents.get(idx)
+                        if pane is not None and isinstance(pane.result, dict):
+                            pane.status = str(pane.result.get("status") or "finished")
+                            self._mark_detail_dirty(pane)
+                    else:
+                        self.agents.pop(idx, None)
+                        self.agent_cancel_events.pop(idx, None)
+            self.candidate_batches.clear()
+            if self.selected_agent not in self.agents and self.agents:
+                self.selected_agent = min(
+                    self.agents,
+                    key=lambda idx: (abs(idx - self.selected_agent), idx),
+                )
+
+        def _prepare_retry_pane(self, pane: AgentPane) -> None:
+            pane.attempt_history.extend(self._current_attempt_blocks(pane))
+            pane.attempt_history.append(("↻", "Retry", "yellow"))
+            pane.status = "queued"
+            pane.rejected = False
+            pane.reasoning_tokens = None
+            pane.input_text = self.pending_prompt
+            pane.final_text = ""
+            pane.result = None
+            pane.lines.clear()
+            pane.thought_lines.clear()
+            pane.output_lines.clear()
+            pane.show_diff = False
+            pane.diff_loading = False
+            pane.diff_text = ""
+            pane.diff_error = ""
+            pane.diff_request += 1
+            self._mark_detail_dirty(pane)
+
+        def _launch_next_candidate_batch(self) -> bool:
+            if self.running or not self.candidate_batches:
+                return False
+            if (
+                self.pending_execution_args is None
+                or self.pending_run_root is None
+                or not self.pending_prompt
+            ):
+                self.status = "Cannot start additional candidates: run metadata is unavailable"
+                self._discard_queued_candidate_batches()
+                self._sync()
+                return False
+
+            batch = self.candidate_batches.pop(0)
+            for idx in batch.indices:
+                pane = self.agents[idx]
+                if idx in batch.retry_indices:
+                    self._prepare_retry_pane(pane)
+                else:
+                    pane.status = "queued"
+                    pane.result = None
+                    self._mark_detail_dirty(pane)
+                self.agent_cancel_events[idx] = threading.Event()
+
+            run_args = argparse.Namespace(**vars(self.pending_execution_args))
+            run_args.num_agents = len(batch.indices)
+            if run_args.max_parallel is not None:
+                run_args.max_parallel = min(run_args.max_parallel, len(batch.indices))
+            cancel_event = threading.Event()
+            run_args.cancel_event = cancel_event
+            run_args.agent_cancel_events = {
+                idx: self.agent_cancel_events[idx] for idx in batch.indices
+            }
+            self.cancel_event = cancel_event
+            self.active_batch_indices = set(batch.indices)
+            self.running = True
+            self.started_at = time.monotonic()
+            self.status = (
+                f"Retrying AGENT-{batch.indices[0]:03d}"
+                if batch.retry_indices and len(batch.indices) == 1
+                else f"Running {len(batch.indices)} additional candidates"
+            )
+            self._sync()
+
+            def target() -> None:
+                previous_disable = logging.root.manager.disable
+                try:
+                    logging.disable(logging.CRITICAL)
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        run_additional_agents(
+                            args=run_args,
+                            prompt=self.pending_prompt,
+                            agent_indices=batch.indices,
+                            run_root=self.pending_run_root,
+                            workspace=self._pending_workspace_path(),
+                            resume_session_id=getattr(run_args, "resume_session_id", None),
+                            retry_indices=batch.retry_indices,
+                            progress_callback=self._post_progress,
+                            cancel_event=cancel_event,
+                            agent_cancel_events=run_args.agent_cancel_events,
+                        )
+                    self._post_progress(
+                        {
+                            "type": "candidate_batch_finished",
+                            "cancelled": cancel_event.is_set(),
+                        }
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    self._post_progress(
+                        {"type": "candidate_batch_failed", "message": str(exc)}
+                    )
+                finally:
+                    logging.disable(previous_disable)
+
+            self.runner_thread = threading.Thread(
+                target=target,
+                name="pcr-tui-candidates",
+                daemon=False,
+            )
+            self.runner_thread.start()
+            return True
+
+        def _finish_cancelled_runner(self) -> None:
+            if self.pending_accept_agent is not None:
+                idx = self.pending_accept_agent
+                self.pending_accept_agent = None
+                if self._finalize_agent(idx, archive_detail=True):
+                    self.status = f"Accepted AGENT-{idx:03d}"
+                return
+            if self.queued_prompt and self.queued_agent is not None:
+                self._continue_queued_prompt()
+                return
+            self.status = "Cancelled"
+            if self._cleanup_after_pending_run():
+                self._clear_pending_run()
+
         def _start_run(self, prompt: str) -> bool:
             if self.running:
                 return self._queue_prompt_from_finished_agent(prompt)
             if not self._commit_runner_inputs():
                 self._sync()
                 return False
-            if self._has_pending_run() and (self._pending_sync_disabled() or self.best_agent is None):
+            if self._has_pending_run() and (
+                self._pending_sync_disabled()
+                or (
+                    self.best_agent is None
+                    and not any(
+                        isinstance(pane.result, dict)
+                        and pane.result.get("status") == "success"
+                        for pane in self.agents.values()
+                    )
+                )
+            ):
                 if not self._discard_pending_run():
                     self._sync()
                     return False
-            if self._has_pending_run() and not self._finalize_agent(self.selected_agent, archive_detail=True):
+            if self._has_pending_run() and not self._finalize_agent(
+                self.selected_agent,
+                archive_detail=True,
+            ):
                 self._sync()
                 return False
             self._archive_command_history()
             self.running = True
             self.exit_after_run = False
+            self.pending_accept_agent = None
+            self.candidate_batches.clear()
+            self.active_batch_indices.clear()
             self.cancel_event = threading.Event()
             self.best_agent = None
             self.started_at = time.monotonic()
+            self.first_success_seen = False
             self.pending_workspace = self.workspace
             self.pending_no_sync_back = bool(getattr(self.args, "no_sync_back", False))
             self.pending_keep_workspaces = bool(getattr(self.args, "keep_workspaces", False))
+            self.pending_prompt = prompt
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.agent_cancel_events = {
                 idx: threading.Event() for idx in range(1, self.num_agents + 1)
@@ -2007,6 +2539,10 @@ else:
             run_args.keep_workspaces = True
             run_args.cancel_event = self.cancel_event
             run_args.agent_cancel_events = self.agent_cancel_events
+            self.pending_execution_args = argparse.Namespace(**vars(run_args))
+            # Keep the configured limit, not the first batch's effective limit.
+            # This preserves max-parallel=auto and larger explicit limits for /more.
+            self.pending_execution_args.max_parallel = getattr(self.args, "max_parallel", None)
 
             def target() -> None:
                 previous_disable = logging.root.manager.disable
@@ -2040,6 +2576,8 @@ else:
                 return False
             self.queued_prompt = prompt
             self.queued_agent = self.selected_agent
+            self.pending_accept_agent = None
+            self._discard_queued_candidate_batches()
             if self.cancel_event is not None:
                 self.cancel_event.set()
             self.status = f"Stopping remaining agents; continuing from AGENT-{self.selected_agent:03d}"
@@ -2095,11 +2633,16 @@ else:
             return self.pending_workspaces_root is not None
 
         def _clear_pending_run(self) -> None:
+            self._discard_queued_candidate_batches()
             self.pending_run_root = None
             self.pending_workspaces_root = None
             self.pending_workspace = None
             self.pending_no_sync_back = None
             self.pending_keep_workspaces = None
+            self.pending_prompt = ""
+            self.pending_execution_args = None
+            self.active_batch_indices.clear()
+            self.pending_accept_agent = None
 
         def _pending_sync_disabled(self) -> bool:
             if self.pending_no_sync_back is not None:
@@ -2231,7 +2774,12 @@ else:
         def _tick(self) -> None:
             if self.running and self.started_at is not None:
                 self.work_frame += 1
-                if self.queued_prompt and self.queued_agent is not None:
+                if self.pending_accept_agent is not None:
+                    self.status = (
+                        f"Stopping remaining agents; accepting "
+                        f"AGENT-{self.pending_accept_agent:03d} {self._pulse()}"
+                    )
+                elif self.queued_prompt and self.queued_agent is not None:
                     self.status = (
                         f"Stopping remaining agents; continuing from "
                         f"AGENT-{self.queued_agent:03d} {self._pulse()}"
@@ -2521,6 +3069,10 @@ else:
             pane = self.agents.get(self.selected_agent)
             if pane is None:
                 return ""
+            if pane.show_diff:
+                if pane.diff_loading:
+                    return self._pulse()
+                return pane.diff_error or pane.diff_text
             blocks = self._detail_blocks(pane)
             if not blocks:
                 return ""
@@ -2536,6 +3088,12 @@ else:
             if key == self._detail_cache_key:
                 return self._detail_cache_renderable
 
+            if pane.show_diff:
+                renderable = self._diff_renderable(pane)
+                self._detail_cache_key = key
+                self._detail_cache_renderable = renderable
+                return renderable
+
             blocks = self._detail_blocks(pane)
             if not blocks:
                 self._detail_cache_key = key
@@ -2550,6 +3108,40 @@ else:
             self._detail_cache_key = key
             self._detail_cache_renderable = renderable
             return renderable
+
+        def _diff_renderable(self, pane: AgentPane) -> object:
+            if pane.diff_loading:
+                return Content.assemble((self._pulse(), "dim white"))
+            text = pane.diff_error or pane.diff_text
+            if not text:
+                return ""
+            parts: list[str | tuple[str, str]] = []
+            current_style = ""
+            current_lines: list[str] = []
+
+            def flush() -> None:
+                if current_lines:
+                    parts.append(("".join(current_lines), current_style))
+                    current_lines.clear()
+
+            for line in text.splitlines(keepends=True):
+                content = line.rstrip("\r\n")
+                if content.startswith("+++") or (content.startswith("+") and not content.startswith("+++")):
+                    style = "green"
+                elif content.startswith("---") or (content.startswith("-") and not content.startswith("---")):
+                    style = "red"
+                elif content.startswith("@@"):
+                    style = "cyan"
+                elif re.match(r"^[AMDT]  ", content):
+                    style = "yellow"
+                else:
+                    style = "white" if not pane.diff_error else "red"
+                if current_lines and style != current_style:
+                    flush()
+                current_style = style
+                current_lines.append(line)
+            flush()
+            return Content.assemble(*parts)
 
         def _archive_agent_detail(self, pane: AgentPane) -> None:
             self.detail_history.extend(self._pane_detail_blocks(pane))
@@ -2571,16 +3163,33 @@ else:
                     self._detail_cache_key = None
 
         def _detail_cache_key_for(self, pane: AgentPane) -> tuple[Any, ...]:
-            pulse = self.work_frame if pane.status == "running" and not pane.thought_lines and not pane.output_lines else None
-            return (pane.idx, pane.revision, self.detail_revision, self._detail_content_width(), pulse)
+            pulse = (
+                self.work_frame
+                if pane.diff_loading
+                or (pane.status == "running" and not pane.thought_lines and not pane.output_lines)
+                else None
+            )
+            return (
+                pane.idx,
+                pane.revision,
+                self.detail_revision,
+                self._detail_content_width(),
+                pane.show_diff,
+                pulse,
+            )
 
         def _detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             return [*self.detail_history, *self._pane_detail_blocks(pane), *self.command_history]
 
         def _has_detail_content(self, pane: AgentPane | None) -> bool:
-            return pane is not None and bool(self._detail_blocks(pane))
+            return pane is not None and (
+                pane.show_diff or bool(self._detail_blocks(pane))
+            )
 
         def _pane_detail_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
+            return [*pane.attempt_history, *self._current_attempt_blocks(pane)]
+
+        def _current_attempt_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
             if pane.input_text:
                 blocks.append((">", pane.input_text, "cyan"))
@@ -2629,6 +3238,10 @@ else:
             parts = []
             if pane.status in {"stopping", "killed"}:
                 parts.append(pane.status)
+            if pane.rejected:
+                parts.append("rejected")
+            if pane.show_diff:
+                parts.append("diff")
             if isinstance(pane.result, dict):
                 seconds = format_seconds(pane.result.get("seconds"))
                 if seconds:
