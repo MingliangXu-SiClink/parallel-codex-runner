@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Set, Tuple
@@ -15,6 +16,9 @@ from .paths import is_relative_to
 EXCLUDE_NAMES: Set[str] = {".codex_parallel_runs", ".codex_parallel_meta", ".git"}
 SYNC_EXCLUDE_NAMES: Set[str] = EXCLUDE_NAMES | {".git"}
 WORKTREE_BASE_STATE_FILE = "pcr-base-state.json"
+GIT_INDEX_LOCK_TIMEOUT_SECONDS = 5.0
+GIT_INDEX_LOCK_POLL_SECONDS = 0.05
+PCR_INDEX_LOCK_OWNER_SUFFIX = ".pcr-owner"
 
 
 def _debug(message: str, *args: object) -> None:
@@ -171,29 +175,152 @@ def _prepared_git_index(
         yield staged_index, destination_index
 
 
-@contextmanager
-def _locked_git_index(source_index: Path, destination_index: Path) -> Iterator[Path]:
-    lock_path = destination_index.with_name(f"{destination_index.name}.lock")
-    try:
-        descriptor = os.open(
-            lock_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            source_index.stat().st_mode & 0o777,
-        )
-    except FileExistsError as exc:
-        raise RuntimeError(f"Git index is locked: {lock_path}") from exc
+def _index_lock_owner_path(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.name}{PCR_INDEX_LOCK_OWNER_SUFFIX}")
 
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _lock_identity(stat_result: os.stat_result) -> Tuple[int, int, int]:
+    ctime_ns = getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000))
+    return int(stat_result.st_dev), int(stat_result.st_ino), int(ctime_ns)
+
+
+def _write_index_lock_owner(lock_path: Path) -> None:
+    owner_path = _index_lock_owner_path(lock_path)
+    temporary = owner_path.with_name(
+        f".{owner_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        device, inode, ctime_ns = _lock_identity(lock_path.stat())
+        payload = {
+            "pid": os.getpid(),
+            "device": device,
+            "inode": inode,
+            "ctime_ns": ctime_ns,
+        }
+        owner_path.unlink(missing_ok=True)
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary, owner_path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _remove_stale_pcr_index_lock(lock_path: Path) -> bool:
+    owner_path = _index_lock_owner_path(lock_path)
+    try:
+        payload = json.loads(owner_path.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        recorded_identity = (
+            int(payload["device"]),
+            int(payload["inode"]),
+            int(payload["ctime_ns"]),
+        )
+        current_identity = _lock_identity(lock_path.stat())
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    if recorded_identity != current_identity or _process_is_alive(pid):
+        return False
+
+    try:
+        if _lock_identity(lock_path.stat()) != recorded_identity:
+            return False
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    try:
+        owner_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _debug("removed stale PCR-owned Git index lock: {}", lock_path)
+    return True
+
+
+def _acquire_git_index_lock(
+    source_index: Path,
+    lock_path: Path,
+    timeout: float,
+    poll_interval: float,
+) -> int:
+    mode = source_index.stat().st_mode & 0o777
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout)
+    while True:
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                mode,
+            )
+            waited = time.monotonic() - started
+            if waited >= poll_interval:
+                _debug("waited {:.2f}s for Git index lock: {}", waited, lock_path)
+            return descriptor
+        except FileExistsError as exc:
+            if _remove_stale_pcr_index_lock(lock_path):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Git index remained locked for {max(0.0, timeout):.1f}s: {lock_path}"
+                ) from exc
+            time.sleep(min(max(0.001, poll_interval), remaining))
+
+
+@contextmanager
+def _locked_git_index(
+    source_index: Path,
+    destination_index: Path,
+    timeout: float = GIT_INDEX_LOCK_TIMEOUT_SECONDS,
+    poll_interval: float = GIT_INDEX_LOCK_POLL_SECONDS,
+) -> Iterator[Path]:
+    lock_path = destination_index.with_name(f"{destination_index.name}.lock")
+    owner_path = _index_lock_owner_path(lock_path)
+    descriptor = _acquire_git_index_lock(
+        source_index,
+        lock_path,
+        timeout,
+        poll_interval,
+    )
     try:
         with os.fdopen(descriptor, "wb") as target, source_index.open("rb") as source:
             shutil.copyfileobj(source, target)
+        _write_index_lock_owner(lock_path)
         yield lock_path
     finally:
+        try:
+            owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         lock_path.unlink(missing_ok=True)
 
 
-def _copy_git_index(source_workspace: Path, destination_workspace: Path) -> None:
+def _copy_git_worktree_state(source_workspace: Path, destination_workspace: Path) -> None:
     with _prepared_git_index(source_workspace, destination_workspace) as (source_index, destination_index):
         with _locked_git_index(source_index, destination_index) as locked_index:
+            # Keep Git/status watchers out until files and the copied index agree.
+            sync_back_with_python(source_workspace, destination_workspace)
             os.replace(locked_index, destination_index)
 
 
@@ -330,11 +457,10 @@ def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
         return False
 
     try:
-        sync_back_with_python(workspace, dst)
-        _copy_git_index(workspace, dst)
+        _copy_git_worktree_state(workspace, dst)
         _record_worktree_base_state(dst, base_head, base_ref)
     except Exception as exc:
-        _debug("git worktree copy failed, falling back to plain copy: {}", exc)
+        _debug("git worktree copy failed: {}", exc)
         cleanup_workspace_copy(workspace, dst)
         raise
     return True

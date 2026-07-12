@@ -170,6 +170,134 @@ class WorkspaceCopyTests(unittest.TestCase):
         self._git(workspace, "add", ".")
         self._git(workspace, "commit", "-m", "initial")
 
+    def test_git_index_lock_waits_for_transient_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+            lock_path.write_bytes(b"external Git operation")
+
+            def release_lock() -> None:
+                time.sleep(0.1)
+                lock_path.unlink()
+
+            release = threading.Thread(target=release_lock)
+            release.start()
+            started = time.monotonic()
+            try:
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=1.0,
+                    poll_interval=0.01,
+                ) as acquired:
+                    self.assertEqual(acquired, lock_path)
+                    self.assertEqual(lock_path.read_bytes(), b"replacement index")
+                    self.assertTrue(
+                        workspace_core._index_lock_owner_path(lock_path).is_file()
+                    )
+                    os.replace(acquired, destination_index)
+            finally:
+                release.join()
+
+            self.assertGreaterEqual(time.monotonic() - started, 0.08)
+            self.assertEqual(destination_index.read_bytes(), b"replacement index")
+            self.assertFalse(
+                workspace_core._index_lock_owner_path(lock_path).exists()
+            )
+
+    def test_git_index_lock_times_out_without_deleting_external_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+            lock_path.write_bytes(b"external Git operation")
+
+            with self.assertRaisesRegex(RuntimeError, "remained locked for 0.1s"):
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=0.05,
+                    poll_interval=0.01,
+                ):
+                    self.fail("external lock should not be acquired")
+
+            self.assertEqual(lock_path.read_bytes(), b"external Git operation")
+
+    def test_git_index_lock_recovers_stale_pcr_owned_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            owner_path = workspace_core._index_lock_owner_path(lock_path)
+            source_index.write_bytes(b"replacement index")
+            lock_path.write_bytes(b"abandoned PCR index")
+            device, inode, ctime_ns = workspace_core._lock_identity(lock_path.stat())
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 99999999,
+                        "device": device,
+                        "inode": inode,
+                        "ctime_ns": ctime_ns,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(workspace_core, "_process_is_alive", return_value=False):
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=0.1,
+                    poll_interval=0.01,
+                ) as acquired:
+                    self.assertEqual(acquired.read_bytes(), b"replacement index")
+                    os.replace(acquired, destination_index)
+
+            self.assertEqual(destination_index.read_bytes(), b"replacement index")
+            self.assertFalse(owner_path.exists())
+
+    def test_git_index_lock_does_not_remove_lock_with_mismatched_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            owner_path = workspace_core._index_lock_owner_path(lock_path)
+            source_index.write_bytes(b"replacement index")
+            lock_path.write_bytes(b"external Git operation")
+            device, inode, ctime_ns = workspace_core._lock_identity(lock_path.stat())
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 99999999,
+                        "device": device,
+                        "inode": inode + 1,
+                        "ctime_ns": ctime_ns,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(workspace_core, "_process_is_alive", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "remained locked"):
+                    with workspace_core._locked_git_index(
+                        source_index,
+                        destination_index,
+                        timeout=0.02,
+                        poll_interval=0.005,
+                    ):
+                        self.fail("mismatched lock ownership must not be trusted")
+
+            self.assertEqual(lock_path.read_bytes(), b"external Git operation")
+            self.assertTrue(owner_path.exists())
+
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_git_workspace_copy_uses_worktree_and_preserves_dirty_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,6 +326,41 @@ class WorkspaceCopyTests(unittest.TestCase):
                 self.assertEqual((dst / "untracked.txt").read_text(encoding="utf-8"), "untracked")
                 copied_status = self._git(dst, "status", "--porcelain=v1").stdout
                 self.assertEqual(copied_status, original_status)
+            finally:
+                cleanup_workspace_copy(workspace, dst)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_workspace_copy_holds_index_lock_while_syncing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+            (workspace / "tracked.txt").write_text("dirty", encoding="utf-8")
+            run_base = root / "runs"
+            dst = run_base / "workspaces" / "agent_001"
+            original_sync = workspace_core.sync_back_with_python
+            observed_lock = []
+
+            def sync_with_lock_check(src: Path, destination: Path) -> None:
+                destination_index = workspace_core._git_index_path(destination)
+                self.assertIsNotNone(destination_index)
+                assert destination_index is not None
+                lock_path = destination_index.with_name(f"{destination_index.name}.lock")
+                observed_lock.append(lock_path.is_file())
+                self.assertTrue(
+                    workspace_core._index_lock_owner_path(lock_path).is_file()
+                )
+                original_sync(src, destination)
+
+            with mock.patch.object(
+                workspace_core,
+                "sync_back_with_python",
+                side_effect=sync_with_lock_check,
+            ):
+                copy_workspace(workspace, dst, run_base)
+            try:
+                self.assertEqual(observed_lock, [True])
+                self.assertEqual((dst / "tracked.txt").read_text(encoding="utf-8"), "dirty")
             finally:
                 cleanup_workspace_copy(workspace, dst)
 
