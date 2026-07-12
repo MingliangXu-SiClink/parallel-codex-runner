@@ -69,6 +69,18 @@ TIP_ICON_COLORS: tuple[str, ...] = (
     "#4b6878",
     "#3e5260",
 )
+COMMAND_SPINNER_FRAMES: tuple[str, ...] = (
+    "⠋",
+    "⠙",
+    "⠹",
+    "⠸",
+    "⠼",
+    "⠴",
+    "⠦",
+    "⠧",
+    "⠇",
+    "⠏",
+)
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
     "输入框为空时，←/→ 可切换 Agent。",
@@ -180,6 +192,61 @@ def command_completion_line(status: str, exit_code: Any) -> str:
     return ""
 
 
+def split_command_detail(text: str) -> tuple[str, str]:
+    lines = text.splitlines()
+    completion = ""
+    if len(lines) > 1 and lines[-1].startswith(("✓ ", "✗ ", "× ", "· ")):
+        completion = lines.pop()
+    return "\n".join(lines).strip(), completion
+
+
+def strip_shell_command_wrapper(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if (
+        len(parts) == 3
+        and Path(parts[0]).name in {"bash", "dash", "ksh", "sh", "zsh"}
+        and parts[1] in {"-c", "-lc"}
+    ):
+        return parts[2]
+    return command
+
+
+def command_completion_display(completion: str) -> tuple[str, str]:
+    if not completion:
+        return "", "running"
+    if completion.startswith("✓ exit "):
+        return f"completed (exit {completion.removeprefix('✓ exit ')})", "success"
+    if completion.startswith("✗ exit "):
+        return f"failed (exit {completion.removeprefix('✗ exit ')})", "failed"
+    if completion.startswith("✓"):
+        return "completed", "success"
+    if completion.startswith("✗"):
+        return "failed", "failed"
+    if completion.startswith("×"):
+        return "cancelled", "cancelled"
+    return completion.removeprefix("· "), "other"
+
+
+def command_detail_display(text: str, *, active: bool = True) -> tuple[str, str]:
+    command, completion = split_command_detail(text)
+    command = strip_shell_command_wrapper(command) or "command"
+    completion_text, state = command_completion_display(completion)
+    if not completion and not active:
+        completion_text = "interrupted"
+        state = "cancelled"
+
+    command_lines = command.splitlines() or ["command"]
+    verb = "Running" if state == "running" else "Ran"
+    lines = [f"{verb} {command_lines[0]}"]
+    lines.extend(f"│ {line}" for line in command_lines[1:])
+    if completion_text:
+        lines.append(f"└ {completion_text}")
+    return "\n".join(lines), state
+
+
 def is_detail_noise_line(text: str) -> bool:
     normalized = " ".join(text.casefold().replace("_", " ").replace("-", " ").split())
     timestamp_stripped = re.sub(
@@ -247,9 +314,9 @@ def display_line_parts_from_json(payload: dict[str, Any]) -> tuple[str, str]:
         command = text_value(item.get("command"))
         status = text_value(item.get("status"))
         exit_code = item.get("exit_code")
-        header = f"$ {command}" if command else "$ command"
+        header = command or "command"
         completion = command_completion_line(status, exit_code)
-        return "activity", f"{header}\n{completion}" if completion else header
+        return "command", f"{header}\n{completion}" if completion else header
 
     text_paths = [
         ("message",),
@@ -447,7 +514,7 @@ else:
             text = text.strip()
             if not text:
                 return
-            category = category if category in {"thought", "output"} else "activity"
+            category = category if category in {"thought", "output", "command"} else "activity"
             if not self.detail_events:
                 self.detail_events.extend(("thought", line) for line in self.thought_lines)
                 self.detail_events.extend(("output", line) for line in self.output_lines)
@@ -459,8 +526,8 @@ else:
                         previous = bucket[index]
                         bucket[index] = text
                         for event_index in range(len(self.detail_events) - 1, -1, -1):
-                            if self.detail_events[event_index] == ("activity", previous):
-                                self.detail_events[event_index] = ("activity", text)
+                            if self.detail_events[event_index] == (category, previous):
+                                self.detail_events[event_index] = (category, text)
                                 break
                         return
             bucket.append(text)
@@ -477,6 +544,12 @@ else:
 
         def has_agent_text(self) -> bool:
             return bool(self.thought_lines or self.output_lines)
+
+        def has_active_command(self) -> bool:
+            return any(
+                category == "command" and not split_command_detail(text)[1]
+                for category, text in self.detail_events
+            )
 
         def clear_detail(self) -> None:
             self.diff_request += 1
@@ -3129,7 +3202,11 @@ else:
             for idx, (prefix, block, style) in enumerate(blocks):
                 if idx:
                     parts.append("\n\n")
-                parts.append((self._format_prefixed_block(prefix, block), style))
+                formatted = self._format_prefixed_block(prefix, block)
+                if style.startswith("command-"):
+                    self._append_command_renderable(parts, formatted, style.removeprefix("command-"))
+                else:
+                    parts.append((formatted, style))
             renderable = Content.assemble(*parts)
             self._detail_cache_key = key
             self._detail_cache_renderable = renderable
@@ -3192,7 +3269,10 @@ else:
             pulse = (
                 self.work_frame
                 if pane.diff_loading
-                or (pane.status == "running" and not pane.has_agent_text())
+                or (
+                    pane.status in {"running", "stopping"}
+                    and (pane.has_active_command() or not pane.has_agent_text())
+                )
                 else None
             )
             return (
@@ -3225,11 +3305,24 @@ else:
                 "output": ("◇", "white"),
                 "activity": ("•", "dim white"),
             }
+            previous_category = ""
             for category, text in pane.ordered_detail_events():
                 if category == "output" and pane.final_text and same_display_message(text, pane.final_text):
                     continue
-                prefix, style = display_by_category.get(category, display_by_category["activity"])
-                if event_blocks and event_blocks[-1][0] == prefix and event_blocks[-1][2] == style:
+                if category == "command":
+                    command_active = pane.status in {"running", "stopping"}
+                    text, command_state = command_detail_display(text, active=command_active)
+                    prefix = self._command_marker() if command_state == "running" else "•"
+                    style = f"command-{command_state}"
+                else:
+                    prefix, style = display_by_category.get(category, display_by_category["activity"])
+                if (
+                    category != "command"
+                    and previous_category == category
+                    and event_blocks
+                    and event_blocks[-1][0] == prefix
+                    and event_blocks[-1][2] == style
+                ):
                     previous_prefix, previous_text, previous_style = event_blocks[-1]
                     event_blocks[-1] = (
                         previous_prefix,
@@ -3238,8 +3331,9 @@ else:
                     )
                 else:
                     event_blocks.append((prefix, text, style))
+                previous_category = category
             blocks.extend(event_blocks)
-            if pane.status == "running" and not pane.has_agent_text():
+            if pane.status == "running" and not pane.has_agent_text() and not pane.has_active_command():
                 blocks.append(("·", self._pulse(), "dim white"))
             if pane.final_text:
                 blocks.append(("✓", pane.final_text, "green"))
@@ -3264,6 +3358,50 @@ else:
             folded = fold_text_by_cells(block, content_width)
             indent = " " * prefix_width
             return f"{prefix} {folded.replace(chr(10), chr(10) + indent)}"
+
+        def _append_command_renderable(
+            self,
+            parts: list[str | tuple[str, str]],
+            formatted: str,
+            state: str,
+        ) -> None:
+            marker_style = {
+                "running": "bold cyan",
+                "success": "bold green",
+                "failed": "bold red",
+                "cancelled": "bold yellow",
+            }.get(state, "bold white")
+            status_style = {
+                "success": "green",
+                "failed": "red",
+                "cancelled": "yellow",
+            }.get(state, "dim white")
+
+            for index, line in enumerate(formatted.splitlines(keepends=True)):
+                if index == 0:
+                    marker, remainder = line[0], line[1:]
+                    parts.append((marker, marker_style))
+                    match = re.match(r"(\s+)(Running|Ran)(\s+)(.*)", remainder.rstrip("\n"))
+                    if match is None:
+                        parts.append((remainder, "white"))
+                        continue
+                    leading, verb, spacing, command = match.groups()
+                    parts.append(leading)
+                    parts.append((verb, "bold white"))
+                    parts.append(spacing)
+                    parts.append((command, "white"))
+                    if line.endswith("\n"):
+                        parts.append("\n")
+                    continue
+
+                stripped = line.lstrip()
+                leading = line[: len(line) - len(stripped)]
+                if stripped.startswith(("│", "└")):
+                    marker, remainder = stripped[0], stripped[1:]
+                    parts.append((leading + marker, "dim white"))
+                    parts.append((remainder, status_style if marker == "└" else "white"))
+                else:
+                    parts.append((line, "white"))
 
         def _detail_title(self, pane: AgentPane) -> str:
             title = f"AGENT-{pane.idx:03d}"
@@ -3334,6 +3472,9 @@ else:
         def _pulse(self) -> str:
             pulses = ("▰▱▱", "▰▰▱", "▰▰▰", "▱▰▰", "▱▱▰", "▱▱▱")
             return pulses[self.work_frame % len(pulses)]
+
+        def _command_marker(self) -> str:
+            return COMMAND_SPINNER_FRAMES[self.work_frame % len(COMMAND_SPINNER_FRAMES)]
 
 
     def run_textual_tui(args: argparse.Namespace) -> int:

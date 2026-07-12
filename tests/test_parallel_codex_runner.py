@@ -2045,10 +2045,19 @@ class TuiCommandTests(unittest.TestCase):
             },
         }
 
-        self.assertEqual(display_line_parts_from_output(json.dumps(started)), ("activity", "$ /bin/zsh -lc 'pytest -q'"))
+        self.assertEqual(
+            display_line_parts_from_output(json.dumps(started)),
+            ("command", "/bin/zsh -lc 'pytest -q'"),
+        )
         self.assertEqual(
             display_line_parts_from_output(json.dumps(completed)),
-            ("activity", "$ /bin/zsh -lc 'pytest -q'\n✓ exit 0"),
+            ("command", "/bin/zsh -lc 'pytest -q'\n✓ exit 0"),
+        )
+        self.assertEqual(
+            tui_textual.command_detail_display(
+                display_line_parts_from_output(json.dumps(completed))[1]
+            ),
+            ("Ran pytest -q\n└ completed (exit 0)", "success"),
         )
 
     def test_display_line_ignores_long_command_output(self) -> None:
@@ -2065,7 +2074,7 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(
             display_line_parts_from_output(json.dumps(completed)),
-            ("activity", "$ /bin/zsh -lc 'pytest -q'\n✓ exit 0"),
+            ("command", "/bin/zsh -lc 'pytest -q'\n✓ exit 0"),
         )
 
     def test_display_line_shows_failed_command_without_output(self) -> None:
@@ -2083,9 +2092,13 @@ class TuiCommandTests(unittest.TestCase):
 
         category, text = display_line_parts_from_output(json.dumps(completed))
 
-        self.assertEqual(category, "activity")
-        self.assertEqual(text, "$ python big.py\n✗ exit 1")
+        self.assertEqual(category, "command")
+        self.assertEqual(text, "python big.py\n✗ exit 1")
         self.assertNotIn(long_line, text)
+        self.assertEqual(
+            tui_textual.command_detail_display(text),
+            ("Ran python big.py\n└ failed (exit 1)", "failed"),
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_keeps_agent_messages_and_merges_command_completion(self) -> None:
@@ -2122,14 +2135,48 @@ class TuiCommandTests(unittest.TestCase):
             pane.output_lines,
             ["I will inspect the project.", "The implementation is here."],
         )
-        self.assertEqual(pane.lines, [f"$ {command}\n✓ exit 0"])
+        self.assertEqual(pane.lines, [f"{command}\n✓ exit 0"])
         self.assertNotIn("many", "\n".join(pane.lines))
         self.assertNotIn("output", "\n".join(pane.lines))
         timeline = app._current_attempt_blocks(pane)
         self.assertEqual([prefix for prefix, _text, _style in timeline], ["◇", "•", "◇"])
         self.assertEqual(timeline[0][1], "I will inspect the project.")
-        self.assertEqual(timeline[1][1], f"$ {command}\n✓ exit 0")
+        self.assertEqual(
+            timeline[1][1],
+            "Ran python - <<'PY'\n"
+            "│ print('hello')\n"
+            "│ PY\n"
+            "└ completed (exit 0)",
+        )
+        self.assertEqual(timeline[1][2], "command-success")
         self.assertEqual(timeline[2][1], "The implementation is here.")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_command_cell_animates_and_keeps_a_stable_layout(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        pane.status = "running"
+        pane.append("/bin/zsh -lc 'pytest -q'", "command")
+
+        app.work_frame = 0
+        running = app._current_attempt_blocks(pane)[0]
+        first_key = app._detail_cache_key_for(pane)
+        app.work_frame = 1
+        second_key = app._detail_cache_key_for(pane)
+
+        self.assertEqual(running[0], tui_textual.COMMAND_SPINNER_FRAMES[0])
+        self.assertEqual(running[1], "Running pytest -q")
+        self.assertEqual(running[2], "command-running")
+        self.assertNotEqual(first_key, second_key)
+
+        pane.append("/bin/zsh -lc 'pytest -q'\n✓ exit 0", "command")
+        completed = app._current_attempt_blocks(pane)[0]
+        self.assertEqual(completed, ("•", "Ran pytest -q\n└ completed (exit 0)", "command-success"))
+        app._mark_detail_dirty(pane)
+        rendered = app._detail_renderable()
+        self.assertIn("• Ran pytest -q\n  └ completed (exit 0)", rendered.plain)
+        self.assertNotIn("/bin/zsh -lc", rendered.plain)
+        self.assertTrue(any(str(span.style) == "bold green" for span in rendered.spans))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
@@ -2717,7 +2764,7 @@ class StreamLogTests(unittest.TestCase):
             self.assertNotIn("aggregated_output", progress_text)
             self.assertEqual(
                 display_line_parts_from_output(progress_text),
-                ("activity", "$ pytest -q\n✓ exit 0"),
+                ("command", "pytest -q\n✓ exit 0"),
             )
 
         asyncio.run(run())
