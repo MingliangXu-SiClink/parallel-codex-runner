@@ -432,6 +432,7 @@ else:
         final_text: str = ""
         result: dict[str, Any] | None = None
         attempt_history: list[tuple[str, str, str]] = field(default_factory=list)
+        detail_events: list[tuple[str, str]] = field(default_factory=list)
         lines: list[str] = field(default_factory=list)
         thought_lines: list[str] = field(default_factory=list)
         output_lines: list[str] = field(default_factory=list)
@@ -446,17 +447,41 @@ else:
             text = text.strip()
             if not text:
                 return
+            category = category if category in {"thought", "output"} else "activity"
+            if not self.detail_events:
+                self.detail_events.extend(("thought", line) for line in self.thought_lines)
+                self.detail_events.extend(("output", line) for line in self.output_lines)
+                self.detail_events.extend(("activity", line) for line in self.lines)
             bucket = self.thought_lines if category == "thought" else self.output_lines if category == "output" else self.lines
             if bucket is self.lines and "\n" in text:
                 for index in range(len(bucket) - 1, -1, -1):
                     if text.startswith(f"{bucket[index]}\n"):
+                        previous = bucket[index]
                         bucket[index] = text
+                        for event_index in range(len(self.detail_events) - 1, -1, -1):
+                            if self.detail_events[event_index] == ("activity", previous):
+                                self.detail_events[event_index] = ("activity", text)
+                                break
                         return
             bucket.append(text)
+            self.detail_events.append((category, text))
+
+        def ordered_detail_events(self) -> list[tuple[str, str]]:
+            if self.detail_events:
+                return self.detail_events
+            return [
+                *(("thought", line) for line in self.thought_lines),
+                *(("output", line) for line in self.output_lines),
+                *(("activity", line) for line in self.lines),
+            ]
+
+        def has_agent_text(self) -> bool:
+            return bool(self.thought_lines or self.output_lines)
 
         def clear_detail(self) -> None:
             self.diff_request += 1
             self.attempt_history.clear()
+            self.detail_events.clear()
             self.lines.clear()
             self.thought_lines.clear()
             self.output_lines.clear()
@@ -2369,6 +2394,7 @@ else:
             pane.input_text = self.pending_prompt
             pane.final_text = ""
             pane.result = None
+            pane.detail_events.clear()
             pane.lines.clear()
             pane.thought_lines.clear()
             pane.output_lines.clear()
@@ -3166,7 +3192,7 @@ else:
             pulse = (
                 self.work_frame
                 if pane.diff_loading
-                or (pane.status == "running" and not pane.thought_lines and not pane.output_lines)
+                or (pane.status == "running" and not pane.has_agent_text())
                 else None
             )
             return (
@@ -3193,22 +3219,28 @@ else:
             blocks: list[tuple[str, str, str]] = []
             if pane.input_text:
                 blocks.append((">", pane.input_text, "cyan"))
-            thoughts = "\n".join(pane.thought_lines)
-            if thoughts:
-                blocks.append(("·", thoughts, "dim white"))
-            elif pane.status == "running" and not pane.output_lines:
+            event_blocks: list[tuple[str, str, str]] = []
+            display_by_category = {
+                "thought": ("·", "dim white"),
+                "output": ("◇", "white"),
+                "activity": ("•", "dim white"),
+            }
+            for category, text in pane.ordered_detail_events():
+                if category == "output" and pane.final_text and same_display_message(text, pane.final_text):
+                    continue
+                prefix, style = display_by_category.get(category, display_by_category["activity"])
+                if event_blocks and event_blocks[-1][0] == prefix and event_blocks[-1][2] == style:
+                    previous_prefix, previous_text, previous_style = event_blocks[-1]
+                    event_blocks[-1] = (
+                        previous_prefix,
+                        f"{previous_text}\n{text}",
+                        previous_style,
+                    )
+                else:
+                    event_blocks.append((prefix, text, style))
+            blocks.extend(event_blocks)
+            if pane.status == "running" and not pane.has_agent_text():
                 blocks.append(("·", self._pulse(), "dim white"))
-            output_lines = [
-                line
-                for line in pane.output_lines
-                if not (pane.final_text and same_display_message(line, pane.final_text))
-            ]
-            output = "\n".join(output_lines)
-            if output:
-                blocks.append(("◇", output, "white"))
-            activity = "\n".join(pane.lines)
-            if activity:
-                blocks.append(("•", activity, "dim white"))
             if pane.final_text:
                 blocks.append(("✓", pane.final_text, "green"))
             return blocks

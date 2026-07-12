@@ -2125,6 +2125,11 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(pane.lines, [f"$ {command}\n✓ exit 0"])
         self.assertNotIn("many", "\n".join(pane.lines))
         self.assertNotIn("output", "\n".join(pane.lines))
+        timeline = app._current_attempt_blocks(pane)
+        self.assertEqual([prefix for prefix, _text, _style in timeline], ["◇", "•", "◇"])
+        self.assertEqual(timeline[0][1], "I will inspect the project.")
+        self.assertEqual(timeline[1][1], f"$ {command}\n✓ exit 0")
+        self.assertEqual(timeline[2][1], "The implementation is here.")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
