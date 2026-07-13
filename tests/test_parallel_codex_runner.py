@@ -2310,6 +2310,32 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_resume_history_reflows_when_terminal_expands(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            app.detail_history = [
+                app._history_detail_block(
+                    app_core.CodexHistoryEntry("output", "中" * 70)
+                )
+            ]
+            async with app.run_test(size=(60, 30)) as pilot:
+                app._mark_detail_dirty()
+                app._sync()
+                await pilot.pause()
+                detail = app.query_one("#detail")
+                narrow_line_breaks = detail.content.plain.count("\n")
+
+                await pilot.resize_terminal(120, 30)
+                await pilot.pause()
+
+                self.assertLess(
+                    detail.content.plain.count("\n"),
+                    narrow_line_breaks,
+                )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_resume_control_dispatches_selected_session(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args([]))

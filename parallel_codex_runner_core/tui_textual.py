@@ -839,6 +839,19 @@ else:
         def _update_follow_tail(self) -> None:
             self.follow_tail = self.is_vertical_scroll_end
 
+    class DetailView(Static):
+        """Rebuild cell-aware wrapping after the Detail viewport changes width."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._render_width = 0
+
+        def on_resize(self, event: events.Resize) -> None:
+            previous_width = self._render_width
+            self._render_width = event.size.width
+            if previous_width and previous_width != self._render_width:
+                self.app.call_after_refresh(self.app._sync)
+
     class RainbowDetailFrame(Vertical):
         """Update border colors without invalidating the Detail viewport."""
 
@@ -1389,7 +1402,7 @@ else:
                         yield Static("", id="runner-recommended-agent", classes="runner-value", markup=False)
                 with RainbowDetailFrame(id="detail-frame"):
                     with DetailScroll(id="detail-scroll"):
-                        yield Static("", id="detail")
+                        yield DetailView("", id="detail")
                 yield Static("", id="suggestions")
                 yield Static(self._tip_renderable(), id="tips")
                 yield PromptEditor(
