@@ -3077,6 +3077,29 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_long_resume_title_does_not_leave_gap_before_recommendation(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(100, 40)) as pilot:
+                resume = app.query_one("#config-resume")
+                app.resume_session_id = "session-1"
+                app.resume_choices = [("中" * 500, "session-1")]
+                app._set_select_control(
+                    resume,
+                    "session-1",
+                    app.resume_choices,
+                )
+                app.recommended_agent = 1
+                app._sync()
+                await pilot.pause()
+
+                recommendation = app.query_one("#runner-recommended-agent-key")
+                self.assertEqual(recommendation.region.y, resume.region.bottom)
+                self.assertEqual(resume.query_one("SelectCurrent").region.height, 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_routes_typing_to_prompt_except_runner_inputs(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args([]))

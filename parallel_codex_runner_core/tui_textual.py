@@ -975,9 +975,18 @@ else:
         .runner-control {
             height: 1;
             min-height: 1;
+            max-height: 1;
             border: none;
             padding: 0;
             background: #171d25;
+        }
+        .runner-control > SelectCurrent,
+        .runner-control > SelectCurrent > #label {
+            height: 1;
+            min-height: 1;
+            max-height: 1;
+            text-wrap: nowrap;
+            text-overflow: clip;
         }
         .runner-control:focus {
             background: #243448;
