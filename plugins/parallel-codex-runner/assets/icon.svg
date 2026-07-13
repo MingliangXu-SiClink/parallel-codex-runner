@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Parallel Codex Runner</title>
+  <rect width="128" height="128" rx="24" fill="#10232c"/>
+  <path d="M20 64h18M38 64c10 0 10-30 22-30h12M38 64c10 0 10-10 22-10h12M38 64c10 0 10 10 22 10h12M38 64c10 0 10 30 22 30h12" fill="none" stroke="#8fa5b0" stroke-width="5" stroke-linecap="round"/>
+  <rect x="70" y="25" width="34" height="18" rx="4" fill="#38bdf8"/>
+  <rect x="70" y="45" width="34" height="18" rx="4" fill="#2dd4bf"/>
+  <rect x="70" y="65" width="34" height="18" rx="4" fill="#ffd166"/>
+  <rect x="70" y="85" width="34" height="18" rx="4" fill="#67d17c"/>
+  <path d="M106 34v60c0 8-5 14-14 14H76" fill="none" stroke="#8fa5b0" stroke-width="5" stroke-linecap="round"/>
+  <path d="m76 108 8-7v14z" fill="#f7fafc"/>
+</svg>

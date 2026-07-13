@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "parallel-codex-runner": {
+      "command": "/bin/sh",
+      "args": ["./scripts/launch_server.sh"],
+      "cwd": "."
+    }
+  }
+}

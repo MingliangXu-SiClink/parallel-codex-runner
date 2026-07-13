@@ -36,6 +36,7 @@ from parallel_codex_runner import (
     parse_args,
     prepare_agent_codex_home,
     promote_codex_session_to_workspace,
+    remove_agent_codex_homes,
     run_one_agent,
     scrub_codex_home_support_entries,
     stream_to_log,
@@ -911,7 +912,7 @@ class TuiCommandTests(unittest.TestCase):
             with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
                 options = tui_textual.codex_model_options("gpt-custom")
 
-        self.assertIn(("default", ""), options)
+        self.assertIn(("default (Codex CLI)", ""), options)
         self.assertIn(("gpt-visible", "gpt-visible"), options)
         self.assertIn(("gpt-custom", "gpt-custom"), options)
         self.assertNotIn(("gpt-hidden", "gpt-hidden"), options)
@@ -1072,6 +1073,27 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIsNone(app.args.effort)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prepared_rows_keep_codex_bin_visible(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["--codex-bin", "/opt/codex/bin/codex"]))
+        app._sync = lambda: None
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {
+                    "type": "run_prepared",
+                    "rows": [
+                        ["WORKSPACE", str(app.workspace)],
+                        ["RUNS_ROOT", "/tmp/pcr-run"],
+                        ["CODEX_BIN", "/opt/codex/bin/codex"],
+                    ],
+                }
+            )
+        )
+        self.assertEqual(
+            dict(app.run_info_rows)["CODEX_BIN"],
+            "/opt/codex/bin/codex",
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_model_change_resets_an_unsupported_effort_to_auto(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1114,6 +1136,10 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(app.args.model, "gpt-narrow")
         self.assertIsNone(app.args.effort)
+        self.assertEqual(
+            app.model_registry.model_options(None)[0][0],
+            "default (gpt-wide)",
+        )
         self.assertEqual(dict(app._base_info_rows())["EFFORT"], "auto (medium)")
         self.assertNotIn(
             ("max", "max"),
@@ -1182,12 +1208,27 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.num_agents, 2)
         self.assertTrue(app._has_pending_run())
         self.assertFalse(app._pending_sync_disabled())
-        self.assertFalse(app._pending_keep_enabled())
+        self.assertTrue(app._pending_keep_enabled())
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
         with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
             self.assertTrue(app._cleanup_after_pending_run())
+        cleanup.assert_not_called()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_cleanup_removes_agent_codex_homes_with_workspaces(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        app.pending_run_root = Path("/tmp/pcr-test")
+        app.pending_workspaces_root = app.pending_run_root / "workspaces"
+        app.pending_workspace = app.workspace
+        app.pending_keep_workspaces = False
+        with (
+            mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup,
+            mock.patch.object(tui_textual, "remove_agent_codex_homes") as remove_homes,
+        ):
+            self.assertTrue(app._cleanup_after_pending_run())
         cleanup.assert_called_once_with(app.workspace, app.pending_workspaces_root)
+        remove_homes.assert_called_once_with(app.pending_run_root / "meta")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_exit_finalizes_displayed_agent_after_next_config_change(self) -> None:
@@ -4416,6 +4457,24 @@ class ResumeSessionTests(unittest.TestCase):
             self.assertTrue((home / "sessions" / "rollout.jsonl").exists())
             self.assertTrue((home / "state_5.sqlite").exists())
             self.assertFalse((home / "auth.json").exists())
+
+    def test_remove_agent_codex_homes_deletes_isolated_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = Path(tmp) / "meta"
+            first = meta / "agent_001" / "codex_home"
+            second = meta / "agent_002" / "codex_home"
+            large_index = meta / "agent_1000" / "codex_home"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            large_index.mkdir(parents=True)
+            (first / "state_5.sqlite").write_text("large", encoding="utf-8")
+            (second / "sessions").mkdir()
+
+            self.assertTrue(remove_agent_codex_homes(meta))
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertFalse(large_index.exists())
+            self.assertTrue((meta / "agent_001").is_dir())
 
     def test_prepare_agent_codex_home_rebinds_cwd_when_rollout_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

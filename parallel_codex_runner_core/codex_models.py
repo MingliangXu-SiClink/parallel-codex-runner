@@ -57,7 +57,7 @@ class CodexModelRegistry:
         return self.models.get(effective_model) if effective_model else None
 
     def model_options(self, current_model: str | None) -> list[tuple[str, str]]:
-        options: list[tuple[str, str]] = [("default", "")]
+        options: list[tuple[str, str]] = [(self.model_display(None), "")]
         seen = {""}
         for info in self.models.values():
             if info.visible and info.slug not in seen:
@@ -67,6 +67,13 @@ class CodexModelRegistry:
         if current and current not in seen:
             options.append((current, current))
         return options
+
+    def model_display(self, model: str | None) -> str:
+        requested = _normalized_text(model)
+        if requested:
+            return requested
+        effective = self.effective_model(None)
+        return f"default ({effective or 'Codex CLI'})"
 
     def supported_efforts(self, model: str | None) -> tuple[str, ...]:
         info = self.model_info(model)

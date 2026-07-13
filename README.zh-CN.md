@@ -9,7 +9,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#运行要求)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[为什么做 PCR？](#为什么做-pcr) · [快速开始](#快速开始) · [使用 TUI](#使用-tui) · [工作区与回写](#工作区与回写) · [完整参考](#完整参考)
+[为什么做 PCR？](#为什么做-pcr) · [快速开始](#快速开始) · [Codex App 插件](#codex-app-插件) · [使用 TUI](#使用-tui) · [完整参考](#完整参考)
 
 <code>pcr "修复失败的测试" -n 8</code>
 
@@ -114,6 +114,37 @@ pcr
 
 TUI 顶部的配置项也可以直接修改。
 
+## Codex App 插件
+
+PCR 现在也可以作为本地 Codex App 插件使用。插件与 CLI 共用同一套执行和工作区代码，只是把审查流程封装成 MCP 工具：Codex 可以启动候选、跟踪事件、分页读取完整 Patch、停止或重试 Agent，并采用你确认的分支。
+
+依次安装运行程序、检查环境、注册本地 Marketplace，然后安装插件：
+
+```bash
+cd /Users/mingliangxu/Desktop/parallel-codex-runner
+
+# 安装 PCR 与 MCP Server
+python3 -m pip install -e .
+
+# 检查运行环境
+python3 plugins/parallel-codex-runner/scripts/check_runtime.py
+
+# 注册本地插件市场
+codex plugin marketplace add /Users/mingliangxu/Desktop/parallel-codex-runner
+
+# 安装插件
+codex plugin add parallel-codex-runner@personal
+```
+
+环境检查最后应显示 `"ok": true`。安装完成后重启 Codex App，并新建对话，随后可以直接输入：
+
+```text
+使用 Parallel Codex Runner，为这个任务运行五个隔离候选。
+和我一起比较它们的 Patch，在我选择前不要回写。
+```
+
+插件不会把“运行完成”或“推荐结果”当作修改项目的授权。只有明确接受某个成功 Agent 后才会回写。工具说明、重启恢复和常见问题见[插件使用指南](plugins/parallel-codex-runner/README.zh-CN.md)。
+
 ## 使用 TUI
 
 ### 查看 Agent 正在做什么
@@ -213,7 +244,7 @@ pcr --prompt-file /tmp/prompt.txt -n 8
 ```
 
 > [!NOTE]
-> 下文所述的大型任务确认目前只在 TUI 中提供。一次性模式会直接开始运行，因此处理大项目时，请将 `--runs-dir` 放在空间充足的文件系统中。
+> 下文所述的大型任务确认在 TUI 和 Codex App 插件中提供。一次性模式会直接开始运行，因此处理大项目时，请将 `--runs-dir` 放在空间充足的文件系统中。
 
 ## 工作区与回写
 
@@ -274,7 +305,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 
 估算超过 5 GiB 时，PCR 会询问是否继续。选择继续后，它会先检查目标文件系统的剩余空间；选择取消则不会创建工作区，也不会把本次需求写入历史。
 
-### 安全边界
+### 安全说明
 
 > [!CAUTION]
 > 工作区隔离只能避免 Agent 修改同一个工作树。它不是容器、虚拟机或操作系统级沙箱。
@@ -414,6 +445,11 @@ PYTHONPATH=vendor/textual/src python3 -m pytest -m 'not syntax' \
 | `parallel_codex_runner_core/prompt_history.py` | 持久化输入历史。 |
 | `parallel_codex_runner_core/diffing.py` | 支持删除操作的工作区 Diff。 |
 | `parallel_codex_runner_core/models.py` | 共享的运行和会话数据模型。 |
+| `parallel_codex_runner_core/plugin_runtime.py` | 插件运行使用的持久化审查控制器。 |
+| `parallel_codex_runner_core/plugin_mcp.py` | Codex App 插件调用的本地 MCP 工具。 |
+| `parallel_codex_runner_core/plugin/` | 持久化状态、事件索引、独立 worker 和产物路径校验。 |
+| `plugins/parallel-codex-runner/` | 插件清单、Skill、运行检查和插件文档。 |
+| `.agents/plugins/marketplace.json` | 仓库内的 Codex 插件 Marketplace。 |
 | `vendor/textual/` | 内置 Textual 与 PCR 的终端输入补丁。 |
 | `tests/` | 回归测试。 |
 

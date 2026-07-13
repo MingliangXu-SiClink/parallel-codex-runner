@@ -1,0 +1,41 @@
+{
+  "name": "parallel-codex-runner",
+  "version": "0.1.4",
+  "description": "Run, compare, and selectively accept isolated Codex candidates from the Codex app.",
+  "author": {
+    "name": "MingliangXu-SiClink",
+    "url": "https://github.com/MingliangXu-SiClink"
+  },
+  "homepage": "https://github.com/MingliangXu-SiClink/parallel-codex-runner/tree/main/plugins/parallel-codex-runner",
+  "repository": "https://github.com/MingliangXu-SiClink/parallel-codex-runner",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "parallel-agents",
+    "code-review",
+    "worktrees"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Parallel Codex Runner",
+    "shortDescription": "Compare isolated Codex attempts before accepting one.",
+    "longDescription": "Run one task through multiple isolated Codex workspaces, follow each candidate, inspect complete patches, stop or retry attempts, and sync only the result you explicitly accept.",
+    "developerName": "MingliangXu-SiClink",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/MingliangXu-SiClink/parallel-codex-runner",
+    "defaultPrompt": [
+      "Run five isolated fixes for this task, then compare their patches with me.",
+      "Resume my latest Codex session in three candidates and show me the strongest patches.",
+      "Run several candidates for this bug and let me choose what reaches the workspace."
+    ],
+    "brandColor": "#19A7AE",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.svg",
+    "logoDark": "./assets/logo-dark.svg"
+  },
+  "mcpServers": "./.mcp.json"
+}

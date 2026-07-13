@@ -9,7 +9,7 @@ English · [简体中文](README.zh-CN.md)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#requirements)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Why PCR?](#why-pcr) · [Quick Start](#quick-start) · [Using the TUI](#using-the-tui) · [Workspaces](#workspaces-and-sync-back) · [Reference](#reference)
+[Why PCR?](#why-pcr) · [Quick Start](#quick-start) · [Codex App Plugin](#codex-app-plugin) · [Using the TUI](#using-the-tui) · [Reference](#reference)
 
 <code>pcr "fix the failing tests" -n 8</code>
 
@@ -114,6 +114,39 @@ To change the next run before submitting:
 
 The settings at the top of the TUI are editable too.
 
+## Codex App Plugin
+
+PCR also ships as a local Codex App plugin. It uses the same execution and workspace code as the CLI, but exposes the review workflow through MCP tools: Codex can start candidates, follow events, inspect paged full patches, stop or retry Agents, and finalize the branch you approve.
+
+Install the runtime, verify it, register this repository as a local marketplace,
+and install the plugin:
+
+```bash
+cd /Users/mingliangxu/Desktop/parallel-codex-runner
+
+# Install PCR and its MCP server
+python3 -m pip install -e .
+
+# Verify the runtime
+python3 plugins/parallel-codex-runner/scripts/check_runtime.py
+
+# Register the local plugin marketplace
+codex plugin marketplace add /Users/mingliangxu/Desktop/parallel-codex-runner
+
+# Install the plugin
+codex plugin add parallel-codex-runner@personal
+```
+
+The runtime check should report `"ok": true`. Restart the Codex App after
+installation, then open a new thread and try:
+
+```text
+Use Parallel Codex Runner to run five isolated fixes for this task.
+Compare their patches with me and do not sync anything until I choose.
+```
+
+The plugin never treats completion or its recommendation as permission to modify the project. Sync-back happens only after a successful Agent is explicitly accepted. See the [plugin guide](plugins/parallel-codex-runner/README.md) for its tools, recovery behavior, and troubleshooting.
+
 ## Using the TUI
 
 ### Follow the work
@@ -213,7 +246,7 @@ pcr --prompt-file /tmp/prompt.txt -n 8
 ```
 
 > [!NOTE]
-> The large-run confirmation described below is currently available in the TUI. One-shot mode starts directly, so use `--runs-dir` on a filesystem with enough free space for large projects.
+> The large-run confirmation described below is available in the TUI and Codex App plugin. One-shot mode starts directly, so use `--runs-dir` on a filesystem with enough free space for large projects.
 
 ## Workspaces and Sync-back
 
@@ -274,7 +307,7 @@ Before a TUI run creates any workspace, PCR estimates the combined size of:
 
 If the estimate is over 5 GiB, PCR asks whether to continue. If you continue, it checks the target filesystem's free space first. Declining leaves the workspace untouched and does not add the prompt to history.
 
-### Security boundaries
+### Safety notes
 
 > [!CAUTION]
 > Workspace isolation prevents Agents from editing the same working tree. It is not a container, virtual machine, or operating-system sandbox.
@@ -414,6 +447,11 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | `parallel_codex_runner_core/prompt_history.py` | Persistent prompt history. |
 | `parallel_codex_runner_core/diffing.py` | Delete-aware workspace diff generation. |
 | `parallel_codex_runner_core/models.py` | Shared run and session data models. |
+| `parallel_codex_runner_core/plugin_runtime.py` | Persistent review-mode controller for plugin runs. |
+| `parallel_codex_runner_core/plugin_mcp.py` | Local MCP tools used by the Codex App plugin. |
+| `parallel_codex_runner_core/plugin/` | Durable state, indexed events, detached workers, and artifact validation. |
+| `plugins/parallel-codex-runner/` | Plugin manifest, Skill, runtime check, and plugin documentation. |
+| `.agents/plugins/marketplace.json` | Repository-local Codex plugin marketplace. |
 | `vendor/textual/` | Vendored Textual and PCR's terminal-input patches. |
 | `tests/` | Regression tests. |
 

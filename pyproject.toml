@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallel-codex-runner"
-version = "0.1.3"
+version = "0.1.4"
 description = "Run multiple isolated Codex agents in parallel and sync back the selected result."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "markdown-it-py[linkify]>=2.1.0",
+    "mcp>=1.27,<2",
     "mdit-py-plugins",
     "platformdirs>=3.6.0,<5",
     "pygments>=2.19.2,<3.0.0",
@@ -28,11 +29,13 @@ pretty = [
 
 [project.scripts]
 pcr = "parallel_codex_runner:main"
+pcr-plugin-server = "parallel_codex_runner_core.plugin_mcp:main"
 
 [tool.setuptools]
 py-modules = ["parallel_codex_runner"]
 packages = [
     "parallel_codex_runner_core",
+    "parallel_codex_runner_core.plugin",
     "parallel_codex_runner_core._vendor",
     "parallel_codex_runner_core._vendor.textual",
     "parallel_codex_runner_core._vendor.textual.css",

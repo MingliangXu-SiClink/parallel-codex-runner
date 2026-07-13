@@ -1,0 +1,4 @@
+interface:
+  display_name: "Parallel Codex Runner"
+  short_description: "Compare isolated Codex candidates before accepting one"
+  default_prompt: "Use $parallel-codex-runner to run several isolated solutions and help me choose one."

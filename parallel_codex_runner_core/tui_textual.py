@@ -502,6 +502,7 @@ else:
         load_codex_session_history,
         normalize_recommend_by,
         promote_best_codex_session_to_workspace,
+        remove_agent_codex_homes,
         run_additional_agents,
         run_once,
         select_best_result,
@@ -2125,7 +2126,13 @@ else:
                 if isinstance(rows, list):
                     run_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
                     self._remember_run_paths(run_rows)
-                    self.run_info_rows = self._visible_info_rows(run_rows)
+                    prepared = dict(run_rows)
+                    merged_rows = [
+                        (label, prepared.pop(label, value))
+                        for label, value in self._base_info_rows()
+                    ]
+                    merged_rows.extend(prepared.items())
+                    self.run_info_rows = self._visible_info_rows(merged_rows)
                     prepared_effort = dict(run_rows).get("EFFORT", "")
                     if self.pending_execution_args is not None and prepared_effort:
                         self.pending_execution_args.effort = (
@@ -3083,6 +3090,8 @@ else:
             if not self._prepare_config_change("keep workspaces"):
                 return
             self.args.keep_workspaces = value
+            if self._has_pending_run() and not self.running:
+                self.pending_keep_workspaces = value
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"keepworkspaces={'on' if value else 'off'}")
 
@@ -3689,6 +3698,8 @@ else:
                 if is_relative_to(root, workspace):
                     raise RuntimeError(f"refusing to delete workspace-owned path: {root}")
                 cleanup_workspace_copies(workspace, root)
+                if self.pending_run_root is not None:
+                    remove_agent_codex_homes(self.pending_run_root / "meta")
                 return True
             except Exception as exc:  # noqa: BLE001
                 self.status = f"Cleanup failed: {exc}"
@@ -4211,7 +4222,12 @@ else:
                         )
                     ),
                 ),
-                ("MODEL", str(getattr(self.args, "model", None) or "default")),
+                (
+                    "MODEL",
+                    self.model_registry.model_display(
+                        getattr(self.args, "model", None)
+                    ),
+                ),
                 (
                     "EFFORT",
                     self.model_registry.effort_display(

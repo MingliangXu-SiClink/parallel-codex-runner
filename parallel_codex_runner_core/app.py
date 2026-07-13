@@ -392,6 +392,27 @@ def scrub_agent_codex_homes(meta_root: Path) -> None:
         scrub_codex_home_support_entries(path)
 
 
+def remove_agent_codex_homes(meta_root: Path) -> bool:
+    """Delete isolated Codex homes when candidate workspaces are not retained."""
+    if not meta_root.exists():
+        return True
+    if meta_root.is_symlink() or not meta_root.is_dir():
+        raise RuntimeError(f"refusing to clean unsafe metadata path: {meta_root}")
+    resolved_meta = meta_root.resolve()
+    for path in meta_root.glob("agent_*/codex_home"):
+        agent_dir = path.parent
+        if (
+            not agent_dir.name.removeprefix("agent_").isdigit()
+            or agent_dir.is_symlink()
+            or agent_dir.parent.resolve() != resolved_meta
+            or path.is_symlink()
+        ):
+            raise RuntimeError(f"refusing to clean unsafe Codex home: {path}")
+        if path.exists():
+            shutil.rmtree(path)
+    return not any(meta_root.glob("agent_*/codex_home"))
+
+
 def copy_sqlite_database(src: Path, dst: Path) -> None:
     if not src.exists():
         return
@@ -2789,6 +2810,8 @@ def run_once(
     resume_session = resolve_resume_session(args, workspace)
     resume_session_id = resume_session.session_id if resume_session else None
     effort_model = args.model or (resume_session.model if resume_session else None)
+    model_registry = CodexModelRegistry.load(get_codex_home())
+    model_display = model_registry.model_display(args.model)
     effective_effort = resolve_codex_reasoning_effort(
         effort_model,
         getattr(args, "effort", None),
@@ -2819,8 +2842,11 @@ def run_once(
                     ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
                     ["MAX_PARALLEL", str(max_parallel)],
                     ["RECOMMEND_BY", args.recommend_by],
-                    ["MODEL", args.model or "default"],
+                    ["MODEL", model_display],
                     ["EFFORT", effective_effort or "default"],
+                    ["CODEX_BIN", str(args.codex_bin)],
+                    ["SYNC_BACK", "NO" if args.no_sync_back else "YES"],
+                    ["KEEP_WORKSPACES", "YES" if args.keep_workspaces else "NO"],
                     ["RESUME", resume_session_id or "NO"],
                     ["METADATA", absolute_path_for_display(meta_root)],
                     ["WORKSPACE COPIES", absolute_path_for_display(workspaces_root)],
@@ -2855,7 +2881,7 @@ def run_once(
         overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
         overview.add_row("MAX_PARALLEL", str(max_parallel))
         overview.add_row("RECOMMEND_BY", args.recommend_by)
-        overview.add_row("MODEL", args.model or "default")
+        overview.add_row("MODEL", model_display)
         overview.add_row("EFFORT", effective_effort or "default")
         overview.add_row("RESUME", resume_session_id or "NO")
         overview.add_row("METADATA", absolute_path_for_display(meta_root))
@@ -2876,7 +2902,7 @@ def run_once(
         log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
         log("info", "max_parallel = {}", max_parallel)
         log("info", "recommend_by = {}", args.recommend_by)
-        log("info", "model = {}", args.model or "default")
+        log("info", "model = {}", model_display)
         log("info", "effort = {}", effective_effort or "default")
         log("info", "resume = {}", resume_session_id or "NO")
 
@@ -2911,6 +2937,7 @@ def run_once(
         scrub_agent_codex_homes(meta_root)
         if not args.keep_workspaces and not is_relative_to(workspaces_root, workspace):
             cleanup_workspace_copies(workspace, workspaces_root)
+            remove_agent_codex_homes(meta_root)
 
     try:
         if HAS_RICH and progress_callback is None:
@@ -3060,6 +3087,7 @@ def run_once(
             raise SystemExit(f"拒绝删除：workspaces_root 位于 workspace 内部：{workspaces_root}")
         cleanup_workspace_copies(workspace, workspaces_root)
         workspaces_deleted = not workspaces_root.exists()
+        remove_agent_codex_homes(meta_root)
 
     write_run_files(
         run_root,
