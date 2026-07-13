@@ -75,7 +75,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -100,10 +100,25 @@ from .workspace import (
     cleanup_workspace_copy,
     cleanup_workspace_copies,
     copy_workspace,
+    estimate_path_storage_bytes,
+    estimate_workspace_copy_bytes,
     sync_best_workspace_back,
 )
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
+GIBIBYTE = 1024**3
+LARGE_RUN_STORAGE_WARNING_BYTES = 5 * GIBIBYTE
+AGENT_METADATA_RESERVE_BYTES = 64 * 1024**2
+
+
+@dataclass(frozen=True)
+class RunStorageEstimate:
+    num_agents: int
+    workspace_bytes_per_agent: int
+    workspace_copies_bytes: int
+    metadata_bytes_per_agent: int
+    metadata_bytes: int
+    total_bytes: int
 
 # Conda's SQLite build can deadlock inside the macOS VFS when separate Python
 # threads open or close databases concurrently. PCR's SQLite sections are
@@ -883,6 +898,99 @@ def find_rollout_path_for_session(codex_home: Path, session_id: str) -> Optional
         except OSError:
             continue
     return None
+
+
+def _copied_codex_entry_storage_bytes(path: Path) -> int:
+    if path.is_symlink():
+        try:
+            target = path.resolve(strict=True)
+        except OSError:
+            return 0
+        return estimate_path_storage_bytes(target) if target.is_file() else 0
+    return estimate_path_storage_bytes(path)
+
+
+def estimate_agent_metadata_bytes(
+    codex_home: Path,
+    resume_session_id: Optional[str] = None,
+    resume_codex_home: Optional[Path] = None,
+    runtime_reserve_bytes: int = AGENT_METADATA_RESERVE_BYTES,
+) -> int:
+    """Estimate one agent's copied CODEX_HOME and runtime metadata."""
+    codex_home = codex_home.expanduser().resolve()
+    total = max(0, int(runtime_reserve_bytes))
+    for name in sorted(CODEX_SUPPORT_FILES | CODEX_SUPPORT_DIRS):
+        total += _copied_codex_entry_storage_bytes(codex_home / name)
+
+    state_db = codex_home / "state_5.sqlite"
+    total += _copied_codex_entry_storage_bytes(state_db)
+    # SQLite backup folds a live WAL into the copied database. Counting both
+    # is conservative and avoids underestimating a busy Codex state database.
+    total += _copied_codex_entry_storage_bytes(
+        state_db.with_name(f"{state_db.name}-wal")
+    )
+
+    if resume_session_id:
+        rollout_home = (resume_codex_home or codex_home).expanduser().resolve()
+        rollout_path = find_rollout_path_for_session(
+            rollout_home,
+            resume_session_id,
+        )
+        if rollout_path is not None:
+            total += _copied_codex_entry_storage_bytes(rollout_path)
+    return total
+
+
+def estimate_run_storage(
+    workspace: Path,
+    num_agents: int,
+    resume_session_id: Optional[str] = None,
+    codex_home: Optional[Path] = None,
+    resume_codex_home: Optional[Path] = None,
+    metadata_reserve_bytes: int = AGENT_METADATA_RESERVE_BYTES,
+) -> RunStorageEstimate:
+    """Estimate storage PCR will allocate before starting an agent run."""
+    if num_agents <= 0:
+        raise ValueError("num_agents must be greater than zero")
+    workspace_bytes = estimate_workspace_copy_bytes(workspace)
+    metadata_bytes = estimate_agent_metadata_bytes(
+        codex_home or get_codex_home(),
+        resume_session_id,
+        resume_codex_home,
+        metadata_reserve_bytes,
+    )
+    workspace_copies_bytes = workspace_bytes * num_agents
+    all_metadata_bytes = metadata_bytes * num_agents
+    return RunStorageEstimate(
+        num_agents=num_agents,
+        workspace_bytes_per_agent=workspace_bytes,
+        workspace_copies_bytes=workspace_copies_bytes,
+        metadata_bytes_per_agent=metadata_bytes,
+        metadata_bytes=all_metadata_bytes,
+        total_bytes=workspace_copies_bytes + all_metadata_bytes,
+    )
+
+
+def available_storage_bytes(path: Path) -> int:
+    """Return free bytes on the filesystem that will contain path."""
+    candidate = path.expanduser().resolve()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    if candidate.is_file():
+        candidate = candidate.parent
+    return int(shutil.disk_usage(candidate).free)
+
+
+def format_storage_bytes(value: int) -> str:
+    size = max(0, int(value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            precision = 0 if unit == "B" else 2
+            return f"{amount:.{precision}f} {unit}"
+        amount /= 1024
+    return f"{size} B"
 
 
 _INTERNAL_HISTORY_PREFIXES = (

@@ -122,6 +122,7 @@ TUI_TIPS: tuple[str, ...] = (
     "注意本项目默认以Codex Full Access 权限运行。",
     "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常加入队列。",
     "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
+    "大型工作区会在复制前估算空间，并在预计超过 5 GiB 时请求确认。",
 )
 
 
@@ -476,7 +477,8 @@ try:
     from textual.containers import Grid, Vertical, VerticalScroll
     from textual.geometry import Region
     from textual.message import Message
-    from textual.widgets import Input, Select, Static, TextArea
+    from textual.screen import ModalScreen
+    from textual.widgets import Button, Input, Select, Static, TextArea
 except (ModuleNotFoundError, RuntimeError) as exc:
     _TEXTUAL_IMPORT_ERROR = exc
 
@@ -489,6 +491,11 @@ except (ModuleNotFoundError, RuntimeError) as exc:
 
 else:
     from .app import (
+        LARGE_RUN_STORAGE_WARNING_BYTES,
+        RunStorageEstimate,
+        available_storage_bytes,
+        estimate_run_storage,
+        format_storage_bytes,
         get_codex_home,
         infer_codex_thread_id_for_result,
         list_resume_sessions,
@@ -503,7 +510,11 @@ else:
     from .diffing import build_workspace_diff_text
     from .models import AgentResult, CodexHistoryEntry
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
-    from .workspace import cleanup_workspace_copies, sync_best_workspace_back
+    from .workspace import (
+        cleanup_workspace_copies,
+        estimate_path_storage_bytes,
+        sync_best_workspace_back,
+    )
     from rich.cells import cell_len
     from rich.panel import Panel
     from rich.table import Table
@@ -683,6 +694,109 @@ else:
             self.workspace = workspace
             self.entries = entries
             self.error = error
+
+
+    class StoragePreflightFinished(Message):
+        def __init__(
+            self,
+            request_id: int,
+            prompt: str,
+            record_history: bool,
+            run_base: Path,
+            estimate: RunStorageEstimate | None = None,
+            error: str = "",
+            reclaimable_bytes: int = 0,
+            configuration_key: tuple[Any, ...] = (),
+        ) -> None:
+            super().__init__()
+            self.request_id = request_id
+            self.prompt = prompt
+            self.record_history = record_history
+            self.run_base = run_base
+            self.estimate = estimate
+            self.error = error
+            self.reclaimable_bytes = max(0, int(reclaimable_bytes))
+            self.configuration_key = configuration_key
+
+
+    class StorageWarningScreen(ModalScreen[bool]):
+        CSS = """
+        StorageWarningScreen {
+            align: center middle;
+        }
+        #storage-warning-dialog {
+            width: 76;
+            max-width: 92%;
+            height: auto;
+            padding: 1 2;
+            background: #171d25;
+            border: round #e5b567;
+        }
+        #storage-warning-title {
+            height: 1;
+            margin-bottom: 1;
+            color: #ffd27a;
+            text-style: bold;
+        }
+        #storage-warning-body {
+            height: auto;
+            margin-bottom: 1;
+            color: #e7ebf2;
+        }
+        #storage-warning-actions {
+            height: 3;
+            grid-size: 2 1;
+            grid-columns: 1fr 1fr;
+            grid-gutter: 0 1;
+        }
+        #storage-warning-actions Button {
+            width: 100%;
+        }
+        """
+
+        BINDINGS = [
+            ("escape", "cancel_run", "Cancel"),
+            ("n", "cancel_run", "Cancel"),
+            ("y", "continue_run", "Continue"),
+        ]
+
+        def __init__(self, estimate: RunStorageEstimate) -> None:
+            super().__init__()
+            self.estimate = estimate
+
+        def compose(self) -> ComposeResult:
+            estimate = self.estimate
+            body = "\n".join(
+                (
+                    f"本次运行预计占用 {format_storage_bytes(estimate.total_bytes)}，"
+                    f"超过 {format_storage_bytes(LARGE_RUN_STORAGE_WARNING_BYTES)} 提醒阈值。",
+                    "",
+                    f"WORKSPACE COPIES  {format_storage_bytes(estimate.workspace_copies_bytes)}",
+                    f"META + RESERVE    {format_storage_bytes(estimate.metadata_bytes)}",
+                    f"AGENTS            {estimate.num_agents}",
+                    "",
+                    "继续后将检查目标磁盘的可用空间。目前尚未创建任何副本。",
+                )
+            )
+            with Vertical(id="storage-warning-dialog"):
+                yield Static("LARGE WORKSPACE", id="storage-warning-title")
+                yield Static(body, id="storage-warning-body", markup=False)
+                with Grid(id="storage-warning-actions"):
+                    yield Button("取消", variant="primary", id="storage-cancel")
+                    yield Button("继续", variant="warning", id="storage-continue")
+
+        def on_mount(self) -> None:
+            self.query_one("#storage-cancel", Button).focus()
+
+        @on(Button.Pressed)
+        def _on_button_pressed(self, event: Button.Pressed) -> None:
+            self.dismiss(event.button.id == "storage-continue")
+
+        def action_cancel_run(self) -> None:
+            self.dismiss(False)
+
+        def action_continue_run(self) -> None:
+            self.dismiss(True)
 
 
     class AgentDiffLoaded(Message):
@@ -1145,6 +1259,8 @@ else:
             self.resume_choices_inflight: tuple[int, Path] | None = None
             self.pending_resume_selector: str | None = None
             self._resume_io_lock = threading.Lock()
+            self.storage_preflight_request = 0
+            self.storage_preflight_inflight = False
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self.queued_prompt_records_history = False
@@ -1489,12 +1605,270 @@ else:
             )
             self._replace_prompt_text(draft)
 
+        def _storage_estimate_inputs(self) -> tuple[Path, str | None, Path | None]:
+            source_workspace = self.workspace
+            resume_session_id = self.resume_session_id or None
+            resume_codex_home: Path | None = None
+            if self._has_pending_run() and not self._pending_sync_disabled():
+                pane = self.agents.get(self.selected_agent)
+                result = pane.result if pane is not None else None
+                if isinstance(result, dict) and result.get("status") == "success":
+                    workspace_dir = result.get("workspace_dir")
+                    if isinstance(workspace_dir, str) and workspace_dir:
+                        source_workspace = Path(workspace_dir).expanduser().resolve()
+                    thread_id = result.get("codex_thread_id")
+                    if isinstance(thread_id, str) and thread_id.strip():
+                        resume_session_id = thread_id.strip()
+                    codex_home = result.get("codex_home")
+                    if isinstance(codex_home, str) and codex_home:
+                        resume_codex_home = Path(codex_home).expanduser().resolve()
+            return source_workspace, resume_session_id, resume_codex_home
+
+        def _storage_run_base(self) -> Path:
+            module_dir = Path(__file__).resolve().parent
+            run_anchor = default_run_anchor(module_dir, self.workspace)
+            return choose_run_base(
+                run_anchor,
+                self.workspace,
+                getattr(self.args, "runs_dir", None),
+            )
+
+        def _storage_preflight_configuration(self) -> tuple[Any, ...]:
+            pane = self.agents.get(self.selected_agent)
+            result = pane.result if pane is not None else None
+            result_values = (
+                (
+                    result.get("workspace_dir"),
+                    result.get("codex_home"),
+                    result.get("codex_thread_id"),
+                )
+                if isinstance(result, dict)
+                else (None, None, None)
+            )
+            return (
+                str(self.workspace),
+                self.num_agents,
+                self.resume_session_id,
+                str(getattr(self.args, "runs_dir", None) or ""),
+                self.selected_agent,
+                str(self.pending_run_root or ""),
+                self._pending_sync_disabled(),
+                self._pending_keep_enabled(),
+                *result_values,
+            )
+
+        def _restore_prompt_after_storage_failure(self, prompt_text: str) -> None:
+            try:
+                prompt = self.query_one("#prompt", PromptEditor)
+            except Exception:
+                return
+            if prompt.text:
+                return
+            self.prompt_history_drafts[self.prompt_history_context] = prompt_text
+            self.prompt_history_navigator.note_edit(prompt_text)
+            self._replace_prompt_text(prompt_text)
+
+        def _request_run_with_storage_check(
+            self,
+            prompt: str,
+            record_history: bool = False,
+        ) -> bool:
+            if self.running:
+                return self._start_run(prompt, record_history=record_history)
+            if self.storage_preflight_inflight:
+                self.status = "A storage check is already in progress"
+                self._sync()
+                return False
+            if not self._commit_runner_inputs():
+                self._sync()
+                return False
+
+            source_workspace, resume_session_id, resume_codex_home = (
+                self._storage_estimate_inputs()
+            )
+            try:
+                run_base = self._storage_run_base()
+            except Exception as exc:  # noqa: BLE001
+                self.status = f"Run failed: cannot resolve run storage: {exc}"
+                self._sync()
+                return False
+
+            reclaimable_root: Path | None = None
+            if (
+                self._has_pending_run()
+                and not self._pending_keep_enabled()
+                and self.pending_run_root is not None
+                and self.pending_workspaces_root is not None
+                and self.pending_run_root.parent.resolve() == run_base.resolve()
+            ):
+                reclaimable_root = self.pending_workspaces_root
+
+            self.storage_preflight_request += 1
+            request_id = self.storage_preflight_request
+            self.storage_preflight_inflight = True
+            num_agents = self.num_agents
+            codex_home = get_codex_home()
+            configuration_key = self._storage_preflight_configuration()
+            self.status = f"Estimating storage for {num_agents} agents"
+            self._sync()
+
+            def target() -> None:
+                estimate: RunStorageEstimate | None = None
+                error = ""
+                reclaimable_bytes = 0
+                try:
+                    estimate = estimate_run_storage(
+                        source_workspace,
+                        num_agents,
+                        resume_session_id=resume_session_id,
+                        codex_home=codex_home,
+                        resume_codex_home=resume_codex_home,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                if not error and reclaimable_root is not None:
+                    try:
+                        reclaimable_bytes = estimate_path_storage_bytes(
+                            reclaimable_root
+                        )
+                    except OSError:
+                        reclaimable_bytes = 0
+                try:
+                    self.call_from_thread(
+                        self.post_message,
+                        StoragePreflightFinished(
+                            request_id,
+                            prompt,
+                            record_history,
+                            run_base,
+                            estimate,
+                            error,
+                            reclaimable_bytes,
+                            configuration_key,
+                        ),
+                    )
+                except RuntimeError:
+                    pass
+
+            threading.Thread(
+                target=target,
+                name="pcr-storage-preflight",
+                daemon=True,
+            ).start()
+            return True
+
+        def _restart_changed_storage_preflight(
+            self,
+            event: StoragePreflightFinished,
+        ) -> bool:
+            if (
+                event.configuration_key
+                and event.configuration_key != self._storage_preflight_configuration()
+            ):
+                self.storage_preflight_inflight = False
+                if not self._request_run_with_storage_check(
+                    event.prompt,
+                    record_history=event.record_history,
+                ):
+                    self._restore_prompt_after_storage_failure(event.prompt)
+                return True
+            return False
+
+        def _complete_storage_preflight(
+            self,
+            event: StoragePreflightFinished,
+            continue_run: bool,
+        ) -> None:
+            if event.request_id != self.storage_preflight_request:
+                return
+            if not continue_run:
+                self.storage_preflight_inflight = False
+                self.status = "Prompt ignored: storage confirmation declined"
+                self._sync()
+                self.query_one("#prompt", PromptEditor).focus()
+                return
+            if self._restart_changed_storage_preflight(event):
+                return
+
+            estimate = event.estimate
+            if estimate is None:
+                self.storage_preflight_inflight = False
+                self.status = "Run failed: storage estimate is unavailable"
+                self._restore_prompt_after_storage_failure(event.prompt)
+                self._sync()
+                return
+            try:
+                available = available_storage_bytes(event.run_base)
+            except Exception as exc:  # noqa: BLE001
+                self.storage_preflight_inflight = False
+                self.status = f"Run failed: cannot inspect available disk space: {exc}"
+                self._restore_prompt_after_storage_failure(event.prompt)
+                self._sync()
+                return
+            usable = available + event.reclaimable_bytes
+            if estimate.total_bytes > usable:
+                self.storage_preflight_inflight = False
+                available_text = format_storage_bytes(available)
+                if event.reclaimable_bytes:
+                    available_text += (
+                        f" + {format_storage_bytes(event.reclaimable_bytes)} "
+                        "reclaimable"
+                    )
+                self.status = (
+                    "Run failed: insufficient disk space "
+                    f"(need {format_storage_bytes(estimate.total_bytes)}, "
+                    f"available {available_text})"
+                )
+                self._restore_prompt_after_storage_failure(event.prompt)
+                self._sync()
+                return
+
+            self.storage_preflight_inflight = False
+            if not self._start_run(
+                event.prompt,
+                record_history=event.record_history,
+            ):
+                self._restore_prompt_after_storage_failure(event.prompt)
+                self._sync()
+
+        @on(StoragePreflightFinished)
+        def _on_storage_preflight_finished(
+            self,
+            event: StoragePreflightFinished,
+        ) -> None:
+            if event.request_id != self.storage_preflight_request:
+                return
+            if self._restart_changed_storage_preflight(event):
+                return
+            if event.error or event.estimate is None:
+                self.storage_preflight_inflight = False
+                message = event.error or "storage estimate is unavailable"
+                self.status = f"Run failed: cannot estimate storage: {message}"
+                self._restore_prompt_after_storage_failure(event.prompt)
+                self._sync()
+                return
+            if event.estimate.total_bytes > LARGE_RUN_STORAGE_WARNING_BYTES:
+                self.status = (
+                    "Storage confirmation required: "
+                    f"{format_storage_bytes(event.estimate.total_bytes)} estimated"
+                )
+                self._sync()
+                self.push_screen(
+                    StorageWarningScreen(event.estimate),
+                    lambda confirmed: self._complete_storage_preflight(
+                        event,
+                        bool(confirmed),
+                    ),
+                )
+                return
+            self._complete_storage_preflight(event, True)
+
         def _submit_task_prompt(self, prompt: str) -> bool:
             actual_context = self._current_prompt_history_context()
             if actual_context != self.prompt_history_context:
                 self._load_prompt_history_context()
             submitted_from_context = self.prompt_history_context
-            if not self._start_run(prompt, record_history=True):
+            if not self._request_run_with_storage_check(prompt, record_history=True):
                 return False
             self.prompt_history_drafts[submitted_from_context] = ""
             self._load_prompt_history_context(draft="")
@@ -1728,6 +2102,10 @@ else:
             await super()._on_key(event)
 
         def _switch_agent(self, delta: int) -> None:
+            if self.storage_preflight_inflight:
+                self.status = "Cannot switch agents while checking storage"
+                self._sync()
+                return
             last_agent = max(self.agents, default=self.num_agents)
             self.selected_agent = min(last_agent, max(1, self.selected_agent + delta))
             self._sync()
@@ -1930,6 +2308,10 @@ else:
                 self._handle_loaded_resume_selector(selector)
 
         def action_clear_view(self) -> None:
+            if self.storage_preflight_inflight:
+                self.status = "Cannot clear while checking storage"
+                self._sync()
+                return
             if self.running:
                 self.status = "Cannot clear while a run is active"
                 self._sync()
@@ -2041,6 +2423,9 @@ else:
                 self._request_exit()
 
         def _request_exit(self) -> None:
+            if self.storage_preflight_inflight:
+                self.storage_preflight_request += 1
+                self.storage_preflight_inflight = False
             if self.running:
                 self.queued_prompt = ""
                 self.queued_agent = None
@@ -2077,6 +2462,10 @@ else:
                 return
             if name in {"/status", "/config"}:
                 self._show_status()
+                return
+            if self.storage_preflight_inflight:
+                self.status = "Storage check in progress; use /exit to cancel"
+                self._sync()
                 return
             if name == "/clear":
                 self.action_clear_view()
@@ -2385,6 +2774,10 @@ else:
             self._sync()
 
         def _prepare_config_change(self, label: str) -> bool:
+            if self.storage_preflight_inflight:
+                self.status = f"Cannot change {label} while checking storage"
+                self._sync()
+                return False
             if self.running:
                 self.status = f"Cannot change {label} while running"
                 self._sync()
@@ -2392,6 +2785,10 @@ else:
             return True
 
         def _prepare_context_change(self, label: str) -> bool:
+            if self.storage_preflight_inflight:
+                self.status = f"Cannot change {label} while checking storage"
+                self._sync()
+                return False
             if self.running:
                 self.status = f"Cannot change {label} while running"
                 self._sync()
@@ -3212,9 +3609,9 @@ else:
                 return
             self._archive_command_history()
             started = (
-                self._start_run(prompt, record_history=True)
+                self._request_run_with_storage_check(prompt, record_history=True)
                 if record_history
-                else self._start_run(prompt)
+                else self._request_run_with_storage_check(prompt)
             )
             if not started:
                 try:
@@ -3302,6 +3699,8 @@ else:
             if self._shutdown_cleanup_started:
                 return
             self._shutdown_cleanup_started = True
+            self.storage_preflight_request += 1
+            self.storage_preflight_inflight = False
 
             if self.cancel_event is not None:
                 self.cancel_event.set()
@@ -3754,7 +4153,7 @@ else:
                     resume_options,
                 )
                 for control in controls:
-                    control.disabled = self.running
+                    control.disabled = self.running or self.storage_preflight_inflight
             finally:
                 self._updating_controls = False
 

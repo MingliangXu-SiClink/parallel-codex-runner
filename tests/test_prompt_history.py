@@ -186,7 +186,11 @@ class PromptHistoryTuiTests(unittest.TestCase):
 
                 app.running = False
                 with mock.patch.object(app, "_finalize_agent", return_value=True):
-                    with mock.patch.object(app, "_start_run", return_value=True) as start:
+                    with mock.patch.object(
+                        app,
+                        "_request_run_with_storage_check",
+                        return_value=True,
+                    ) as start:
                         app._continue_queued_prompt()
 
                 start.assert_called_once_with("follow up", record_history=True)

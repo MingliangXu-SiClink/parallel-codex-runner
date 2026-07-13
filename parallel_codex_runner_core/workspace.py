@@ -53,6 +53,82 @@ def make_ignore_func(extra_excluded_abs: Sequence[Path]):
     return ignore
 
 
+def _allocated_bytes(stat_result: os.stat_result) -> int:
+    """Estimate destination storage, including allocation for small files."""
+    block_bytes = int(getattr(stat_result, "st_blocks", 0) or 0) * 512
+    return max(int(stat_result.st_size), block_bytes)
+
+
+def estimate_path_storage_bytes(path: Path) -> int:
+    """Estimate storage for a copied path without following nested symlinks."""
+    try:
+        root_stat = path.lstat()
+    except FileNotFoundError:
+        return 0
+
+    total = _allocated_bytes(root_stat)
+    if path.is_symlink() or not path.is_dir():
+        return total
+
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    stat_result = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                total += _allocated_bytes(stat_result)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+    return total
+
+
+def estimate_workspace_copy_bytes(workspace: Path) -> int:
+    """Estimate one isolated workspace copy using PCR's exclusion rules."""
+    workspace = workspace.expanduser().resolve()
+    if not workspace.is_dir():
+        raise NotADirectoryError(f"workspace is not a directory: {workspace}")
+
+    total = _allocated_bytes(workspace.stat())
+    pending = [workspace]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            continue
+        with entries:
+            for entry in entries:
+                if entry.name in EXCLUDE_NAMES:
+                    continue
+                try:
+                    stat_result = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                total += _allocated_bytes(stat_result)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+
+    if git_workspace_toplevel(workspace) is not None:
+        # A worktree shares Git objects, but it still receives an index. Split
+        # indexes may be expanded while PCR mirrors the source worktree state.
+        index_paths = {_git_index_path(workspace), _git_shared_index_path(workspace)}
+        for index_path in index_paths:
+            if index_path is None:
+                continue
+            try:
+                total += _allocated_bytes(index_path.stat())
+            except FileNotFoundError:
+                continue
+    return total
+
+
 def git_workspace_toplevel(workspace: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -446,7 +522,17 @@ def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
     base_ref = _git_head_ref(workspace)
 
     result = subprocess.run(
-        ["git", "-C", str(workspace), "worktree", "add", "--detach", str(dst), "HEAD"],
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            str(dst),
+            "HEAD",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

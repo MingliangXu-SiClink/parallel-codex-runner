@@ -566,6 +566,76 @@ class WorkspaceCopyTests(unittest.TestCase):
                     cleanup_workspace_copy(workspace, workspace_copy)
 
 
+class RunStorageEstimateTests(unittest.TestCase):
+    def test_workspace_estimate_matches_copy_exclusions_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "source.bin").write_bytes(b"x" * 8192)
+            (workspace / ".codex_parallel_runs").mkdir()
+            (workspace / ".codex_parallel_runs" / "old.bin").write_bytes(
+                b"x" * (2 * 1024 * 1024)
+            )
+            external = root / "external.bin"
+            external.write_bytes(b"x" * (2 * 1024 * 1024))
+            (workspace / "linked.bin").symlink_to(external)
+
+            with mock.patch.object(
+                workspace_core,
+                "git_workspace_toplevel",
+                return_value=None,
+            ):
+                estimate = workspace_core.estimate_workspace_copy_bytes(workspace)
+
+        self.assertGreaterEqual(estimate, 8192)
+        self.assertLess(estimate, 1024 * 1024)
+
+    def test_agent_metadata_estimate_includes_resume_rollout_and_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex-home"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            state = codex_home / "state_5.sqlite"
+            wal = codex_home / "state_5.sqlite-wal"
+            rollout = codex_home / "sessions" / "rollout-session-1.jsonl"
+            config.write_bytes(b"c" * 1024)
+            state.write_bytes(b"s" * 4096)
+            wal.write_bytes(b"w" * 2048)
+            rollout.parent.mkdir()
+            rollout.write_bytes(b"r" * 8192)
+
+            estimated = app_core.estimate_agent_metadata_bytes(
+                codex_home,
+                "session-1",
+                runtime_reserve_bytes=123,
+            )
+            expected = 123 + sum(
+                workspace_core.estimate_path_storage_bytes(path)
+                for path in (config, state, wal, rollout)
+            )
+
+        self.assertEqual(estimated, expected)
+
+    def test_run_storage_estimate_multiplies_workspace_and_meta_per_agent(self) -> None:
+        with mock.patch.object(
+            app_core,
+            "estimate_workspace_copy_bytes",
+            return_value=100,
+        ), mock.patch.object(
+            app_core,
+            "estimate_agent_metadata_bytes",
+            return_value=50,
+        ):
+            estimate = app_core.estimate_run_storage(Path.cwd(), 3)
+
+        self.assertEqual(estimate.workspace_bytes_per_agent, 100)
+        self.assertEqual(estimate.workspace_copies_bytes, 300)
+        self.assertEqual(estimate.metadata_bytes_per_agent, 50)
+        self.assertEqual(estimate.metadata_bytes, 150)
+        self.assertEqual(estimate.total_bytes, 450)
+
+
 class RunRootTests(unittest.TestCase):
     def test_create_unique_run_root_adds_suffix_on_collision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2372,7 +2442,7 @@ class TuiCommandTests(unittest.TestCase):
             app = tui_textual.PcrTextualApp(args)
             app._sync = lambda: None
             app._show_text = lambda _text: None
-            app._start_run = (
+            app._request_run_with_storage_check = (
                 lambda prompt, record_history=False: prompts.append(prompt) or True
             )
 
@@ -2667,7 +2737,11 @@ class TuiCommandTests(unittest.TestCase):
 
         continued: list[str] = []
         with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
-            with mock.patch.object(app, "_start_run", side_effect=continued.append):
+            with mock.patch.object(
+                app,
+                "_request_run_with_storage_check",
+                side_effect=continued.append,
+            ):
                 app._on_runner_event(
                     tui_textual.RunnerEvent(
                         {
@@ -3231,6 +3305,175 @@ class TuiCommandTests(unittest.TestCase):
 
                 self.assertFalse(scroll.follow_tail)
                 self.assertFalse(scroll.is_vertical_scroll_end)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_large_storage_estimate_can_ignore_prompt_before_copying(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                workspace.mkdir()
+                history_path = root / "history.json"
+                total = tui_textual.LARGE_RUN_STORAGE_WARNING_BYTES + 1
+                estimate = app_core.RunStorageEstimate(
+                    num_agents=2,
+                    workspace_bytes_per_agent=total // 2,
+                    workspace_copies_bytes=total,
+                    metadata_bytes_per_agent=0,
+                    metadata_bytes=0,
+                    total_bytes=total,
+                )
+                with mock.patch.dict(
+                    os.environ,
+                    {"PCR_PROMPT_HISTORY_PATH": str(history_path)},
+                ):
+                    app = tui_textual.PcrTextualApp(
+                        parse_args(["--workspace", str(workspace), "-n", "2"])
+                    )
+                with mock.patch.object(
+                    tui_textual,
+                    "list_resume_sessions",
+                    return_value=[],
+                ), mock.patch.object(
+                    tui_textual,
+                    "estimate_run_storage",
+                    return_value=estimate,
+                ), mock.patch.object(
+                    app,
+                    "_start_run",
+                    return_value=True,
+                ) as start_run:
+                    async with app.run_test(size=(90, 32)) as pilot:
+                        self.assertTrue(app._submit_task_prompt("large question"))
+                        for _ in range(100):
+                            await pilot.pause()
+                            if isinstance(app.screen, tui_textual.StorageWarningScreen):
+                                break
+
+                        self.assertIsInstance(
+                            app.screen,
+                            tui_textual.StorageWarningScreen,
+                        )
+                        start_run.assert_not_called()
+                        await pilot.click("#storage-cancel")
+                        await pilot.pause()
+
+                        start_run.assert_not_called()
+                        self.assertFalse(app.storage_preflight_inflight)
+                        self.assertIn("Prompt ignored", app.status)
+                        self.assertEqual(
+                            app.prompt_history_store.entries(workspace, None),
+                            [],
+                        )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_storage_confirmation_fails_when_disk_is_too_small(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                workspace.mkdir()
+                total = tui_textual.LARGE_RUN_STORAGE_WARNING_BYTES + 1
+                estimate = app_core.RunStorageEstimate(
+                    num_agents=1,
+                    workspace_bytes_per_agent=total,
+                    workspace_copies_bytes=total,
+                    metadata_bytes_per_agent=0,
+                    metadata_bytes=0,
+                    total_bytes=total,
+                )
+                app = tui_textual.PcrTextualApp(
+                    parse_args(["--workspace", str(workspace)])
+                )
+                with mock.patch.object(
+                    tui_textual,
+                    "list_resume_sessions",
+                    return_value=[],
+                ), mock.patch.object(
+                    tui_textual,
+                    "estimate_run_storage",
+                    return_value=estimate,
+                ), mock.patch.object(
+                    tui_textual,
+                    "available_storage_bytes",
+                    return_value=total - 1,
+                ), mock.patch.object(
+                    app,
+                    "_start_run",
+                    return_value=True,
+                ) as start_run:
+                    async with app.run_test(size=(90, 32)) as pilot:
+                        self.assertTrue(app._submit_task_prompt("large question"))
+                        for _ in range(100):
+                            await pilot.pause()
+                            if isinstance(app.screen, tui_textual.StorageWarningScreen):
+                                break
+                        await pilot.click("#storage-continue")
+                        await pilot.pause()
+
+                        start_run.assert_not_called()
+                        self.assertFalse(app.storage_preflight_inflight)
+                        self.assertIn("insufficient disk space", app.status)
+                        self.assertEqual(
+                            app.query_one("#prompt").text,
+                            "large question",
+                        )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_small_storage_estimate_starts_without_confirmation(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp) / "workspace"
+                workspace.mkdir()
+                estimate = app_core.RunStorageEstimate(
+                    num_agents=1,
+                    workspace_bytes_per_agent=1024,
+                    workspace_copies_bytes=1024,
+                    metadata_bytes_per_agent=1024,
+                    metadata_bytes=1024,
+                    total_bytes=2048,
+                )
+                app = tui_textual.PcrTextualApp(
+                    parse_args(["--workspace", str(workspace)])
+                )
+                with mock.patch.object(
+                    tui_textual,
+                    "list_resume_sessions",
+                    return_value=[],
+                ), mock.patch.object(
+                    tui_textual,
+                    "estimate_run_storage",
+                    return_value=estimate,
+                ), mock.patch.object(
+                    tui_textual,
+                    "available_storage_bytes",
+                    return_value=4096,
+                ), mock.patch.object(
+                    app,
+                    "_start_run",
+                    return_value=True,
+                ) as start_run:
+                    async with app.run_test() as pilot:
+                        self.assertTrue(app._submit_task_prompt("small question"))
+                        for _ in range(100):
+                            await pilot.pause()
+                            if start_run.called:
+                                break
+
+                        start_run.assert_called_once_with(
+                            "small question",
+                            record_history=True,
+                        )
+                        self.assertNotIsInstance(
+                            app.screen,
+                            tui_textual.StorageWarningScreen,
+                        )
 
         asyncio.run(run())
 

@@ -34,6 +34,7 @@ Related upstream issue: [openai/codex#30364](https://github.com/openai/codex/iss
 - **Resume support**: continue from an existing Codex session and promote the winning session back.
 - **Candidate controls**: accept, reject, retry, or add more candidates without leaving the TUI.
 - **Workspace diff review**: inspect every added, modified, and deleted file before accepting an agent.
+- **Storage preflight**: estimate workspace copies and metadata before a TUI run, confirm estimates above 5 GiB, and reject runs that exceed free disk space.
 - **Background bells**: receive a terminal bell on the first success and when all candidates finish while the TUI is unfocused.
 - **Hackable TUI stack**: Textual 8.2.8 is vendored in the repository, including local CJK and grapheme-aware editor fixes.
 
