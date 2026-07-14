@@ -449,14 +449,13 @@ python3 -m compileall -q parallel_codex_runner.py parallel_codex_runner_core
 git diff --check
 ```
 
-修改内置 Textual 补丁时，还应运行相关上游测试：
+内置 Textual 的行为由针对性兼容测试覆盖：
 
 ```bash
-PYTHONPATH=vendor/textual/src python3 -m pytest -m 'not syntax' \
-  vendor/textual/tests/input vendor/textual/tests/text_area
+python3 -m unittest tests.test_vendored_textual
 ```
 
-固定的 Textual 版本与本地补丁清单见 [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md)。
+固定的 Textual 版本、保留的源码结构与本地补丁清单见 [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md)。
 
 <details>
 <summary><strong>项目结构</strong></summary>

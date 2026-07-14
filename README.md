@@ -452,14 +452,13 @@ python3 -m compileall -q parallel_codex_runner.py parallel_codex_runner_core
 git diff --check
 ```
 
-Changes to the vendored Textual patches should also run the focused upstream tests:
+Vendored Textual behavior is covered by the focused compatibility tests:
 
 ```bash
-PYTHONPATH=vendor/textual/src python3 -m pytest -m 'not syntax' \
-  vendor/textual/tests/input vendor/textual/tests/text_area
+python3 -m unittest tests.test_vendored_textual
 ```
 
-See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pinned revision and local patch inventory.
+See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pinned revision, retained source layout, and local patch inventory.
 
 <details>
 <summary><strong>Project layout</strong></summary>
