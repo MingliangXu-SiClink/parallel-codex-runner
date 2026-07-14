@@ -82,11 +82,14 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List,
 from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
 from .codex_models import CodexModelRegistry
 from .models import (
+    AGENT_ROLE_CANDIDATE,
+    AGENT_ROLE_SYNTHESIS,
     AgentResult,
     AgentState,
     CodexHistoryEntry,
     CodexSessionPromotion,
     ResumeSession,
+    normalize_agent_role,
 )
 from .paths import (
     absolute_path_for_display,
@@ -96,6 +99,7 @@ from .paths import (
     is_relative_to,
     safe_tail,
 )
+from .synthesis import create_synthesis_context, preferred_recommendation_pool
 from .workspace import (
     cleanup_workspace_copy,
     cleanup_workspace_copies,
@@ -989,6 +993,53 @@ def estimate_run_storage(
         metadata_bytes_per_agent=metadata_bytes,
         metadata_bytes=all_metadata_bytes,
         total_bytes=workspace_copies_bytes + all_metadata_bytes,
+    )
+
+
+def estimate_staged_run_storage(
+    workspace: Path,
+    candidate_agents: int,
+    synthesis_agents: int = 0,
+    resume_session_id: Optional[str] = None,
+    codex_home: Optional[Path] = None,
+    resume_codex_home: Optional[Path] = None,
+    metadata_reserve_bytes: int = AGENT_METADATA_RESERVE_BYTES,
+) -> RunStorageEstimate:
+    """Estimate first-stage candidates and fresh second-stage synthesis agents."""
+    if candidate_agents <= 0:
+        raise ValueError("candidate_agents must be greater than zero")
+    if synthesis_agents < 0:
+        raise ValueError("synthesis_agents must not be negative")
+
+    codex_home = codex_home or get_codex_home()
+    workspace_bytes = estimate_workspace_copy_bytes(workspace)
+    candidate_metadata = estimate_agent_metadata_bytes(
+        codex_home,
+        resume_session_id,
+        resume_codex_home,
+        metadata_reserve_bytes,
+    )
+    synthesis_metadata = (
+        estimate_agent_metadata_bytes(
+            codex_home,
+            runtime_reserve_bytes=metadata_reserve_bytes,
+        )
+        if synthesis_agents
+        else 0
+    )
+    total_agents = candidate_agents + synthesis_agents
+    workspace_copies_bytes = workspace_bytes * total_agents
+    metadata_bytes = (
+        candidate_metadata * candidate_agents
+        + synthesis_metadata * synthesis_agents
+    )
+    return RunStorageEstimate(
+        num_agents=total_agents,
+        workspace_bytes_per_agent=workspace_bytes,
+        workspace_copies_bytes=workspace_copies_bytes,
+        metadata_bytes_per_agent=(metadata_bytes + total_agents - 1) // total_agents,
+        metadata_bytes=metadata_bytes,
+        total_bytes=workspace_copies_bytes + metadata_bytes,
     )
 
 
@@ -1989,7 +2040,9 @@ async def run_one_agent(
     progress_callback: ProgressCallback = None,
     cancel_event: Any = None,
     agent_cancel_event: Any = None,
+    agent_role: str = AGENT_ROLE_CANDIDATE,
 ) -> AgentResult:
+    agent_role = normalize_agent_role(agent_role)
     meta_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = meta_dir / "stdout.log"
     stderr_log = meta_dir / "stderr.log"
@@ -2001,6 +2054,7 @@ async def run_one_agent(
         json.dumps(
             {
                 "idx": idx,
+                "role": agent_role,
                 "cwd": str(agent_workspace),
                 "codex_home": str(codex_home),
                 "command": command,
@@ -2028,7 +2082,9 @@ async def run_one_agent(
             status = requested_status
             raise RuntimeError("__pcr_stopped_before_start__")
         if progress_callback is not None:
-            progress_callback({"type": "agent_started", "idx": idx})
+            progress_callback(
+                {"type": "agent_started", "idx": idx, "role": agent_role}
+            )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(codex_home)
         process_options: Dict[str, Any] = {}
@@ -2109,6 +2165,7 @@ async def run_one_agent(
         returncode=returncode,
         status=status,
         seconds=seconds,
+        role=agent_role,
         codex_thread_id=state.codex_thread_id,
         reasoning_tokens=state.reasoning_tokens,
         reasoning_token_values=compact_token_values(state.reasoning_values),
@@ -2119,7 +2176,14 @@ async def run_one_agent(
     )
     status_json.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
     if progress_callback is not None:
-        progress_callback({"type": "agent_finished", "idx": idx, "result": asdict(result)})
+        progress_callback(
+            {
+                "type": "agent_finished",
+                "idx": idx,
+                "role": agent_role,
+                "result": asdict(result),
+            }
+        )
     return result
 
 
@@ -2135,7 +2199,9 @@ async def run_all_agents(
     cancel_event: Any = None,
     agent_cancel_events: Optional[Dict[int, Any]] = None,
     agent_indices: Optional[Sequence[int]] = None,
+    agent_role: str = AGENT_ROLE_CANDIDATE,
 ) -> List[AgentResult]:
+    agent_role = normalize_agent_role(agent_role)
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
     indices = list(agent_indices) if agent_indices is not None else list(range(1, n + 1))
@@ -2154,10 +2220,18 @@ async def run_all_agents(
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 agent_cancel_event=agent_cancel_event,
+                agent_role=agent_role,
             )
 
         if progress_callback is not None:
-            progress_callback({"type": "agent_status", "idx": idx, "status": "queued"})
+            progress_callback(
+                {
+                    "type": "agent_status",
+                    "idx": idx,
+                    "status": "queued",
+                    "role": agent_role,
+                }
+            )
         while True:
             if cancel_requested(cancel_event):
                 return await execute()
@@ -2266,30 +2340,40 @@ def select_best_result(
     *,
     warn_missing_tokens: bool = True,
 ) -> Optional[AgentResult]:
-    if not successes:
+    candidates = preferred_recommendation_pool(successes)
+    if not candidates:
         return None
 
     if recommend_by == "reasoning_tokens":
-        with_tokens = [r for r in successes if r.reasoning_tokens is not None]
+        with_tokens = [r for r in candidates if r.reasoning_tokens is not None]
         if not with_tokens:
             if warn_missing_tokens:
-                logger.warning("所有成功 agent 的 reasoning_tokens 都是 N/A；回退为按最长时长选择。")
-            return max(successes, key=lambda r: (r.seconds, -r.idx))
-        return max(successes, key=lambda r: (reasoning_score(r), r.seconds, -r.idx))
+                logger.warning(
+                    "当前推荐范围内所有成功 agent 的 reasoning_tokens 都是 N/A；"
+                    "回退为按最长时长选择。"
+                )
+            return max(candidates, key=lambda r: (r.seconds, -r.idx))
+        return max(candidates, key=lambda r: (reasoning_score(r), r.seconds, -r.idx))
 
-    return max(successes, key=lambda r: (r.seconds, reasoning_score(r), -r.idx))
+    return max(candidates, key=lambda r: (r.seconds, reasoning_score(r), -r.idx))
 
 
-def result_sort_key(result: AgentResult, recommend_by: str) -> Tuple[bool, float, int, int]:
+def result_sort_key(
+    result: AgentResult,
+    recommend_by: str,
+) -> Tuple[bool, int, float, int, int]:
+    role_rank = 0 if result.role == AGENT_ROLE_SYNTHESIS else 1
     if recommend_by == "reasoning_tokens":
         return (
             result.status != "success",
+            role_rank,
             -float(reasoning_score(result)),
             -int(result.seconds * 1000),
             result.idx,
         )
     return (
         result.status != "success",
+        role_rank,
         -result.seconds,
         -reasoning_score(result),
         result.idx,
@@ -2319,6 +2403,7 @@ def make_summary_table(
         table.add_column("rank", justify="right")
         table.add_column("best", justify="center")
         table.add_column("agent", justify="right")
+        table.add_column("role")
         table.add_column("status")
         table.add_column("ret", justify="right")
         table.add_column("seconds", justify="right")
@@ -2332,6 +2417,7 @@ def make_summary_table(
                 str(rank),
                 "*" if r.idx == best_idx else "",
                 f"{r.idx:03d}",
+                r.role,
                 f"[{status_style}]{r.status}[/{status_style}]",
                 "-" if r.returncode is None else str(r.returncode),
                 f"{r.seconds:.2f}",
@@ -2341,12 +2427,13 @@ def make_summary_table(
         return table
 
     lines = [f"Codex parallel run summary (recommend_by={recommend_by})"]
-    lines.append("rank best agent status ret seconds rtok_max rtok_values workspace")
+    lines.append("rank best agent role status ret seconds rtok_max rtok_values workspace")
     for rank, r in enumerate(rows, 1):
         rtok = "-" if r.reasoning_tokens is None else str(r.reasoning_tokens)
         values = "-" if not r.reasoning_token_values else ",".join(map(str, r.reasoning_token_values))
         lines.append(
-            f"{rank:>4} {('*' if r.idx == best_idx else ''):^4} {r.idx:>5} {r.status:<8} {str(r.returncode):>4} "
+            f"{rank:>4} {('*' if r.idx == best_idx else ''):^4} {r.idx:>5} {r.role:<9} "
+            f"{r.status:<8} {str(r.returncode):>4} "
             f"{r.seconds:>8.2f} {rtok:>8} {values:<24} {absolute_path_for_display(Path(r.workspace_dir))}"
         )
     return "\n".join(lines)
@@ -2452,6 +2539,7 @@ def write_run_files(
     workspaces_deleted: bool,
     resume_session: Optional[ResumeSession] = None,
     codex_session_promotion: Optional[CodexSessionPromotion] = None,
+    synthesis_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     (run_root / "prompt.txt").write_text(prompt, encoding="utf-8")
     summary = {
@@ -2468,6 +2556,20 @@ def write_run_files(
         "workspaces_deleted": workspaces_deleted,
         "results": [asdict(r) for r in sorted(results, key=lambda x: x.idx)],
     }
+    if synthesis_info is not None:
+        normalized_synthesis = dict(synthesis_info)
+        normalized_synthesis["launched_agents"] = [
+            result.idx
+            for result in sorted(results, key=lambda item: item.idx)
+            if result.role == AGENT_ROLE_SYNTHESIS
+        ]
+        normalized_synthesis["successful_agents"] = [
+            result.idx
+            for result in sorted(results, key=lambda item: item.idx)
+            if result.role == AGENT_ROLE_SYNTHESIS
+            and result.status == "success"
+        ]
+        summary["synthesis"] = normalized_synthesis
     (run_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     (run_root / "BEST_AGENT.txt").write_text((f"agent_{best.idx:03d}" if best else "") + "\n", encoding="utf-8")
     (run_root / "FINAL_RESULT_WORKSPACE.txt").write_text((str(workspace) if synced else "") + "\n", encoding="utf-8")
@@ -2485,7 +2587,7 @@ def write_run_files(
             for delta, count in sorted(r.reasoning_token_counts.items())
         )
         token_lines.append(
-            f"agent_{r.idx:03d}\tstatus={r.status}\tseconds={r.seconds:.2f}\t"
+            f"agent_{r.idx:03d}\trole={r.role}\tstatus={r.status}\tseconds={r.seconds:.2f}\t"
             f"reasoning_tokens={r.reasoning_tokens if r.reasoning_tokens is not None else 'N/A'}\t"
             f"values={','.join(map(str, r.reasoning_token_values)) if r.reasoning_token_values else 'N/A'}\t"
             f"increments={increments or 'N/A'}"
@@ -2518,6 +2620,13 @@ def refresh_run_result_files(
     new_results: Sequence[AgentResult],
     recommend_by: str,
 ) -> None:
+    recorded_prompt = prompt
+    prompt_path = run_root / "prompt.txt"
+    if prompt_path.exists():
+        try:
+            recorded_prompt = prompt_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
     recorded = _load_recorded_results(run_root)
     for result in new_results:
         recorded[result.idx] = result
@@ -2551,7 +2660,7 @@ def refresh_run_result_files(
     write_run_files(
         run_root=run_root,
         workspace=workspace,
-        prompt=prompt,
+        prompt=recorded_prompt,
         results=results,
         best=best,
         recommend_by=recommend_by,
@@ -2559,6 +2668,11 @@ def refresh_run_result_files(
         workspaces_deleted=False,
         resume_session=resume_session,
         codex_session_promotion=promotion,
+        synthesis_info=(
+            summary.get("synthesis")
+            if isinstance(summary.get("synthesis"), dict)
+            else None
+        ),
     )
 
 
@@ -2583,7 +2697,10 @@ def run_additional_agents(
     progress_callback: ProgressCallback = None,
     cancel_event: Any = None,
     agent_cancel_events: Optional[Dict[int, Any]] = None,
+    agent_role: str = AGENT_ROLE_CANDIDATE,
+    refresh_result_files: bool = True,
 ) -> List[AgentResult]:
+    agent_role = normalize_agent_role(agent_role)
     indices = list(dict.fromkeys(int(idx) for idx in agent_indices))
     if not indices or any(idx <= 0 for idx in indices):
         raise ValueError("agent indices must contain positive integers")
@@ -2628,7 +2745,14 @@ def run_additional_agents(
             touched.append(idx)
 
             if progress_callback is not None:
-                progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
+                progress_callback(
+                    {
+                        "type": "agent_status",
+                        "idx": idx,
+                        "status": "copying",
+                        "role": agent_role,
+                    }
+                )
             copy_workspace(workspace, agent_workspace, run_base=run_root.parent)
             agent_codex_home = agent_meta_dir / "codex_home"
             prepare_agent_codex_home(
@@ -2675,18 +2799,20 @@ def run_additional_agents(
                 cancel_event=cancel_event,
                 agent_cancel_events=agent_cancel_events,
                 agent_indices=prepared,
+                agent_role=agent_role,
             )
         )
     finally:
         for idx in prepared:
             scrub_codex_home_support_entries(codex_home_by_agent[idx])
-    refresh_run_result_files(
-        run_root=run_root,
-        workspace=workspace,
-        prompt=prompt,
-        new_results=results,
-        recommend_by=args.recommend_by,
-    )
+    if refresh_result_files:
+        refresh_run_result_files(
+            run_root=run_root,
+            workspace=workspace,
+            prompt=prompt,
+            new_results=results,
+            recommend_by=args.recommend_by,
+        )
     return results
 
 
@@ -2698,8 +2824,8 @@ def run_additional_agents(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run N isolated Codex agents in parallel on full copies of a workspace, then sync "
-            "the selected successful result back. With no prompt on an interactive terminal, "
+            "Run isolated Codex candidates, optionally synthesize their results, then sync "
+            "the recommended successful result back. With no prompt on an interactive terminal, "
             "opens the PCR TUI."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -2707,10 +2833,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("prompt", nargs="?", help="Prompt text. Omit it in a TTY to open the interactive TUI.")
     parser.add_argument("-n", "--num-agents", type=int, default=5, help="Number of Codex agents to run.")
     parser.add_argument(
+        "--synthesis-agents",
+        type=int,
+        default=0,
+        help=(
+            "After all candidates finish, run this many fresh agents to review "
+            "and synthesize their successful results. Zero disables synthesis."
+        ),
+    )
+    parser.add_argument(
         "--max-parallel",
         type=int,
         default=None,
-        help="Maximum Codex agents to run concurrently. Defaults to --num-agents.",
+        help="Maximum Codex agents to run concurrently within each stage. Defaults to that stage's agent count.",
     )
     parser.add_argument("--serial", action="store_true", help="Run agents one at a time, equivalent to --max-parallel 1.")
     parser.add_argument(
@@ -2719,7 +2854,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=normalize_recommend_by,
         default="reasoning_tokens",
         metavar="{duration,reasoning_tokens}",
-        help="Final candidate selection strategy: duration chooses longest successful run; reasoning_tokens chooses max observed reasoning tokens.",
+        help="Recommendation strategy: duration chooses the longest successful run; reasoning_tokens chooses the maximum observed reasoning tokens.",
     )
     parser.add_argument("--prompt-file", type=str, default=None, help="Read prompt from UTF-8 text file.")
     parser.add_argument("--workspace", type=str, default=None, help="Workspace to copy. Defaults to current directory.")
@@ -2748,14 +2883,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Include non-interactive codex exec sessions in the --resume picker.",
     )
-    parser.add_argument("--no-sync-back", action="store_true", help="Do not copy the selected best workspace back to the original workspace.")
-    parser.add_argument("--keep-workspaces", action="store_true", help="Keep isolated candidate workspaces after the run.")
+    parser.add_argument("--no-sync-back", action="store_true", help="Do not copy the recommended workspace back to the original workspace.")
+    parser.add_argument("--keep-workspaces", action="store_true", help="Keep isolated candidate and synthesis workspaces after the run.")
     return parser.parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.num_agents <= 0:
         raise SystemExit("-n / --num-agents 必须大于 0。")
+    if getattr(args, "synthesis_agents", 0) < 0:
+        raise SystemExit("--synthesis-agents 不能小于 0。")
     if args.max_parallel is not None and args.max_parallel <= 0:
         raise SystemExit("--max-parallel 必须大于 0。")
     if args.serial and args.max_parallel not in (None, 1):
@@ -2787,6 +2924,7 @@ def run_once(
     progress_callback: ProgressCallback = None,
     print_output: bool = True,
 ) -> int:
+    synthesis_agents = max(0, int(getattr(args, "synthesis_agents", 0) or 0))
     max_parallel = 1 if args.serial else (args.max_parallel or args.num_agents)
     max_parallel = min(max_parallel, args.num_agents)
     external_cancel_event = getattr(args, "cancel_event", None)
@@ -2839,6 +2977,7 @@ def run_once(
                     ["RUN_ANCHOR", absolute_path_for_display(run_anchor)],
                     ["RUNS_ROOT", absolute_path_for_display(run_root)],
                     ["AGENTS", str(args.num_agents)],
+                    ["SYNTHESIS_AGENTS", str(synthesis_agents)],
                     ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
                     ["MAX_PARALLEL", str(max_parallel)],
                     ["RECOMMEND_BY", args.recommend_by],
@@ -2878,6 +3017,7 @@ def run_once(
         overview.add_row("RUN_ANCHOR", absolute_path_for_display(run_anchor))
         overview.add_row("RUNS_ROOT", absolute_path_for_display(run_root))
         overview.add_row("AGENTS", str(args.num_agents))
+        overview.add_row("SYNTHESIS_AGENTS", str(synthesis_agents))
         overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
         overview.add_row("MAX_PARALLEL", str(max_parallel))
         overview.add_row("RECOMMEND_BY", args.recommend_by)
@@ -2899,6 +3039,7 @@ def run_once(
         log("info", "run_anchor = {}", run_anchor)
         log("info", "runs_root = {}", run_root)
         log("info", "agents = {}", args.num_agents)
+        log("info", "synthesis_agents = {}", synthesis_agents)
         log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
         log("info", "max_parallel = {}", max_parallel)
         log("info", "recommend_by = {}", args.recommend_by)
@@ -2971,7 +3112,14 @@ def run_once(
                 if cancel_requested(cancel_event):
                     break
                 if progress_callback is not None:
-                    progress_callback({"type": "agent_status", "idx": idx, "status": "copying"})
+                    progress_callback(
+                        {
+                            "type": "agent_status",
+                            "idx": idx,
+                            "status": "copying",
+                            "role": AGENT_ROLE_CANDIDATE,
+                        }
+                    )
                 agent_workspace = workspaces_root / f"agent_{idx:03d}"
                 agent_meta_dir = meta_root / f"agent_{idx:03d}"
                 agent_codex_home = agent_meta_dir / "codex_home"
@@ -3050,6 +3198,108 @@ def run_once(
             progress_callback({"type": "run_failed", "message": "agent execution failed"})
         raise
 
+    initial_results = list(results)
+    synthesis_info: Dict[str, Any] = {
+        "requested_agents": synthesis_agents,
+        "source_agents": [],
+        "launched_agents": [],
+        "successful_agents": [],
+        "context_path": None,
+        "status": "disabled" if synthesis_agents == 0 else "pending",
+        "reason": None,
+        "error": None,
+    }
+    initial_successes = [
+        result for result in initial_results if result.status == "success"
+    ]
+    if synthesis_agents and cancel_requested(cancel_event):
+        synthesis_info["status"] = "cancelled"
+        synthesis_info["reason"] = "run cancelled after first stage"
+    elif synthesis_agents and not initial_successes:
+        synthesis_info["status"] = "skipped"
+        synthesis_info["reason"] = "no successful first-stage candidates"
+    elif synthesis_agents:
+        synthesis_indices = list(
+            range(
+                args.num_agents + 1,
+                args.num_agents + synthesis_agents + 1,
+            )
+        )
+        synthesis_info["source_agents"] = [
+            result.idx
+            for result in sorted(initial_successes, key=lambda item: item.idx)
+        ]
+        synthesis_info["launched_agents"] = synthesis_indices
+        for idx in synthesis_indices:
+            agent_cancel_events.setdefault(idx, threading.Event())
+        try:
+            context_path, synthesis_prompt = create_synthesis_context(
+                run_root,
+                prompt,
+                initial_successes,
+            )
+            synthesis_info["context_path"] = str(context_path)
+            synthesis_info["status"] = "running"
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "type": "synthesis_started",
+                        "indices": synthesis_indices,
+                        "source_agents": synthesis_info["source_agents"],
+                        "context_path": str(context_path),
+                        "prompt": synthesis_prompt,
+                    }
+                )
+            synthesis_results = run_additional_agents(
+                args=args,
+                prompt=synthesis_prompt,
+                agent_indices=synthesis_indices,
+                run_root=run_root,
+                workspace=workspace,
+                resume_session_id=None,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                agent_cancel_events=agent_cancel_events,
+                agent_role=AGENT_ROLE_SYNTHESIS,
+                refresh_result_files=False,
+            )
+            results.extend(synthesis_results)
+            synthesis_info["status"] = (
+                "cancelled" if cancel_requested(cancel_event) else "completed"
+            )
+            if cancel_requested(cancel_event):
+                synthesis_info["reason"] = "run cancelled during synthesis"
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "type": "synthesis_finished",
+                        "indices": synthesis_indices,
+                        "success": sum(
+                            result.status == "success"
+                            for result in synthesis_results
+                        ),
+                        "cancelled": cancel_requested(cancel_event),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            synthesis_info["status"] = "failed"
+            synthesis_info["error"] = str(exc)
+            log(
+                "warning",
+                "synthesis stage failed; falling back to first-stage candidates: {}",
+                exc,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "type": "synthesis_finished",
+                        "indices": synthesis_indices,
+                        "success": 0,
+                        "cancelled": cancel_requested(cancel_event),
+                        "error": str(exc),
+                    }
+                )
+
     scrub_agent_codex_homes(meta_root)
 
     cancelled = cancel_requested(cancel_event)
@@ -3100,6 +3350,7 @@ def run_once(
         workspaces_deleted,
         resume_session,
         codex_session_promotion,
+        synthesis_info,
     )
     if progress_callback is not None:
         progress_callback(
@@ -3110,6 +3361,7 @@ def run_once(
                 "success": best is not None,
                 "synced": synced,
                 "cancelled": cancelled,
+                "synthesis": synthesis_info,
             }
         )
     if print_output:

@@ -38,6 +38,10 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
         "/recommendby <duration|reasoning_tokens>",
         "choose how successful agents are recommended",
     ),
+    (
+        "/synthesis <n|off>",
+        "set fresh review-and-synthesis agents for the next run",
+    ),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
     ("/effort <auto|level>", "set a model-supported reasoning effort for the next run"),
     ("/workspace <path>", "set the workspace PCR operates on"),
@@ -54,7 +58,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the current Detail view when safe"),
     ("/exit", "stop active agents, clean up, and quit"),
 )
-MAX_SUGGESTIONS = 14
+MAX_SUGGESTIONS = 15
 UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
@@ -114,6 +118,8 @@ TUI_TIPS: tuple[str, ...] = (
     "输入 /accept 可立即采用当前 Agent。",
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
     "输入 /retry 可重跑失败或被终止的 Agent，/more 3 可追加 3 个候选 Agent。",
+    "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
+    "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
     "TUI 不在前台时，首个成功和全部完成会触发终端铃声。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
@@ -494,7 +500,7 @@ else:
         LARGE_RUN_STORAGE_WARNING_BYTES,
         RunStorageEstimate,
         available_storage_bytes,
-        estimate_run_storage,
+        estimate_staged_run_storage,
         format_storage_bytes,
         get_codex_home,
         infer_codex_thread_id_for_result,
@@ -509,7 +515,13 @@ else:
         subagent_resume_error,
     )
     from .diffing import build_workspace_diff_text
-    from .models import AgentResult, CodexHistoryEntry
+    from .models import (
+        AGENT_ROLE_CANDIDATE,
+        AGENT_ROLE_SYNTHESIS,
+        AgentResult,
+        CodexHistoryEntry,
+        normalize_agent_role,
+    )
     from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
     from .workspace import (
         cleanup_workspace_copies,
@@ -580,11 +592,13 @@ else:
     @dataclass
     class AgentPane:
         idx: int
+        role: str = AGENT_ROLE_CANDIDATE
         status: str = "idle"
         rejected: bool = False
         reasoning_tokens: int | None = None
         reasoning_token_counts: dict[int, int] = field(default_factory=dict)
         input_text: str = ""
+        execution_prompt: str = ""
         final_text: str = ""
         result: dict[str, Any] | None = None
         attempt_history: list[tuple[str, str, str]] = field(default_factory=list)
@@ -657,6 +671,8 @@ else:
     class CandidateBatch:
         indices: list[int]
         retry_indices: set[int] = field(default_factory=set)
+        role: str = AGENT_ROLE_CANDIDATE
+        prompt: str = ""
 
 
     class RunnerEvent(Message):
@@ -1107,7 +1123,7 @@ else:
             background: #243448;
             color: #ffffff;
         }
-        #config-agents, #config-max-parallel {
+        #config-agents, #config-synthesis-agents, #config-max-parallel {
             width: 12;
         }
         #config-execution, #config-recommend-by, #config-effort {
@@ -1188,6 +1204,11 @@ else:
             self.args.resume_include_non_interactive = True
             self.workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
             self.num_agents = args.num_agents
+            self.synthesis_agents = max(
+                0,
+                int(getattr(args, "synthesis_agents", 0) or 0),
+            )
+            self.args.synthesis_agents = self.synthesis_agents
             self.resume_session_id = (args.resume_session_id or "").strip()
             self.resume_entries = []
             self.model_registry = CodexModelRegistry.load(get_codex_home())
@@ -1268,6 +1289,7 @@ else:
             self._updating_controls = False
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
+                "config-synthesis-agents": str(self.synthesis_agents),
                 "config-max-parallel": dict(self.run_info_rows).get("MAX_PARALLEL", ""),
             }
             self._mouse_down_in_runner_control = False
@@ -1450,6 +1472,13 @@ else:
                         yield Input(
                             str(self.num_agents),
                             id="config-agents",
+                            classes="runner-control",
+                            type="integer",
+                        )
+                        yield Static("SYNTHESIS_AGENTS", classes="runner-key")
+                        yield Input(
+                            str(self.synthesis_agents),
+                            id="config-synthesis-agents",
                             classes="runner-control",
                             type="integer",
                         )
@@ -1649,6 +1678,7 @@ else:
             return (
                 str(self.workspace),
                 self.num_agents,
+                self.synthesis_agents,
                 self.resume_session_id,
                 str(getattr(self.args, "runs_dir", None) or ""),
                 self.selected_agent,
@@ -1707,10 +1737,18 @@ else:
             self.storage_preflight_request += 1
             request_id = self.storage_preflight_request
             self.storage_preflight_inflight = True
-            num_agents = self.num_agents
+            candidate_agents = self.num_agents
+            synthesis_agents = self.synthesis_agents
             codex_home = get_codex_home()
             configuration_key = self._storage_preflight_configuration()
-            self.status = f"Estimating storage for {num_agents} agents"
+            self.status = (
+                f"Estimating storage for {candidate_agents} candidates"
+                + (
+                    f" + {synthesis_agents} synthesis agents"
+                    if synthesis_agents
+                    else ""
+                )
+            )
             self._sync()
 
             def target() -> None:
@@ -1718,9 +1756,10 @@ else:
                 error = ""
                 reclaimable_bytes = 0
                 try:
-                    estimate = estimate_run_storage(
+                    estimate = estimate_staged_run_storage(
                         source_workspace,
-                        num_agents,
+                        candidate_agents,
+                        synthesis_agents,
                         resume_session_id=resume_session_id,
                         codex_home=codex_home,
                         resume_codex_home=resume_codex_home,
@@ -1968,6 +2007,32 @@ else:
             self._set_committed_input_value(control, str(self.num_agents))
             return applied
 
+        def _commit_synthesis_agents_control(self) -> bool:
+            try:
+                control = self.query_one("#config-synthesis-agents", Input)
+            except Exception:
+                return True
+            value_text = control.value.strip()
+            if value_text == self._committed_input_values.get(
+                "config-synthesis-agents"
+            ):
+                return True
+            try:
+                requested = int(value_text)
+            except ValueError:
+                requested = None
+            self._handle_synthesis([value_text])
+            applied = (
+                requested is not None
+                and requested >= 0
+                and self.synthesis_agents == requested
+            )
+            self._set_committed_input_value(
+                control,
+                str(self.synthesis_agents),
+            )
+            return applied
+
         def _commit_max_parallel_control(self) -> bool:
             try:
                 control = self.query_one("#config-max-parallel", Input)
@@ -1998,6 +2063,9 @@ else:
             if not self._commit_agents_control():
                 self.query_one("#config-agents", Input).focus()
                 return False
+            if not self._commit_synthesis_agents_control():
+                self.query_one("#config-synthesis-agents", Input).focus()
+                return False
             if not self._commit_max_parallel_control():
                 self.query_one("#config-max-parallel", Input).focus()
                 return False
@@ -2013,6 +2081,20 @@ else:
         def _on_agents_blurred(self, _event: events.DescendantBlur) -> None:
             if not self._updating_controls:
                 self._commit_agents_control()
+
+        @on(Input.Submitted, "#config-synthesis-agents")
+        def _on_synthesis_agents_submitted(self, _event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._commit_synthesis_agents_control()
+
+        @on(events.DescendantBlur, "#config-synthesis-agents")
+        def _on_synthesis_agents_blurred(
+            self,
+            _event: events.DescendantBlur,
+        ) -> None:
+            if not self._updating_controls:
+                self._commit_synthesis_agents_control()
 
         @on(Input.Submitted, "#config-max-parallel")
         def _on_max_parallel_submitted(self, _event: Input.Submitted) -> None:
@@ -2118,9 +2200,61 @@ else:
         @on(RunnerEvent)
         def _on_runner_event(self, event: RunnerEvent) -> None:
             payload = event.payload
-            idx = int(payload.get("idx") or 0)
-            pane = self.agents.get(idx)
             kind = str(payload.get("type") or "")
+            idx = int(payload.get("idx") or 0)
+            role = normalize_agent_role(payload.get("role"))
+            if kind == "synthesis_started":
+                raw_indices = payload.get("indices")
+                indices = (
+                    [
+                        int(value)
+                        for value in raw_indices
+                        if isinstance(value, int) and value > 0
+                    ]
+                    if isinstance(raw_indices, list)
+                    else []
+                )
+                execution_prompt = str(payload.get("prompt") or "")
+                for synthesis_idx in indices:
+                    pane = self.agents.get(synthesis_idx)
+                    if pane is None:
+                        self.agents[synthesis_idx] = AgentPane(
+                            idx=synthesis_idx,
+                            role=AGENT_ROLE_SYNTHESIS,
+                            status="queued",
+                            input_text=self.pending_prompt,
+                            execution_prompt=execution_prompt,
+                        )
+                    else:
+                        pane.role = AGENT_ROLE_SYNTHESIS
+                        pane.execution_prompt = execution_prompt
+                    self.agent_cancel_events.setdefault(
+                        synthesis_idx,
+                        threading.Event(),
+                    )
+                self.active_batch_indices = set(indices)
+                self.status = f"Running {len(indices)} synthesis agents"
+                self._mark_detail_dirty()
+            pane = self.agents.get(idx)
+            if (
+                pane is None
+                and idx > 0
+                and role == AGENT_ROLE_SYNTHESIS
+                and kind in {
+                    "agent_status",
+                    "agent_started",
+                    "agent_tokens",
+                    "agent_line",
+                    "agent_finished",
+                }
+            ):
+                pane = AgentPane(
+                    idx=idx,
+                    role=role,
+                    input_text=self.pending_prompt,
+                )
+                self.agents[idx] = pane
+                self.agent_cancel_events.setdefault(idx, threading.Event())
             if kind == "run_prepared":
                 rows = payload.get("rows")
                 if isinstance(rows, list):
@@ -2139,6 +2273,7 @@ else:
                             None if prepared_effort == "default" else prepared_effort
                         )
             elif kind == "agent_status" and pane is not None:
+                pane.role = role
                 pane.status = (
                     "stopping"
                     if self._agent_kill_requested(idx)
@@ -2146,6 +2281,7 @@ else:
                 )
                 self._mark_detail_dirty(pane)
             elif kind == "agent_started" and pane is not None:
+                pane.role = role
                 pane.status = "stopping" if self._agent_kill_requested(idx) else "running"
                 self._mark_detail_dirty(pane)
             elif kind == "agent_tokens" and pane is not None:
@@ -2163,6 +2299,7 @@ else:
                 self._mark_detail_dirty(pane)
             elif kind == "agent_finished" and pane is not None:
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+                pane.role = normalize_agent_role(result.get("role", role))
                 pane.result = result
                 pane.status = str(result.get("status") or "finished")
                 pane.diff_request += 1
@@ -2183,6 +2320,30 @@ else:
                     self.first_success_seen = True
                     self._ring_if_background()
                 self._mark_detail_dirty(pane)
+            elif kind == "synthesis_finished":
+                self.active_batch_indices.clear()
+                error = str(payload.get("error") or "")
+                raw_indices = payload.get("indices")
+                indices = raw_indices if isinstance(raw_indices, list) else []
+                unresolved_status = ""
+                if error:
+                    unresolved_status = "error"
+                elif payload.get("cancelled"):
+                    unresolved_status = "cancelled"
+                if unresolved_status:
+                    for value in indices:
+                        if not isinstance(value, int):
+                            continue
+                        unresolved = self.agents.get(value)
+                        if unresolved is not None and unresolved.result is None:
+                            unresolved.status = unresolved_status
+                            self._mark_detail_dirty(unresolved)
+                if error:
+                    self.status = "Synthesis failed; using first-stage candidates"
+                elif payload.get("cancelled"):
+                    self.status = "Stopping synthesis agents"
+                else:
+                    self.status = "Synthesis complete"
             elif kind == "run_finished":
                 self.running = False
                 self.cancel_event = None
@@ -2489,6 +2650,9 @@ else:
             if name == "/more":
                 self._handle_more(args)
                 return
+            if name in {"/synthesis", "/synthesisagents", "/synthesis-agents"}:
+                self._handle_synthesis(args)
+                return
             if name == "/diff":
                 self._handle_diff(args)
                 return
@@ -2630,7 +2794,14 @@ else:
                 self.status = "No current question is available to retry"
                 self._sync()
                 return
-            self.candidate_batches.append(CandidateBatch([idx], {idx}))
+            self.candidate_batches.append(
+                CandidateBatch(
+                    [idx],
+                    {idx},
+                    role=pane.role,
+                    prompt=pane.execution_prompt or self.pending_prompt,
+                )
+            )
             pane.status = "retry queued"
             self._mark_detail_dirty(pane)
             if self.running:
@@ -2657,13 +2828,15 @@ else:
                 self._sync()
                 return
 
-            start = max(self.agents, default=0) + 1
+            reserved_indices = set(self.agents) | set(self.agent_cancel_events)
+            start = max(reserved_indices, default=0) + 1
             indices = list(range(start, start + count))
             for idx in indices:
                 self.agents[idx] = AgentPane(
                     idx=idx,
                     status="queued",
                     input_text=self.pending_prompt,
+                    execution_prompt=self.pending_prompt,
                 )
                 self.agent_cancel_events[idx] = threading.Event()
             self.candidate_batches.append(CandidateBatch(indices))
@@ -2867,6 +3040,40 @@ else:
                 self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"Next run will use {value} agents")
+
+        def _handle_synthesis(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"synthesis={self.synthesis_agents}"
+                )
+                return
+            if len(args) != 1:
+                self.status = "Usage: /synthesis <non-negative integer|off>"
+                self._sync()
+                return
+            value_text = args[0].strip().lower()
+            if value_text in {"off", "none", "disable", "disabled"}:
+                value = 0
+            else:
+                try:
+                    value = int(value_text)
+                except ValueError:
+                    value = -1
+            if value < 0:
+                self.status = "Usage: /synthesis <non-negative integer|off>"
+                self._sync()
+                return
+            if not self._prepare_config_change("synthesis agent count"):
+                return
+            self.synthesis_agents = value
+            self.args.synthesis_agents = value
+            self.run_info_rows = self._base_info_rows()
+            if value:
+                self._show_setting(
+                    f"Next run will use {value} synthesis agents"
+                )
+            else:
+                self._show_setting("Synthesis is disabled for the next run")
 
         def _handle_maxparallel(self, args: list[str]) -> None:
             current = getattr(self.args, "max_parallel", None)
@@ -3385,8 +3592,12 @@ else:
                 return False
 
             batch = self.candidate_batches.pop(0)
+            batch.role = normalize_agent_role(batch.role)
+            execution_prompt = batch.prompt or self.pending_prompt
             for idx in batch.indices:
                 pane = self.agents[idx]
+                pane.role = batch.role
+                pane.execution_prompt = execution_prompt
                 if idx in batch.retry_indices:
                     self._prepare_retry_pane(pane)
                 else:
@@ -3422,15 +3633,20 @@ else:
                     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         run_additional_agents(
                             args=run_args,
-                            prompt=self.pending_prompt,
+                            prompt=execution_prompt,
                             agent_indices=batch.indices,
                             run_root=self.pending_run_root,
                             workspace=self._pending_workspace_path(),
-                            resume_session_id=getattr(run_args, "resume_session_id", None),
+                            resume_session_id=(
+                                None
+                                if batch.role == AGENT_ROLE_SYNTHESIS
+                                else getattr(run_args, "resume_session_id", None)
+                            ),
                             retry_indices=batch.retry_indices,
                             progress_callback=self._post_progress,
                             cancel_event=cancel_event,
                             agent_cancel_events=run_args.agent_cancel_events,
+                            agent_role=batch.role,
                         )
                     self._post_progress(
                         {
@@ -3525,10 +3741,15 @@ else:
             self.pending_prompt_records_history = record_history
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.agent_cancel_events = {
-                idx: threading.Event() for idx in range(1, self.num_agents + 1)
+                idx: threading.Event()
+                for idx in range(
+                    1,
+                    self.num_agents + self.synthesis_agents + 1,
+                )
             }
             for pane in self.agents.values():
                 pane.input_text = prompt
+                pane.execution_prompt = prompt
             self.selected_agent = min(self.selected_agent, self.num_agents)
             self._mark_detail_dirty()
             self.run_info_rows = self._base_info_rows()
@@ -3539,7 +3760,8 @@ else:
             run_args.prompt = prompt
             run_args.prompt_file = None
             run_args.num_agents = self.num_agents
-            run_args.max_parallel = min(run_args.max_parallel or self.num_agents, self.num_agents)
+            run_args.synthesis_agents = self.synthesis_agents
+            run_args.max_parallel = getattr(self.args, "max_parallel", None)
             run_args.resume = False
             run_args.resume_session_id = self.resume_session_id or None
             run_args.effort = effective_effort
@@ -4111,6 +4333,7 @@ else:
             resume_select = self.query_one("#config-resume", Select)
             controls = [
                 self.query_one("#config-agents", Input),
+                self.query_one("#config-synthesis-agents", Input),
                 self.query_one("#config-max-parallel", Input),
                 execution_select,
                 recommend_by_select,
@@ -4127,6 +4350,16 @@ else:
                     agents_value = str(self.num_agents)
                     agents_input.value = agents_value
                     self._committed_input_values["config-agents"] = agents_value
+                synthesis_input = self.query_one(
+                    "#config-synthesis-agents",
+                    Input,
+                )
+                if self.focused is not synthesis_input:
+                    synthesis_value = str(self.synthesis_agents)
+                    synthesis_input.value = synthesis_value
+                    self._committed_input_values[
+                        "config-synthesis-agents"
+                    ] = synthesis_value
                 max_parallel_input = self.query_one("#config-max-parallel", Input)
                 if self.focused is not max_parallel_input:
                     max_parallel_value = rows.get("MAX_PARALLEL", "")
@@ -4213,6 +4446,7 @@ else:
                 ("WORKSPACE", absolute_path_for_display(self.workspace)),
                 ("RUNS_ROOT", f"pending under {absolute_path_for_display(run_base)}"),
                 ("AGENTS", str(self.num_agents)),
+                ("SYNTHESIS_AGENTS", str(self.synthesis_agents)),
                 ("EXECUTION", execution),
                 ("MAX_PARALLEL", str(max_parallel)),
                 (
@@ -4486,6 +4720,8 @@ else:
             recommended = pane.idx == self.recommended_agent
             title = f"{'★ ' if recommended else ''}AGENT-{pane.idx:03d}"
             parts = []
+            if pane.role == AGENT_ROLE_SYNTHESIS:
+                parts.append("synthesis")
             if pane.status in {"stopping", "killed"}:
                 parts.append(pane.status)
             if pane.rejected:

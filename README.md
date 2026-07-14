@@ -19,14 +19,16 @@ Codex can solve the same task very differently from one run to the next. A stron
 
 `parallel-codex-runner` (PCR) runs the same prompt in several isolated workspaces. You can watch every Agent as it works, inspect its patch, stop or retry candidates, and choose the one that should reach your real workspace.
 
-PCR does **not** combine several answers into one. Each Agent owns a complete branch of the task, and you adopt one branch as a whole.
+By default, each Agent owns a complete branch of the task and you adopt one branch as a whole. For important tasks, you can add an optional second stage: fresh synthesis Agents review every successful candidate, combine compatible strengths in their own workspaces, and produce new branches for you to inspect.
 
 ```text
                          +--> AGENT-001 --> conversation + patch
 your prompt --> PCR -----+--> AGENT-002 --> conversation + patch
                          +--> AGENT-003 --> conversation + patch
                                       |
-                               inspect and choose
+                     optional synthesis Agents
+                                      |
+                      inspect any successful branch
                                       |
                                       v
                               original workspace
@@ -103,13 +105,15 @@ PCR will:
 2. create one isolated workspace per Agent;
 3. run the same prompt in every workspace;
 4. stream each Agent's conversation and command activity;
-5. recommend a successful result while leaving the final choice to you.
+5. optionally run fresh Agents that review and synthesize the candidates;
+6. recommend a successful result while leaving the final choice to you.
 
 To change the next run before submitting:
 
 ```text
 /numofagents 8
 /maxparallel 4
+/synthesis 3
 ```
 
 The settings at the top of the TUI are editable too.
@@ -177,6 +181,18 @@ A useful review loop is:
 
 This also works before every Agent has finished. If one result is already good enough, continue from that Agent; PCR stops the remaining work, syncs the chosen branch, and starts the next round from its workspace and Codex session.
 
+### Add a synthesis stage
+
+Set `SYNTHESIS_AGENTS` in the top panel, or run this before submitting the next prompt:
+
+```text
+/synthesis 3
+```
+
+After all first-stage candidates finish, PCR starts three fresh synthesis Agents. Each one receives a clean copy of the original workspace, plus references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. For code tasks, it compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
+
+Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` remains different; it adds ordinary independent candidates for the current question.
+
 ### Review and control candidates
 
 | Command | What it does |
@@ -187,6 +203,7 @@ This also works before every Agent has finished. If one result is already good e
 | `/kill [agent]` | Stop a running Agent. Queued Agents still start normally. |
 | `/retry [agent]` | Rerun a failed or killed Agent in a fresh workspace. |
 | `/more <n>` | Add more candidates for the current question. |
+| `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
 
 ### Continue an earlier Codex conversation
 
@@ -239,6 +256,9 @@ pcr "implement the migration" -n 10 --max-parallel 3
 # Run candidates one at a time
 pcr "refactor the parser" -n 4 --serial
 
+# Run six candidates, then two independent synthesis Agents
+pcr "implement the migration" -n 6 --synthesis-agents 2
+
 # Inspect results without changing the original workspace
 pcr "investigate this bug" --no-sync-back --keep-workspaces
 
@@ -282,7 +302,7 @@ PCR creates full directory copies while preserving symlinks. Sync-back is delete
 
 ### Cleanup and retention
 
-Candidate workspaces are removed after finalization or exit unless `--keep-workspaces` is enabled. Metadata, logs, and resumable session state remain in the run directory.
+Candidate and synthesis workspaces are removed after finalization or exit unless `--keep-workspaces` is enabled. Metadata, logs, and resumable session state remain in the run directory.
 
 Use `--no-sync-back` when you want to inspect a run without changing the original workspace.
 
@@ -330,6 +350,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | Option | Description |
 | --- | --- |
 | `-n, --num-agents` | Number of candidates; default `5`. |
+| `--synthesis-agents` | Fresh review-and-synthesis Agents started after candidates finish; default `0`. |
 | `--max-parallel` | Maximum number of concurrent Codex processes. |
 | `--serial` | Run one candidate at a time. |
 | `--recommend-by` | Recommend by `reasoning_tokens` or `duration`. |
@@ -358,6 +379,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/reject` | Exclude the displayed Agent from recommendations. |
 | `/retry [agent]` | Rerun a failed or killed Agent. |
 | `/more <n>` | Add candidates for the current question. |
+| `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
 | `/diff` | Toggle the displayed Agent's complete patch. |
 | `/kill [agent]` | Stop a running Agent. |
 | `/numofagents <n>` | Set the Agent count for the next run. |
@@ -404,7 +426,9 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 
 | Path | Contents |
 | --- | --- |
-| `prompt.txt` | Prompt sent to every candidate. |
+| `prompt.txt` | Original user prompt sent to first-stage candidates. |
+| `synthesis_context.md` | Original request and paths to successful candidate workspaces and responses. |
+| `synthesis_prompt.txt` | Instructions sent to second-stage synthesis Agents. |
 | `summary.json` | Settings, results, recommendation, sync, and cleanup state. |
 | `BEST_AGENT.txt` | Recommended Agent for the recorded run. |
 | `BEST_CODEX_SESSION.txt` | Recommended Codex session ID, when available. |
@@ -442,6 +466,7 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | --- | --- |
 | `parallel_codex_runner.py` | Package entry point and compatibility imports. |
 | `parallel_codex_runner_core/app.py` | CLI orchestration, Agent execution, summaries, and session promotion. |
+| `parallel_codex_runner_core/synthesis.py` | Second-stage context generation and recommendation priority. |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive TUI and review workflow. |
 | `parallel_codex_runner_core/workspace.py` | Workspace estimation, worktrees, copying, cleanup, and sync-back. |
 | `parallel_codex_runner_core/codex_cli.py` | Codex capability detection and command construction. |

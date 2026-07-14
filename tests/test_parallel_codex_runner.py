@@ -52,6 +52,7 @@ def make_agent_result_data(
     status: str = "success",
     seconds: float = 1.0,
     reasoning_tokens: int | None = 10,
+    role: str = "candidate",
 ) -> dict[str, object]:
     return asdict(
         AgentResult(
@@ -66,6 +67,7 @@ def make_agent_result_data(
             returncode=0 if status == "success" else 1,
             status=status,
             seconds=seconds,
+            role=role,
             codex_thread_id=f"session-{idx}" if status == "success" else None,
             reasoning_tokens=reasoning_tokens,
         )
@@ -636,6 +638,30 @@ class RunStorageEstimateTests(unittest.TestCase):
         self.assertEqual(estimate.metadata_bytes, 150)
         self.assertEqual(estimate.total_bytes, 450)
 
+    def test_staged_storage_estimate_uses_resume_only_for_candidates(self) -> None:
+        with mock.patch.object(
+            app_core,
+            "estimate_workspace_copy_bytes",
+            return_value=100,
+        ), mock.patch.object(
+            app_core,
+            "estimate_agent_metadata_bytes",
+            side_effect=[80, 50],
+        ) as estimate_metadata:
+            estimate = app_core.estimate_staged_run_storage(
+                Path.cwd(),
+                candidate_agents=3,
+                synthesis_agents=2,
+                resume_session_id="session-1",
+            )
+
+        self.assertEqual(estimate.num_agents, 5)
+        self.assertEqual(estimate.workspace_copies_bytes, 500)
+        self.assertEqual(estimate.metadata_bytes, 340)
+        self.assertEqual(estimate.total_bytes, 840)
+        self.assertEqual(estimate_metadata.call_args_list[0].args[1], "session-1")
+        self.assertIsNone(estimate_metadata.call_args_list[1].kwargs.get("resume_session_id"))
+
 
 class RunRootTests(unittest.TestCase):
     def test_create_unique_run_root_adds_suffix_on_collision(self) -> None:
@@ -711,6 +737,20 @@ class ArgParseTests(unittest.TestCase):
 
         self.assertEqual(args.effort, "xhigh")
 
+    def test_synthesis_agents_are_disabled_by_default_and_configurable(self) -> None:
+        self.assertEqual(parse_args(["fix tests"]).synthesis_agents, 0)
+        args = parse_args(["fix tests", "--synthesis-agents", "3"])
+
+        app_core.validate_args(args)
+
+        self.assertEqual(args.synthesis_agents, 3)
+
+    def test_negative_synthesis_agent_count_is_rejected(self) -> None:
+        args = parse_args(["fix tests", "--synthesis-agents", "-1"])
+
+        with self.assertRaisesRegex(SystemExit, "synthesis-agents"):
+            app_core.validate_args(args)
+
     def test_recommend_by_replaces_best_by_without_an_alias(self) -> None:
         args = parse_args(["fix tests", "--recommend-by", "duration"])
 
@@ -718,6 +758,100 @@ class ArgParseTests(unittest.TestCase):
         with mock.patch.object(sys, "stderr", io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["fix tests", "--best-by", "duration"])
+
+
+class SynthesisTests(unittest.TestCase):
+    def test_recommendation_prefers_synthesis_then_falls_back_to_candidates(self) -> None:
+        candidate = AgentResult(
+            **make_agent_result_data(
+                1,
+                Path("/tmp/candidate"),
+                reasoning_tokens=1000,
+            )
+        )
+        synthesis = AgentResult(
+            **make_agent_result_data(
+                2,
+                Path("/tmp/synthesis"),
+                reasoning_tokens=10,
+                role="synthesis",
+            )
+        )
+
+        recommended = app_core.select_best_result(
+            [candidate, synthesis],
+            "reasoning_tokens",
+        )
+        fallback = app_core.select_best_result(
+            [
+                candidate,
+                AgentResult(
+                    **make_agent_result_data(
+                        2,
+                        Path("/tmp/failed-synthesis"),
+                        status="failed",
+                        role="synthesis",
+                    )
+                ),
+            ],
+            "reasoning_tokens",
+        )
+
+        self.assertEqual(recommended.idx, 2)
+        self.assertEqual(fallback.idx, 1)
+
+    def test_synthesis_context_references_every_successful_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            sources = [
+                AgentResult(
+                    **make_agent_result_data(idx, run_root / f"agent-{idx}")
+                )
+                for idx in (2, 1)
+            ]
+
+            context_path, prompt = app_core.create_synthesis_context(
+                run_root,
+                "Fix the failing tests.",
+                sources,
+            )
+
+            context = context_path.read_text(encoding="utf-8")
+            self.assertLess(context.index("AGENT-001"), context.index("AGENT-002"))
+            self.assertIn("Fix the failing tests.", context)
+            self.assertIn(str(sources[0].workspace_dir), context)
+            self.assertIn(str(context_path), prompt)
+            self.assertIn("read-only references", prompt)
+
+    def test_synthesis_retry_does_not_replace_recorded_user_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            workspace = run_root / "workspace"
+            workspace.mkdir()
+            (run_root / "prompt.txt").write_text(
+                "original user request",
+                encoding="utf-8",
+            )
+            result = AgentResult(
+                **make_agent_result_data(
+                    2,
+                    run_root / "agent-2",
+                    role="synthesis",
+                )
+            )
+
+            app_core.refresh_run_result_files(
+                run_root,
+                workspace,
+                "wrapped synthesis prompt",
+                [result],
+                "reasoning_tokens",
+            )
+
+            self.assertEqual(
+                (run_root / "prompt.txt").read_text(encoding="utf-8"),
+                "original user request",
+            )
 
 
 class ReasoningEffortTests(unittest.TestCase):
@@ -779,6 +913,98 @@ class RunOnceCleanupTests(unittest.TestCase):
                         app_core.run_once(args, "prompt", progress_callback=lambda _payload: None, print_output=False)
 
             self.assertFalse(any(path.exists() for path in runs.glob("*/workspaces")))
+
+    def test_run_once_launches_synthesis_agents_after_candidates_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            runs = root / "runs"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            codex_home.mkdir()
+            (workspace / "base.txt").write_text("baseline", encoding="utf-8")
+            args = parse_args(
+                [
+                    "prompt",
+                    "--workspace",
+                    str(workspace),
+                    "--runs-dir",
+                    str(runs),
+                    "-n",
+                    "2",
+                    "--synthesis-agents",
+                    "2",
+                    "--no-sync-back",
+                    "--keep-workspaces",
+                ]
+            )
+            args.cancel_event = threading.Event()
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "Path('received_prompt.txt').write_text(sys.stdin.read(), encoding='utf-8')"
+                ),
+            ]
+            events: list[dict[str, object]] = []
+
+            def copy_tree(source: Path, destination: Path, **_kwargs: object) -> None:
+                shutil.copytree(source, destination)
+
+            def prepare_home(
+                _source: Path,
+                destination: Path,
+                _workspace: Path,
+                _session_id: str | None,
+            ) -> None:
+                destination.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(app_core, "get_codex_home", return_value=codex_home), mock.patch.object(
+                app_core,
+                "read_codex_exec_help",
+                return_value="Usage: codex exec",
+            ), mock.patch.object(
+                app_core,
+                "copy_workspace",
+                side_effect=copy_tree,
+            ), mock.patch.object(
+                app_core,
+                "prepare_agent_codex_home",
+                side_effect=prepare_home,
+            ), mock.patch.object(
+                app_core,
+                "build_codex_command",
+                return_value=(command, {}),
+            ):
+                returncode = app_core.run_once(
+                    args,
+                    "Fix the project.",
+                    progress_callback=events.append,
+                    print_output=False,
+                )
+
+            run_root = next(runs.iterdir())
+            summary = json.loads(
+                (run_root / "summary.json").read_text(encoding="utf-8")
+            )
+            results = summary["results"]
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(
+                [result["role"] for result in results],
+                ["candidate", "candidate", "synthesis", "synthesis"],
+            )
+            self.assertIn(summary["best_agent"], {"agent_003", "agent_004"})
+            self.assertEqual(summary["synthesis"]["source_agents"], [1, 2])
+            self.assertEqual(summary["synthesis"]["status"], "completed")
+            synthesis_prompt = (
+                run_root / "workspaces" / "agent_003" / "received_prompt.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("second-stage synthesis Agent", synthesis_prompt)
+            self.assertTrue(
+                any(event.get("type") == "synthesis_started" for event in events)
+            )
 
 
 class AdditionalAgentTests(unittest.TestCase):
@@ -1043,6 +1269,7 @@ class TuiCommandTests(unittest.TestCase):
         app._show_text = lambda _text: None
 
         app._handle_command("/numofagents 4")
+        app._handle_command("/synthesis 2")
         app._handle_command("/maxparallel 2")
         app._handle_command("/serial")
         app._handle_command("/recommendby duration")
@@ -1054,6 +1281,8 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(app.num_agents, 4)
         self.assertEqual(app.args.num_agents, 4)
+        self.assertEqual(app.synthesis_agents, 2)
+        self.assertEqual(app.args.synthesis_agents, 2)
         self.assertEqual(app.args.max_parallel, 2)
         self.assertTrue(app.args.serial)
         self.assertEqual(app.args.recommend_by, "duration")
@@ -1375,6 +1604,77 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("rejected", app._detail_title(app.agents[1]))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prefers_synthesis_without_changing_displayed_agent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.pending_execution_args = argparse.Namespace(
+            recommend_by="reasoning_tokens"
+        )
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/candidate-1"),
+            reasoning_tokens=1000,
+        )
+        app.agents[3] = tui_textual.AgentPane(
+            idx=3,
+            role="synthesis",
+            result=make_agent_result_data(
+                3,
+                Path("/tmp/synthesis-3"),
+                reasoning_tokens=10,
+                role="synthesis",
+            ),
+        )
+        app.selected_agent = 1
+
+        app._recompute_recommendation()
+
+        self.assertEqual(app.recommended_agent, 3)
+        self.assertEqual(app.selected_agent, 1)
+        app.agents[3].rejected = True
+        app._recompute_recommendation()
+        self.assertEqual(app.recommended_agent, 1)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_creates_synthesis_panes_from_core_stage_event(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.running = True
+        app.pending_prompt = "original request"
+
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {
+                    "type": "synthesis_started",
+                    "indices": [3, 4],
+                    "source_agents": [1, 2],
+                    "prompt": "wrapped synthesis prompt",
+                }
+            )
+        )
+
+        self.assertEqual(set(app.agents), {1, 2, 3, 4})
+        self.assertEqual(app.agents[3].role, "synthesis")
+        self.assertEqual(app.agents[3].input_text, "original request")
+        self.assertEqual(
+            app.agents[3].execution_prompt,
+            "wrapped synthesis prompt",
+        )
+        self.assertIn("synthesis", app._detail_title(app.agents[3]))
+
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {
+                    "type": "synthesis_finished",
+                    "indices": [3, 4],
+                    "error": "copy failed",
+                }
+            )
+        )
+        self.assertEqual(app.agents[3].status, "error")
+        self.assertEqual(app.agents[4].status, "error")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_follow_up_still_uses_rejected_displayed_agent(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
         app._sync = lambda: None
@@ -1403,6 +1703,23 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertTrue(app._start_run("current question"))
 
         self.assertIsNone(app.pending_execution_args.max_parallel)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_more_does_not_reuse_reserved_synthesis_indices(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "2", "--synthesis-agents", "2"])
+        )
+        app._sync = lambda: None
+
+        with mock.patch.object(app, "_commit_runner_inputs", return_value=True):
+            with mock.patch.object(tui_textual.threading, "Thread"):
+                self.assertTrue(app._start_run("current question"))
+
+        app._handle_command("/more 2")
+
+        self.assertEqual(set(app.agents), {1, 2, 5, 6})
+        self.assertEqual(app.candidate_batches[0].indices, [5, 6])
+        self.assertTrue({3, 4}.issubset(app.agent_cancel_events))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_retry_and_more_queue_candidates_for_current_question(self) -> None:
@@ -1440,6 +1757,34 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.selected_agent, 3)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_retry_preserves_synthesis_role_and_wrapped_prompt(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        app.running = True
+        app.pending_prompt = "original request"
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.agents[2] = tui_textual.AgentPane(
+            idx=2,
+            role="synthesis",
+            status="failed",
+            execution_prompt="wrapped synthesis prompt",
+            result=make_agent_result_data(
+                2,
+                Path("/tmp/synthesis-2"),
+                status="failed",
+                role="synthesis",
+            ),
+        )
+        app.selected_agent = 2
+
+        app._handle_command("/retry")
+
+        batch = app.candidate_batches[0]
+        self.assertEqual(batch.role, "synthesis")
+        self.assertEqual(batch.prompt, "wrapped synthesis prompt")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_launches_queued_candidate_batch_with_original_run_settings(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2", "--model", "original-model"]))
         app._sync = lambda: None
@@ -1468,6 +1813,48 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(call["prompt"], "current question")
         self.assertEqual(call["args"].model, "original-model")
         self.assertEqual(events[-1]["type"], "candidate_batch_finished")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_synthesis_retry_starts_fresh_without_candidate_resume(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "1", "--resume-session-id", "candidate-session"])
+        )
+        app._sync = lambda: None
+        app.pending_prompt = "original request"
+        app.pending_run_root = Path("/tmp/pcr-test/run")
+        app.pending_workspaces_root = app.pending_run_root / "workspaces"
+        app.pending_workspace = Path("/tmp/pcr-test/workspace")
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.agents[2] = tui_textual.AgentPane(
+            idx=2,
+            role="synthesis",
+            status="queued",
+            input_text="original request",
+            execution_prompt="wrapped synthesis prompt",
+        )
+        app.candidate_batches.append(
+            tui_textual.CandidateBatch(
+                [2],
+                {2},
+                role="synthesis",
+                prompt="wrapped synthesis prompt",
+            )
+        )
+        app._post_progress = lambda _event: None
+
+        with mock.patch.object(
+            tui_textual,
+            "run_additional_agents",
+            return_value=[],
+        ) as retry:
+            with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                self.assertTrue(app._launch_next_candidate_batch())
+                thread_cls.call_args.kwargs["target"]()
+
+        call = retry.call_args.kwargs
+        self.assertEqual(call["prompt"], "wrapped synthesis prompt")
+        self.assertEqual(call["agent_role"], "synthesis")
+        self.assertIsNone(call["resume_session_id"])
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_diff_view_loads_and_toggles_full_patch(self) -> None:
@@ -1750,6 +2137,16 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.pause()
                     self.assertEqual(app.num_agents, 3)
                     self.assertEqual(app.args.num_agents, 3)
+
+                    synthesis_agents = app.query_one(
+                        "#config-synthesis-agents"
+                    )
+                    synthesis_agents.value = "2"
+                    synthesis_agents.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertEqual(app.synthesis_agents, 2)
+                    self.assertEqual(app.args.synthesis_agents, 2)
 
                     max_parallel = app.query_one("#config-max-parallel")
                     max_parallel.value = "2"
@@ -3172,6 +3569,10 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertEqual(panel.border_title, "PARALLEL-CODEX-RUNNER")
                 self.assertTrue(panel.styles.border_title_style.bold)
                 self.assertEqual(app.query_one("#config-agents").value, "5")
+                self.assertEqual(
+                    app.query_one("#config-synthesis-agents").value,
+                    "0",
+                )
                 self.assertEqual(app.query_one("#config-max-parallel").value, "5")
                 self.assertEqual(app.query_one("#config-execution").value, "parallel")
                 self.assertEqual(
@@ -3194,6 +3595,7 @@ class TuiCommandTests(unittest.TestCase):
                     child_ids.index("runner-workspace"),
                 )
                 self.assertIn("RECOMMEND_BY", labels)
+                self.assertIn("SYNTHESIS_AGENTS", labels)
                 self.assertNotIn("BEST_BY", labels)
                 self.assertNotIn("METADATA", labels)
                 self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])
@@ -3392,7 +3794,7 @@ class TuiCommandTests(unittest.TestCase):
                     return_value=[],
                 ), mock.patch.object(
                     tui_textual,
-                    "estimate_run_storage",
+                    "estimate_staged_run_storage",
                     return_value=estimate,
                 ), mock.patch.object(
                     app,
@@ -3449,7 +3851,7 @@ class TuiCommandTests(unittest.TestCase):
                     return_value=[],
                 ), mock.patch.object(
                     tui_textual,
-                    "estimate_run_storage",
+                    "estimate_staged_run_storage",
                     return_value=estimate,
                 ), mock.patch.object(
                     tui_textual,
@@ -3502,7 +3904,7 @@ class TuiCommandTests(unittest.TestCase):
                     return_value=[],
                 ), mock.patch.object(
                     tui_textual,
-                    "estimate_run_storage",
+                    "estimate_staged_run_storage",
                     return_value=estimate,
                 ), mock.patch.object(
                     tui_textual,

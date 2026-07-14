@@ -4,6 +4,18 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
+AGENT_ROLE_CANDIDATE = "candidate"
+AGENT_ROLE_SYNTHESIS = "synthesis"
+
+
+def normalize_agent_role(value: object) -> str:
+    return (
+        AGENT_ROLE_SYNTHESIS
+        if str(value or "").strip().lower() == AGENT_ROLE_SYNTHESIS
+        else AGENT_ROLE_CANDIDATE
+    )
+
+
 @dataclass
 class AgentResult:
     idx: int
@@ -24,8 +36,10 @@ class AgentResult:
     error: Optional[str] = None
     stdout_tail: str = ""
     stderr_tail: str = ""
+    role: str = AGENT_ROLE_CANDIDATE
 
     def __post_init__(self) -> None:
+        self.role = normalize_agent_role(self.role)
         normalized: Dict[int, int] = {}
         source = self.reasoning_token_counts if isinstance(self.reasoning_token_counts, dict) else {}
         for raw_delta, raw_count in source.items():
