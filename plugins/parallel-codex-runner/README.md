@@ -24,7 +24,7 @@ python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 Register this repository as a local marketplace:
 
 ```bash
-codex plugin marketplace add /absolute/path/to/parallel-codex-runner
+codex plugin marketplace add "$PWD"
 ```
 
 Restart the Codex App, open **Plugins**, choose the **Personal** marketplace, and install **Parallel Codex Runner**. A CLI installation is also available:

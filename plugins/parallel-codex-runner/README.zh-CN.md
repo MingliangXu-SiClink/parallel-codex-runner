@@ -24,7 +24,7 @@ python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 把当前仓库注册为本地插件市场：
 
 ```bash
-codex plugin marketplace add /absolute/path/to/parallel-codex-runner
+codex plugin marketplace add "$PWD"
 ```
 
 重启 Codex App，进入 **Plugins**，在 **Personal** Marketplace 中安装 **Parallel Codex Runner**。也可以通过命令安装：

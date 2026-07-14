@@ -122,12 +122,10 @@ then review Codex's comparison and recommendation. Nothing is synced until you
 confirm an Agent. The worker, event, and retention machinery stays in the
 background so an App or MCP restart does not silently lose an active run.
 
-Install the runtime, verify it, register this repository as a local marketplace,
-and install the plugin:
+From the repository root, install the runtime, verify it, register this
+repository as a local marketplace, and install the plugin:
 
 ```bash
-cd /Users/mingliangxu/Desktop/parallel-codex-runner
-
 # Install PCR and its MCP server
 python3 -m pip install -e .
 
@@ -135,7 +133,7 @@ python3 -m pip install -e .
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 
 # Register the local plugin marketplace
-codex plugin marketplace add /Users/mingliangxu/Desktop/parallel-codex-runner
+codex plugin marketplace add "$PWD"
 
 # Install the plugin
 codex plugin add parallel-codex-runner@personal
