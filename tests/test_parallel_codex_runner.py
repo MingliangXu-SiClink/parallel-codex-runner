@@ -3179,6 +3179,20 @@ class TuiCommandTests(unittest.TestCase):
                     "reasoning_tokens",
                 )
                 labels = [label for label, _value in app._tree_rows()]
+                self.assertEqual(
+                    labels[:3],
+                    ["CONVERSATION", "CODEX_BIN", "WORKSPACE"],
+                )
+                runner_children = list(app.query_one("#runner-grid").children)
+                child_ids = [child.id for child in runner_children]
+                self.assertLess(
+                    child_ids.index("runner-conversation"),
+                    child_ids.index("runner-codex-bin"),
+                )
+                self.assertLess(
+                    child_ids.index("runner-codex-bin"),
+                    child_ids.index("runner-workspace"),
+                )
                 self.assertIn("RECOMMEND_BY", labels)
                 self.assertNotIn("BEST_BY", labels)
                 self.assertNotIn("METADATA", labels)

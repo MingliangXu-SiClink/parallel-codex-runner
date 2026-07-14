@@ -1440,6 +1440,8 @@ else:
                     with Grid(id="runner-grid"):
                         yield Static("CONVERSATION", classes="runner-key")
                         yield Static("", id="runner-conversation", classes="runner-value", markup=False)
+                        yield Static("CODEX_BIN", classes="runner-key")
+                        yield Static("", id="runner-codex-bin", classes="runner-value", markup=False)
                         yield Static("WORKSPACE", classes="runner-key")
                         yield Static("", id="runner-workspace", classes="runner-value", markup=False)
                         yield Static("RUNS_ROOT", classes="runner-key")
@@ -1495,8 +1497,6 @@ else:
                             id="config-effort",
                             classes="runner-control",
                         )
-                        yield Static("CODEX_BIN", classes="runner-key")
-                        yield Static("", id="runner-codex-bin", classes="runner-value", markup=False)
                         yield Static("SYNC_BACK", classes="runner-key")
                         yield Select(
                             [("YES", True), ("NO", False)],
@@ -4209,6 +4209,7 @@ else:
             run_anchor = default_run_anchor(module_dir, self.workspace)
             run_base = choose_run_base(run_anchor, self.workspace, getattr(self.args, "runs_dir", None))
             return [
+                ("CODEX_BIN", str(getattr(self.args, "codex_bin", "codex"))),
                 ("WORKSPACE", absolute_path_for_display(self.workspace)),
                 ("RUNS_ROOT", f"pending under {absolute_path_for_display(run_base)}"),
                 ("AGENTS", str(self.num_agents)),
@@ -4237,7 +4238,6 @@ else:
                         getattr(self.args, "effort", None),
                     ),
                 ),
-                ("CODEX_BIN", str(getattr(self.args, "codex_bin", "codex"))),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),
