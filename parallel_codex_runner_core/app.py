@@ -79,7 +79,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-from .codex_cli import build_codex_command, read_codex_exec_help, read_codex_exec_resume_help
+from .codex_cli import (
+    build_codex_command,
+    merge_codex_developer_instructions,
+    read_effective_codex_developer_instructions,
+    read_codex_exec_help,
+    read_codex_exec_resume_help,
+)
 from .codex_models import CodexModelRegistry
 from .models import (
     AGENT_ROLE_CANDIDATE,
@@ -1005,7 +1011,7 @@ def estimate_staged_run_storage(
     resume_codex_home: Optional[Path] = None,
     metadata_reserve_bytes: int = AGENT_METADATA_RESERVE_BYTES,
 ) -> RunStorageEstimate:
-    """Estimate first-stage candidates and fresh second-stage synthesis agents."""
+    """Estimate candidates and synthesis agents sharing one resume baseline."""
     if candidate_agents <= 0:
         raise ValueError("candidate_agents must be greater than zero")
     if synthesis_agents < 0:
@@ -1013,31 +1019,20 @@ def estimate_staged_run_storage(
 
     codex_home = codex_home or get_codex_home()
     workspace_bytes = estimate_workspace_copy_bytes(workspace)
-    candidate_metadata = estimate_agent_metadata_bytes(
+    metadata_per_agent = estimate_agent_metadata_bytes(
         codex_home,
         resume_session_id,
         resume_codex_home,
         metadata_reserve_bytes,
     )
-    synthesis_metadata = (
-        estimate_agent_metadata_bytes(
-            codex_home,
-            runtime_reserve_bytes=metadata_reserve_bytes,
-        )
-        if synthesis_agents
-        else 0
-    )
     total_agents = candidate_agents + synthesis_agents
     workspace_copies_bytes = workspace_bytes * total_agents
-    metadata_bytes = (
-        candidate_metadata * candidate_agents
-        + synthesis_metadata * synthesis_agents
-    )
+    metadata_bytes = metadata_per_agent * total_agents
     return RunStorageEstimate(
         num_agents=total_agents,
         workspace_bytes_per_agent=workspace_bytes,
         workspace_copies_bytes=workspace_copies_bytes,
-        metadata_bytes_per_agent=(metadata_bytes + total_agents - 1) // total_agents,
+        metadata_bytes_per_agent=metadata_per_agent,
         metadata_bytes=metadata_bytes,
         total_bytes=workspace_copies_bytes + metadata_bytes,
     )
@@ -2699,6 +2694,7 @@ def run_additional_agents(
     agent_cancel_events: Optional[Dict[int, Any]] = None,
     agent_role: str = AGENT_ROLE_CANDIDATE,
     refresh_result_files: bool = True,
+    developer_instructions: Optional[str] = None,
 ) -> List[AgentResult]:
     agent_role = normalize_agent_role(agent_role)
     indices = list(dict.fromkeys(int(idx) for idx in agent_indices))
@@ -2761,6 +2757,18 @@ def run_additional_agents(
                 agent_workspace,
                 resume_session_id,
             )
+            effective_developer_instructions = (
+                merge_codex_developer_instructions(
+                    read_effective_codex_developer_instructions(
+                        args.codex_bin,
+                        agent_codex_home,
+                        agent_workspace,
+                    ),
+                    developer_instructions,
+                )
+                if developer_instructions
+                else None
+            )
             command, _caps = build_codex_command(
                 args.codex_bin,
                 help_text,
@@ -2768,6 +2776,7 @@ def run_additional_agents(
                 model=args.model,
                 effort=effective_effort,
                 resume_session_id=resume_session_id,
+                developer_instructions=effective_developer_instructions,
             )
             command_by_agent[idx] = command
             codex_home_by_agent[idx] = agent_codex_home
@@ -2837,7 +2846,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "After all candidates finish, run this many fresh agents to review "
+            "After all candidates finish, run this many isolated agents to review "
             "and synthesize their successful results. Zero disables synthesis."
         ),
     )
@@ -3205,6 +3214,8 @@ def run_once(
         "launched_agents": [],
         "successful_agents": [],
         "context_path": None,
+        "instructions_path": None,
+        "resume_session_id": resume_session_id,
         "status": "disabled" if synthesis_agents == 0 else "pending",
         "reason": None,
         "error": None,
@@ -3233,12 +3244,15 @@ def run_once(
         for idx in synthesis_indices:
             agent_cancel_events.setdefault(idx, threading.Event())
         try:
-            context_path, synthesis_prompt = create_synthesis_context(
+            context_path, synthesis_instructions = create_synthesis_context(
                 run_root,
                 prompt,
                 initial_successes,
             )
             synthesis_info["context_path"] = str(context_path)
+            synthesis_info["instructions_path"] = str(
+                run_root / "synthesis_instructions.txt"
+            )
             synthesis_info["status"] = "running"
             if progress_callback is not None:
                 progress_callback(
@@ -3247,21 +3261,26 @@ def run_once(
                         "indices": synthesis_indices,
                         "source_agents": synthesis_info["source_agents"],
                         "context_path": str(context_path),
-                        "prompt": synthesis_prompt,
+                        "instructions_path": synthesis_info["instructions_path"],
+                        "prompt": prompt,
+                        "user_prompt": prompt,
+                        "developer_instructions": synthesis_instructions,
+                        "resume_session_id": resume_session_id,
                     }
                 )
             synthesis_results = run_additional_agents(
                 args=args,
-                prompt=synthesis_prompt,
+                prompt=prompt,
                 agent_indices=synthesis_indices,
                 run_root=run_root,
                 workspace=workspace,
-                resume_session_id=None,
+                resume_session_id=resume_session_id,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 agent_cancel_events=agent_cancel_events,
                 agent_role=AGENT_ROLE_SYNTHESIS,
                 refresh_result_files=False,
+                developer_instructions=synthesis_instructions,
             )
             results.extend(synthesis_results)
             synthesis_info["status"] = (

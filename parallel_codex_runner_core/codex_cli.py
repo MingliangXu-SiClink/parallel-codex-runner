@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 def _warn(message: str, *args: object) -> None:
@@ -54,6 +58,186 @@ def short_flag_supported(help_text: str, flag: str) -> bool:
     return any(token in help_text for token in (f"{flag},", f"{flag} ", f"{flag}\t"))
 
 
+def read_effective_codex_developer_instructions(
+    codex_bin: str,
+    codex_home: Path,
+    workspace: Path,
+    timeout: float = 15.0,
+) -> Optional[str]:
+    """Ask Codex to resolve its effective developer instructions for a workspace."""
+    codex_home = codex_home.expanduser().resolve()
+    workspace = workspace.expanduser().resolve()
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        process = subprocess.Popen(
+            [codex_bin, "app-server", "--stdio"],
+            cwd=str(workspace),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "cannot start Codex app-server to preserve developer instructions: "
+            f"{exc}"
+        ) from exc
+
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    messages: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
+    stderr_tail: list[str] = []
+
+    def read_stream(name: str, stream: Any) -> None:
+        try:
+            for line in stream:
+                messages.put((name, line))
+        finally:
+            messages.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", process.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", process.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + max(0.1, float(timeout))
+
+    def failure(message: str) -> RuntimeError:
+        detail = "".join(stderr_tail)[-2000:].strip()
+        suffix = f": {detail}" if detail else ""
+        return RuntimeError(
+            f"{message}{suffix}. Upgrade Codex CLI before running synthesis."
+        )
+
+    def send(payload: Dict[str, Any]) -> None:
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise failure("Codex app-server closed during config resolution") from exc
+
+    def response(request_id: int) -> Dict[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure("Codex app-server config resolution timed out")
+            try:
+                source, line = messages.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise failure("Codex app-server config resolution timed out") from exc
+            if source == "stderr":
+                if line:
+                    stderr_tail.append(line)
+                continue
+            if line is None:
+                raise failure("Codex app-server exited before resolving config")
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise failure("Codex app-server returned malformed JSON") from exc
+            if not isinstance(payload, dict):
+                raise failure("Codex app-server returned an invalid JSON message")
+            if payload.get("id") != request_id:
+                continue
+            error = payload.get("error")
+            if error is not None:
+                raise failure(
+                    (
+                        "Codex app-server rejected config/read"
+                        if request_id == 1
+                        else "Codex app-server initialization failed"
+                    )
+                    + f" ({error})"
+                )
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise failure("Codex app-server returned an invalid response")
+            return result
+
+    try:
+        send(
+            {
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "parallel_codex_runner",
+                        "title": "Parallel Codex Runner",
+                        "version": "0.1.5",
+                    }
+                },
+            }
+        )
+        response(0)
+        send({"method": "initialized", "params": {}})
+        send(
+            {
+                "method": "config/read",
+                "id": 1,
+                "params": {
+                    "includeLayers": False,
+                    "cwd": str(workspace),
+                },
+            }
+        )
+        result = response(1)
+        config = result.get("config")
+        if not isinstance(config, dict):
+            raise failure("Codex app-server config/read omitted config")
+        value = config.get("developer_instructions")
+        if value is not None and not isinstance(value, str):
+            raise failure(
+                "Codex app-server returned non-string developer_instructions"
+            )
+        return value
+    finally:
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+        for reader in readers:
+            reader.join(timeout=0.2)
+
+
+def merge_codex_developer_instructions(
+    existing_instructions: Optional[str],
+    additional_instructions: Optional[str],
+) -> Optional[str]:
+    """Append PCR instructions without replacing Codex's effective guidance."""
+    existing = existing_instructions
+    additional = str(additional_instructions or "")
+    if existing and additional.strip():
+        return f"{existing}\n\n{additional}"
+    return existing or (additional if additional.strip() else None)
+
+
 def build_codex_command(
     codex_bin: str,
     help_text: str,
@@ -61,6 +245,7 @@ def build_codex_command(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     resume_session_id: Optional[str] = None,
+    developer_instructions: Optional[str] = None,
 ) -> Tuple[List[str], Dict[str, bool]]:
     cmd: List[str] = [codex_bin, "exec"]
     if resume_session_id:
@@ -91,7 +276,9 @@ def build_codex_command(
         if short_flag_supported(help_text, "-c")
         else None
     )
-    caps["effort"] = config_flag is not None
+    caps["config"] = config_flag is not None
+    caps["effort"] = caps["config"]
+    caps["developer_instructions"] = caps["config"]
     if effort:
         if caps["effort"]:
             assert config_flag is not None
@@ -103,6 +290,19 @@ def build_codex_command(
                 "当前 Codex CLI help 中未检测到 --config；忽略 --effort {}",
                 effort,
             )
+
+    if developer_instructions and developer_instructions.strip():
+        if config_flag is None:
+            raise RuntimeError(
+                "当前 Codex CLI 不支持 --config，无法安全注入 synthesis developer instructions。"
+            )
+        cmd.extend(
+            [
+                config_flag,
+                "developer_instructions="
+                + json.dumps(developer_instructions, ensure_ascii=False),
+            ]
+        )
 
     caps["dangerously_bypass"] = flag_supported(help_text, "--dangerously-bypass-approvals-and-sandbox")
     caps["sandbox"] = flag_supported(help_text, "--sandbox")

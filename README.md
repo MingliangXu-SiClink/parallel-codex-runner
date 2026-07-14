@@ -19,7 +19,7 @@ Codex can solve the same task very differently from one run to the next. A stron
 
 `parallel-codex-runner` (PCR) runs the same prompt in several isolated workspaces. You can watch every Agent as it works, inspect its patch, stop or retry candidates, and choose the one that should reach your real workspace.
 
-By default, each Agent owns a complete branch of the task and you adopt one branch as a whole. For important tasks, you can add an optional second stage: fresh synthesis Agents review every successful candidate, combine compatible strengths in their own workspaces, and produce new branches for you to inspect.
+By default, each Agent owns a complete branch of the task and you adopt one branch as a whole. For important tasks, you can add an optional second stage: isolated synthesis Agents review every successful candidate, combine compatible strengths in their own workspaces, and produce new branches for you to inspect.
 
 ```text
                          +--> AGENT-001 --> conversation + patch
@@ -105,7 +105,7 @@ PCR will:
 2. create one isolated workspace per Agent;
 3. run the same prompt in every workspace;
 4. stream each Agent's conversation and command activity;
-5. optionally run fresh Agents that review and synthesize the candidates;
+5. optionally run isolated Agents that review and synthesize the candidates;
 6. recommend a successful result while leaving the final choice to you.
 
 To change the next run before submitting:
@@ -189,9 +189,11 @@ Set `SYNTHESIS_AGENTS` in the top panel, or run this before submitting the next 
 /synthesis 3
 ```
 
-After all first-stage candidates finish, PCR starts three fresh synthesis Agents. Each one receives a clean copy of the original workspace, plus references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. For code tasks, it compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
+After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
 
-Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` remains different; it adds ordinary independent candidates for the current question.
+Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results.
+
+If the installed Codex CLI cannot resolve or inject developer instructions safely, PCR marks the synthesis stage as failed and keeps the successful first-stage candidates available instead of silently changing prompt roles.
 
 ### Review and control candidates
 
@@ -256,7 +258,7 @@ pcr "implement the migration" -n 10 --max-parallel 3
 # Run candidates one at a time
 pcr "refactor the parser" -n 4 --serial
 
-# Run six candidates, then two independent synthesis Agents
+# Run six candidates, then two isolated synthesis Agents
 pcr "implement the migration" -n 6 --synthesis-agents 2
 
 # Inspect results without changing the original workspace
@@ -350,7 +352,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | Option | Description |
 | --- | --- |
 | `-n, --num-agents` | Number of candidates; default `5`. |
-| `--synthesis-agents` | Fresh review-and-synthesis Agents started after candidates finish; default `0`. |
+| `--synthesis-agents` | Isolated review-and-synthesis Agents started after candidates finish; default `0`. |
 | `--max-parallel` | Maximum number of concurrent Codex processes. |
 | `--serial` | Run one candidate at a time. |
 | `--recommend-by` | Recommend by `reasoning_tokens` or `duration`. |
@@ -426,9 +428,9 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 
 | Path | Contents |
 | --- | --- |
-| `prompt.txt` | Original user prompt sent to first-stage candidates. |
+| `prompt.txt` | Original user prompt sent to candidate and synthesis Agents. |
 | `synthesis_context.md` | Original request and paths to successful candidate workspaces and responses. |
-| `synthesis_prompt.txt` | Instructions sent to second-stage synthesis Agents. |
+| `synthesis_instructions.txt` | Internal developer instructions used by second-stage synthesis Agents. |
 | `summary.json` | Settings, results, recommendation, sync, and cleanup state. |
 | `BEST_AGENT.txt` | Recommended Agent for the recorded run. |
 | `BEST_CODEX_SESSION.txt` | Recommended Codex session ID, when available. |

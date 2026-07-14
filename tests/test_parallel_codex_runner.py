@@ -18,6 +18,7 @@ from pathlib import Path
 
 import parallel_codex_runner_core.tui_textual as tui_textual
 import parallel_codex_runner_core.app as app_core
+import parallel_codex_runner_core.codex_cli as codex_cli_core
 import parallel_codex_runner_core.workspace as workspace_core
 from parallel_codex_runner_core.codex_models import CodexModelInfo, CodexModelRegistry
 from parallel_codex_runner_core.diffing import build_workspace_diff_text
@@ -72,6 +73,42 @@ def make_agent_result_data(
             reasoning_tokens=reasoning_tokens,
         )
     )
+
+
+def make_config_read_process(
+    developer_instructions: object = None,
+    *,
+    config_error: object = None,
+    malformed: bool = False,
+) -> mock.Mock:
+    process = mock.Mock()
+    process.stdin = mock.Mock()
+    lines = [
+        json.dumps({"method": "server/notification", "params": {}}),
+        json.dumps({"id": 0, "result": {"userAgent": "codex-test"}}),
+    ]
+    if malformed:
+        lines.append("not-json")
+    elif config_error is not None:
+        lines.append(json.dumps({"id": 1, "error": config_error}))
+    else:
+        lines.append(
+            json.dumps(
+                {
+                    "id": 1,
+                    "result": {
+                        "config": {
+                            "developer_instructions": developer_instructions,
+                        }
+                    },
+                }
+            )
+        )
+    process.stdout = io.StringIO("\n".join(lines) + "\n")
+    process.stderr = io.StringIO("")
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    return process
 
 
 class WorkspaceDiffTests(unittest.TestCase):
@@ -638,7 +675,7 @@ class RunStorageEstimateTests(unittest.TestCase):
         self.assertEqual(estimate.metadata_bytes, 150)
         self.assertEqual(estimate.total_bytes, 450)
 
-    def test_staged_storage_estimate_uses_resume_only_for_candidates(self) -> None:
+    def test_staged_storage_estimate_uses_resume_for_every_agent(self) -> None:
         with mock.patch.object(
             app_core,
             "estimate_workspace_copy_bytes",
@@ -646,7 +683,7 @@ class RunStorageEstimateTests(unittest.TestCase):
         ), mock.patch.object(
             app_core,
             "estimate_agent_metadata_bytes",
-            side_effect=[80, 50],
+            return_value=80,
         ) as estimate_metadata:
             estimate = app_core.estimate_staged_run_storage(
                 Path.cwd(),
@@ -657,10 +694,10 @@ class RunStorageEstimateTests(unittest.TestCase):
 
         self.assertEqual(estimate.num_agents, 5)
         self.assertEqual(estimate.workspace_copies_bytes, 500)
-        self.assertEqual(estimate.metadata_bytes, 340)
-        self.assertEqual(estimate.total_bytes, 840)
-        self.assertEqual(estimate_metadata.call_args_list[0].args[1], "session-1")
-        self.assertIsNone(estimate_metadata.call_args_list[1].kwargs.get("resume_session_id"))
+        self.assertEqual(estimate.metadata_bytes, 400)
+        self.assertEqual(estimate.total_bytes, 900)
+        estimate_metadata.assert_called_once()
+        self.assertEqual(estimate_metadata.call_args.args[1], "session-1")
 
 
 class RunRootTests(unittest.TestCase):
@@ -699,6 +736,162 @@ class CommandBuildTests(unittest.TestCase):
         self.assertTrue(caps["effort"])
         self.assertIn("--config", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
+
+    def test_developer_instructions_use_a_toml_config_override(self) -> None:
+        instructions = "Review every candidate.\n保留原始用户消息。"
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            developer_instructions=instructions,
+        )
+
+        override = next(
+            value for value in cmd if value.startswith("developer_instructions=")
+        )
+        self.assertTrue(caps["config"])
+        self.assertTrue(caps["developer_instructions"])
+        self.assertEqual(json.loads(override.split("=", 1)[1]), instructions)
+
+    def test_developer_instructions_require_config_support(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "developer instructions"):
+            build_codex_command(
+                "codex",
+                "Usage: codex exec [OPTIONS]\n",
+                Path("final.md"),
+                developer_instructions="Review every candidate.",
+            )
+
+    def test_codex_config_read_resolves_effective_developer_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            workspace = root / "workspace"
+            codex_home.mkdir()
+            workspace.mkdir()
+            process = make_config_read_process("Project guidance.\n")
+
+            with mock.patch.object(
+                codex_cli_core.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen:
+                existing = (
+                    codex_cli_core.read_effective_codex_developer_instructions(
+                        "codex-custom",
+                        codex_home,
+                        workspace,
+                    )
+                )
+                merged = codex_cli_core.merge_codex_developer_instructions(
+                    existing,
+                    "Review every candidate.",
+                )
+
+        self.assertEqual(existing, "Project guidance.\n")
+        self.assertEqual(
+            merged,
+            "Project guidance.\n\n\nReview every candidate.",
+        )
+        popen.assert_called_once()
+        self.assertEqual(
+            popen.call_args.args[0],
+            ["codex-custom", "app-server", "--stdio"],
+        )
+        self.assertEqual(popen.call_args.kwargs["cwd"], str(workspace.resolve()))
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["CODEX_HOME"],
+            str(codex_home.resolve()),
+        )
+        requests = [
+            json.loads(call.args[0])
+            for call in process.stdin.write.call_args_list
+        ]
+        self.assertEqual(
+            [request["method"] for request in requests],
+            ["initialize", "initialized", "config/read"],
+        )
+        self.assertEqual(
+            requests[-1]["params"],
+            {"includeLayers": False, "cwd": str(workspace.resolve())},
+        )
+        process.stdin.close.assert_called_once()
+        process.terminate.assert_called_once()
+
+    def test_codex_config_read_accepts_no_existing_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            workspace = root / "workspace"
+            codex_home.mkdir()
+            workspace.mkdir()
+            process = make_config_read_process(None)
+
+            with mock.patch.object(
+                codex_cli_core.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                existing = (
+                    codex_cli_core.read_effective_codex_developer_instructions(
+                        "codex",
+                        codex_home,
+                        workspace,
+                    )
+                )
+                merged = codex_cli_core.merge_codex_developer_instructions(
+                    existing,
+                    "Review every candidate.",
+                )
+
+        self.assertIsNone(existing)
+        self.assertEqual(merged, "Review every candidate.")
+
+    def test_codex_config_read_failure_is_explicit_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            workspace = root / "workspace"
+            codex_home.mkdir()
+            workspace.mkdir()
+            process = make_config_read_process(
+                config_error={"code": -32601, "message": "Method not found"}
+            )
+
+            with mock.patch.object(
+                codex_cli_core.subprocess,
+                "Popen",
+                return_value=process,
+            ), self.assertRaisesRegex(RuntimeError, "config/read"):
+                codex_cli_core.read_effective_codex_developer_instructions(
+                    "codex",
+                    codex_home,
+                    workspace,
+                )
+        process.stdin.close.assert_called_once()
+        process.terminate.assert_called_once()
+
+    def test_codex_config_read_rejects_malformed_json_and_invalid_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            workspace = root / "workspace"
+            codex_home.mkdir()
+            workspace.mkdir()
+            for process, message in (
+                (make_config_read_process(malformed=True), "malformed JSON"),
+                (make_config_read_process(["not", "text"]), "non-string"),
+            ):
+                with self.subTest(message=message), mock.patch.object(
+                    codex_cli_core.subprocess,
+                    "Popen",
+                    return_value=process,
+                ), self.assertRaisesRegex(RuntimeError, message):
+                    codex_cli_core.read_effective_codex_developer_instructions(
+                        "codex",
+                        codex_home,
+                        workspace,
+                    )
 
     def test_resume_command_uses_exec_resume_session_id_and_stdin_prompt(self) -> None:
         cmd, caps = build_codex_command(
@@ -810,7 +1003,7 @@ class SynthesisTests(unittest.TestCase):
                 for idx in (2, 1)
             ]
 
-            context_path, prompt = app_core.create_synthesis_context(
+            context_path, instructions = app_core.create_synthesis_context(
                 run_root,
                 "Fix the failing tests.",
                 sources,
@@ -820,10 +1013,17 @@ class SynthesisTests(unittest.TestCase):
             self.assertLess(context.index("AGENT-001"), context.index("AGENT-002"))
             self.assertIn("Fix the failing tests.", context)
             self.assertIn(str(sources[0].workspace_dir), context)
-            self.assertIn(str(context_path), prompt)
-            self.assertIn("read-only references", prompt)
+            self.assertIn(str(context_path), instructions)
+            self.assertIn("read-only references", instructions)
+            self.assertEqual(
+                (run_root / "synthesis_instructions.txt").read_text(
+                    encoding="utf-8"
+                ),
+                instructions,
+            )
+            self.assertFalse((run_root / "synthesis_prompt.txt").exists())
 
-    def test_synthesis_retry_does_not_replace_recorded_user_prompt(self) -> None:
+    def test_synthesis_result_refresh_does_not_replace_recorded_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             workspace = run_root / "workspace"
@@ -843,7 +1043,7 @@ class SynthesisTests(unittest.TestCase):
             app_core.refresh_run_result_files(
                 run_root,
                 workspace,
-                "wrapped synthesis prompt",
+                "unexpected replacement",
                 [result],
                 "reasoning_tokens",
             )
@@ -934,6 +1134,8 @@ class RunOnceCleanupTests(unittest.TestCase):
                     "2",
                     "--synthesis-agents",
                     "2",
+                    "--resume-session-id",
+                    "session-base",
                     "--no-sync-back",
                     "--keep-workspaces",
                 ]
@@ -948,6 +1150,8 @@ class RunOnceCleanupTests(unittest.TestCase):
                 ),
             ]
             events: list[dict[str, object]] = []
+            prepared_session_ids: list[str | None] = []
+            build_calls: list[dict[str, object]] = []
 
             def copy_tree(source: Path, destination: Path, **_kwargs: object) -> None:
                 shutil.copytree(source, destination)
@@ -956,14 +1160,37 @@ class RunOnceCleanupTests(unittest.TestCase):
                 _source: Path,
                 destination: Path,
                 _workspace: Path,
-                _session_id: str | None,
+                session_id: str | None,
             ) -> None:
                 destination.mkdir(parents=True, exist_ok=True)
+                prepared_session_ids.append(session_id)
 
-            with mock.patch.object(app_core, "get_codex_home", return_value=codex_home), mock.patch.object(
+            def build_command(
+                *_args: object,
+                **kwargs: object,
+            ) -> tuple[list[str], dict[str, bool]]:
+                build_calls.append(dict(kwargs))
+                return command, {}
+
+            resume_session = app_core.ResumeSession(
+                session_id="session-base",
+                title="previous conversation",
+                cwd=str(workspace),
+                updated_at=1,
+            )
+
+            with mock.patch.object(
                 app_core,
-                "read_codex_exec_help",
-                return_value="Usage: codex exec",
+                "get_codex_home",
+                return_value=codex_home,
+            ), mock.patch.object(
+                app_core,
+                "resolve_resume_session",
+                return_value=resume_session,
+            ), mock.patch.object(
+                app_core,
+                "read_codex_exec_resume_help",
+                return_value="Usage: codex exec resume\n  -c, --config <key=value>",
             ), mock.patch.object(
                 app_core,
                 "copy_workspace",
@@ -974,8 +1201,12 @@ class RunOnceCleanupTests(unittest.TestCase):
                 side_effect=prepare_home,
             ), mock.patch.object(
                 app_core,
+                "read_effective_codex_developer_instructions",
+                return_value="User guidance.",
+            ), mock.patch.object(
+                app_core,
                 "build_codex_command",
-                return_value=(command, {}),
+                side_effect=build_command,
             ):
                 returncode = app_core.run_once(
                     args,
@@ -998,13 +1229,251 @@ class RunOnceCleanupTests(unittest.TestCase):
             self.assertIn(summary["best_agent"], {"agent_003", "agent_004"})
             self.assertEqual(summary["synthesis"]["source_agents"], [1, 2])
             self.assertEqual(summary["synthesis"]["status"], "completed")
-            synthesis_prompt = (
-                run_root / "workspaces" / "agent_003" / "received_prompt.txt"
-            ).read_text(encoding="utf-8")
-            self.assertIn("second-stage synthesis Agent", synthesis_prompt)
-            self.assertTrue(
-                any(event.get("type") == "synthesis_started" for event in events)
+            self.assertEqual(
+                summary["synthesis"]["resume_session_id"],
+                "session-base",
             )
+            self.assertEqual(prepared_session_ids, ["session-base"] * 4)
+            self.assertTrue(
+                all(call.get("resume_session_id") == "session-base" for call in build_calls)
+            )
+            for idx in range(1, 5):
+                received_prompt = (
+                    run_root
+                    / "workspaces"
+                    / f"agent_{idx:03d}"
+                    / "received_prompt.txt"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(received_prompt, "Fix the project.")
+            instructions_path = run_root / "synthesis_instructions.txt"
+            synthesis_instructions = instructions_path.read_text(encoding="utf-8")
+            self.assertIn("second-stage synthesis Agent", synthesis_instructions)
+            self.assertFalse((run_root / "synthesis_prompt.txt").exists())
+            self.assertEqual(
+                Path(summary["synthesis"]["instructions_path"]).resolve(),
+                instructions_path.resolve(),
+            )
+            self.assertTrue(
+                all(not call.get("developer_instructions") for call in build_calls[:2])
+            )
+            self.assertTrue(
+                all(
+                    str(call.get("developer_instructions") or "").startswith(
+                        "User guidance.\n\n"
+                    )
+                    and
+                    "second-stage synthesis Agent"
+                    in str(call.get("developer_instructions") or "")
+                    for call in build_calls[2:]
+                )
+            )
+            synthesis_event = next(
+                event for event in events if event.get("type") == "synthesis_started"
+            )
+            self.assertEqual(synthesis_event["prompt"], "Fix the project.")
+            self.assertEqual(synthesis_event["user_prompt"], "Fix the project.")
+            self.assertEqual(
+                synthesis_event["developer_instructions"],
+                synthesis_instructions,
+            )
+            self.assertEqual(
+                Path(str(synthesis_event["instructions_path"])).resolve(),
+                instructions_path.resolve(),
+            )
+
+    def test_run_once_synthesis_without_resume_starts_new_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            runs = root / "runs"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            codex_home.mkdir()
+            (workspace / "base.txt").write_text("baseline", encoding="utf-8")
+            args = parse_args(
+                [
+                    "prompt",
+                    "--workspace",
+                    str(workspace),
+                    "--runs-dir",
+                    str(runs),
+                    "-n",
+                    "1",
+                    "--synthesis-agents",
+                    "1",
+                    "--no-sync-back",
+                    "--keep-workspaces",
+                ]
+            )
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "Path('received_prompt.txt').write_text(sys.stdin.read(), encoding='utf-8')"
+                ),
+            ]
+            prepared_session_ids: list[str | None] = []
+            build_calls: list[dict[str, object]] = []
+
+            def copy_tree(source: Path, destination: Path, **_kwargs: object) -> None:
+                shutil.copytree(source, destination)
+
+            def prepare_home(
+                _source: Path,
+                destination: Path,
+                _workspace: Path,
+                session_id: str | None,
+            ) -> None:
+                destination.mkdir(parents=True, exist_ok=True)
+                prepared_session_ids.append(session_id)
+
+            def build_command(
+                *_args: object,
+                **kwargs: object,
+            ) -> tuple[list[str], dict[str, bool]]:
+                build_calls.append(dict(kwargs))
+                return command, {}
+
+            with mock.patch.object(
+                app_core,
+                "get_codex_home",
+                return_value=codex_home,
+            ), mock.patch.object(
+                app_core,
+                "read_codex_exec_help",
+                return_value="Usage: codex exec\n  -c, --config <key=value>",
+            ), mock.patch.object(
+                app_core,
+                "copy_workspace",
+                side_effect=copy_tree,
+            ), mock.patch.object(
+                app_core,
+                "prepare_agent_codex_home",
+                side_effect=prepare_home,
+            ), mock.patch.object(
+                app_core,
+                "read_effective_codex_developer_instructions",
+                return_value=None,
+            ), mock.patch.object(
+                app_core,
+                "build_codex_command",
+                side_effect=build_command,
+            ):
+                returncode = app_core.run_once(
+                    args,
+                    "Original request.",
+                    progress_callback=lambda _event: None,
+                    print_output=False,
+                )
+
+            run_root = next(runs.iterdir())
+            summary = json.loads(
+                (run_root / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(returncode, 0)
+            self.assertEqual(prepared_session_ids, [None, None])
+            self.assertTrue(
+                all(call.get("resume_session_id") is None for call in build_calls)
+            )
+            self.assertIsNone(summary["synthesis"]["resume_session_id"])
+            for idx in (1, 2):
+                received_prompt = (
+                    run_root
+                    / "workspaces"
+                    / f"agent_{idx:03d}"
+                    / "received_prompt.txt"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(received_prompt, "Original request.")
+            self.assertFalse(build_calls[0].get("developer_instructions"))
+            self.assertIn(
+                "second-stage synthesis Agent",
+                str(build_calls[1].get("developer_instructions") or ""),
+            )
+
+    def test_config_resolution_failure_falls_back_to_first_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            runs = root / "runs"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            codex_home.mkdir()
+            (workspace / "base.txt").write_text("baseline", encoding="utf-8")
+            args = parse_args(
+                [
+                    "prompt",
+                    "--workspace",
+                    str(workspace),
+                    "--runs-dir",
+                    str(runs),
+                    "-n",
+                    "1",
+                    "--synthesis-agents",
+                    "1",
+                    "--no-sync-back",
+                    "--keep-workspaces",
+                ]
+            )
+            command = [sys.executable, "-c", "pass"]
+            events: list[dict[str, object]] = []
+
+            def copy_tree(source: Path, destination: Path, **_kwargs: object) -> None:
+                shutil.copytree(source, destination)
+
+            def prepare_home(
+                _source: Path,
+                destination: Path,
+                _workspace: Path,
+                _session_id: str | None,
+            ) -> None:
+                destination.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(
+                app_core,
+                "get_codex_home",
+                return_value=codex_home,
+            ), mock.patch.object(
+                app_core,
+                "read_codex_exec_help",
+                return_value="Usage: codex exec\n  -c, --config <key=value>",
+            ), mock.patch.object(
+                app_core,
+                "copy_workspace",
+                side_effect=copy_tree,
+            ), mock.patch.object(
+                app_core,
+                "prepare_agent_codex_home",
+                side_effect=prepare_home,
+            ), mock.patch.object(
+                app_core,
+                "read_effective_codex_developer_instructions",
+                side_effect=RuntimeError("config/read unavailable"),
+            ), mock.patch.object(
+                app_core,
+                "build_codex_command",
+                return_value=(command, {}),
+            ) as build_command:
+                returncode = app_core.run_once(
+                    args,
+                    "Original request.",
+                    progress_callback=events.append,
+                    print_output=False,
+                )
+
+            run_root = next(runs.iterdir())
+            summary = json.loads(
+                (run_root / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(returncode, 0)
+            self.assertEqual(summary["best_agent"], "agent_001")
+            self.assertEqual(summary["synthesis"]["status"], "failed")
+            self.assertIn("config/read unavailable", summary["synthesis"]["error"])
+            build_command.assert_called_once()
+            synthesis_finished = next(
+                event for event in events if event.get("type") == "synthesis_finished"
+            )
+            self.assertIn("config/read unavailable", str(synthesis_finished["error"]))
 
 
 class AdditionalAgentTests(unittest.TestCase):
@@ -1648,7 +2117,9 @@ class TuiCommandTests(unittest.TestCase):
                     "type": "synthesis_started",
                     "indices": [3, 4],
                     "source_agents": [1, 2],
-                    "prompt": "wrapped synthesis prompt",
+                    "prompt": "original request",
+                    "user_prompt": "original request",
+                    "developer_instructions": "internal synthesis instructions",
                 }
             )
         )
@@ -1658,8 +2129,17 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.agents[3].input_text, "original request")
         self.assertEqual(
             app.agents[3].execution_prompt,
-            "wrapped synthesis prompt",
+            "original request",
         )
+        self.assertEqual(
+            app.agents[3].developer_instructions,
+            "internal synthesis instructions",
+        )
+        detail_text = "\n".join(
+            text for _prefix, text, _style in app._detail_blocks(app.agents[3])
+        )
+        self.assertIn("original request", detail_text)
+        self.assertNotIn("internal synthesis instructions", detail_text)
         self.assertIn("synthesis", app._detail_title(app.agents[3]))
 
         app._on_runner_event(
@@ -1757,7 +2237,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.selected_agent, 3)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_retry_preserves_synthesis_role_and_wrapped_prompt(self) -> None:
+    def test_tui_retry_preserves_synthesis_role_and_internal_instructions(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
         app._sync = lambda: None
         app.running = True
@@ -1768,7 +2248,8 @@ class TuiCommandTests(unittest.TestCase):
             idx=2,
             role="synthesis",
             status="failed",
-            execution_prompt="wrapped synthesis prompt",
+            execution_prompt="original request",
+            developer_instructions="internal synthesis instructions",
             result=make_agent_result_data(
                 2,
                 Path("/tmp/synthesis-2"),
@@ -1782,17 +2263,34 @@ class TuiCommandTests(unittest.TestCase):
 
         batch = app.candidate_batches[0]
         self.assertEqual(batch.role, "synthesis")
-        self.assertEqual(batch.prompt, "wrapped synthesis prompt")
+        self.assertEqual(batch.prompt, "original request")
+        self.assertEqual(
+            batch.developer_instructions,
+            "internal synthesis instructions",
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_launches_queued_candidate_batch_with_original_run_settings(self) -> None:
-        app = tui_textual.PcrTextualApp(parse_args(["-n", "2", "--model", "original-model"]))
+    def test_tui_launches_queued_candidate_batch_with_run_start_settings(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(
+                [
+                    "-n",
+                    "2",
+                    "--model",
+                    "original-model",
+                    "--resume-session-id",
+                    "run-start-session",
+                ]
+            )
+        )
         app._sync = lambda: None
         app.pending_prompt = "current question"
         app.pending_run_root = Path("/tmp/pcr-test/run")
         app.pending_workspaces_root = app.pending_run_root / "workspaces"
         app.pending_workspace = Path("/tmp/pcr-test/workspace")
         app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.resume_session_id = "later-live-session"
+        app.args.resume_session_id = "later-live-session"
         app.agents[3] = tui_textual.AgentPane(
             idx=3,
             status="queued",
@@ -1812,10 +2310,11 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(call["agent_indices"], [3])
         self.assertEqual(call["prompt"], "current question")
         self.assertEqual(call["args"].model, "original-model")
+        self.assertEqual(call["resume_session_id"], "run-start-session")
         self.assertEqual(events[-1]["type"], "candidate_batch_finished")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_synthesis_retry_starts_fresh_without_candidate_resume(self) -> None:
+    def test_tui_synthesis_retry_inherits_resume_and_internal_instructions(self) -> None:
         app = tui_textual.PcrTextualApp(
             parse_args(["-n", "1", "--resume-session-id", "candidate-session"])
         )
@@ -1830,14 +2329,16 @@ class TuiCommandTests(unittest.TestCase):
             role="synthesis",
             status="queued",
             input_text="original request",
-            execution_prompt="wrapped synthesis prompt",
+            execution_prompt="original request",
+            developer_instructions="internal synthesis instructions",
         )
         app.candidate_batches.append(
             tui_textual.CandidateBatch(
                 [2],
                 {2},
                 role="synthesis",
-                prompt="wrapped synthesis prompt",
+                prompt="original request",
+                developer_instructions="internal synthesis instructions",
             )
         )
         app._post_progress = lambda _event: None
@@ -1852,9 +2353,13 @@ class TuiCommandTests(unittest.TestCase):
                 thread_cls.call_args.kwargs["target"]()
 
         call = retry.call_args.kwargs
-        self.assertEqual(call["prompt"], "wrapped synthesis prompt")
+        self.assertEqual(call["prompt"], "original request")
         self.assertEqual(call["agent_role"], "synthesis")
-        self.assertIsNone(call["resume_session_id"])
+        self.assertEqual(call["resume_session_id"], "candidate-session")
+        self.assertEqual(
+            call["developer_instructions"],
+            "internal synthesis instructions",
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_diff_view_loads_and_toggles_full_patch(self) -> None:

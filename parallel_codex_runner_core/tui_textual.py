@@ -40,7 +40,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ),
     (
         "/synthesis <n|off>",
-        "set fresh review-and-synthesis agents for the next run",
+        "set isolated review-and-synthesis agents for the next run",
     ),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
     ("/effort <auto|level>", "set a model-supported reasoning effort for the next run"),
@@ -599,6 +599,7 @@ else:
         reasoning_token_counts: dict[int, int] = field(default_factory=dict)
         input_text: str = ""
         execution_prompt: str = ""
+        developer_instructions: str = ""
         final_text: str = ""
         result: dict[str, Any] | None = None
         attempt_history: list[tuple[str, str, str]] = field(default_factory=list)
@@ -673,6 +674,7 @@ else:
         retry_indices: set[int] = field(default_factory=set)
         role: str = AGENT_ROLE_CANDIDATE
         prompt: str = ""
+        developer_instructions: str = ""
 
 
     class RunnerEvent(Message):
@@ -2214,7 +2216,14 @@ else:
                     if isinstance(raw_indices, list)
                     else []
                 )
-                execution_prompt = str(payload.get("prompt") or "")
+                user_prompt = str(
+                    payload.get("user_prompt")
+                    or payload.get("prompt")
+                    or self.pending_prompt
+                )
+                developer_instructions = str(
+                    payload.get("developer_instructions") or ""
+                )
                 for synthesis_idx in indices:
                     pane = self.agents.get(synthesis_idx)
                     if pane is None:
@@ -2222,12 +2231,15 @@ else:
                             idx=synthesis_idx,
                             role=AGENT_ROLE_SYNTHESIS,
                             status="queued",
-                            input_text=self.pending_prompt,
-                            execution_prompt=execution_prompt,
+                            input_text=user_prompt,
+                            execution_prompt=user_prompt,
+                            developer_instructions=developer_instructions,
                         )
                     else:
                         pane.role = AGENT_ROLE_SYNTHESIS
-                        pane.execution_prompt = execution_prompt
+                        pane.input_text = user_prompt
+                        pane.execution_prompt = user_prompt
+                        pane.developer_instructions = developer_instructions
                     self.agent_cancel_events.setdefault(
                         synthesis_idx,
                         threading.Event(),
@@ -2800,6 +2812,7 @@ else:
                     {idx},
                     role=pane.role,
                     prompt=pane.execution_prompt or self.pending_prompt,
+                    developer_instructions=pane.developer_instructions,
                 )
             )
             pane.status = "retry queued"
@@ -3598,6 +3611,7 @@ else:
                 pane = self.agents[idx]
                 pane.role = batch.role
                 pane.execution_prompt = execution_prompt
+                pane.developer_instructions = batch.developer_instructions
                 if idx in batch.retry_indices:
                     self._prepare_retry_pane(pane)
                 else:
@@ -3637,16 +3651,19 @@ else:
                             agent_indices=batch.indices,
                             run_root=self.pending_run_root,
                             workspace=self._pending_workspace_path(),
-                            resume_session_id=(
-                                None
-                                if batch.role == AGENT_ROLE_SYNTHESIS
-                                else getattr(run_args, "resume_session_id", None)
+                            resume_session_id=getattr(
+                                run_args,
+                                "resume_session_id",
+                                None,
                             ),
                             retry_indices=batch.retry_indices,
                             progress_callback=self._post_progress,
                             cancel_event=cancel_event,
                             agent_cancel_events=run_args.agent_cancel_events,
                             agent_role=batch.role,
+                            developer_instructions=(
+                                batch.developer_instructions or None
+                            ),
                         )
                     self._post_progress(
                         {
