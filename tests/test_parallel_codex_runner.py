@@ -1207,7 +1207,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.recommended_agent, 5)
         self.assertEqual(app.num_agents, 2)
         self.assertTrue(app._has_pending_run())
-        self.assertFalse(app._pending_sync_disabled())
+        self.assertTrue(app._pending_sync_disabled())
         self.assertTrue(app._pending_keep_enabled())
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
@@ -1231,7 +1231,7 @@ class TuiCommandTests(unittest.TestCase):
         remove_homes.assert_called_once_with(app.pending_run_root / "meta")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_exit_finalizes_displayed_agent_after_next_config_change(self) -> None:
+    def test_tui_exit_discards_pending_run_after_sync_is_disabled(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "5"]))
         app._sync = lambda: None
         app._show_text = lambda _text: None
@@ -1242,15 +1242,15 @@ class TuiCommandTests(unittest.TestCase):
         app.agents[3].result = {"status": "success"}
         app._handle_syncback(["off"])
 
-        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
-            with mock.patch.object(app, "exit") as exit_app:
-                app._request_exit()
+        with (
+            mock.patch.object(app, "_finalize_agent", return_value=True) as finalize,
+            mock.patch.object(app, "_discard_pending_run", return_value=True) as discard,
+            mock.patch.object(app, "exit") as exit_app,
+        ):
+            app._request_exit()
 
-        finalize.assert_called_once_with(
-            3,
-            require_resume=False,
-            archive_detail=False,
-        )
+        finalize.assert_not_called()
+        discard.assert_called_once_with()
         exit_app.assert_called_once_with()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -2750,7 +2750,6 @@ class TuiCommandTests(unittest.TestCase):
         app.recommended_agent = 5
         app.selected_agent = 4
         app._handle_numofagents(["2"])
-        app._handle_syncback(["off"])
 
         with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
             with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:

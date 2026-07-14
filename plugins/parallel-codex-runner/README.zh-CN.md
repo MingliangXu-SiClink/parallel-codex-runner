@@ -54,10 +54,13 @@ codex plugin add parallel-codex-runner@personal
 完整流程如下：
 
 1. PCR 估算所需空间并启动隔离候选。
-2. Codex 分页读取各 Agent 按时间排序的事件。
-3. 你检查最终回复和完整工作区 Diff。
-4. 你可以排除、停止、重试或增加候选。
-5. 只有你明确接受的成功 Agent 才会被回写。
+2. Codex 持续查看候选进度，直到这一批任务结束。
+3. Codex 比较最终回复与完整工作区 Diff，说明理由并推荐一个候选。
+4. 你确认采用哪个 Agent，也可以要求排除、重试或增加候选。
+5. 只有经过你确认的成功 Agent 才会被回写到原始工作区。
+
+等待你审查期间，候选工作区会自动保留。只有希望采用结果后仍保留这些目录时，
+才需要设置 `keep_workspaces=true`；Codex 比较候选时不需要开启它。
 
 下一项需求需要沿用某个 Agent 的工作区和 Codex 对话时，可以使用
 `pcr_continue_from_agent` 一次完成采用和继续运行。
@@ -72,7 +75,7 @@ codex plugin add parallel-codex-runner@personal
 | `pcr_wait_for_run` | 等待一小段时间并返回状态和新增事件。 |
 | `pcr_get_run` / `pcr_get_agent` | 查看运行、Agent、回复、日志与 Token 状态。 |
 | `pcr_get_diff` | 以无损分页方式读取支持删除操作的完整 Patch。 |
-| `pcr_kill_agent` / `pcr_stop_run` | 停止单个候选或整批任务。 |
+| `pcr_kill_agent` / `pcr_stop_run` | 停止一个正在运行的候选，或停止整批任务。 |
 | `pcr_reject_agent` | 从推荐范围排除候选，或恢复候选。 |
 | `pcr_retry_agent` / `pcr_add_agents` | 重试未成功的候选，或增加候选。 |
 | `pcr_accept_agent` | 采用成功 Agent，按配置回写并清理。 |

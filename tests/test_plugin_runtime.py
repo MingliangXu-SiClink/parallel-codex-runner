@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import parallel_codex_runner_core.plugin_runtime as plugin_runtime
+from parallel_codex_runner_core.plugin import worker as plugin_worker
 from parallel_codex_runner_core.codex_models import (
     CodexModelInfo,
     CodexModelRegistry,
@@ -27,7 +29,7 @@ from parallel_codex_runner_core.plugin_runtime import (
     PluginRunError,
     PluginRunManager,
 )
-from parallel_codex_runner_core.plugin.artifacts import RUN_MARKER_NAME
+from parallel_codex_runner_core.plugin.artifacts import ArtifactError, RUN_MARKER_NAME
 from parallel_codex_runner_core.plugin.events import EventLog
 
 
@@ -171,6 +173,91 @@ class PluginRunManagerTests(unittest.TestCase):
         self.assertFalse(completed["still_running"])
         self.assertEqual(completed["status"], "completed")
         return completed
+
+    def execute_expired_worker(
+        self,
+        root: Path,
+        *,
+        keep_workspaces: bool,
+        fail_diff_persistence: bool = False,
+    ) -> tuple[Path, dict]:
+        workspace = root / "workspace"
+        workspace.mkdir()
+        (workspace / "tracked.txt").write_text("original\n", encoding="utf-8")
+        runs_dir = root / "runs"
+        state_dir = root / "state"
+        run = ManagedRun(
+            run_id="pcr-20260713T120000Z-1234abcd",
+            prompt="expired task",
+            workspace=str(workspace.resolve()),
+            config={
+                "num_agents": 1,
+                "max_parallel": 1,
+                "serial": False,
+                "recommend_by": "reasoning_tokens",
+                "model": None,
+                "effort": None,
+                "resume_session_id": None,
+                "runs_dir": str(runs_dir),
+                "codex_bin": "codex",
+                "keep_workspaces": keep_workspaces,
+                "run_base": str(runs_dir.resolve()),
+            },
+            artifact_token="artifact-token",
+            worker_deadline=(
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+            ).isoformat(),
+        )
+        request_path = state_dir / "workers" / "requests" / "request.json"
+        request_path.parent.mkdir(parents=True)
+        request_path.write_text(
+            json.dumps({"run": run.to_dict(), "operation": "initial"}),
+            encoding="utf-8",
+        )
+        run_root = runs_dir / "20260713_120003"
+
+        def fake_run(args, prompt, progress_callback, print_output):
+            del args, prompt, print_output
+            run_root.mkdir(parents=True)
+            progress_callback(
+                {"type": "run_prepared", "rows": [["RUNS_ROOT", str(run_root)]]}
+            )
+            result = make_result(run_root, 1, tokens=100)
+            candidate = Path(result.workspace_dir)
+            (candidate / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+            Path(result.codex_home).mkdir(parents=True)
+            progress_callback(
+                {"type": "agent_finished", "idx": 1, "result": asdict(result)}
+            )
+            progress_callback(
+                {
+                    "type": "run_finished",
+                    "run_root": str(run_root),
+                    "cancelled": True,
+                }
+            )
+            return 130
+
+        with mock.patch.object(plugin_worker, "run_once", side_effect=fake_run):
+            if fail_diff_persistence:
+                with mock.patch.object(
+                    plugin_worker.ArtifactStore,
+                    "persist_successful_diffs",
+                    side_effect=ArtifactError("cannot preserve diff"),
+                ):
+                    plugin_worker.execute_request(state_dir, request_path)
+            else:
+                plugin_worker.execute_request(state_dir, request_path)
+
+        events = EventLog(state_dir / "events").read(
+            run.run_id,
+            cursor=0,
+            limit=100,
+        )["events"]
+        finished = next(
+            event for event in reversed(events) if event["type"] == "plugin_worker_finished"
+        )
+        return run_root, finished
 
     def test_run_events_diff_recommendation_and_accept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +590,93 @@ class PluginRunManagerTests(unittest.TestCase):
             finally:
                 manager.close()
 
+    def test_expired_worker_preserves_diff_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root, finished = self.execute_expired_worker(
+                Path(tmp),
+                keep_workspaces=False,
+            )
+
+            patch = run_root / "plugin" / "diffs" / "agent_001.patch"
+            self.assertIn("candidate", patch.read_text(encoding="utf-8"))
+            self.assertFalse((run_root / "workspaces").exists())
+            self.assertFalse((run_root / "meta" / "agent_001" / "codex_home").exists())
+            self.assertTrue(finished["cleanup_attempted"])
+            self.assertTrue(finished["workspaces_deleted"])
+            self.assertTrue(finished["codex_homes_deleted"])
+            self.assertIsNone(finished["cleanup_error"])
+
+    def test_expired_worker_reports_retained_artifacts_truthfully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root, finished = self.execute_expired_worker(
+                Path(tmp),
+                keep_workspaces=True,
+            )
+
+            self.assertTrue((run_root / "workspaces" / "agent_001").is_dir())
+            self.assertTrue(
+                (run_root / "meta" / "agent_001" / "codex_home").is_dir()
+            )
+            self.assertFalse(finished["cleanup_attempted"])
+            self.assertFalse(finished["workspaces_deleted"])
+            self.assertFalse(finished["codex_homes_deleted"])
+            self.assertIsNone(finished["cleanup_error"])
+
+    def test_expired_worker_keeps_workspace_when_diff_cannot_be_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root, finished = self.execute_expired_worker(
+                Path(tmp),
+                keep_workspaces=False,
+                fail_diff_persistence=True,
+            )
+
+            self.assertTrue((run_root / "workspaces" / "agent_001").is_dir())
+            self.assertFalse(finished["workspaces_deleted"])
+            self.assertFalse(finished["codex_homes_deleted"])
+            self.assertIn("cannot preserve diff", finished["cleanup_error"])
+
+    def test_expired_worker_event_does_not_infer_cleanup_from_no_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PluginRunManager(Path(tmp) / "state")
+            try:
+                run = ManagedRun(
+                    run_id="pcr-20260713T120000Z-1234abcd",
+                    prompt="retained",
+                    workspace=str(Path(tmp).resolve()),
+                    config={"keep_workspaces": True},
+                    status="running",
+                )
+                manager._apply_progress_locked(
+                    run,
+                    {
+                        "type": "plugin_worker_finished",
+                        "expired": True,
+                        "cleanup_error": None,
+                        "workspaces_deleted": False,
+                        "codex_homes_deleted": False,
+                    },
+                )
+                self.assertEqual(run.status, "expired")
+                self.assertFalse(run.workspaces_deleted)
+                self.assertFalse(run.codex_homes_deleted)
+            finally:
+                manager.close()
+
+    def test_worker_removes_consumed_request_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            request = state_dir / "workers" / "requests" / "operation.json"
+            request.parent.mkdir(parents=True)
+            request.write_text("{}\n", encoding="utf-8")
+
+            with mock.patch.object(plugin_worker, "execute_request", return_value=0):
+                exit_code = plugin_worker.main(
+                    ["--state-dir", str(state_dir), "--request", str(request)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(request.exists())
+
     def test_kill_agent_stops_only_requested_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -553,6 +727,37 @@ class PluginRunManagerTests(unittest.TestCase):
                         started["run_id"], timeout_seconds=5
                     )
                 self.assertEqual(completed["agents"][0]["status"], "killed")
+            finally:
+                manager.close()
+
+    def test_kill_agent_rejects_queued_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = PluginRunManager(root / "state")
+            run = ManagedRun(
+                run_id="pcr-20260713T120000Z-1234abcd",
+                prompt="queued task",
+                workspace=str(root.resolve()),
+                config={},
+                status="running",
+                agent_statuses={1: "queued"},
+            )
+            try:
+                manager._runs[run.run_id] = run
+                with mock.patch.object(
+                    manager,
+                    "_worker_active_locked",
+                    return_value=True,
+                ):
+                    with self.assertRaisesRegex(
+                        PluginRunError,
+                        "queued Agents start normally",
+                    ):
+                        manager.kill_agent(run.run_id, 1)
+                self.assertEqual(run.agent_statuses[1], "queued")
+                self.assertFalse(
+                    (manager.control_dir / run.run_id / "kill-agent-001").exists()
+                )
             finally:
                 manager.close()
 
@@ -661,6 +866,58 @@ class PluginRunManagerTests(unittest.TestCase):
                     manager.discard_run(completed["run_id"])
                 self.assertTrue((run_root / "workspaces" / "agent_001").exists())
             finally:
+                manager.close()
+
+    def test_retention_purges_run_root_and_worker_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            manager = PluginRunManager(state_dir)
+            observer = None
+            try:
+                completed = self.start_completed_run(root, manager, num_agents=1)
+                run_id = completed["run_id"]
+                run_root = Path(completed["run_root"])
+                observer = PluginRunManager(state_dir)
+                self.assertEqual(observer.get_run(run_id)["status"], "completed")
+                manager.artifact_retention_seconds = 1
+                expired_at = (
+                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=5)
+                ).isoformat()
+                with manager._lock:
+                    manager._runs[run_id].expires_at = expired_at
+                    manager._save_state_locked()
+
+                control_file = state_dir / "control" / run_id / "stop"
+                control_file.parent.mkdir(parents=True, exist_ok=True)
+                control_file.write_text("stop\n", encoding="utf-8")
+                workers_dir = state_dir / "workers"
+                workers_dir.mkdir(parents=True, exist_ok=True)
+                status_file = workers_dir / f"{run_id}.json"
+                status_file.write_text("{}\n", encoding="utf-8")
+                request_file = workers_dir / "requests" / f"{run_id}-stale.json"
+                request_file.parent.mkdir(parents=True, exist_ok=True)
+                request_file.write_text("{}\n", encoding="utf-8")
+                operation_lock = state_dir / "locks" / f"{run_id}.lock"
+                operation_lock.write_text("{}\n", encoding="utf-8")
+
+                cleaned = manager.cleanup_expired_runs()
+                observer.close()
+
+                self.assertIn(run_id, cleaned["cleaned_records"])
+                self.assertFalse(run_root.exists())
+                self.assertFalse(control_file.parent.exists())
+                self.assertFalse(status_file.exists())
+                self.assertFalse(request_file.exists())
+                self.assertFalse(operation_lock.exists())
+                self.assertFalse((state_dir / "events" / f"{run_id}.jsonl").exists())
+                payload = json.loads(
+                    (state_dir / "runs.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(payload["runs"], [])
+            finally:
+                if observer is not None:
+                    observer.close()
                 manager.close()
 
     def test_active_runs_are_recovered_as_interrupted(self) -> None:

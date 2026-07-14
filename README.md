@@ -116,7 +116,11 @@ The settings at the top of the TUI are editable too.
 
 ## Codex App Plugin
 
-PCR also ships as a local Codex App plugin. It uses the same execution and workspace code as the CLI, but exposes the review workflow through MCP tools: Codex can start candidates, follow events, inspect paged full patches, stop or retry Agents, and finalize the branch you approve.
+PCR also ships as a local Codex App plugin. The normal interaction is deliberately
+short: give Codex a task, let PCR keep the isolated candidates while they run,
+then review Codex's comparison and recommendation. Nothing is synced until you
+confirm an Agent. The worker, event, and retention machinery stays in the
+background so an App or MCP restart does not silently lose an active run.
 
 Install the runtime, verify it, register this repository as a local marketplace,
 and install the plugin:

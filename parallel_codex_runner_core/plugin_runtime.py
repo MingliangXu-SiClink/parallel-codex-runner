@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -34,7 +35,7 @@ from .app import (
 )
 from .codex_models import CodexModelRegistry
 from .models import AgentResult
-from .paths import choose_run_base, default_run_anchor
+from .paths import choose_run_base, default_run_anchor, is_relative_to
 from .workspace import cleanup_workspace_copies, sync_best_workspace_back
 from .plugin.artifacts import (
     ArtifactError,
@@ -243,7 +244,12 @@ class PluginRunManager:
         if changed:
             self._save_state_locked()
 
-    def _save_state_locked(self) -> None:
+    def _save_state_locked(
+        self,
+        *,
+        deleted_run_ids: set[str] | None = None,
+    ) -> None:
+        deleted = deleted_run_ids or set()
         with self._state_store.locked():
             try:
                 payload = self._state_store.load_payload()
@@ -254,9 +260,13 @@ class PluginRunManager:
                     if not isinstance(value, dict):
                         continue
                     disk_run = ManagedRun.from_dict(value)
+                    if disk_run.run_id in deleted:
+                        continue
                     local = self._runs.get(disk_run.run_id)
                     if local is None or disk_run.updated_at > local.updated_at:
                         self._runs[disk_run.run_id] = disk_run
+            for run_id in deleted:
+                self._runs.pop(run_id, None)
             self._state_store.write_runs(self._runs)
         self._harden_path(self.state_path, 0o600)
 
@@ -307,15 +317,22 @@ class PluginRunManager:
             return
         if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
             return
+        disk_run_ids: set[str] = set()
         for value in payload["runs"]:
             if not isinstance(value, dict):
                 continue
             disk_run = ManagedRun.from_dict(value)
             if not RUN_ID_PATTERN.fullmatch(disk_run.run_id):
                 continue
+            disk_run_ids.add(disk_run.run_id)
             local = self._runs.get(disk_run.run_id)
             if local is None or disk_run.updated_at > local.updated_at:
                 self._runs[disk_run.run_id] = disk_run
+        for run_id, run in list(self._runs.items()):
+            if run_id in disk_run_ids or run_id in self._run_operations:
+                continue
+            if not self._worker_active_locked(run):
+                self._runs.pop(run_id, None)
 
     def _require_run_locked(self, run_id: str) -> ManagedRun:
         self._sync_state_from_disk_locked()
@@ -396,6 +413,7 @@ class PluginRunManager:
     def _finish_shutdown_locked(self) -> None:
         if not self._closed or self._run_operations:
             return
+        self._sync_state_from_disk_locked()
         self._save_state_locked()
 
     def _recompute_recommendation_locked(self, run: ManagedRun) -> None:
@@ -489,8 +507,13 @@ class PluginRunManager:
             if payload.get("expired"):
                 run.status = "expired"
                 run.error = "PCR worker exceeded its configured runtime limit"
-                run.workspaces_deleted = not bool(payload.get("cleanup_error"))
-                run.codex_homes_deleted = not bool(payload.get("cleanup_error"))
+                if "workspaces_deleted" in payload:
+                    run.workspaces_deleted = bool(payload.get("workspaces_deleted"))
+                if "codex_homes_deleted" in payload:
+                    run.codex_homes_deleted = bool(payload.get("codex_homes_deleted"))
+                cleanup_error = str(payload.get("cleanup_error") or "").strip()
+                if cleanup_error:
+                    run.error += f"; artifact cleanup failed: {cleanup_error}"
         run.updated_at = str(payload.get("timestamp") or _utc_now())
 
     def _refresh_events_locked(
@@ -568,17 +591,12 @@ class PluginRunManager:
             run.codex_homes_deleted = True
             return
         if preserve_diffs:
-            for idx, result in sorted(run.results.items()):
-                if result.get("status") != "success":
-                    continue
-                try:
-                    self._artifacts.persist_diff(
-                        run,
-                        idx,
-                        result.get("workspace_dir"),
-                    )
-                except ArtifactError:
-                    pass
+            try:
+                self._artifacts.persist_successful_diffs(run)
+            except ArtifactError as exc:
+                raise PluginRunError(
+                    f"Cannot preserve completed Agent diffs before cleanup: {exc}"
+                ) from exc
         workspace = self._workspace_for_run(run)
         workspaces_root = self._workspaces_root_for_run(run)
         if workspaces_root.exists():
@@ -588,6 +606,75 @@ class PluginRunManager:
             run.codex_homes_deleted = self._artifacts.remove_codex_homes(run)
         except ArtifactError as exc:
             raise PluginRunError(str(exc)) from exc
+
+    def _validated_state_parent(self, parent: Path) -> Path:
+        if parent.is_symlink():
+            raise PluginRunError(f"Plugin state directory was replaced by a symlink: {parent}")
+        resolved = parent.resolve()
+        if resolved == self.state_dir or not is_relative_to(resolved, self.state_dir):
+            raise PluginRunError(f"Refusing to clean an unverified state path: {parent}")
+        return resolved
+
+    def _remove_owned_state_path(
+        self,
+        path: Path,
+        parent: Path,
+        *,
+        directory: bool = False,
+    ) -> None:
+        verified_parent = self._validated_state_parent(parent)
+        if path.parent.resolve() != verified_parent:
+            raise PluginRunError(f"Refusing to clean an unverified state path: {path}")
+        if path.is_symlink():
+            path.unlink()
+            return
+        if not path.exists():
+            return
+        if directory:
+            if not path.is_dir():
+                raise PluginRunError(f"Expected a plugin state directory: {path}")
+            shutil.rmtree(path)
+            return
+        if not path.is_file():
+            raise PluginRunError(f"Expected a plugin state file: {path}")
+        path.unlink()
+
+    def _purge_retained_artifacts_locked(self, run: ManagedRun) -> None:
+        operation = "retained artifact cleanup"
+        try:
+            with RunOperationLock(self.locks_dir, run.run_id, operation):
+                if not self._artifacts.remove_run_root(run):
+                    raise PluginRunError(
+                        f"Could not remove retained run artifacts for {run.run_id}"
+                    )
+
+                self._remove_owned_state_path(
+                    self.control_dir / run.run_id,
+                    self.control_dir,
+                    directory=True,
+                )
+                workers_dir = self.state_dir / "workers"
+                self._remove_owned_state_path(
+                    workers_dir / f"{run.run_id}.json",
+                    workers_dir,
+                )
+                requests_dir = workers_dir / "requests"
+                self._validated_state_parent(requests_dir)
+                if requests_dir.exists():
+                    for request in requests_dir.glob(f"{run.run_id}-*.json"):
+                        self._remove_owned_state_path(request, requests_dir)
+                self._events.delete(run.run_id)
+        except RuntimeError as exc:
+            raise PluginRunError(str(exc)) from exc
+
+        self._remove_owned_state_path(
+            self.locks_dir / f"{run.run_id}.lock",
+            self.locks_dir,
+        )
+        self._contexts.pop(run.run_id, None)
+        process = self._worker_processes.pop(run.run_id, None)
+        if process is not None:
+            process.poll()
 
     def _run_maintenance_locked(self) -> None:
         now = time.time()
@@ -632,12 +719,23 @@ class PluginRunManager:
                 and run.status in FINAL_RUN_STATES | {"expired", "interrupted", "failed"}
             ):
                 removable.append(run.run_id)
+        removed: set[str] = set()
         for run_id in removable:
-            self._events.delete(run_id)
+            run = self._runs.get(run_id)
+            if run is None:
+                continue
+            try:
+                self._purge_retained_artifacts_locked(run)
+            except Exception as exc:  # noqa: BLE001
+                run.error = f"Retained artifact cleanup failed: {exc}"
+                run.updated_at = _utc_now()
+                changed = True
+                continue
             self._runs.pop(run_id, None)
+            removed.add(run_id)
             changed = True
         if changed:
-            self._save_state_locked()
+            self._save_state_locked(deleted_run_ids=removed)
 
     def cleanup_expired_runs(self) -> Dict[str, Any]:
         with self._lock:
@@ -1311,6 +1409,14 @@ class PluginRunManager:
             current = run.agent_statuses.get(agent)
             if current in {"success", "failed", "error", "killed", "cancelled"}:
                 raise PluginRunError(f"AGENT-{agent:03d} has already finished")
+            if current == "queued":
+                raise PluginRunError(
+                    f"AGENT-{agent:03d} is queued; queued Agents start normally"
+                )
+            if current == "stopping":
+                raise PluginRunError(f"AGENT-{agent:03d} is already stopping")
+            if current != "running":
+                raise PluginRunError(f"AGENT-{agent:03d} is not running")
             if context is not None:
                 cancel_event = context.agent_cancel_events.get(agent)
                 if cancel_event is None:
@@ -1723,19 +1829,12 @@ class PluginRunManager:
             raise PluginRunError(str(exc)) from exc
 
     def _persist_completed_diffs_locked(self, run: ManagedRun) -> None:
-        for idx, value in sorted(run.results.items()):
-            if value.get("status") != "success":
-                continue
-            try:
-                self._artifacts.persist_diff(
-                    run,
-                    idx,
-                    value.get("workspace_dir"),
-                )
-            except ArtifactError as exc:
-                self._startup_warnings.append(
-                    f"Could not preserve AGENT-{idx:03d} diff: {exc}"
-                )
+        try:
+            self._artifacts.persist_successful_diffs(run)
+        except ArtifactError as exc:
+            raise PluginRunError(
+                f"Cannot preserve completed Agent diffs before cleanup: {exc}"
+            ) from exc
 
     def _mark_cleanup_failure(
         self,

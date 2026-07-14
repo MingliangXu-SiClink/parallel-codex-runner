@@ -108,6 +108,8 @@ def pcr_start_run(
 ) -> Dict[str, Any]:
     """Start isolated Codex candidates without changing the original workspace yet.
 
+    Candidate workspaces remain available for review until accept, discard, or
+    expiry. keep_workspaces controls whether they remain after finalization.
     A result with status confirmation_required is not a started run. Present its
     storage estimate to the user and call again with confirm_large_run only after
     explicit approval.
@@ -234,7 +236,7 @@ def pcr_reject_agent(
 
 @mcp.tool(annotations=DESTRUCTIVE)
 def pcr_kill_agent(run_id: str, agent: int) -> Dict[str, Any]:
-    """Stop one running or queued Agent without cancelling the other candidates."""
+    """Stop one running Agent without cancelling the other candidates."""
     return get_manager().kill_agent(run_id=run_id, agent=agent)
 
 

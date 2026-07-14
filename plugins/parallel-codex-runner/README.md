@@ -54,10 +54,14 @@ from the session I select.
 The normal workflow is:
 
 1. PCR estimates the storage needed and starts isolated candidates.
-2. Codex follows paged chronological events while the candidates run.
-3. You review final responses and complete workspace diffs.
-4. You can reject, kill, retry, or add candidates.
-5. PCR syncs only the successful Agent you explicitly accept.
+2. Codex follows the candidates until the batch settles.
+3. Codex compares their final responses and complete workspace diffs, then recommends one candidate with reasons.
+4. You confirm which Agent to accept, or ask to reject, retry, or add candidates.
+5. Only the successful Agent you confirm is synced to the original workspace.
+
+Candidate workspaces stay available throughout this review automatically.
+`keep_workspaces=true` is only needed when you also want them retained after
+finalization; it is not required for Codex to compare candidates.
 
 Use `pcr_continue_from_agent` when the next request should begin from a selected
 Agent's workspace and promoted Codex conversation in one operation.
@@ -72,7 +76,7 @@ Runs and additional candidate batches estimated above 5 GiB require a separate c
 | `pcr_wait_for_run` | Wait briefly and return status plus new chronological events. |
 | `pcr_get_run` / `pcr_get_agent` | Inspect run and Agent state, messages, logs, and tokens. |
 | `pcr_get_diff` | Read the complete delete-aware patch in lossless pages. |
-| `pcr_kill_agent` / `pcr_stop_run` | Stop one candidate or the whole active batch. |
+| `pcr_kill_agent` / `pcr_stop_run` | Stop one running candidate or the whole active batch. |
 | `pcr_reject_agent` | Exclude or restore a candidate in the recommendation pool. |
 | `pcr_retry_agent` / `pcr_add_agents` | Retry an unsuccessful candidate or add more candidates. |
 | `pcr_accept_agent` | Finalize one successful Agent, sync if enabled, and clean up. |

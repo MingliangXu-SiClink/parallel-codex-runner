@@ -85,7 +85,8 @@ def execute_request(state_dir: Path, request_path: Path) -> int:
     write_json_atomic(status_path, status)
 
     def report(payload: Dict[str, Any]) -> None:
-        if payload.get("type") == "run_prepared":
+        kind = str(payload.get("type") or "")
+        if kind == "run_prepared":
             rows = payload.get("rows")
             if isinstance(rows, list):
                 values = {
@@ -96,6 +97,14 @@ def execute_request(state_dir: Path, request_path: Path) -> int:
                 run.run_root = values.get("RUNS_ROOT", run.run_root)
                 if run.run_root:
                     artifacts.write_marker(run)
+        elif kind == "agent_finished":
+            try:
+                idx = int(payload.get("idx") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            result = payload.get("result")
+            if idx > 0 and isinstance(result, dict):
+                run.results[idx] = dict(result)
         events.append(run.run_id, payload)
 
     report(
@@ -160,19 +169,32 @@ def execute_request(state_dir: Path, request_path: Path) -> int:
 
     expired = cancel.deadline_elapsed
     cleanup_error = ""
+    cleanup_attempted = False
+    workspaces_deleted = False
+    codex_homes_deleted = False
     if expired and run.run_root and not bool(run.config.get("keep_workspaces")):
+        cleanup_attempted = True
         try:
+            artifacts.persist_successful_diffs(run)
             workspaces_root = artifacts.workspaces_root(run)
-            cleanup_workspace_copies(artifacts.workspace(run), workspaces_root)
-            artifacts.remove_codex_homes(run)
+            if workspaces_root.exists():
+                cleanup_workspace_copies(artifacts.workspace(run), workspaces_root)
+            workspaces_deleted = not workspaces_root.exists()
+            codex_homes_deleted = artifacts.remove_codex_homes(run)
         except Exception as exc:  # noqa: BLE001
             cleanup_error = str(exc)
+    elif expired and not run.run_root:
+        workspaces_deleted = True
+        codex_homes_deleted = True
     report(
         {
             "type": "plugin_worker_finished",
             "operation": operation,
             "exit_code": exit_code,
             "expired": expired,
+            "cleanup_attempted": cleanup_attempted,
+            "workspaces_deleted": workspaces_deleted,
+            "codex_homes_deleted": codex_homes_deleted,
             "cleanup_error": cleanup_error or None,
         }
     )
@@ -182,6 +204,9 @@ def execute_request(state_dir: Path, request_path: Path) -> int:
             "finished_at": utc_now(),
             "exit_code": exit_code,
             "expired": expired,
+            "cleanup_attempted": cleanup_attempted,
+            "workspaces_deleted": workspaces_deleted,
+            "codex_homes_deleted": codex_homes_deleted,
             "error": error or None,
             "cleanup_error": cleanup_error or None,
         }
@@ -201,12 +226,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    return execute_request(
-        Path(args.state_dir).expanduser().resolve(),
-        Path(args.request).expanduser().resolve(),
-    )
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    request_path = Path(args.request).expanduser().resolve()
+    try:
+        return execute_request(state_dir, request_path)
+    finally:
+        expected_parent = (state_dir / "workers" / "requests").resolve()
+        if request_path.parent == expected_parent and not request_path.is_dir():
+            try:
+                request_path.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

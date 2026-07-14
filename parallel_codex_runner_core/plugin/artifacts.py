@@ -49,6 +49,43 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 class ArtifactStore:
     """Validate PCR-owned paths and preserve review artifacts before cleanup."""
 
+    @staticmethod
+    def _run_root_location(run: ManagedRun, workspace: Path) -> Path:
+        raw_root = Path(run.run_root).expanduser()
+        if raw_root.is_symlink() or not raw_root.exists() or not raw_root.is_dir():
+            raise ArtifactError(
+                f"The recorded run root is no longer a real directory: {raw_root}"
+            )
+        root = raw_root.resolve()
+        configured_base = str(run.config.get("run_base") or "").strip()
+        if not configured_base:
+            raise ArtifactError("The run does not contain a verified run base")
+        base = Path(configured_base).expanduser().resolve()
+        if is_relative_to(base, workspace) or root.parent != base:
+            raise ArtifactError(f"The run root is outside its recorded run base: {root}")
+        if RUN_ROOT_PATTERN.fullmatch(root.name) is None:
+            raise ArtifactError(f"Unexpected PCR run directory name: {root.name}")
+        return root
+
+    @staticmethod
+    def _validate_marker(run: ManagedRun, root: Path) -> None:
+        marker = root / RUN_MARKER_NAME
+        if marker.is_symlink() or not marker.is_file():
+            raise ArtifactError(f"PCR plugin marker is missing: {marker}")
+        try:
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ArtifactError(f"Cannot validate PCR plugin marker: {marker}") from exc
+        expected = {
+            "run_id": run.run_id,
+            "workspace": run.workspace,
+            "artifact_token": run.artifact_token,
+        }
+        if not run.artifact_token or not isinstance(marker_data, dict):
+            raise ArtifactError(f"PCR plugin marker is invalid: {marker}")
+        if any(marker_data.get(key) != value for key, value in expected.items()):
+            raise ArtifactError(f"PCR plugin marker does not match this run: {marker}")
+
     def workspace(self, run: ManagedRun) -> Path:
         raw = Path(run.workspace).expanduser()
         if raw.is_symlink() or not raw.exists() or not raw.is_dir():
@@ -71,39 +108,10 @@ class ArtifactStore:
         if not run.run_root:
             raise ArtifactError("Run artifacts are not available")
         workspace = self.workspace(run)
-        raw_root = Path(run.run_root).expanduser()
-        if raw_root.is_symlink() or not raw_root.exists() or not raw_root.is_dir():
-            raise ArtifactError(
-                f"The recorded run root is no longer a real directory: {raw_root}"
-            )
-        root = raw_root.resolve()
-        configured_base = str(run.config.get("run_base") or "").strip()
-        if not configured_base:
-            raise ArtifactError("The run does not contain a verified run base")
-        base = Path(configured_base).expanduser().resolve()
-        if is_relative_to(base, workspace) or root.parent != base:
-            raise ArtifactError(f"The run root is outside its recorded run base: {root}")
-        if RUN_ROOT_PATTERN.fullmatch(root.name) is None:
-            raise ArtifactError(f"Unexpected PCR run directory name: {root.name}")
+        root = self._run_root_location(run, workspace)
         if not require_marker:
             return root
-
-        marker = root / RUN_MARKER_NAME
-        if marker.is_symlink() or not marker.is_file():
-            raise ArtifactError(f"PCR plugin marker is missing: {marker}")
-        try:
-            marker_data = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ArtifactError(f"Cannot validate PCR plugin marker: {marker}") from exc
-        expected = {
-            "run_id": run.run_id,
-            "workspace": str(workspace),
-            "artifact_token": run.artifact_token,
-        }
-        if not run.artifact_token or not isinstance(marker_data, dict):
-            raise ArtifactError(f"PCR plugin marker is invalid: {marker}")
-        if any(marker_data.get(key) != value for key, value in expected.items()):
-            raise ArtifactError(f"PCR plugin marker does not match this run: {marker}")
+        self._validate_marker(run, root)
         return root
 
     def write_marker(self, run: ManagedRun) -> None:
@@ -193,8 +201,25 @@ class ArtifactStore:
             raise ArtifactError(
                 f"Cannot build the AGENT-{agent:03d} diff: {exc}"
             ) from exc
-        write_text_atomic(destination, diff)
+        try:
+            write_text_atomic(destination, diff)
+        except OSError as exc:
+            raise ArtifactError(
+                f"Cannot persist the AGENT-{agent:03d} diff: {exc}"
+            ) from exc
         return destination
+
+    def persist_successful_diffs(self, run: ManagedRun) -> Dict[int, Path]:
+        paths: Dict[int, Path] = {}
+        for agent, result in sorted(run.results.items()):
+            if result.get("status") != "success":
+                continue
+            paths[agent] = self.persist_diff(
+                run,
+                agent,
+                result.get("workspace_dir"),
+            )
+        return paths
 
     def remove_codex_homes(self, run: ManagedRun) -> bool:
         root = self.run_root(run)
@@ -216,3 +241,15 @@ class ArtifactStore:
             if codex_home.exists():
                 shutil.rmtree(codex_home)
         return not any(meta.glob("agent_*/codex_home"))
+
+    def remove_run_root(self, run: ManagedRun) -> bool:
+        if not run.run_root:
+            return True
+        raw_root = Path(run.run_root).expanduser()
+        if not raw_root.exists() and not raw_root.is_symlink():
+            return True
+        recorded_workspace = Path(run.workspace).expanduser().resolve()
+        root = self._run_root_location(run, recorded_workspace)
+        self._validate_marker(run, root)
+        shutil.rmtree(root)
+        return not root.exists()

@@ -3076,6 +3076,8 @@ else:
             if not self._prepare_config_change("sync back"):
                 return
             self.args.no_sync_back = not value
+            if self._has_pending_run() and not self.running:
+                self.pending_no_sync_back = not value
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"syncback={'on' if value else 'off'}")
 
