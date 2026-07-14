@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallel-codex-runner"
-version = "0.1.4"
+version = "0.1.5"
 description = "Run multiple isolated Codex agents in parallel and sync back the selected result."
 readme = "README.md"
 license = { file = "LICENSE" }

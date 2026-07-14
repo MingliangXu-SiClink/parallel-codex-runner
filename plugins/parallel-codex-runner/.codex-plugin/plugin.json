@@ -1,6 +1,6 @@
 {
   "name": "parallel-codex-runner",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Run, compare, and selectively accept isolated Codex candidates from the Codex app.",
   "author": {
     "name": "MingliangXu-SiClink",
