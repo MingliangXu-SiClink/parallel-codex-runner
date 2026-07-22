@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS = 1_000
+
+
 def _warn(message: str, *args: object) -> None:
     try:
         from .app import logger
@@ -279,6 +282,17 @@ def build_codex_command(
     caps["config"] = config_flag is not None
     caps["effort"] = caps["config"]
     caps["developer_instructions"] = caps["config"]
+    caps["multi_agent_wait_timeout"] = caps["config"]
+    if config_flag is not None:
+        # Some Codex models poll wait_agent at one second even though the CLI's
+        # default router floor is ten seconds. Make that generated call valid.
+        cmd.extend(
+            [
+                config_flag,
+                "features.multi_agent_v2.min_wait_timeout_ms="
+                f"{CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS}",
+            ]
+        )
     if effort:
         if caps["effort"]:
             assert config_flag is not None

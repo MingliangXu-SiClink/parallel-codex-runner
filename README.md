@@ -19,14 +19,14 @@ Codex can solve the same task very differently from one run to the next. A stron
 
 `parallel-codex-runner` (PCR) runs the same prompt in several isolated workspaces. You can watch every Agent as it works, inspect its patch, stop or retry candidates, and choose the one that should reach your real workspace.
 
-By default, each Agent owns a complete branch of the task and you adopt one branch as a whole. For important tasks, you can add an optional second stage: isolated synthesis Agents review every successful candidate, combine compatible strengths in their own workspaces, and produce new branches for you to inspect.
+By default, PCR starts four candidate Agents, then two isolated synthesis Agents review every successful candidate and combine compatible strengths in their own workspaces. Every result remains a complete branch: you can inspect and adopt any successful candidate or synthesis branch as a whole. Set `--synthesis-agents 0` to skip the second stage.
 
 ```text
                          +--> AGENT-001 --> conversation + patch
 your prompt --> PCR -----+--> AGENT-002 --> conversation + patch
                          +--> AGENT-003 --> conversation + patch
                                       |
-                     optional synthesis Agents
+                    synthesis Agents (default: 2)
                                       |
                       inspect any successful branch
                                       |
@@ -105,7 +105,7 @@ PCR will:
 2. create one isolated workspace per Agent;
 3. run the same prompt in every workspace;
 4. stream each Agent's conversation and command activity;
-5. optionally run isolated Agents that review and synthesize the candidates;
+5. run the configured synthesis Agents to review and combine the candidates;
 6. recommend a successful result while leaving the final choice to you.
 
 To change the next run before submitting:
@@ -183,10 +183,11 @@ This also works before every Agent has finished. If one result is already good e
 
 ### Add a synthesis stage
 
-Set `SYNTHESIS_AGENTS` in the top panel, or run this before submitting the next prompt:
+PCR starts two synthesis Agents by default. Set `SYNTHESIS_AGENTS` in the top panel, or change it before submitting the next prompt:
 
 ```text
 /synthesis 3
+/synthesis off
 ```
 
 After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
@@ -247,7 +248,7 @@ Provide a prompt on the command line when you do not need interactive review:
 pcr "fix the flaky test and add regression coverage"
 ```
 
-One-shot mode runs five candidates by default, recommends one successful result, syncs it to the original workspace, and cleans up candidate workspaces.
+One-shot mode runs four candidates and two synthesis Agents by default, recommends one successful result, syncs it to the original workspace, and cleans up the temporary workspaces.
 
 Common examples:
 
@@ -351,8 +352,8 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 
 | Option | Description |
 | --- | --- |
-| `-n, --num-agents` | Number of candidates; default `5`. |
-| `--synthesis-agents` | Isolated review-and-synthesis Agents started after candidates finish; default `0`. |
+| `-n, --num-agents` | Number of candidates; default `4`. |
+| `--synthesis-agents` | Isolated review-and-synthesis Agents started after candidates finish; default `2`; use `0` to disable. |
 | `--max-parallel` | Maximum number of concurrent Codex processes. |
 | `--serial` | Run one candidate at a time. |
 | `--recommend-by` | Recommend by `reasoning_tokens` or `duration`. |

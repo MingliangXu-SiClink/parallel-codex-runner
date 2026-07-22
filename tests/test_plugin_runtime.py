@@ -1,4 +1,5 @@
 import datetime as dt
+import inspect
 import json
 import os
 import shutil
@@ -80,6 +81,14 @@ def make_result(
 
 
 class PluginRunManagerTests(unittest.TestCase):
+    def test_plugin_agent_defaults_match_the_cli(self) -> None:
+        for method in (PluginRunManager.estimate, PluginRunManager.start_run):
+            with self.subTest(method=method.__name__):
+                self.assertEqual(
+                    inspect.signature(method).parameters["num_agents"].default,
+                    4,
+                )
+
     @contextmanager
     def patched_storage(self, total_bytes: int = 1024, free_bytes: int = 1 << 40):
         with (

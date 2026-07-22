@@ -737,6 +737,29 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("--config", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
 
+    def test_codex_config_accepts_one_second_multi_agent_waits(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+        )
+
+        self.assertTrue(caps["multi_agent_wait_timeout"])
+        self.assertIn(
+            "features.multi_agent_v2.min_wait_timeout_ms=1000",
+            cmd,
+        )
+
+    def test_multi_agent_wait_override_requires_config_support(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  --json\n",
+            Path("final.md"),
+        )
+
+        self.assertFalse(caps["multi_agent_wait_timeout"])
+        self.assertFalse(any("min_wait_timeout_ms" in value for value in cmd))
+
     def test_developer_instructions_use_a_toml_config_override(self) -> None:
         instructions = "Review every candidate.\n保留原始用户消息。"
         cmd, caps = build_codex_command(
@@ -920,18 +943,18 @@ class CommandBuildTests(unittest.TestCase):
 
 
 class ArgParseTests(unittest.TestCase):
-    def test_default_num_agents_is_five(self) -> None:
+    def test_default_agent_counts_are_four_candidates_and_two_synthesis(self) -> None:
         args = parse_args(["fix tests"])
 
-        self.assertEqual(args.num_agents, 5)
+        self.assertEqual(args.num_agents, 4)
+        self.assertEqual(args.synthesis_agents, 2)
 
     def test_effort_option_is_available_to_cli_runs(self) -> None:
         args = parse_args(["fix tests", "--effort", "xhigh"])
 
         self.assertEqual(args.effort, "xhigh")
 
-    def test_synthesis_agents_are_disabled_by_default_and_configurable(self) -> None:
-        self.assertEqual(parse_args(["fix tests"]).synthesis_agents, 0)
+    def test_synthesis_agents_are_configurable(self) -> None:
         args = parse_args(["fix tests", "--synthesis-agents", "3"])
 
         app_core.validate_args(args)
@@ -2747,12 +2770,13 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(app.num_agents, 4)
                     self.assertEqual(len(app.agents), 4)
                     self.assertEqual(captured_args[0].num_agents, 4)
+                    self.assertEqual(captured_args[0].synthesis_agents, 2)
                     self.assertEqual(captured_args[0].max_parallel, 2)
                     self.assertEqual(captured_args[0].recommend_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
                     self.assertEqual(
                         set(captured_args[0].agent_cancel_events),
-                        {1, 2, 3, 4},
+                        {1, 2, 3, 4, 5, 6},
                     )
                     app.running = False
 
@@ -4073,12 +4097,12 @@ class TuiCommandTests(unittest.TestCase):
 
                 self.assertEqual(panel.border_title, "PARALLEL-CODEX-RUNNER")
                 self.assertTrue(panel.styles.border_title_style.bold)
-                self.assertEqual(app.query_one("#config-agents").value, "5")
+                self.assertEqual(app.query_one("#config-agents").value, "4")
                 self.assertEqual(
                     app.query_one("#config-synthesis-agents").value,
-                    "0",
+                    "2",
                 )
-                self.assertEqual(app.query_one("#config-max-parallel").value, "5")
+                self.assertEqual(app.query_one("#config-max-parallel").value, "4")
                 self.assertEqual(app.query_one("#config-execution").value, "parallel")
                 self.assertEqual(
                     app.query_one("#config-recommend-by").value,

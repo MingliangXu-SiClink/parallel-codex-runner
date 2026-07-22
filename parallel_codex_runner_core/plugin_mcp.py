@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from .models import DEFAULT_NUM_AGENTS
 from .plugin_runtime import PluginRunManager
 
 
@@ -76,7 +77,7 @@ def pcr_health() -> Dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 def pcr_estimate_run(
     workspace: str,
-    num_agents: int = 5,
+    num_agents: int = DEFAULT_NUM_AGENTS,
     runs_dir: Optional[str] = None,
     resume_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -93,7 +94,7 @@ def pcr_estimate_run(
 def pcr_start_run(
     prompt: str,
     workspace: str,
-    num_agents: int = 5,
+    num_agents: int = DEFAULT_NUM_AGENTS,
     max_parallel: Optional[int] = None,
     serial: bool = False,
     recommend_by: str = "reasoning_tokens",

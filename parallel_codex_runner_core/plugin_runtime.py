@@ -34,7 +34,7 @@ from .app import (
     validate_args,
 )
 from .codex_models import CodexModelRegistry
-from .models import AgentResult
+from .models import AgentResult, DEFAULT_NUM_AGENTS
 from .paths import choose_run_base, default_run_anchor, is_relative_to
 from .workspace import cleanup_workspace_copies, sync_best_workspace_back
 from .plugin.artifacts import (
@@ -857,7 +857,7 @@ class PluginRunManager:
     def estimate(
         self,
         workspace: str,
-        num_agents: int = 5,
+        num_agents: int = DEFAULT_NUM_AGENTS,
         runs_dir: Optional[str] = None,
         resume_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -927,7 +927,7 @@ class PluginRunManager:
         self,
         prompt: str,
         workspace: str = "",
-        num_agents: int = 5,
+        num_agents: int = DEFAULT_NUM_AGENTS,
         max_parallel: Optional[int] = None,
         serial: bool = False,
         recommend_by: str = "reasoning_tokens",
@@ -2206,7 +2206,9 @@ class PluginRunManager:
                     f"AGENT-{int(agent):03d} has not finished successfully"
                 )
             config = dict(run.config)
-            target_agents = int(num_agents or config.get("num_agents") or 5)
+            target_agents = int(
+                num_agents or config.get("num_agents") or DEFAULT_NUM_AGENTS
+            )
             session_id = str(result.get("codex_thread_id") or "") or None
             workspace = run.workspace
         storage = self.estimate(

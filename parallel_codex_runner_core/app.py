@@ -90,6 +90,8 @@ from .codex_models import CodexModelRegistry
 from .models import (
     AGENT_ROLE_CANDIDATE,
     AGENT_ROLE_SYNTHESIS,
+    DEFAULT_NUM_AGENTS,
+    DEFAULT_SYNTHESIS_AGENTS,
     AgentResult,
     AgentState,
     CodexHistoryEntry,
@@ -2840,11 +2842,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("prompt", nargs="?", help="Prompt text. Omit it in a TTY to open the interactive TUI.")
-    parser.add_argument("-n", "--num-agents", type=int, default=5, help="Number of Codex agents to run.")
+    parser.add_argument(
+        "-n",
+        "--num-agents",
+        type=int,
+        default=DEFAULT_NUM_AGENTS,
+        help="Number of Codex agents to run.",
+    )
     parser.add_argument(
         "--synthesis-agents",
         type=int,
-        default=0,
+        default=DEFAULT_SYNTHESIS_AGENTS,
         help=(
             "After all candidates finish, run this many isolated agents to review "
             "and synthesize their successful results. Zero disables synthesis."

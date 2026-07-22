@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 
 AGENT_ROLE_CANDIDATE = "candidate"
 AGENT_ROLE_SYNTHESIS = "synthesis"
+DEFAULT_NUM_AGENTS = 4
+DEFAULT_SYNTHESIS_AGENTS = 2
 
 
 def normalize_agent_role(value: object) -> str:
