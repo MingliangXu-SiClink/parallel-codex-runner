@@ -193,6 +193,19 @@ PCR 默认启动 2 个综合 Agent。可以直接修改顶部的 `SYNTHESIS_AGEN
 
 如果已安装的 Codex CLI 无法安全解析或注入 developer instructions，PCR 会把综合阶段标记为失败并保留第一阶段的成功候选，而不会悄悄改变消息角色。
 
+### 控制 Codex 嵌套 Agent
+
+PCR 的候选 Agent 与 Codex 自己创建的 Subagent 是两层不同的并行。嵌套 Agent 默认关闭，避免 4 个 PCR 候选在没有明确选择的情况下继续扩张成更多模型线程。
+
+高级用户可以在顶部栏目中启用，也可以输入：
+
+```text
+/subagents on
+/subagentslimit 8
+```
+
+`SUBAGENTS_LIMIT` 对每个 PCR Agent 分别生效，只计算它创建的嵌套 Agent，不包含该 Agent 自己的根线程。同一候选内部的嵌套 Agent 会共享这个候选的工作区。较大的限制可能有利于拆分大型任务，但也会迅速放大 Token、CPU、内存和速率限制压力。
+
 ### 审查和控制候选
 
 | 命令 | 作用 |
@@ -258,6 +271,9 @@ pcr "重构解析器" -n 4 --serial
 
 # 先运行 6 个候选，再运行 2 个相互隔离的综合 Agent
 pcr "实现数据迁移" -n 6 --synthesis-agents 2
+
+# 允许每个 PCR Agent 最多创建 8 个 Codex 嵌套 Agent
+pcr "审核整个服务" --subagents --subagents-limit 8
 
 # 只检查结果，不修改原始工作区
 pcr "调查这个问题" --no-sync-back --keep-workspaces
@@ -337,6 +353,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 - 当 Codex CLI 支持时，PCR 会请求 Full Access/绕过审批模式。
 - Agent 仍然共享宿主机、网络、Codex 账户、配额和 Git 对象数据库。
 - 执行所需的配置与凭据会复制到 Agent 的临时目录，并在运行后清除；用于恢复对话的状态会保留在元数据中。
+- Codex 嵌套 Agent 默认关闭。启用后，同一候选内的 Subagent 会共享该候选工作区，并可能成倍增加资源消耗。
 - 回写包括文件删除，也可能包括最终 Agent 的提交和索引状态。
 - 普通文件复制会排除 `.git`、`.codex_parallel_runs` 和 `.codex_parallel_meta`。
 
@@ -352,6 +369,8 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `-n, --num-agents` | 候选数量，默认 `4`。 |
 | `--synthesis-agents` | 候选完成后启动的隔离审核与综合 Agent 数量，默认 `2`；设为 `0` 可关闭。 |
 | `--max-parallel` | Codex 最大并发进程数。 |
+| `--subagents`、`--no-subagents` | 启用或禁用 Codex 嵌套 Agent，默认禁用。 |
+| `--subagents-limit` | 启用后每个 PCR Agent 最多创建的嵌套 Agent 数量，默认 `8`。 |
 | `--serial` | 每次只运行一个候选。 |
 | `--recommend-by` | 按 `reasoning_tokens` 或 `duration` 推荐。 |
 | `--prompt-file` | 从 UTF-8 文件读取需求。 |
@@ -384,6 +403,8 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/kill [agent]` | 停止正在运行的 Agent。 |
 | `/numofagents <n>` | 设置下一轮 Agent 数量。 |
 | `/maxparallel <n\|auto>` | 设置或清除并发限制。 |
+| `/subagents <on\|off>` | 为下一轮启用或禁用 Codex 嵌套 Agent。 |
+| `/subagentslimit <n>` | 设置每个 PCR Agent 的嵌套 Agent 数量限制。 |
 | `/serial` | 串行运行 Agent。 |
 | `/parallel` | 并行运行 Agent。 |
 | `/recommendby <duration\|reasoning_tokens>` | 设置推荐方式。 |

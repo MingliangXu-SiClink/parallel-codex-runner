@@ -196,6 +196,19 @@ Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, P
 
 If the installed Codex CLI cannot resolve or inject developer instructions safely, PCR marks the synthesis stage as failed and keeps the successful first-stage candidates available instead of silently changing prompt roles.
 
+### Control nested Codex Agents
+
+PCR's candidate Agents and Codex's own subagents are two separate levels of parallelism. Nested Codex Agents are disabled by default so four PCR candidates cannot silently expand into many more active model threads.
+
+Advanced users can enable them from the top panel or with:
+
+```text
+/subagents on
+/subagentslimit 8
+```
+
+`SUBAGENTS_LIMIT` applies independently to every PCR Agent and counts nested subagents, not that Agent's root thread. Nested subagents inside one candidate share its workspace. Larger values may improve delegation on broad tasks, but they can multiply token, CPU, memory, and rate-limit usage quickly.
+
 ### Review and control candidates
 
 | Command | What it does |
@@ -261,6 +274,9 @@ pcr "refactor the parser" -n 4 --serial
 
 # Run six candidates, then two isolated synthesis Agents
 pcr "implement the migration" -n 6 --synthesis-agents 2
+
+# Allow up to eight nested Codex subagents inside each PCR Agent
+pcr "audit the whole service" --subagents --subagents-limit 8
 
 # Inspect results without changing the original workspace
 pcr "investigate this bug" --no-sync-back --keep-workspaces
@@ -340,6 +356,7 @@ If the estimate is over 5 GiB, PCR asks whether to continue. If you continue, it
 - PCR requests Codex's full-access/approval-bypass mode when the installed CLI supports it.
 - Agents still share the host, network, Codex account, quota, and Git object database.
 - Support credentials and configuration are copied into temporary Agent homes for execution, then scrubbed; resumable state remains in metadata.
+- Nested Codex Agents are disabled by default. When enabled, subagents within one candidate share that candidate's workspace and can multiply resource usage.
 - Sync-back includes deletions and may include the selected Agent's commits and index state.
 - `.git`, `.codex_parallel_runs`, and `.codex_parallel_meta` are excluded from ordinary file copying.
 
@@ -355,6 +372,8 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `-n, --num-agents` | Number of candidates; default `4`. |
 | `--synthesis-agents` | Isolated review-and-synthesis Agents started after candidates finish; default `2`; use `0` to disable. |
 | `--max-parallel` | Maximum number of concurrent Codex processes. |
+| `--subagents`, `--no-subagents` | Enable or disable nested Codex Agents; disabled by default. |
+| `--subagents-limit` | Maximum nested subagents per PCR Agent when enabled; default `8`. |
 | `--serial` | Run one candidate at a time. |
 | `--recommend-by` | Recommend by `reasoning_tokens` or `duration`. |
 | `--prompt-file` | Read a UTF-8 prompt file. |
@@ -387,6 +406,8 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/kill [agent]` | Stop a running Agent. |
 | `/numofagents <n>` | Set the Agent count for the next run. |
 | `/maxparallel <n\|auto>` | Set or clear the concurrency limit. |
+| `/subagents <on\|off>` | Enable or disable nested Codex Agents for the next run. |
+| `/subagentslimit <n>` | Set the nested Agent limit for each PCR Agent. |
 | `/serial` | Run Agents one at a time. |
 | `/parallel` | Run Agents concurrently. |
 | `/recommendby <duration\|reasoning_tokens>` | Set the recommendation heuristic. |

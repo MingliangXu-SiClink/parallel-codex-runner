@@ -249,6 +249,8 @@ def build_codex_command(
     effort: Optional[str] = None,
     resume_session_id: Optional[str] = None,
     developer_instructions: Optional[str] = None,
+    subagents: Optional[bool] = None,
+    subagents_limit: Optional[int] = None,
 ) -> Tuple[List[str], Dict[str, bool]]:
     cmd: List[str] = [codex_bin, "exec"]
     if resume_session_id:
@@ -283,15 +285,48 @@ def build_codex_command(
     caps["effort"] = caps["config"]
     caps["developer_instructions"] = caps["config"]
     caps["multi_agent_wait_timeout"] = caps["config"]
-    if config_flag is not None:
+    caps["subagents"] = caps["config"] or flag_supported(help_text, "--disable")
+    caps["subagents_limit"] = caps["config"]
+
+    def append_config(value: str) -> None:
+        assert config_flag is not None
+        cmd.extend([config_flag, value])
+
+    if subagents is False:
+        if config_flag is not None:
+            append_config("features.multi_agent=false")
+        elif flag_supported(help_text, "--disable"):
+            cmd.extend(["--disable", "multi_agent"])
+        else:
+            raise RuntimeError(
+                "当前 Codex CLI 不支持 --config 或 --disable，无法禁用嵌套 Agent。"
+            )
+    elif subagents is True:
+        if config_flag is None:
+            raise RuntimeError(
+                "当前 Codex CLI 不支持 --config，无法设置嵌套 Agent 数量限制。"
+            )
+        if (
+            isinstance(subagents_limit, bool)
+            or not isinstance(subagents_limit, int)
+            or subagents_limit <= 0
+        ):
+            raise ValueError("subagents_limit must be a positive integer")
+        append_config("features.multi_agent=true")
+        append_config(f"agents.max_threads={subagents_limit}")
+        # Codex V2 counts the root thread as one concurrency slot, while PCR's
+        # setting counts only nested subagents.
+        append_config(
+            "features.multi_agent_v2.max_concurrent_threads_per_session="
+            f"{subagents_limit + 1}"
+        )
+
+    if config_flag is not None and subagents is not False:
         # Some Codex models poll wait_agent at one second even though the CLI's
         # default router floor is ten seconds. Make that generated call valid.
-        cmd.extend(
-            [
-                config_flag,
-                "features.multi_agent_v2.min_wait_timeout_ms="
-                f"{CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS}",
-            ]
+        append_config(
+            "features.multi_agent_v2.min_wait_timeout_ms="
+            f"{CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS}"
         )
     if effort:
         if caps["effort"]:

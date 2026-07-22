@@ -91,6 +91,7 @@ from .models import (
     AGENT_ROLE_CANDIDATE,
     AGENT_ROLE_SYNTHESIS,
     DEFAULT_NUM_AGENTS,
+    DEFAULT_SUBAGENTS_LIMIT,
     DEFAULT_SYNTHESIS_AGENTS,
     AgentResult,
     AgentState,
@@ -2779,6 +2780,10 @@ def run_additional_agents(
                 effort=effective_effort,
                 resume_session_id=resume_session_id,
                 developer_instructions=effective_developer_instructions,
+                subagents=bool(getattr(args, "subagents", False)),
+                subagents_limit=int(
+                    getattr(args, "subagents_limit", DEFAULT_SUBAGENTS_LIMIT)
+                ),
             )
             command_by_agent[idx] = command
             codex_home_by_agent[idx] = agent_codex_home
@@ -2864,6 +2869,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="Maximum Codex agents to run concurrently within each stage. Defaults to that stage's agent count.",
     )
+    parser.add_argument(
+        "--subagents",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow each PCR agent to create nested Codex subagents. Disabled by "
+            "default because nested parallelism can multiply resource usage."
+        ),
+    )
+    parser.add_argument(
+        "--subagents-limit",
+        type=int,
+        default=DEFAULT_SUBAGENTS_LIMIT,
+        help=(
+            "Maximum active nested Codex subagents per PCR agent when "
+            "--subagents is enabled."
+        ),
+    )
     parser.add_argument("--serial", action="store_true", help="Run agents one at a time, equivalent to --max-parallel 1.")
     parser.add_argument(
         "--recommend-by",
@@ -2912,6 +2935,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--synthesis-agents 不能小于 0。")
     if args.max_parallel is not None and args.max_parallel <= 0:
         raise SystemExit("--max-parallel 必须大于 0。")
+    subagents_limit = getattr(
+        args,
+        "subagents_limit",
+        DEFAULT_SUBAGENTS_LIMIT,
+    )
+    if isinstance(subagents_limit, bool) or not isinstance(subagents_limit, int):
+        raise SystemExit("--subagents-limit 必须是正整数。")
+    if subagents_limit <= 0:
+        raise SystemExit("--subagents-limit 必须大于 0。")
+    args.subagents = bool(getattr(args, "subagents", False))
+    args.subagents_limit = subagents_limit
     if args.serial and args.max_parallel not in (None, 1):
         raise SystemExit("--serial 不能和 --max-parallel > 1 同时使用。")
     effort = str(getattr(args, "effort", None) or "").strip().lower()
@@ -2942,6 +2976,10 @@ def run_once(
     print_output: bool = True,
 ) -> int:
     synthesis_agents = max(0, int(getattr(args, "synthesis_agents", 0) or 0))
+    subagents = bool(getattr(args, "subagents", False))
+    subagents_limit = int(
+        getattr(args, "subagents_limit", DEFAULT_SUBAGENTS_LIMIT)
+    )
     max_parallel = 1 if args.serial else (args.max_parallel or args.num_agents)
     max_parallel = min(max_parallel, args.num_agents)
     external_cancel_event = getattr(args, "cancel_event", None)
@@ -2997,6 +3035,8 @@ def run_once(
                     ["SYNTHESIS_AGENTS", str(synthesis_agents)],
                     ["EXECUTION", "serial" if max_parallel == 1 else "parallel"],
                     ["MAX_PARALLEL", str(max_parallel)],
+                    ["SUBAGENTS", "YES" if subagents else "NO"],
+                    ["SUBAGENTS_LIMIT", str(subagents_limit)],
                     ["RECOMMEND_BY", args.recommend_by],
                     ["MODEL", model_display],
                     ["EFFORT", effective_effort or "default"],
@@ -3037,6 +3077,8 @@ def run_once(
         overview.add_row("SYNTHESIS_AGENTS", str(synthesis_agents))
         overview.add_row("EXECUTION", "serial" if max_parallel == 1 else "parallel")
         overview.add_row("MAX_PARALLEL", str(max_parallel))
+        overview.add_row("SUBAGENTS", "YES" if subagents else "NO")
+        overview.add_row("SUBAGENTS_LIMIT", str(subagents_limit))
         overview.add_row("RECOMMEND_BY", args.recommend_by)
         overview.add_row("MODEL", model_display)
         overview.add_row("EFFORT", effective_effort or "default")
@@ -3059,6 +3101,8 @@ def run_once(
         log("info", "synthesis_agents = {}", synthesis_agents)
         log("info", "execution = {}", "serial" if max_parallel == 1 else "parallel")
         log("info", "max_parallel = {}", max_parallel)
+        log("info", "subagents = {}", "YES" if subagents else "NO")
+        log("info", "subagents_limit = {}", subagents_limit)
         log("info", "recommend_by = {}", args.recommend_by)
         log("info", "model = {}", model_display)
         log("info", "effort = {}", effective_effort or "default")
@@ -3118,6 +3162,14 @@ def run_once(
                         model=args.model,
                         effort=effective_effort,
                         resume_session_id=resume_session_id,
+                        subagents=bool(getattr(args, "subagents", False)),
+                        subagents_limit=int(
+                            getattr(
+                                args,
+                                "subagents_limit",
+                                DEFAULT_SUBAGENTS_LIMIT,
+                            )
+                        ),
                     )
                     command_by_agent[idx] = cmd
                     caps_by_agent[idx] = caps
@@ -3150,6 +3202,14 @@ def run_once(
                     model=args.model,
                     effort=effective_effort,
                     resume_session_id=resume_session_id,
+                    subagents=bool(getattr(args, "subagents", False)),
+                    subagents_limit=int(
+                        getattr(
+                            args,
+                            "subagents_limit",
+                            DEFAULT_SUBAGENTS_LIMIT,
+                        )
+                    ),
                 )
                 command_by_agent[idx] = cmd
                 caps_by_agent[idx] = caps

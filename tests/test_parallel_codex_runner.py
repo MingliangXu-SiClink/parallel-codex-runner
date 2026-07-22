@@ -760,6 +760,51 @@ class CommandBuildTests(unittest.TestCase):
         self.assertFalse(caps["multi_agent_wait_timeout"])
         self.assertFalse(any("min_wait_timeout_ms" in value for value in cmd))
 
+    def test_subagents_are_disabled_with_a_codex_config_override(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            subagents=False,
+            subagents_limit=8,
+        )
+
+        self.assertTrue(caps["subagents"])
+        self.assertIn("features.multi_agent=false", cmd)
+        self.assertFalse(any("max_threads" in value for value in cmd))
+        self.assertFalse(any("min_wait_timeout_ms" in value for value in cmd))
+
+    def test_subagents_limit_supports_codex_v1_and_v2(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            subagents=True,
+            subagents_limit=8,
+        )
+
+        self.assertTrue(caps["subagents_limit"])
+        self.assertIn("features.multi_agent=true", cmd)
+        self.assertIn("agents.max_threads=8", cmd)
+        self.assertIn(
+            "features.multi_agent_v2.max_concurrent_threads_per_session=9",
+            cmd,
+        )
+        self.assertIn(
+            "features.multi_agent_v2.min_wait_timeout_ms=1000",
+            cmd,
+        )
+
+    def test_enabling_subagents_requires_codex_config_support(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Agent 数量限制"):
+            build_codex_command(
+                "codex",
+                "Usage: codex exec [OPTIONS]\n  --enable <FEATURE>\n",
+                Path("final.md"),
+                subagents=True,
+                subagents_limit=8,
+            )
+
     def test_developer_instructions_use_a_toml_config_override(self) -> None:
         instructions = "Review every candidate.\n保留原始用户消息。"
         cmd, caps = build_codex_command(
@@ -948,6 +993,26 @@ class ArgParseTests(unittest.TestCase):
 
         self.assertEqual(args.num_agents, 4)
         self.assertEqual(args.synthesis_agents, 2)
+
+    def test_subagents_are_opt_in_with_a_configurable_limit(self) -> None:
+        defaults = parse_args(["fix tests"])
+        enabled = parse_args(
+            ["fix tests", "--subagents", "--subagents-limit", "12"]
+        )
+
+        app_core.validate_args(defaults)
+        app_core.validate_args(enabled)
+
+        self.assertFalse(defaults.subagents)
+        self.assertEqual(defaults.subagents_limit, 8)
+        self.assertTrue(enabled.subagents)
+        self.assertEqual(enabled.subagents_limit, 12)
+
+    def test_non_positive_subagents_limit_is_rejected(self) -> None:
+        args = parse_args(["fix tests", "--subagents-limit", "0"])
+
+        with self.assertRaisesRegex(SystemExit, "subagents-limit"):
+            app_core.validate_args(args)
 
     def test_effort_option_is_available_to_cli_runs(self) -> None:
         args = parse_args(["fix tests", "--effort", "xhigh"])
@@ -1692,6 +1757,14 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/effort <auto|level>", "\n".join(command_suggestions("/effort")))
+        self.assertIn(
+            "/subagents <on|off>",
+            "\n".join(command_suggestions("/subagents")),
+        )
+        self.assertIn(
+            "/subagentslimit <n>",
+            "\n".join(command_suggestions("/subagentsl")),
+        )
         self.assertIn("/recommendby <duration|reasoning_tokens>", slash_commands)
         self.assertEqual(command_suggestions("/bestby"), [])
         self.assertIn(
@@ -1730,6 +1803,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(any("/kill" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/accept" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/diff" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("SUBAGENTS" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -1763,6 +1837,8 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/numofagents 4")
         app._handle_command("/synthesis 2")
         app._handle_command("/maxparallel 2")
+        app._handle_command("/subagents on")
+        app._handle_command("/subagentslimit 12")
         app._handle_command("/serial")
         app._handle_command("/recommendby duration")
         app._handle_command("/model gpt-5")
@@ -1776,6 +1852,8 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.synthesis_agents, 2)
         self.assertEqual(app.args.synthesis_agents, 2)
         self.assertEqual(app.args.max_parallel, 2)
+        self.assertTrue(app.args.subagents)
+        self.assertEqual(app.args.subagents_limit, 12)
         self.assertTrue(app.args.serial)
         self.assertEqual(app.args.recommend_by, "duration")
         self.assertEqual(app.args.model, "gpt-5")
@@ -1786,10 +1864,12 @@ class TuiCommandTests(unittest.TestCase):
 
         app._handle_command("/parallel")
         app._handle_command("/maxparallel auto")
+        app._handle_command("/subagents off")
         app._handle_command("/model clear")
         app._handle_command("/effort auto")
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
+        self.assertFalse(app.args.subagents)
         self.assertIsNone(app.args.model)
         self.assertIsNone(app.args.effort)
 
@@ -2683,6 +2763,16 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.pause()
                     self.assertEqual(app.args.max_parallel, 2)
 
+                    subagents = app.query_one("#config-subagents")
+                    subagents.value = True
+                    await pilot.pause()
+
+                    subagents_limit = app.query_one("#config-subagents-limit")
+                    subagents_limit.value = "12"
+                    subagents_limit.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+
                     for selector, value in (
                         ("#config-execution", "serial"),
                         ("#config-recommend-by", "duration"),
@@ -2711,6 +2801,8 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(app.args.recommend_by, "duration")
                     self.assertEqual(app.args.model, "gpt-test")
                     self.assertEqual(app.args.effort, "high")
+                    self.assertTrue(app.args.subagents)
+                    self.assertEqual(app.args.subagents_limit, 12)
                     self.assertTrue(app.args.no_sync_back)
                     self.assertTrue(app.args.keep_workspaces)
                     self.assertGreaterEqual(len(app.command_history), 6)
@@ -2742,6 +2834,18 @@ class TuiCommandTests(unittest.TestCase):
 
                     self.assertEqual(app.args.max_parallel, 2)
 
+                    subagents_limit = app.query_one("#config-subagents-limit")
+                    subagents_limit.focus()
+                    subagents_limit.value = "10"
+                    prompt.focus()
+                    await pilot.pause()
+
+                    self.assertEqual(app.args.subagents_limit, 10)
+
+                    subagents = app.query_one("#config-subagents")
+                    subagents.value = True
+                    await pilot.pause()
+
                     recommend_by = app.query_one("#config-recommend-by")
                     recommend_by.value = "duration"
                     model = app.query_one("#config-model")
@@ -2772,6 +2876,8 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(captured_args[0].num_agents, 4)
                     self.assertEqual(captured_args[0].synthesis_agents, 2)
                     self.assertEqual(captured_args[0].max_parallel, 2)
+                    self.assertTrue(captured_args[0].subagents)
+                    self.assertEqual(captured_args[0].subagents_limit, 10)
                     self.assertEqual(captured_args[0].recommend_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
                     self.assertEqual(
@@ -4103,6 +4209,8 @@ class TuiCommandTests(unittest.TestCase):
                     "2",
                 )
                 self.assertEqual(app.query_one("#config-max-parallel").value, "4")
+                self.assertFalse(app.query_one("#config-subagents").value)
+                self.assertEqual(app.query_one("#config-subagents-limit").value, "8")
                 self.assertEqual(app.query_one("#config-execution").value, "parallel")
                 self.assertEqual(
                     app.query_one("#config-recommend-by").value,
@@ -4125,6 +4233,12 @@ class TuiCommandTests(unittest.TestCase):
                 )
                 self.assertIn("RECOMMEND_BY", labels)
                 self.assertIn("SYNTHESIS_AGENTS", labels)
+                self.assertIn("SUBAGENTS", labels)
+                self.assertIn("SUBAGENTS_LIMIT", labels)
+                self.assertLess(
+                    labels.index("MAX_PARALLEL"),
+                    labels.index("SUBAGENTS_LIMIT"),
+                )
                 self.assertNotIn("BEST_BY", labels)
                 self.assertNotIn("METADATA", labels)
                 self.assertNotIn("WORKSPACE COPIES", [label for label, _value in app._tree_rows()])

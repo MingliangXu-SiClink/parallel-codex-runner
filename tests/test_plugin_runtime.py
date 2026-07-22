@@ -1140,7 +1140,7 @@ class PluginRunManagerTests(unittest.TestCase):
             fake_codex.write_text(
                 """#!/bin/sh
 if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
-  printf '%s\\n' 'Usage: codex exec [OPTIONS]' '  --json' '  --output-last-message FILE'
+  printf '%s\\n' 'Usage: codex exec [OPTIONS]' '  -c, --config KEY=VALUE' '  --json' '  --output-last-message FILE'
   exit 0
 fi
 output=''

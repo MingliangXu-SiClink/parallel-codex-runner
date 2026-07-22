@@ -42,6 +42,8 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
         "/synthesis <n|off>",
         "set isolated review-and-synthesis agents for the next run",
     ),
+    ("/subagents <on|off>", "allow or block nested Codex agents for the next run"),
+    ("/subagentslimit <n>", "limit nested Codex agents within each PCR agent"),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
     ("/effort <auto|level>", "set a model-supported reasoning effort for the next run"),
     ("/workspace <path>", "set the workspace PCR operates on"),
@@ -129,6 +131,7 @@ TUI_TIPS: tuple[str, ...] = (
     "运行中输入 /kill，可终止当前显示且正在运行的 Agent，排队 Agent 会正常加入队列。",
     "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
     "大型工作区会在复制前估算空间，并在预计超过 5 GiB 时请求确认。",
+    "SUBAGENTS 默认关闭；启用后可用 SUBAGENTS_LIMIT 控制每个 PCR Agent 的嵌套数量。",
 )
 
 
@@ -518,6 +521,7 @@ else:
     from .models import (
         AGENT_ROLE_CANDIDATE,
         AGENT_ROLE_SYNTHESIS,
+        DEFAULT_SUBAGENTS_LIMIT,
         AgentResult,
         CodexHistoryEntry,
         normalize_agent_role,
@@ -1125,7 +1129,8 @@ else:
             background: #243448;
             color: #ffffff;
         }
-        #config-agents, #config-synthesis-agents, #config-max-parallel {
+        #config-agents, #config-synthesis-agents, #config-max-parallel,
+        #config-subagents-limit {
             width: 12;
         }
         #config-execution, #config-recommend-by, #config-effort {
@@ -1134,7 +1139,7 @@ else:
         #config-model {
             width: 36;
         }
-        #config-sync-back, #config-keep-workspaces {
+        #config-subagents, #config-sync-back, #config-keep-workspaces {
             width: 10;
         }
         #detail-frame {
@@ -1293,6 +1298,13 @@ else:
                 "config-agents": str(self.num_agents),
                 "config-synthesis-agents": str(self.synthesis_agents),
                 "config-max-parallel": dict(self.run_info_rows).get("MAX_PARALLEL", ""),
+                "config-subagents-limit": str(
+                    getattr(
+                        self.args,
+                        "subagents_limit",
+                        DEFAULT_SUBAGENTS_LIMIT,
+                    )
+                ),
             }
             self._mouse_down_in_runner_control = False
             self._last_screen_selection = ""
@@ -1498,6 +1510,28 @@ else:
                             str(dict(self._base_info_rows())["MAX_PARALLEL"]),
                             id="config-max-parallel",
                             classes="runner-control",
+                        )
+                        yield Static("SUBAGENTS", classes="runner-key")
+                        yield Select(
+                            [("YES", True), ("NO", False)],
+                            value=bool(getattr(self.args, "subagents", False)),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-subagents",
+                            classes="runner-control",
+                        )
+                        yield Static("SUBAGENTS_LIMIT", classes="runner-key")
+                        yield Input(
+                            str(
+                                getattr(
+                                    self.args,
+                                    "subagents_limit",
+                                    DEFAULT_SUBAGENTS_LIMIT,
+                                )
+                            ),
+                            id="config-subagents-limit",
+                            classes="runner-control",
+                            type="integer",
                         )
                         yield Static("RECOMMEND_BY", classes="runner-key")
                         yield Select(
@@ -2061,6 +2095,36 @@ else:
             self._set_committed_input_value(control, display_value)
             return applied
 
+        def _commit_subagents_limit_control(self) -> bool:
+            try:
+                control = self.query_one("#config-subagents-limit", Input)
+            except Exception:
+                return True
+            value_text = control.value.strip()
+            if value_text == self._committed_input_values.get(
+                "config-subagents-limit"
+            ):
+                return True
+            try:
+                requested = int(value_text)
+            except ValueError:
+                requested = None
+            self._handle_subagentslimit([value_text])
+            applied = (
+                requested is not None
+                and requested > 0
+                and getattr(self.args, "subagents_limit", None) == requested
+            )
+            display_value = str(
+                getattr(
+                    self.args,
+                    "subagents_limit",
+                    DEFAULT_SUBAGENTS_LIMIT,
+                )
+            )
+            self._set_committed_input_value(control, display_value)
+            return applied
+
         def _commit_runner_inputs(self) -> bool:
             if not self._commit_agents_control():
                 self.query_one("#config-agents", Input).focus()
@@ -2070,6 +2134,9 @@ else:
                 return False
             if not self._commit_max_parallel_control():
                 self.query_one("#config-max-parallel", Input).focus()
+                return False
+            if not self._commit_subagents_limit_control():
+                self.query_one("#config-subagents-limit", Input).focus()
                 return False
             return True
 
@@ -2109,6 +2176,20 @@ else:
             if not self._updating_controls:
                 self._commit_max_parallel_control()
 
+        @on(Input.Submitted, "#config-subagents-limit")
+        def _on_subagents_limit_submitted(self, _event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._commit_subagents_limit_control()
+
+        @on(events.DescendantBlur, "#config-subagents-limit")
+        def _on_subagents_limit_blurred(
+            self,
+            _event: events.DescendantBlur,
+        ) -> None:
+            if not self._updating_controls:
+                self._commit_subagents_limit_control()
+
         @on(Select.Changed, "#config-execution")
         def _on_execution_selected(self, event: Select.Changed) -> None:
             if self._updating_controls:
@@ -2117,6 +2198,14 @@ else:
             current_serial = dict(self._tree_rows()).get("EXECUTION") == "serial"
             if serial != current_serial:
                 self._handle_execution(serial=serial)
+
+        @on(Select.Changed, "#config-subagents")
+        def _on_subagents_toggled(self, event: Select.Changed) -> None:
+            if self._updating_controls:
+                return
+            value = bool(event.value)
+            if value != bool(getattr(self.args, "subagents", False)):
+                self._handle_subagents(["on" if value else "off"])
 
         @on(Select.Changed, "#config-recommend-by")
         def _on_recommend_by_selected(self, event: Select.Changed) -> None:
@@ -2677,6 +2766,16 @@ else:
             if name in {"/maxparallel", "/max-parallel"}:
                 self._handle_maxparallel(args)
                 return
+            if name in {"/subagents", "/sub-agents"}:
+                self._handle_subagents(args)
+                return
+            if name in {
+                "/subagentslimit",
+                "/subagents-limit",
+                "/sub-agents-limit",
+            }:
+                self._handle_subagentslimit(args)
+                return
             if name == "/serial":
                 self._handle_execution(serial=True)
                 return
@@ -3114,6 +3213,53 @@ else:
                 self.args.serial = False
             self.run_info_rows = self._base_info_rows()
             self._show_setting(f"maxparallel={value if value is not None else 'auto'}")
+
+        def _handle_subagents(self, args: list[str]) -> None:
+            current = bool(getattr(self.args, "subagents", False))
+            if not args:
+                self._show_setting(
+                    "subagents="
+                    f"{'on' if current else 'off'} "
+                    f"(limit={getattr(self.args, 'subagents_limit', DEFAULT_SUBAGENTS_LIMIT)})"
+                )
+                return
+            value = self._parse_bool_arg(args, "/subagents")
+            if value is None:
+                return
+            if not self._prepare_config_change("nested agents"):
+                return
+            self.args.subagents = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(
+                "subagents="
+                f"{'on' if value else 'off'} "
+                f"(limit={getattr(self.args, 'subagents_limit', DEFAULT_SUBAGENTS_LIMIT)})"
+            )
+
+        def _handle_subagentslimit(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    "subagentslimit="
+                    f"{getattr(self.args, 'subagents_limit', DEFAULT_SUBAGENTS_LIMIT)}"
+                )
+                return
+            if len(args) != 1:
+                self.status = "Usage: /subagentslimit <positive integer>"
+                self._sync()
+                return
+            try:
+                value = int(args[0])
+            except ValueError:
+                value = 0
+            if value <= 0:
+                self.status = "subagentslimit must be > 0"
+                self._sync()
+                return
+            if not self._prepare_config_change("nested agent limit"):
+                return
+            self.args.subagents_limit = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"subagentslimit={value}")
 
         def _handle_execution(self, serial: bool) -> None:
             if not self._prepare_config_change("execution mode"):
@@ -4328,6 +4474,7 @@ else:
                 self.model_choices = self.model_registry.model_options(current_model)
                 model_options = self.model_choices
             current_effort = str(getattr(self.args, "effort", None) or "")
+            current_subagents = bool(getattr(self.args, "subagents", False))
             desired_effort_choices = self._effort_options_for_context()
             effort_options = None
             if desired_effort_choices != self.effort_choices:
@@ -4342,6 +4489,7 @@ else:
                 resume_options = self.resume_choices
 
             execution_select = self.query_one("#config-execution", Select)
+            subagents_select = self.query_one("#config-subagents", Select)
             recommend_by_select = self.query_one("#config-recommend-by", Select)
             model_select = self.query_one("#config-model", Select)
             effort_select = self.query_one("#config-effort", Select)
@@ -4352,6 +4500,8 @@ else:
                 self.query_one("#config-agents", Input),
                 self.query_one("#config-synthesis-agents", Input),
                 self.query_one("#config-max-parallel", Input),
+                subagents_select,
+                self.query_one("#config-subagents-limit", Input),
                 execution_select,
                 recommend_by_select,
                 model_select,
@@ -4382,9 +4532,29 @@ else:
                     max_parallel_value = rows.get("MAX_PARALLEL", "")
                     max_parallel_input.value = max_parallel_value
                     self._committed_input_values["config-max-parallel"] = max_parallel_value
+                subagents_limit_input = self.query_one(
+                    "#config-subagents-limit",
+                    Input,
+                )
+                if self.focused is not subagents_limit_input:
+                    subagents_limit_value = str(
+                        getattr(
+                            self.args,
+                            "subagents_limit",
+                            DEFAULT_SUBAGENTS_LIMIT,
+                        )
+                    )
+                    subagents_limit_input.value = subagents_limit_value
+                    self._committed_input_values[
+                        "config-subagents-limit"
+                    ] = subagents_limit_value
                 self._set_select_control(
                     execution_select,
                     rows.get("EXECUTION", "parallel"),
+                )
+                self._set_select_control(
+                    subagents_select,
+                    current_subagents,
                 )
                 self._set_select_control(
                     recommend_by_select,
@@ -4466,6 +4636,20 @@ else:
                 ("SYNTHESIS_AGENTS", str(self.synthesis_agents)),
                 ("EXECUTION", execution),
                 ("MAX_PARALLEL", str(max_parallel)),
+                (
+                    "SUBAGENTS",
+                    "YES" if getattr(self.args, "subagents", False) else "NO",
+                ),
+                (
+                    "SUBAGENTS_LIMIT",
+                    str(
+                        getattr(
+                            self.args,
+                            "subagents_limit",
+                            DEFAULT_SUBAGENTS_LIMIT,
+                        )
+                    ),
+                ),
                 (
                     "RECOMMEND_BY",
                     str(
