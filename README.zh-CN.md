@@ -118,6 +118,11 @@ pcr
 
 TUI 顶部的配置项也可以直接修改。
 
+PCR 会为每个 workspace 独立记住这些 TUI 配置，包括 Agent 数量、综合 Agent
+数量、执行模式、并发数、嵌套 Agent 限制、推荐策略、模型、effort、是否回写、是否
+保留工作区以及当前选择的 resume 会话。配置保存在用户的 PCR 状态目录中，不会写入
+项目本身；如果启动命令显式传入这些选项，则以命令行选项为准。
+
 ## Codex App 插件
 
 PCR 现在也可以作为本地 Codex App 插件使用。正常使用流程很简单：把任务交给
@@ -492,6 +497,7 @@ python3 -m unittest tests.test_vendored_textual
 | `parallel_codex_runner_core/codex_cli.py` | Codex 能力检测与命令构造。 |
 | `parallel_codex_runner_core/codex_models.py` | 模型缓存与兼容 Effort 选择。 |
 | `parallel_codex_runner_core/prompt_history.py` | 持久化输入历史。 |
+| `parallel_codex_runner_core/workspace_config.py` | 按 workspace 持久化 TUI 配置。 |
 | `parallel_codex_runner_core/diffing.py` | 支持删除操作的工作区 Diff。 |
 | `parallel_codex_runner_core/models.py` | 共享的运行和会话数据模型。 |
 | `parallel_codex_runner_core/plugin_runtime.py` | 插件运行使用的持久化审查控制器。 |

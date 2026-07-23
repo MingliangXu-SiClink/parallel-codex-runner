@@ -118,6 +118,13 @@ To change the next run before submitting:
 
 The settings at the top of the TUI are editable too.
 
+PCR remembers these TUI settings separately for each workspace, including the
+Agent counts, execution mode, nested-Agent limits, recommendation strategy,
+model, effort, sync-back, workspace retention, and selected resume session.
+They are stored in the user's PCR state directory rather than inside the
+project. Explicit command-line options take precedence over the remembered
+workspace values.
+
 ## Codex App Plugin
 
 PCR also ships as a local Codex App plugin. The normal interaction is deliberately
@@ -495,6 +502,7 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | `parallel_codex_runner_core/codex_cli.py` | Codex capability detection and command construction. |
 | `parallel_codex_runner_core/codex_models.py` | Model cache and compatible effort selection. |
 | `parallel_codex_runner_core/prompt_history.py` | Persistent prompt history. |
+| `parallel_codex_runner_core/workspace_config.py` | Per-workspace TUI configuration persistence. |
 | `parallel_codex_runner_core/diffing.py` | Delete-aware workspace diff generation. |
 | `parallel_codex_runner_core/models.py` | Shared run and session data models. |
 | `parallel_codex_runner_core/plugin_runtime.py` | Persistent review-mode controller for plugin runs. |

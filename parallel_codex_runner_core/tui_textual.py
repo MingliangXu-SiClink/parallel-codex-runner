@@ -19,6 +19,7 @@ from typing import Any
 from ._vendor import activate_textual
 from .codex_models import CodexModelRegistry
 from .prompt_history import PromptHistoryNavigator, PromptHistoryStore
+from .workspace_config import WorkspaceConfigStore, WorkspaceSettings
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show all TUI commands"),
@@ -115,6 +116,7 @@ TUI_TIPS: tuple[str, ...] = (
     "后续提问会从当前显示的已完成 Agent 继续。",
     "某个 Agent 完成后，即可从该 Agent 继续提问。",
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
+    "PCR 会按 workspace 记住顶部配置，下次打开同一目录时自动恢复。",
     "EFFORT 会随 MODEL 更新可选等级，auto 会选择兼容的推理等级。",
     "带 ★ 和彩虹边框的 Agent 是当前推荐结果。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
@@ -124,7 +126,7 @@ TUI_TIPS: tuple[str, ...] = (
     "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
     "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
-    "TUI 不在前台时，首个成功和全部完成会触发终端铃声。",
+    "TUI 不在前台时，所有 Agent 结束后会触发完成通知，失败也算结束。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
@@ -1237,6 +1239,11 @@ else:
             self.args = args
             self.args.resume_include_non_interactive = True
             self.workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
+            self.workspace_config_store = WorkspaceConfigStore()
+            self._workspace_config_explicit = frozenset(
+                getattr(args, "_pcr_explicit_tui_settings", set())
+            )
+            self._apply_saved_workspace_settings()
             self.num_agents = args.num_agents
             self.synthesis_agents = max(
                 0,
@@ -1351,7 +1358,23 @@ else:
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
             self.app_in_foreground = True
-            self.first_success_seen = False
+            self.completion_notification_sent = False
+
+        def _apply_saved_workspace_settings(self) -> bool:
+            settings = self.workspace_config_store.load(self.workspace)
+            if settings is None:
+                return False
+            settings.apply_to_args(self.args, self._workspace_config_explicit)
+            return True
+
+        def _persist_workspace_settings(self) -> bool:
+            settings = WorkspaceSettings.from_runtime(
+                self.num_agents,
+                self.synthesis_agents,
+                self.args,
+                self.resume_session_id,
+            )
+            return self.workspace_config_store.save(self.workspace, settings)
 
         def _is_runner_control(self, node: Any) -> bool:
             while node is not None:
@@ -2487,9 +2510,6 @@ else:
                 final_text = self._read_final_message(result) if pane.status == "success" else ""
                 if final_text:
                     pane.final_text = final_text
-                if pane.status == "success" and not self.first_success_seen:
-                    self.first_success_seen = True
-                    self._ring_if_background()
                 self._mark_detail_dirty(pane)
             elif kind == "synthesis_finished":
                 self.active_batch_indices.clear()
@@ -2530,7 +2550,7 @@ else:
                     self._recompute_recommendation(fallback)
                     if not self._launch_next_candidate_batch():
                         self.status = self._completed_status()
-                        self._ring_if_background()
+                        self._notify_completion_if_background()
                         self._schedule_follow_up_after_completion()
             elif kind == "run_failed":
                 self.running = False
@@ -2564,7 +2584,7 @@ else:
                     self._recompute_recommendation()
                     if not self._launch_next_candidate_batch():
                         self.status = self._completed_status()
-                        self._ring_if_background()
+                        self._notify_completion_if_background()
                         self._schedule_follow_up_after_completion()
             elif kind == "candidate_batch_failed":
                 self.running = False
@@ -2582,7 +2602,7 @@ else:
                 elif not self._launch_next_candidate_batch():
                     self._recompute_recommendation()
                     self.status = f"Additional candidates failed: {payload.get('message') or ''}"
-                    self._ring_if_background()
+                    self._notify_completion_if_background()
                     self._schedule_follow_up_after_completion()
             if kind not in {"agent_line", "agent_tokens", "agent_status"}:
                 self._sync()
@@ -2620,6 +2640,7 @@ else:
                 return
 
             self.resume_session_id = event.session_id
+            self.args.resume_session_id = event.session_id
             self._load_prompt_history_context()
             self._reset_conversation_detail()
             self._refresh_effort_for_context()
@@ -2636,6 +2657,7 @@ else:
             if not self.running and not self._has_pending_run():
                 self.status = loaded_status
             self._mark_detail_dirty()
+            self._persist_workspace_settings()
             self._sync()
 
         @on(ResumeChoicesLoaded)
@@ -2775,6 +2797,7 @@ else:
                 self._request_exit()
 
         def _request_exit(self) -> None:
+            self._persist_workspace_settings()
             if self.storage_preflight_inflight:
                 self.storage_preflight_request += 1
                 self.storage_preflight_inflight = False
@@ -3005,6 +3028,8 @@ else:
                 self.status = "No current question is available to retry"
                 self._sync()
                 return
+            if not self.running and not self.candidate_batches:
+                self.completion_notification_sent = False
             self.candidate_batches.append(
                 CandidateBatch(
                     [idx],
@@ -3051,6 +3076,8 @@ else:
                     execution_prompt=self.pending_prompt,
                 )
                 self.agent_cancel_events[idx] = threading.Event()
+            if not self.running and not self.candidate_batches:
+                self.completion_notification_sent = False
             self.candidate_batches.append(CandidateBatch(indices))
             self._mark_detail_dirty()
             if self.running:
@@ -3493,9 +3520,24 @@ else:
                 return
             if not self._prepare_context_change("workspace"):
                 return
+            self._persist_workspace_settings()
             self.workspace = workspace
             self.args.workspace = str(workspace)
             self.resume_session_id = ""
+            self.args.resume_session_id = None
+            self._workspace_config_explicit = frozenset()
+            self._apply_saved_workspace_settings()
+            self.num_agents = self.args.num_agents
+            self.synthesis_agents = max(
+                0,
+                int(getattr(self.args, "synthesis_agents", 0) or 0),
+            )
+            self.args.synthesis_agents = self.synthesis_agents
+            self.resume_session_id = (self.args.resume_session_id or "").strip()
+            self.model_choices = self.model_registry.model_options(
+                getattr(self.args, "model", None)
+            )
+            self.effort_choices = self._effort_options_for_context()
             self._load_prompt_history_context()
             self.resume_history_request += 1
             self._reset_conversation_detail()
@@ -3667,6 +3709,7 @@ else:
                     self._sync()
                     return
                 self.resume_session_id = ""
+                self.args.resume_session_id = None
                 self._load_prompt_history_context()
                 self.resume_history_request += 1
                 self.pending_resume_selector = None
@@ -3675,6 +3718,7 @@ else:
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = "Resume cleared"
+                self._persist_workspace_settings()
                 self._sync()
                 return
 
@@ -3780,9 +3824,21 @@ else:
                 return "Done: all successful agents are rejected"
             return "No successful agent"
 
-        def _ring_if_background(self) -> None:
+        def _notify_completion_if_background(self) -> None:
+            if self.completion_notification_sent:
+                return
+            self.completion_notification_sent = True
             if self.app_in_foreground:
                 return
+            workspace = self._pending_workspace_path()
+            workspace_name = workspace.name or str(workspace)
+            with contextlib.suppress(Exception):
+                self.notify(
+                    workspace_name,
+                    title="parallel-codex-runner",
+                    timeout=5,
+                    markup=False,
+                )
             with contextlib.suppress(Exception):
                 self.bell()
 
@@ -4003,7 +4059,7 @@ else:
             self.cancel_event = threading.Event()
             self.recommended_agent = None
             self.started_at = time.monotonic()
-            self.first_success_seen = False
+            self.completion_notification_sent = False
             self.pending_workspace = self.workspace
             self.pending_no_sync_back = bool(getattr(self.args, "no_sync_back", False))
             self.pending_keep_workspaces = bool(getattr(self.args, "keep_workspaces", False))
@@ -5354,5 +5410,6 @@ else:
         try:
             app.run()
         finally:
+            app._persist_workspace_settings()
             app._shutdown_runner_and_cleanup()
         return 0

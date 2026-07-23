@@ -2837,7 +2837,38 @@ def run_additional_agents(
 # -----------------------------------------------------------------------------
 
 
+def _explicit_tui_settings(argv: Sequence[str]) -> set[str]:
+    """Record CLI settings so workspace defaults do not override explicit flags."""
+    option_to_setting = {
+        "-n": "agents",
+        "--num-agents": "agents",
+        "--synthesis-agents": "synthesis_agents",
+        "--serial": "execution",
+        "--max-parallel": "max_parallel",
+        "--subagents": "subagents",
+        "--no-subagents": "subagents",
+        "--subagents-limit": "subagents_limit",
+        "--recommend-by": "recommend_by",
+        "--model": "model",
+        "--effort": "effort",
+        "--no-sync-back": "sync_back",
+        "--keep-workspaces": "keep_workspaces",
+        "--resume": "resume",
+        "--resume-session-id": "resume",
+    }
+    explicit: set[str] = set()
+    for raw in argv:
+        option = raw.split("=", 1)[0]
+        setting = option_to_setting.get(option)
+        if setting is not None:
+            explicit.add(setting)
+        elif raw.startswith("-n") and raw != "-n":
+            explicit.add("agents")
+    return explicit
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description=(
             "Run isolated Codex candidates, optionally synthesize their results, then sync "
@@ -2925,7 +2956,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-sync-back", action="store_true", help="Do not copy the recommended workspace back to the original workspace.")
     parser.add_argument("--keep-workspaces", action="store_true", help="Keep isolated candidate and synthesis workspaces after the run.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    args._pcr_explicit_tui_settings = _explicit_tui_settings(raw_argv)
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:

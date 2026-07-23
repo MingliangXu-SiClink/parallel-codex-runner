@@ -1678,6 +1678,24 @@ class AdditionalAgentTests(unittest.TestCase):
 
 
 class TuiCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # TUI tests intentionally create and close many apps; isolate their
+        # per-workspace settings from the user's real PCR state.
+        self._workspace_config_tmp = tempfile.TemporaryDirectory()
+        previous = os.environ.get("PCR_WORKSPACE_CONFIG_PATH")
+        os.environ["PCR_WORKSPACE_CONFIG_PATH"] = str(
+            Path(self._workspace_config_tmp.name) / "workspace_config.json"
+        )
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("PCR_WORKSPACE_CONFIG_PATH", None)
+            else:
+                os.environ["PCR_WORKSPACE_CONFIG_PATH"] = previous
+
+        self.addCleanup(restore)
+        self.addCleanup(self._workspace_config_tmp.cleanup)
+
     def test_tui_model_choices_use_visible_codex_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2526,40 +2544,86 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.agents[1].diff_text, "")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_rings_for_first_success_and_all_complete_only_in_background(self) -> None:
-        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
-        app._sync = lambda: None
-        app.running = True
-        app.app_in_foreground = False
-        app.pending_execution_args = argparse.Namespace(recommend_by="reasoning_tokens")
-        with mock.patch.object(app, "bell") as bell:
-            for idx in (1, 2):
+    def test_tui_notifies_only_after_all_agents_finish_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "project"
+            workspace.mkdir()
+            app = tui_textual.PcrTextualApp(
+                parse_args(["--workspace", str(workspace), "-n", "2"])
+            )
+            app._sync = lambda: None
+            app.running = True
+            app.app_in_foreground = False
+            app.pending_execution_args = argparse.Namespace(recommend_by="reasoning_tokens")
+            with (
+                mock.patch.object(app, "bell") as bell,
+                mock.patch.object(app, "notify") as notify,
+            ):
                 app._on_runner_event(
                     tui_textual.RunnerEvent(
                         {
                             "type": "agent_finished",
-                            "idx": idx,
-                            "result": make_agent_result_data(idx, Path(f"/tmp/agent-{idx}")),
+                            "idx": 1,
+                            "result": make_agent_result_data(
+                                1,
+                                Path("/tmp/agent-1"),
+                            ),
                         }
                     )
                 )
-            app._on_runner_event(
-                tui_textual.RunnerEvent(
-                    {
-                        "type": "run_finished",
-                        "run_root": "/tmp/pcr-test/run",
-                        "best_agent": 1,
-                        "cancelled": False,
-                    }
+                bell.assert_not_called()
+                notify.assert_not_called()
+                app._on_runner_event(
+                    tui_textual.RunnerEvent(
+                        {
+                            "type": "agent_finished",
+                            "idx": 2,
+                            "result": make_agent_result_data(
+                                2,
+                                Path("/tmp/agent-2"),
+                                status="failed",
+                            ),
+                        }
+                    )
                 )
-            )
+                bell.assert_not_called()
+                notify.assert_not_called()
+                app._on_runner_event(
+                    tui_textual.RunnerEvent(
+                        {
+                            "type": "run_finished",
+                            "run_root": "/tmp/pcr-test/run",
+                            "best_agent": 1,
+                            "cancelled": False,
+                        }
+                    )
+                )
+                app._on_runner_event(
+                    tui_textual.RunnerEvent(
+                        {
+                            "type": "run_finished",
+                            "run_root": "/tmp/pcr-test/run",
+                            "best_agent": 1,
+                            "cancelled": False,
+                        }
+                    )
+                )
 
-        self.assertEqual(bell.call_count, 2)
+            bell.assert_called_once_with()
+            notify.assert_called_once_with(
+                "project",
+                title="parallel-codex-runner",
+                timeout=5,
+                markup=False,
+            )
 
         foreground_app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
         foreground_app._sync = lambda: None
         foreground_app.app_in_foreground = True
-        with mock.patch.object(foreground_app, "bell") as foreground_bell:
+        with (
+            mock.patch.object(foreground_app, "bell") as foreground_bell,
+            mock.patch.object(foreground_app, "notify") as foreground_notify,
+        ):
             foreground_app._on_runner_event(
                 tui_textual.RunnerEvent(
                     {
@@ -2570,6 +2634,7 @@ class TuiCommandTests(unittest.TestCase):
                 )
             )
         foreground_bell.assert_not_called()
+        foreground_notify.assert_not_called()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_workspace_change_finalizes_displayed_agent(self) -> None:
