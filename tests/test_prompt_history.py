@@ -195,6 +195,47 @@ class PromptHistoryTuiTests(unittest.TestCase):
 
                 start.assert_called_once_with("follow up", record_history=True)
 
+    def test_unfinished_agent_follow_up_keeps_history_flag_in_deferred_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "prompt_history.json"
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            args = parse_args(["--workspace", str(workspace)])
+
+            with mock.patch.dict(
+                os.environ,
+                {"PCR_PROMPT_HISTORY_PATH": str(history_path)},
+            ):
+                app = tui_textual.PcrTextualApp(args)
+                app._sync = lambda: None
+                app.running = True
+
+                self.assertTrue(app._submit_task_prompt("queued follow up"))
+                self.assertEqual(
+                    PromptHistoryStore(history_path).entries(workspace, ""),
+                    [],
+                )
+                self.assertEqual(len(app.follow_up_queue), 1)
+                self.assertTrue(app.follow_up_queue[0].record_history)
+
+                app.running = False
+                app.pending_workspaces_root = Path(tmp) / "run" / "workspaces"
+                app.pending_no_sync_back = False
+                app.agents[1].result = {"status": "success"}
+                with mock.patch.object(app, "_finalize_agent", return_value=True):
+                    with mock.patch.object(
+                        app,
+                        "_request_run_with_storage_check",
+                        return_value=True,
+                    ) as start:
+                        self.assertTrue(app._dispatch_follow_up())
+
+                start.assert_called_once_with(
+                    "queued follow up",
+                    record_history=True,
+                    from_follow_up_queue=True,
+                )
+
     def test_prompt_up_down_navigation_and_edited_draft(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:

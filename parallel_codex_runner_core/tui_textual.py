@@ -64,6 +64,7 @@ MAX_SUGGESTIONS = 15
 UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
+FOLLOW_UP_DELAY_SECONDS = 60.0
 TIP_ICON = "✦"
 TIP_ICON_COLORS: tuple[str, ...] = (
     "#32404b",
@@ -132,6 +133,7 @@ TUI_TIPS: tuple[str, ...] = (
     "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
     "大型工作区会在复制前估算空间，并在预计超过 5 GiB 时请求确认。",
     "SUBAGENTS 默认关闭；启用后可用 SUBAGENTS_LIMIT 控制每个 PCR Agent 的嵌套数量。",
+    "当前 Agent 未完成时提交的新问题会排队，本轮结束后留出 60 秒选择续接的 Agent。",
 )
 
 
@@ -154,6 +156,7 @@ def build_help_text() -> str:
         [
             "",
             "Enter normal text to start a parallel Codex run.",
+            "Prompts submitted from unfinished agents queue without stopping the active run.",
             "Run-setting commands apply to the next run without selecting an agent.",
             "Accept, follow-up, exit, workspace, and resume actions use the displayed agent.",
             "Ctrl-C copies selected text; otherwise it clears a non-empty prompt or exits.",
@@ -681,6 +684,12 @@ else:
         developer_instructions: str = ""
 
 
+    @dataclass(frozen=True)
+    class QueuedFollowUp:
+        prompt: str
+        record_history: bool = False
+
+
     class RunnerEvent(Message):
         def __init__(self, payload: dict[str, Any]) -> None:
             super().__init__()
@@ -730,6 +739,8 @@ else:
             error: str = "",
             reclaimable_bytes: int = 0,
             configuration_key: tuple[Any, ...] = (),
+            from_follow_up_queue: bool = False,
+            bypass_follow_up_queue: bool = False,
         ) -> None:
             super().__init__()
             self.request_id = request_id
@@ -740,6 +751,8 @@ else:
             self.error = error
             self.reclaimable_bytes = max(0, int(reclaimable_bytes))
             self.configuration_key = configuration_key
+            self.from_follow_up_queue = from_follow_up_queue
+            self.bypass_follow_up_queue = bypass_follow_up_queue
 
 
     class StorageWarningScreen(ModalScreen[bool]):
@@ -1179,6 +1192,20 @@ else:
             text-wrap: nowrap;
             text-overflow: clip;
         }
+        #follow-up-queue-frame {
+            height: 1;
+            min-height: 1;
+            max-height: 6;
+            margin: 0 1;
+            background: #141b23;
+            color: #d6e4f0;
+            scrollbar-size: 1 1;
+        }
+        #follow-up-queue {
+            width: 100%;
+            height: auto;
+            padding: 0 1;
+        }
         #prompt {
             height: 3;
             min-height: 3;
@@ -1293,6 +1320,16 @@ else:
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self.queued_prompt_records_history = False
+            # Follow-ups submitted from unfinished panes wait without stopping
+            # the current run; queued_prompt above remains the immediate path.
+            self.follow_up_queue: list[QueuedFollowUp] = []
+            self.follow_up_continue_at: float | None = None
+            self.follow_up_ready = False
+            self.follow_up_source_finalized = False
+            self._follow_up_countdown_second: int | None = None
+            self._follow_up_queue_cache = ""
+            self._follow_up_queue_items_cache: tuple[str, ...] = ()
+            self._follow_up_queue_refresh_deferred = False
             self._updating_controls = False
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
@@ -1374,17 +1411,21 @@ else:
             if self._selection_drag_active():
                 return
             refresh_tip = self._tip_refresh_deferred_for_selection
+            refresh_follow_up_queue = self._follow_up_queue_refresh_deferred
             sync = self._sync_deferred_for_selection
             refresh_recommend_border = (
                 self._recommend_border_deferred_for_selection
                 and not self._screen_selection_active()
             )
             self._tip_refresh_deferred_for_selection = False
+            self._follow_up_queue_refresh_deferred = False
             self._sync_deferred_for_selection = False
             if refresh_recommend_border:
                 self._recommend_border_deferred_for_selection = False
             if refresh_tip:
                 self._refresh_tip()
+            if refresh_follow_up_queue:
+                self._refresh_follow_up_queue()
             if sync:
                 self._sync()
 
@@ -1596,6 +1637,8 @@ else:
                         yield DetailView("", id="detail")
                 yield Static("", id="suggestions")
                 yield Static(self._tip_renderable(), id="tips")
+                with VerticalScroll(id="follow-up-queue-frame"):
+                    yield Static("", id="follow-up-queue", markup=False)
                 yield PromptEditor(
                     "",
                     id="prompt",
@@ -1739,7 +1782,20 @@ else:
             self,
             prompt: str,
             record_history: bool = False,
+            *,
+            from_follow_up_queue: bool = False,
+            bypass_follow_up_queue: bool = False,
         ) -> bool:
+            if (
+                self.follow_up_queue
+                and not from_follow_up_queue
+                and not bypass_follow_up_queue
+                and not self.running
+            ):
+                return self._enqueue_follow_up(
+                    prompt,
+                    record_history=record_history,
+                )
             if self.running:
                 return self._start_run(prompt, record_history=record_history)
             if self.storage_preflight_inflight:
@@ -1821,6 +1877,8 @@ else:
                             error,
                             reclaimable_bytes,
                             configuration_key,
+                            from_follow_up_queue,
+                            bypass_follow_up_queue,
                         ),
                     )
                 except RuntimeError:
@@ -1845,8 +1903,11 @@ else:
                 if not self._request_run_with_storage_check(
                     event.prompt,
                     record_history=event.record_history,
+                    from_follow_up_queue=event.from_follow_up_queue,
+                    bypass_follow_up_queue=event.bypass_follow_up_queue,
                 ):
-                    self._restore_prompt_after_storage_failure(event.prompt)
+                    if not event.from_follow_up_queue:
+                        self._restore_prompt_after_storage_failure(event.prompt)
                 return True
             return False
 
@@ -1859,6 +1920,8 @@ else:
                 return
             if not continue_run:
                 self.storage_preflight_inflight = False
+                if event.from_follow_up_queue:
+                    self._consume_follow_up(event.prompt)
                 self.status = "Prompt ignored: storage confirmation declined"
                 self._sync()
                 self.query_one("#prompt", PromptEditor).focus()
@@ -1870,7 +1933,8 @@ else:
             if estimate is None:
                 self.storage_preflight_inflight = False
                 self.status = "Run failed: storage estimate is unavailable"
-                self._restore_prompt_after_storage_failure(event.prompt)
+                if not event.from_follow_up_queue:
+                    self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
             try:
@@ -1878,7 +1942,8 @@ else:
             except Exception as exc:  # noqa: BLE001
                 self.storage_preflight_inflight = False
                 self.status = f"Run failed: cannot inspect available disk space: {exc}"
-                self._restore_prompt_after_storage_failure(event.prompt)
+                if not event.from_follow_up_queue:
+                    self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
             usable = available + event.reclaimable_bytes
@@ -1895,15 +1960,19 @@ else:
                     f"(need {format_storage_bytes(estimate.total_bytes)}, "
                     f"available {available_text})"
                 )
-                self._restore_prompt_after_storage_failure(event.prompt)
+                if not event.from_follow_up_queue:
+                    self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
 
             self.storage_preflight_inflight = False
-            if not self._start_run(
+            started = self._start_run(
                 event.prompt,
                 record_history=event.record_history,
-            ):
+            )
+            if started and event.from_follow_up_queue:
+                self._consume_follow_up(event.prompt)
+            elif not started and not event.from_follow_up_queue:
                 self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
 
@@ -1920,7 +1989,8 @@ else:
                 self.storage_preflight_inflight = False
                 message = event.error or "storage estimate is unavailable"
                 self.status = f"Run failed: cannot estimate storage: {message}"
-                self._restore_prompt_after_storage_failure(event.prompt)
+                if not event.from_follow_up_queue:
+                    self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
             if event.estimate.total_bytes > LARGE_RUN_STORAGE_WARNING_BYTES:
@@ -2461,6 +2531,7 @@ else:
                     if not self._launch_next_candidate_batch():
                         self.status = self._completed_status()
                         self._ring_if_background()
+                        self._schedule_follow_up_after_completion()
             elif kind == "run_failed":
                 self.running = False
                 self.cancel_event = None
@@ -2469,6 +2540,16 @@ else:
                     self.queued_prompt and self.queued_agent is not None
                 ):
                     self._finish_cancelled_runner()
+                elif self.follow_up_queue and self._has_pending_run():
+                    self._recompute_recommendation()
+                    if self.recommended_agent is not None:
+                        self._schedule_follow_up_after_completion()
+                    else:
+                        self.follow_up_ready = False
+                        self.status = (
+                            f"Run failed: {payload.get('message') or ''}; "
+                            "queued follow-up is waiting for /retry or /more"
+                        )
                 else:
                     self.status = f"Run failed: {payload.get('message') or ''}"
                     if self._cleanup_after_pending_run():
@@ -2484,6 +2565,7 @@ else:
                     if not self._launch_next_candidate_batch():
                         self.status = self._completed_status()
                         self._ring_if_background()
+                        self._schedule_follow_up_after_completion()
             elif kind == "candidate_batch_failed":
                 self.running = False
                 self.cancel_event = None
@@ -2501,6 +2583,7 @@ else:
                     self._recompute_recommendation()
                     self.status = f"Additional candidates failed: {payload.get('message') or ''}"
                     self._ring_if_background()
+                    self._schedule_follow_up_after_completion()
             if kind not in {"agent_line", "agent_tokens", "agent_status"}:
                 self._sync()
             if kind in {
@@ -2695,6 +2778,11 @@ else:
             if self.storage_preflight_inflight:
                 self.storage_preflight_request += 1
                 self.storage_preflight_inflight = False
+            self.follow_up_queue.clear()
+            self.follow_up_continue_at = None
+            self.follow_up_ready = False
+            self.follow_up_source_finalized = False
+            self._follow_up_countdown_second = None
             if self.running:
                 self.queued_prompt = ""
                 self.queued_agent = None
@@ -2823,6 +2911,13 @@ else:
                 self.status = "Usage: /accept"
                 self._sync()
                 return
+            if (
+                self.follow_up_queue
+                and self.follow_up_source_finalized
+                and not self.running
+            ):
+                self._dispatch_follow_up()
+                return
             pane = self.agents.get(self.selected_agent)
             result = pane.result if pane is not None else None
             if not self._has_pending_run() or not isinstance(result, dict):
@@ -2848,8 +2943,13 @@ else:
                 self.status = f"Stopping remaining agents; accepting AGENT-{self.selected_agent:03d}"
                 self._sync()
                 return
-            if self._finalize_agent(self.selected_agent, archive_detail=True):
-                self.status = f"Accepted AGENT-{self.selected_agent:03d}"
+            accepted_idx = self.selected_agent
+            if self._finalize_agent(accepted_idx, archive_detail=True):
+                if self.follow_up_queue:
+                    self.follow_up_source_finalized = True
+                    self._dispatch_follow_up()
+                else:
+                    self.status = f"Accepted AGENT-{accepted_idx:03d}"
             self._sync()
 
         def _handle_reject(self, args: list[str]) -> None:
@@ -3751,6 +3851,9 @@ else:
                 return False
 
             batch = self.candidate_batches.pop(0)
+            self.follow_up_continue_at = None
+            self.follow_up_ready = False
+            self._follow_up_countdown_second = None
             batch.role = normalize_agent_role(batch.role)
             execution_prompt = batch.prompt or self.pending_prompt
             for idx in batch.indices:
@@ -3837,7 +3940,11 @@ else:
                 idx = self.pending_accept_agent
                 self.pending_accept_agent = None
                 if self._finalize_agent(idx, archive_detail=True):
-                    self.status = f"Accepted AGENT-{idx:03d}"
+                    if self.follow_up_queue and not self.exit_after_run:
+                        self.follow_up_source_finalized = True
+                        self._dispatch_follow_up()
+                    else:
+                        self.status = f"Accepted AGENT-{idx:03d}"
                 return
             if self.queued_prompt and self.queued_agent is not None:
                 self._continue_queued_prompt()
@@ -3848,7 +3955,7 @@ else:
 
         def _start_run(self, prompt: str, record_history: bool = False) -> bool:
             if self.running:
-                return self._queue_prompt_from_finished_agent(
+                return self._handle_prompt_while_running(
                     prompt,
                     record_history=record_history,
                 )
@@ -3955,25 +4062,59 @@ else:
                 self._record_started_prompt(prompt)
             return True
 
-        def _queue_prompt_from_finished_agent(
+        def _successful_agent_result(self, idx: int) -> dict[str, Any] | None:
+            pane = self.agents.get(idx)
+            result = pane.result if pane is not None else None
+            if isinstance(result, dict) and result.get("status") == "success":
+                return result
+            return None
+
+        def _enqueue_follow_up(
             self,
             prompt: str,
             record_history: bool = False,
         ) -> bool:
-            if self.queued_prompt:
-                self.status = "Already stopping remaining agents"
+            if self._pending_sync_disabled():
+                self.status = "Cannot queue a follow-up while sync back is disabled"
                 self._sync()
                 return False
-            if getattr(self.args, "no_sync_back", False):
+            self.follow_up_queue.append(
+                QueuedFollowUp(prompt, record_history=record_history)
+            )
+            if self.running:
+                self.follow_up_continue_at = None
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = None
+                suffix = "current agents continue"
+            else:
+                suffix = "the first queued follow-up keeps its current schedule"
+            self.status = f"Queued follow-up #{len(self.follow_up_queue)}; {suffix}"
+            self._sync()
+            return True
+
+        def _handle_prompt_while_running(
+            self,
+            prompt: str,
+            record_history: bool = False,
+        ) -> bool:
+            if self._pending_sync_disabled():
                 self.status = "Cannot continue a running agent while sync back is disabled"
                 self._sync()
                 return False
-            pane = self.agents.get(self.selected_agent)
-            result = pane.result if pane is not None else None
-            if not isinstance(result, dict) or result.get("status") != "success":
-                self.status = f"AGENT-{self.selected_agent:03d} has not finished successfully"
-                self._sync()
-                return False
+            if (
+                self.follow_up_queue
+                or self.queued_prompt
+                or self.pending_accept_agent is not None
+            ):
+                return self._enqueue_follow_up(
+                    prompt,
+                    record_history=record_history,
+                )
+            if self._successful_agent_result(self.selected_agent) is None:
+                return self._enqueue_follow_up(
+                    prompt,
+                    record_history=record_history,
+                )
             self.queued_prompt = prompt
             self.queued_agent = self.selected_agent
             self.queued_prompt_records_history = record_history
@@ -3984,6 +4125,100 @@ else:
             self.status = f"Stopping remaining agents; continuing from AGENT-{self.selected_agent:03d}"
             self._sync()
             return True
+
+        def _schedule_follow_up_after_completion(self) -> bool:
+            if (
+                not self.follow_up_queue
+                or self.running
+                or self.exit_after_run
+                or self.storage_preflight_inflight
+            ):
+                return False
+            idx = self.recommended_agent
+            if idx is None or self._successful_agent_result(idx) is None:
+                self.follow_up_continue_at = None
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = None
+                self.status = (
+                    "Queued follow-up is waiting for a successful recommended Agent"
+                )
+                return False
+            self.selected_agent = idx
+            self.follow_up_continue_at = (
+                time.monotonic() + FOLLOW_UP_DELAY_SECONDS
+            )
+            self.follow_up_ready = False
+            self._follow_up_countdown_second = int(FOLLOW_UP_DELAY_SECONDS)
+            self.status = (
+                f"Queued follow-up starts from AGENT-{idx:03d} in "
+                f"{int(FOLLOW_UP_DELAY_SECONDS)}s; ←/→ changes the Agent"
+            )
+            return True
+
+        def _consume_follow_up(self, prompt: str) -> None:
+            if self.follow_up_queue:
+                if self.follow_up_queue[0].prompt == prompt:
+                    self.follow_up_queue.pop(0)
+                else:
+                    for index, item in enumerate(self.follow_up_queue):
+                        if item.prompt == prompt:
+                            self.follow_up_queue.pop(index)
+                            break
+            self.follow_up_continue_at = None
+            self.follow_up_ready = False
+            self._follow_up_countdown_second = None
+            if self.running or not self.follow_up_queue:
+                self.follow_up_source_finalized = False
+            elif self.follow_up_source_finalized:
+                self.follow_up_continue_at = (
+                    time.monotonic() + FOLLOW_UP_DELAY_SECONDS
+                )
+            self._refresh_follow_up_queue()
+
+        def _dispatch_follow_up(self) -> bool:
+            if (
+                not self.follow_up_queue
+                or self.running
+                or self.storage_preflight_inflight
+            ):
+                return False
+            item = self.follow_up_queue[0]
+            self.follow_up_continue_at = None
+            self.follow_up_ready = False
+            self._follow_up_countdown_second = None
+            if not self.follow_up_source_finalized:
+                if self._successful_agent_result(self.selected_agent) is None:
+                    self.follow_up_ready = True
+                    self.status = (
+                        f"Queued follow-up is waiting: AGENT-{self.selected_agent:03d} "
+                        "is not successful"
+                    )
+                    self._sync()
+                    return False
+                if self._pending_sync_disabled():
+                    self.follow_up_ready = True
+                    self.status = (
+                        "Queued follow-up is waiting because sync back is disabled"
+                    )
+                    self._sync()
+                    return False
+                if not self._finalize_agent(
+                    self.selected_agent,
+                    archive_detail=True,
+                ):
+                    self._sync()
+                    return False
+                self.follow_up_source_finalized = True
+
+            self._archive_command_history()
+            started = self._request_run_with_storage_check(
+                item.prompt,
+                record_history=item.record_history,
+                from_follow_up_queue=True,
+            )
+            if not started:
+                self._sync()
+            return started
 
         def _continue_queued_prompt(self) -> None:
             prompt = self.queued_prompt
@@ -4004,11 +4239,19 @@ else:
                     pass
                 return
             self._archive_command_history()
-            started = (
-                self._request_run_with_storage_check(prompt, record_history=True)
-                if record_history
-                else self._request_run_with_storage_check(prompt)
-            )
+            if self.follow_up_queue:
+                started = self._request_run_with_storage_check(
+                    prompt,
+                    record_history=record_history,
+                    bypass_follow_up_queue=True,
+                )
+            elif record_history:
+                started = self._request_run_with_storage_check(
+                    prompt,
+                    record_history=True,
+                )
+            else:
+                started = self._request_run_with_storage_check(prompt)
             if not started:
                 try:
                     editor = self.query_one("#prompt", PromptEditor)
@@ -4210,6 +4453,31 @@ else:
                 else:
                     self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
                 self._sync()
+                return
+            if self.follow_up_continue_at is not None:
+                remaining = max(
+                    0,
+                    int(self.follow_up_continue_at - time.monotonic() + 0.999),
+                )
+                if remaining <= 0:
+                    self.follow_up_continue_at = None
+                    self.follow_up_ready = True
+                    self._follow_up_countdown_second = None
+                    self._dispatch_follow_up()
+                elif remaining != self._follow_up_countdown_second:
+                    self._follow_up_countdown_second = remaining
+                    self._refresh_follow_up_queue()
+                return
+            if (
+                self.follow_up_ready
+                and self.follow_up_queue
+                and self._successful_agent_result(self.selected_agent) is not None
+                and (
+                    self.follow_up_source_finalized
+                    or not self._pending_sync_disabled()
+                )
+            ):
+                self._dispatch_follow_up()
 
         @property
         def current_tip(self) -> str:
@@ -4246,6 +4514,88 @@ else:
         def _advance_tip_icon(self) -> None:
             self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_COLORS)
             self._refresh_tip()
+
+        def _follow_up_queue_text(self) -> str:
+            if not self.follow_up_queue:
+                return ""
+            if self.running:
+                state = "waiting for current agents"
+            elif self.storage_preflight_inflight:
+                state = "preparing next run"
+            elif self.follow_up_continue_at is not None:
+                remaining = max(
+                    0,
+                    int(self.follow_up_continue_at - time.monotonic() + 0.999),
+                )
+                state = (
+                    f"next in {remaining}s from "
+                    f"AGENT-{self.selected_agent:03d}"
+                )
+            elif self.follow_up_ready:
+                state = (
+                    f"ready from AGENT-{self.selected_agent:03d}; "
+                    "select a successful Agent"
+                )
+            elif self.follow_up_source_finalized:
+                state = "waiting to start from the finalized Agent"
+            else:
+                state = "waiting for a successful recommended Agent"
+
+            lines: list[str] = []
+            count = len(self.follow_up_queue)
+            for index, item in enumerate(self.follow_up_queue, 1):
+                prompt_lines = item.prompt.splitlines() or [""]
+                prefix = (
+                    f"↳ QUEUE {count} · {state} · {index}  "
+                    if index == 1
+                    else f"  {index}  "
+                )
+                lines.append(prefix + prompt_lines[0])
+                continuation = " " * len(prefix)
+                lines.extend(continuation + line for line in prompt_lines[1:])
+            return "\n".join(lines)
+
+        def _refresh_follow_up_queue(self) -> None:
+            if self._selection_drag_active() or self._screen_selection_active():
+                self._follow_up_queue_refresh_deferred = True
+                return
+            try:
+                frame = self.query_one(
+                    "#follow-up-queue-frame",
+                    VerticalScroll,
+                )
+                widget = self.query_one("#follow-up-queue", Static)
+            except Exception:
+                return
+            text = self._follow_up_queue_text()
+            frame.display = bool(text)
+            if not text:
+                self._follow_up_queue_cache = ""
+                self._follow_up_queue_items_cache = ()
+                return
+            content_width = max(
+                20,
+                int(
+                    getattr(frame.content_size, "width", 0)
+                    or getattr(frame.size, "width", 0)
+                    or 80
+                )
+                - 2,
+            )
+            visible_lines = sum(
+                max(1, (cell_len(line) + content_width - 1) // content_width)
+                for line in text.splitlines()
+            )
+            frame.styles.height = min(6, max(1, visible_lines))
+            item_key = tuple(item.prompt for item in self.follow_up_queue)
+            items_changed = item_key != self._follow_up_queue_items_cache
+            if text != self._follow_up_queue_cache:
+                widget.update(text)
+                self._follow_up_queue_cache = text
+                self._follow_up_queue_items_cache = item_key
+            if items_changed:
+                self.call_after_refresh(frame.scroll_home, animate=False)
+            self._follow_up_queue_refresh_deferred = False
 
         def _selected_agent_is_recommended(self) -> bool:
             pane = self.agents.get(self.selected_agent)
@@ -4355,6 +4705,7 @@ else:
                 return
             self._sync_deferred_for_selection = False
             self._sync_runner_panel()
+            self._refresh_follow_up_queue()
             frame = self.query_one("#detail-frame", RainbowDetailFrame)
             pane = self.agents.get(self.selected_agent)
             detail_visible = self._has_detail_content(pane)

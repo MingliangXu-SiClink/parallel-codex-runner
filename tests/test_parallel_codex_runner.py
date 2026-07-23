@@ -1784,6 +1784,10 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("limit how many agents may run concurrently", descriptions)
         self.assertIn("set the workspace PCR operates on", descriptions)
         self.assertNotIn("same as", tui_textual.build_help_text().lower())
+        self.assertIn(
+            "queue without stopping the active run",
+            tui_textual.build_help_text(),
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_tip_row_rotates_text_and_animates_icon_above_prompt(self) -> None:
@@ -1804,6 +1808,8 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(any("/accept" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/diff" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("SUBAGENTS" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("60 秒" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertEqual(tui_textual.FOLLOW_UP_DELAY_SECONDS, 60.0)
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -3831,22 +3837,123 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIsNone(app.queued_agent)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_keeps_follow_up_text_when_selected_agent_is_still_running(self) -> None:
+    def test_tui_queues_follow_up_when_selected_agent_is_still_running(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
             with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
                 async with app.run_test() as pilot:
                     app.running = True
+                    app.cancel_event = threading.Event()
                     prompt = app.query_one("#prompt")
                     prompt.text = "follow-up question"
                     prompt.focus()
                     await pilot.press("enter")
                     await pilot.pause()
 
-                    self.assertEqual(prompt.text, "follow-up question")
-                    self.assertIn("has not finished successfully", app.status)
+                    queue_frame = app.query_one("#follow-up-queue-frame")
+                    queue = app.query_one("#follow-up-queue")
+                    self.assertEqual(prompt.text, "")
+                    self.assertEqual(
+                        [item.prompt for item in app.follow_up_queue],
+                        ["follow-up question"],
+                    )
+                    self.assertFalse(app.cancel_event.is_set())
+                    self.assertTrue(queue_frame.display)
+                    self.assertLess(app.query_one("#tips").region.y, queue_frame.region.y)
+                    self.assertLess(queue_frame.region.y, prompt.region.y)
+                    self.assertIn("follow-up question", str(queue.content))
+                    self.assertIn("current agents continue", app.status)
+
+                    prompt.text = "second follow-up"
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    self.assertEqual(
+                        [item.prompt for item in app.follow_up_queue],
+                        ["follow-up question", "second follow-up"],
+                    )
+                    self.assertFalse(app.cancel_event.is_set())
+                    self.assertIn("second follow-up", str(queue.content))
 
         asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_completed_run_selects_recommended_agent_and_delays_queued_follow_up(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.running = True
+        app.selected_agent = 1
+        app.pending_execution_args = argparse.Namespace(
+            recommend_by="reasoning_tokens"
+        )
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question", True)
+        )
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+            reasoning_tokens=100,
+        )
+        app.agents[2].result = make_agent_result_data(
+            2,
+            Path("/tmp/agent-2"),
+            reasoning_tokens=200,
+        )
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            app._on_runner_event(
+                tui_textual.RunnerEvent(
+                    {
+                        "type": "run_finished",
+                        "run_root": "/tmp/pcr-test/run",
+                        "best_agent": 2,
+                    }
+                )
+            )
+
+        self.assertEqual(app.recommended_agent, 2)
+        self.assertEqual(app.selected_agent, 2)
+        self.assertEqual(app.follow_up_continue_at, 160.0)
+        self.assertIn("in 60s", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_delayed_follow_up_uses_agent_displayed_at_deadline(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question", True)
+        )
+        app.follow_up_continue_at = 10.0
+        app.selected_agent = 1
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+        )
+        app.agents[2].result = make_agent_result_data(
+            2,
+            Path("/tmp/agent-2"),
+        )
+
+        # The user switches away from the initially recommended Agent during
+        # the one-minute review window.
+        app.selected_agent = 2
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=11.0):
+            with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
+                with mock.patch.object(
+                    app,
+                    "_request_run_with_storage_check",
+                    return_value=True,
+                ) as start:
+                    app._tick()
+
+        finalize.assert_called_once_with(2, archive_detail=True)
+        start.assert_called_once_with(
+            "follow-up question",
+            record_history=True,
+            from_follow_up_queue=True,
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_run_finished_does_not_auto_switch_to_recommended_agent(self) -> None:
