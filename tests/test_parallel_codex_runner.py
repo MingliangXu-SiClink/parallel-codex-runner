@@ -1053,6 +1053,143 @@ class CommandBuildTests(unittest.TestCase):
         process.stdin.close.assert_called_once()
         process.terminate.assert_called_once()
 
+    def test_workspace_guard_is_appended_and_config_is_resolved_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            first_workspace = root / "workspaces" / "agent_001"
+            second_workspace = root / "workspaces" / "agent_002"
+            codex_home.mkdir()
+            first_workspace.mkdir(parents=True)
+            second_workspace.mkdir(parents=True)
+            resolver = app_core._AgentDeveloperInstructionResolver()
+
+            with mock.patch.object(
+                app_core,
+                "read_effective_codex_developer_instructions",
+                return_value="Project guidance.",
+            ) as read_instructions:
+                first = resolver.for_workspace(
+                    codex_bin="codex",
+                    codex_home=codex_home,
+                    agent_workspace=first_workspace,
+                )
+                second = resolver.for_workspace(
+                    codex_bin="codex",
+                    codex_home=codex_home,
+                    agent_workspace=second_workspace,
+                    additional_instructions="Review the candidate results.",
+                )
+
+        read_instructions.assert_called_once()
+        self.assertTrue(first.startswith("Project guidance.\n\n"))
+        self.assertIn(str(first_workspace.resolve()), first)
+        self.assertNotIn(str(second_workspace.resolve()), first)
+        self.assertLess(
+            second.index("Review the candidate results."),
+            second.index("PCR workspace isolation requirement:"),
+        )
+        self.assertIn(str(second_workspace.resolve()), second)
+        self.assertIn("Never modify the original workspace", second)
+        self.assertTrue(second.endswith("but they are read-only."))
+
+    def test_workspace_guard_survives_optional_config_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            first_workspace = root / "workspaces" / "agent_001"
+            second_workspace = root / "workspaces" / "agent_002"
+            codex_home.mkdir()
+            first_workspace.mkdir(parents=True)
+            second_workspace.mkdir(parents=True)
+            resolver = app_core._AgentDeveloperInstructionResolver()
+
+            with mock.patch.object(
+                app_core,
+                "read_effective_codex_developer_instructions",
+                side_effect=RuntimeError("config/read unavailable"),
+            ) as read_instructions, mock.patch.object(
+                app_core.logger,
+                "warning",
+            ) as warning:
+                first = resolver.for_workspace(
+                    codex_bin="codex",
+                    codex_home=codex_home,
+                    agent_workspace=first_workspace,
+                )
+                second = resolver.for_workspace(
+                    codex_bin="codex",
+                    codex_home=codex_home,
+                    agent_workspace=second_workspace,
+                )
+
+        read_instructions.assert_called_once()
+        warning.assert_called_once()
+        self.assertIn(str(first_workspace.resolve()), first)
+        self.assertIn(str(second_workspace.resolve()), second)
+
+    def test_synthesis_does_not_discard_existing_instructions_on_read_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            workspace = root / "workspaces" / "agent_001"
+            codex_home.mkdir()
+            workspace.mkdir(parents=True)
+            resolver = app_core._AgentDeveloperInstructionResolver()
+
+            with mock.patch.object(
+                app_core,
+                "read_effective_codex_developer_instructions",
+                side_effect=RuntimeError("config/read unavailable"),
+            ), self.assertRaisesRegex(RuntimeError, "config/read unavailable"):
+                resolver.for_workspace(
+                    codex_bin="codex",
+                    codex_home=codex_home,
+                    agent_workspace=workspace,
+                    additional_instructions="Review every candidate.",
+                )
+
+    def test_agent_environment_removes_source_workspace_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent_workspace = root / "workspaces" / "agent_001"
+            codex_home = root / "meta" / "agent_001" / "codex_home"
+            source_workspace = root / "source"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PWD": str(source_workspace),
+                    "OLDPWD": str(source_workspace),
+                    "INIT_CWD": str(source_workspace),
+                    "VSCODE_CWD": str(source_workspace),
+                    "GIT_DIR": str(source_workspace / ".git"),
+                    "GIT_WORK_TREE": str(source_workspace),
+                    "GIT_INDEX_FILE": str(source_workspace / ".git" / "index"),
+                    "GIT_COMMON_DIR": str(source_workspace / ".git"),
+                    "GIT_OBJECT_DIRECTORY": str(
+                        source_workspace / ".git" / "objects"
+                    ),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                        source_workspace / ".git" / "objects-alt"
+                    ),
+                    "GIT_PREFIX": "nested/",
+                    "PRESERVED": "yes",
+                },
+                clear=True,
+            ):
+                env = app_core.agent_process_environment(
+                    agent_workspace,
+                    codex_home,
+                )
+
+        self.assertEqual(env["PWD"], str(agent_workspace.resolve()))
+        self.assertEqual(env["CODEX_HOME"], str(codex_home.resolve()))
+        self.assertEqual(env["PRESERVED"], "yes")
+        for key in app_core.AGENT_ENV_PATH_KEYS_TO_CLEAR:
+            self.assertNotIn(key, env)
+
     def test_codex_config_read_accepts_no_existing_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1408,6 +1545,10 @@ class RunOnceCleanupTests(unittest.TestCase):
                 return_value="Usage: codex exec\n  --json",
             ), mock.patch.object(
                 app_core,
+                "read_effective_codex_developer_instructions",
+                return_value=None,
+            ), mock.patch.object(
+                app_core,
                 "build_codex_command",
                 return_value=([sys.executable, "-c", "pass"], {}),
             ), mock.patch.object(
@@ -1536,7 +1677,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                 app_core,
                 "read_effective_codex_developer_instructions",
                 return_value="User guidance.",
-            ), mock.patch.object(
+            ) as read_instructions, mock.patch.object(
                 app_core,
                 "build_codex_command",
                 side_effect=build_command,
@@ -1571,6 +1712,16 @@ class RunOnceCleanupTests(unittest.TestCase):
                 all(call.get("resume_session_id") == "session-base" for call in build_calls)
             )
             for idx in range(1, 5):
+                self.assertIn(
+                    str(
+                        (
+                            run_root
+                            / "workspaces"
+                            / f"agent_{idx:03d}"
+                        ).resolve()
+                    ),
+                    str(build_calls[idx - 1].get("developer_instructions") or ""),
+                )
                 received_prompt = (
                     run_root
                     / "workspaces"
@@ -1586,17 +1737,32 @@ class RunOnceCleanupTests(unittest.TestCase):
                 Path(summary["synthesis"]["instructions_path"]).resolve(),
                 instructions_path.resolve(),
             )
+            self.assertEqual(read_instructions.call_count, 2)
             self.assertTrue(
-                all(not call.get("developer_instructions") for call in build_calls[:2])
+                all(
+                    str(call.get("developer_instructions") or "").startswith(
+                        "User guidance.\n\n"
+                    )
+                    and "PCR workspace isolation requirement:"
+                    in str(call.get("developer_instructions") or "")
+                    and "second-stage synthesis Agent"
+                    not in str(call.get("developer_instructions") or "")
+                    for call in build_calls[:2]
+                )
             )
             self.assertTrue(
                 all(
                     str(call.get("developer_instructions") or "").startswith(
                         "User guidance.\n\n"
                     )
-                    and
-                    "second-stage synthesis Agent"
+                    and "second-stage synthesis Agent"
                     in str(call.get("developer_instructions") or "")
+                    and str(call.get("developer_instructions") or "").index(
+                        "second-stage synthesis Agent"
+                    )
+                    < str(call.get("developer_instructions") or "").index(
+                        "PCR workspace isolation requirement:"
+                    )
                     for call in build_calls[2:]
                 )
             )
@@ -1718,10 +1884,25 @@ class RunOnceCleanupTests(unittest.TestCase):
                     / "received_prompt.txt"
                 ).read_text(encoding="utf-8")
                 self.assertEqual(received_prompt, "Original request.")
-            self.assertFalse(build_calls[0].get("developer_instructions"))
+            self.assertIn(
+                "PCR workspace isolation requirement:",
+                str(build_calls[0].get("developer_instructions") or ""),
+            )
+            self.assertNotIn(
+                "second-stage synthesis Agent",
+                str(build_calls[0].get("developer_instructions") or ""),
+            )
             self.assertIn(
                 "second-stage synthesis Agent",
                 str(build_calls[1].get("developer_instructions") or ""),
+            )
+            self.assertLess(
+                str(build_calls[1].get("developer_instructions") or "").index(
+                    "second-stage synthesis Agent"
+                ),
+                str(build_calls[1].get("developer_instructions") or "").index(
+                    "PCR workspace isolation requirement:"
+                ),
             )
 
     def test_config_resolution_failure_falls_back_to_first_stage(self) -> None:
@@ -1781,7 +1962,7 @@ class RunOnceCleanupTests(unittest.TestCase):
             ), mock.patch.object(
                 app_core,
                 "read_effective_codex_developer_instructions",
-                side_effect=RuntimeError("config/read unavailable"),
+                side_effect=[None, RuntimeError("config/read unavailable")],
             ), mock.patch.object(
                 app_core,
                 "build_codex_command",
@@ -2019,6 +2200,10 @@ class AdditionalAgentTests(unittest.TestCase):
                 with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec"):
                     with mock.patch.object(
                         app_core,
+                        "read_effective_codex_developer_instructions",
+                        return_value=None,
+                    ), mock.patch.object(
+                        app_core,
                         "build_codex_command",
                         return_value=(command, {}),
                     ):
@@ -2084,6 +2269,10 @@ class AdditionalAgentTests(unittest.TestCase):
             with mock.patch.object(app_core, "get_codex_home", return_value=codex_home):
                 with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec"):
                     with mock.patch.object(
+                        app_core,
+                        "read_effective_codex_developer_instructions",
+                        return_value=None,
+                    ), mock.patch.object(
                         app_core,
                         "build_codex_command",
                         return_value=([sys.executable, "-c", "pass"], {}),
@@ -6819,6 +7008,25 @@ class ResumeSessionTests(unittest.TestCase):
                                 ]
                             }
                         },
+                        "file_system_sandbox_policy": {
+                            "kind": "restricted",
+                            "entries": [
+                                {
+                                    "path": {
+                                        "type": "path",
+                                        "path": old_workspace,
+                                    },
+                                    "access": "write",
+                                },
+                                {
+                                    "path": {
+                                        "type": "special",
+                                        "value": {"kind": "slash_tmp"},
+                                    },
+                                    "access": "write",
+                                },
+                            ],
+                        },
                     },
                 },
                 {
@@ -6832,6 +7040,18 @@ class ResumeSessionTests(unittest.TestCase):
                                         {"path": {"type": "path", "path": old_workspace + "/.codex"}}
                                     ]
                                 }
+                            },
+                            "file_system_sandbox_policy": {
+                                "kind": "restricted",
+                                "entries": [
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": old_workspace + "/generated",
+                                        },
+                                        "access": "write",
+                                    }
+                                ],
                             },
                         }
                     },
@@ -6883,10 +7103,22 @@ class ResumeSessionTests(unittest.TestCase):
                 isolated_records[1]["payload"]["permission_profile"]["file_system"]["entries"][1]["path"]["path"],
                 target + "/.git",
             )
+            self.assertEqual(
+                isolated_records[1]["payload"]["file_system_sandbox_policy"]["entries"][0]["path"]["path"],
+                target,
+            )
+            self.assertEqual(
+                isolated_records[1]["payload"]["file_system_sandbox_policy"]["entries"][1]["path"]["type"],
+                "special",
+            )
             self.assertEqual(isolated_records[2]["payload"]["thread_settings"]["cwd"], target)
             self.assertEqual(
                 isolated_records[2]["payload"]["thread_settings"]["permission_profile"]["file_system"]["entries"][0]["path"]["path"],
                 target + "/.codex",
+            )
+            self.assertEqual(
+                isolated_records[2]["payload"]["thread_settings"]["file_system_sandbox_policy"]["entries"][0]["path"]["path"],
+                target + "/generated",
             )
             environment = isolated_records[3]["payload"]["state"]["environments"]
             self.assertEqual(environment["environments"]["local"]["cwd"], target)
@@ -6928,6 +7160,21 @@ class ResumeSessionTests(unittest.TestCase):
                                 "payload": {
                                     "cwd": str(agent_workspace),
                                     "workspace_roots": [str(agent_workspace)],
+                                    "file_system_sandbox_policy": {
+                                        "kind": "restricted",
+                                        "entries": [
+                                            {
+                                                "path": {
+                                                    "type": "path",
+                                                    "path": str(
+                                                        agent_workspace
+                                                        / "generated"
+                                                    ),
+                                                },
+                                                "access": "write",
+                                            }
+                                        ],
+                                    },
                                 },
                             }
                         ),
@@ -6986,6 +7233,10 @@ class ResumeSessionTests(unittest.TestCase):
             self.assertEqual(meta["originator"], "codex-tui")
             self.assertEqual(rollout_records[1]["payload"]["cwd"], str(workspace.resolve()))
             self.assertEqual(rollout_records[1]["payload"]["workspace_roots"], [str(workspace.resolve())])
+            self.assertEqual(
+                rollout_records[1]["payload"]["file_system_sandbox_policy"]["entries"][0]["path"]["path"],
+                str(workspace.resolve() / "generated"),
+            )
 
     def test_import_codex_session_from_isolated_home_to_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

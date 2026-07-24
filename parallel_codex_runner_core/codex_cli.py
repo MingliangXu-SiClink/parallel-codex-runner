@@ -123,7 +123,7 @@ def read_effective_codex_developer_instructions(
         detail = "".join(stderr_tail)[-2000:].strip()
         suffix = f": {detail}" if detail else ""
         return RuntimeError(
-            f"{message}{suffix}. Upgrade Codex CLI before running synthesis."
+            f"{message}{suffix}. Upgrade Codex CLI or retry PCR."
         )
 
     def send(payload: Dict[str, Any]) -> None:
@@ -227,6 +227,11 @@ def read_effective_codex_developer_instructions(
             process.wait()
         for reader in readers:
             reader.join(timeout=0.2)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 def merge_codex_developer_instructions(
@@ -343,7 +348,7 @@ def build_codex_command(
     if developer_instructions and developer_instructions.strip():
         if config_flag is None:
             raise RuntimeError(
-                "当前 Codex CLI 不支持 --config，无法安全注入 synthesis developer instructions。"
+                "当前 Codex CLI 不支持 --config，无法安全注入 PCR developer instructions。"
             )
         cmd.extend(
             [

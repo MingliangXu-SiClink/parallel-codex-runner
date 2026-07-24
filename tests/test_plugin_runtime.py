@@ -1139,6 +1139,19 @@ class PluginRunManagerTests(unittest.TestCase):
             fake_codex = root / "codex"
             fake_codex.write_text(
                 """#!/bin/sh
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r request; do
+    case "$request" in
+      *'"id": 0'*)
+        printf '%s\\n' '{"id":0,"result":{"userAgent":"codex-test"}}'
+        ;;
+      *'"id": 1'*)
+        printf '%s\\n' '{"id":1,"result":{"config":{"developer_instructions":null}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
 if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
   printf '%s\\n' 'Usage: codex exec [OPTIONS]' '  -c, --config KEY=VALUE' '  --json' '  --output-last-message FILE'
   exit 0

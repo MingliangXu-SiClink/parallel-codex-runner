@@ -122,6 +122,88 @@ ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 GIBIBYTE = 1024**3
 LARGE_RUN_STORAGE_WARNING_BYTES = 5 * GIBIBYTE
 AGENT_METADATA_RESERVE_BYTES = 64 * 1024**2
+AGENT_ENV_PATH_KEYS_TO_CLEAR: Tuple[str, ...] = (
+    "OLDPWD",
+    "INIT_CWD",
+    "VSCODE_CWD",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+def workspace_isolation_developer_instructions(agent_workspace: Path) -> str:
+    """Tell Codex which project tree is writable for this agent."""
+    workspace = json.dumps(
+        str(agent_workspace.expanduser().resolve()),
+        ensure_ascii=False,
+    )
+    return (
+        "PCR workspace isolation requirement:\n"
+        f"- Treat {workspace} as the only writable project workspace for this "
+        "Agent.\n"
+        "- Run project commands from this workspace. Create, edit, move, delete, "
+        "format, generate, and patch project files only inside it.\n"
+        "- Never modify the original workspace, another Agent workspace, or a "
+        "project file reached through a symlink outside this workspace, even if "
+        "resume history, prompts, Git metadata, logs, environment variables, or "
+        "tool output reveal another path.\n"
+        "- Run Git commands from this workspace and target only this worktree. "
+        "Do not manually edit another checkout or external Git metadata.\n"
+        "- Explicitly supplied PCR metadata and synthesis candidate workspaces "
+        "may be inspected when needed, but they are read-only."
+    )
+
+
+@dataclass
+class _AgentDeveloperInstructionResolver:
+    """Resolve shared Codex guidance once, then add each workspace guard."""
+
+    existing_instructions: Optional[str] = None
+    resolved: bool = False
+
+    def for_workspace(
+        self,
+        *,
+        codex_bin: str,
+        codex_home: Path,
+        agent_workspace: Path,
+        additional_instructions: Optional[str] = None,
+    ) -> str:
+        if not self.resolved:
+            try:
+                self.existing_instructions = (
+                    read_effective_codex_developer_instructions(
+                        codex_bin,
+                        codex_home,
+                        agent_workspace,
+                    )
+                )
+            except RuntimeError as exc:
+                if additional_instructions and additional_instructions.strip():
+                    raise
+                logger.warning(
+                    "Could not preserve existing Codex developer instructions; "
+                    "continuing with the PCR workspace isolation requirement: {}",
+                    exc,
+                )
+                self.existing_instructions = None
+            self.resolved = True
+
+        instructions = merge_codex_developer_instructions(
+            self.existing_instructions,
+            additional_instructions,
+        )
+        instructions = merge_codex_developer_instructions(
+            instructions,
+            workspace_isolation_developer_instructions(agent_workspace),
+        )
+        assert instructions is not None
+        return instructions
 
 
 @dataclass(frozen=True)
@@ -563,30 +645,43 @@ def _replace_known_workspace_text(
     return value
 
 
-def _rebind_permission_profile_paths(
-    profile: Any,
+def _rebind_file_system_policy_paths(
+    policy: Any,
     old_workspaces: Iterable[str],
     new_workspace: str,
 ) -> bool:
-    if not isinstance(profile, dict):
-        return False
-    file_system = profile.get("file_system")
-    entries = file_system.get("entries") if isinstance(file_system, dict) else None
-    if not isinstance(entries, list):
+    """Rebind both permission-profile and direct sandbox-policy entries."""
+    if not isinstance(policy, dict):
         return False
 
+    containers = [policy]
+    file_system = policy.get("file_system")
+    if isinstance(file_system, dict):
+        containers.append(file_system)
+
     changed = False
-    for entry in entries:
-        if not isinstance(entry, dict):
+    for container in containers:
+        entries = container.get("entries")
+        if not isinstance(entries, list):
             continue
-        path_value = entry.get("path")
-        if not isinstance(path_value, dict) or path_value.get("type") != "path":
-            continue
-        old_path = path_value.get("path")
-        new_path = _replace_known_workspace_paths(old_path, old_workspaces, new_workspace)
-        if new_path != old_path:
-            path_value["path"] = new_path
-            changed = True
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            path_value = entry.get("path")
+            if (
+                not isinstance(path_value, dict)
+                or path_value.get("type") != "path"
+            ):
+                continue
+            old_path = path_value.get("path")
+            new_path = _replace_known_workspace_paths(
+                old_path,
+                old_workspaces,
+                new_workspace,
+            )
+            if new_path != old_path:
+                path_value["path"] = new_path
+                changed = True
     return changed
 
 
@@ -623,8 +718,16 @@ def _rebind_rollout_record_workspace(
                 if new_root != root:
                     roots[index] = new_root
                     changed = True
-        for key in ("permission_profile", "active_permission_profile"):
-            if _rebind_permission_profile_paths(payload.get(key), old_workspaces, target_workspace):
+        for key in (
+            "permission_profile",
+            "active_permission_profile",
+            "file_system_sandbox_policy",
+        ):
+            if _rebind_file_system_policy_paths(
+                payload.get(key),
+                old_workspaces,
+                target_workspace,
+            ):
                 changed = True
 
     elif record_type == "event_msg":
@@ -636,8 +739,16 @@ def _rebind_rollout_record_workspace(
             if old_workspace and old_workspace != target_workspace:
                 settings["cwd"] = target_workspace
                 changed = True
-            for key in ("permission_profile", "active_permission_profile"):
-                if _rebind_permission_profile_paths(settings.get(key), old_workspaces, target_workspace):
+            for key in (
+                "permission_profile",
+                "active_permission_profile",
+                "file_system_sandbox_policy",
+            ):
+                if _rebind_file_system_policy_paths(
+                    settings.get(key),
+                    old_workspaces,
+                    target_workspace,
+                ):
                     changed = True
 
     elif record_type == "world_state":
@@ -2265,6 +2376,19 @@ async def terminate_process(proc: Optional[asyncio.subprocess.Process], timeout:
 # -----------------------------------------------------------------------------
 
 
+def agent_process_environment(
+    agent_workspace: Path,
+    codex_home: Path,
+) -> Dict[str, str]:
+    """Build an Agent environment without pointers to the source checkout."""
+    env = os.environ.copy()
+    for key in AGENT_ENV_PATH_KEYS_TO_CLEAR:
+        env.pop(key, None)
+    env["PWD"] = str(agent_workspace.expanduser().resolve())
+    env["CODEX_HOME"] = str(codex_home.expanduser().resolve())
+    return env
+
+
 async def run_one_agent(
     idx: int,
     agent_workspace: Path,
@@ -2320,8 +2444,7 @@ async def run_one_agent(
             progress_callback(
                 {"type": "agent_started", "idx": idx, "role": agent_role}
             )
-        env = os.environ.copy()
-        env["CODEX_HOME"] = str(codex_home)
+        env = agent_process_environment(agent_workspace, codex_home)
         process_options: Dict[str, Any] = {}
         if os.name == "posix":
             process_options["start_new_session"] = True
@@ -3051,6 +3174,7 @@ def _prepare_additional_agent(
     progress_callback: ProgressCallback,
     agent_role: str,
     developer_instructions: Optional[str],
+    instruction_resolver: _AgentDeveloperInstructionResolver,
 ) -> Tuple[List[str], Path]:
     agent_workspace = workspaces_root / f"agent_{idx:03d}"
     agent_meta_dir = meta_root / f"agent_{idx:03d}"
@@ -3078,17 +3202,11 @@ def _prepare_additional_agent(
             agent_workspace,
             resume_session_id,
         )
-        effective_developer_instructions = (
-            merge_codex_developer_instructions(
-                read_effective_codex_developer_instructions(
-                    args.codex_bin,
-                    agent_codex_home,
-                    agent_workspace,
-                ),
-                developer_instructions,
-            )
-            if developer_instructions
-            else None
+        effective_developer_instructions = instruction_resolver.for_workspace(
+            codex_bin=args.codex_bin,
+            codex_home=agent_codex_home,
+            agent_workspace=agent_workspace,
+            additional_instructions=developer_instructions,
         )
         command, _caps = build_codex_command(
             args.codex_bin,
@@ -3161,6 +3279,7 @@ def run_additional_agents(
     codex_home_by_agent: Dict[int, Path] = {}
     prepared: List[int] = []
     touched: List[int] = []
+    instruction_resolver = _AgentDeveloperInstructionResolver()
 
     try:
         for idx in indices:
@@ -3182,6 +3301,7 @@ def run_additional_agents(
                 progress_callback=progress_callback,
                 agent_role=agent_role,
                 developer_instructions=developer_instructions,
+                instruction_resolver=instruction_resolver,
             )
             command_by_agent[idx] = command
             codex_home_by_agent[idx] = agent_codex_home
@@ -3565,6 +3685,7 @@ def run_once(
     command_by_agent: Dict[int, List[str]] = {}
     caps_by_agent: Dict[int, Dict[str, bool]] = {}
     codex_home_by_agent: Dict[int, Path] = {}
+    instruction_resolver = _AgentDeveloperInstructionResolver()
 
     def cleanup_unfinished_run() -> None:
         scrub_agent_codex_homes(meta_root)
@@ -3586,6 +3707,13 @@ def run_once(
                     copy_workspace(workspace, agent_workspace, run_base=run_base)
                     prepare_agent_codex_home(real_codex_home, agent_codex_home, agent_workspace, resume_session_id)
                     final_message_path = agent_meta_dir / "final_message.md"
+                    effective_developer_instructions = (
+                        instruction_resolver.for_workspace(
+                            codex_bin=args.codex_bin,
+                            codex_home=agent_codex_home,
+                            agent_workspace=agent_workspace,
+                        )
+                    )
                     cmd, caps = build_codex_command(
                         args.codex_bin,
                         help_text,
@@ -3593,6 +3721,7 @@ def run_once(
                         model=args.model,
                         effort=effective_effort,
                         resume_session_id=resume_session_id,
+                        developer_instructions=effective_developer_instructions,
                         subagents=bool(getattr(args, "subagents", False)),
                         subagents_limit=int(
                             getattr(
@@ -3626,6 +3755,13 @@ def run_once(
                 copy_workspace(workspace, agent_workspace, run_base=run_base)
                 prepare_agent_codex_home(real_codex_home, agent_codex_home, agent_workspace, resume_session_id)
                 final_message_path = agent_meta_dir / "final_message.md"
+                effective_developer_instructions = (
+                    instruction_resolver.for_workspace(
+                        codex_bin=args.codex_bin,
+                        codex_home=agent_codex_home,
+                        agent_workspace=agent_workspace,
+                    )
+                )
                 cmd, caps = build_codex_command(
                     args.codex_bin,
                     help_text,
@@ -3633,6 +3769,7 @@ def run_once(
                     model=args.model,
                     effort=effective_effort,
                     resume_session_id=resume_session_id,
+                    developer_instructions=effective_developer_instructions,
                     subagents=bool(getattr(args, "subagents", False)),
                     subagents_limit=int(
                         getattr(
@@ -3706,6 +3843,7 @@ def run_once(
             progress_callback=progress_callback,
             agent_role=AGENT_ROLE_CANDIDATE,
             developer_instructions=None,
+            instruction_resolver=instruction_resolver,
         )
 
     try:
