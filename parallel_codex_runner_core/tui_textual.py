@@ -1324,6 +1324,7 @@ else:
             self._resume_io_lock = threading.Lock()
             self.storage_preflight_request = 0
             self.storage_preflight_inflight = False
+            self._approved_large_storage_workspaces: set[str] = set()
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self.queued_prompt_records_history = False
@@ -1793,6 +1794,9 @@ else:
                 *result_values,
             )
 
+        def _large_storage_approval_key(self) -> str:
+            return str(self.workspace.expanduser().resolve())
+
         def _restore_prompt_after_storage_failure(self, prompt_text: str) -> None:
             try:
                 prompt = self.query_one("#prompt", PromptEditor)
@@ -1941,6 +1945,8 @@ else:
             self,
             event: StoragePreflightFinished,
             continue_run: bool,
+            *,
+            remember_large_storage_approval: bool = False,
         ) -> None:
             if event.request_id != self.storage_preflight_request:
                 return
@@ -1963,6 +1969,10 @@ else:
                     self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
+            if remember_large_storage_approval:
+                self._approved_large_storage_workspaces.add(
+                    self._large_storage_approval_key()
+                )
             try:
                 available = available_storage_bytes(event.run_base)
             except Exception as exc:  # noqa: BLE001
@@ -2019,7 +2029,14 @@ else:
                     self._restore_prompt_after_storage_failure(event.prompt)
                 self._sync()
                 return
-            if event.estimate.total_bytes > LARGE_RUN_STORAGE_WARNING_BYTES:
+            warning_approved = (
+                self._large_storage_approval_key()
+                in self._approved_large_storage_workspaces
+            )
+            if (
+                event.estimate.total_bytes > LARGE_RUN_STORAGE_WARNING_BYTES
+                and not warning_approved
+            ):
                 self.status = (
                     "Storage confirmation required: "
                     f"{format_storage_bytes(event.estimate.total_bytes)} estimated"
@@ -2030,6 +2047,7 @@ else:
                     lambda confirmed: self._complete_storage_preflight(
                         event,
                         bool(confirmed),
+                        remember_large_storage_approval=bool(confirmed),
                     ),
                 )
                 return
@@ -2485,6 +2503,12 @@ else:
                 return
             last_agent = max(self.agents, default=self.num_agents)
             self.selected_agent = min(last_agent, max(1, self.selected_agent + delta))
+            if self.follow_up_continue_at is not None:
+                remaining = max(
+                    0,
+                    int(self.follow_up_continue_at - time.monotonic() + 0.999),
+                )
+                self._set_follow_up_countdown_status(remaining)
             self._sync()
 
         def _agent_kill_requested(self, idx: int) -> bool:
@@ -4315,11 +4339,29 @@ else:
             )
             self.follow_up_ready = False
             self._follow_up_countdown_second = int(FOLLOW_UP_DELAY_SECONDS)
-            self.status = (
-                f"Queued follow-up starts from AGENT-{idx:03d} in "
-                f"{int(FOLLOW_UP_DELAY_SECONDS)}s; ←/→ changes the Agent"
+            self._set_follow_up_countdown_status(
+                self._follow_up_countdown_second
             )
             return True
+
+        def _set_follow_up_countdown_status(self, remaining: int) -> None:
+            self.status = (
+                f"Queued follow-up starts from AGENT-{self.selected_agent:03d} "
+                f"in {max(0, remaining)}s; ←/→ changes the Agent"
+            )
+
+        def _refresh_follow_up_countdown(self, remaining: int) -> None:
+            self._set_follow_up_countdown_status(remaining)
+            if self._selection_drag_active() or self._screen_selection_active():
+                self._follow_up_queue_refresh_deferred = True
+                self._sync_deferred_for_selection = True
+                return
+            self._refresh_follow_up_queue()
+            try:
+                self.query_one("#runner-conversation", Static).update(self.status)
+                self.query_one("#state", Static).update(self._state_text())
+            except Exception:
+                return
 
         def _consume_follow_up(self, prompt: str) -> None:
             if self.follow_up_queue:
@@ -4632,7 +4674,7 @@ else:
                     self._dispatch_follow_up()
                 elif remaining != self._follow_up_countdown_second:
                     self._follow_up_countdown_second = remaining
-                    self._refresh_follow_up_queue()
+                    self._refresh_follow_up_countdown(remaining)
                 return
             if (
                 self.follow_up_ready

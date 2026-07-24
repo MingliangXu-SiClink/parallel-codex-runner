@@ -4299,6 +4299,59 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.follow_up_continue_at, 160.0)
         self.assertIn("in 60s", app.status)
 
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=101.0):
+            app._tick()
+            queue_text = app._follow_up_queue_text()
+
+        self.assertEqual(app._follow_up_countdown_second, 59)
+        self.assertIn("in 59s", app.status)
+        self.assertIn("next in 59s", queue_text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_countdown_updates_visible_status(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            with mock.patch.object(
+                tui_textual,
+                "list_resume_sessions",
+                return_value=[],
+            ):
+                async with app.run_test(size=(90, 32)) as pilot:
+                    app.selected_agent = 2
+                    app.follow_up_queue.append(
+                        tui_textual.QueuedFollowUp("follow-up question", True)
+                    )
+                    app.follow_up_continue_at = 100.0
+                    app._follow_up_countdown_second = 60
+                    app._set_follow_up_countdown_status(60)
+                    app._sync()
+
+                    with mock.patch.object(
+                        tui_textual.time,
+                        "monotonic",
+                        return_value=58.5,
+                    ):
+                        app._tick()
+                    await pilot.pause()
+
+                    self.assertEqual(app._follow_up_countdown_second, 42)
+                    self.assertIn(
+                        "AGENT-002 in 42s",
+                        str(app.query_one("#runner-conversation").content),
+                    )
+                    self.assertIn(
+                        "next in 42s",
+                        str(app.query_one("#follow-up-queue").content),
+                    )
+                    self.assertIn(
+                        "in 42s",
+                        str(app.query_one("#state").content),
+                    )
+                    app.follow_up_continue_at = None
+                    app.follow_up_queue.clear()
+
+        asyncio.run(run())
+
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_delayed_follow_up_uses_agent_displayed_at_deadline(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
@@ -4956,6 +5009,97 @@ class TuiCommandTests(unittest.TestCase):
                             app.prompt_history_store.entries(workspace, None),
                             [],
                         )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_large_storage_confirmation_is_reused_for_follow_up(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                workspace.mkdir()
+                history_path = root / "history.json"
+                total = tui_textual.LARGE_RUN_STORAGE_WARNING_BYTES + 1
+                estimate = app_core.RunStorageEstimate(
+                    num_agents=2,
+                    workspace_bytes_per_agent=total // 2,
+                    workspace_copies_bytes=total,
+                    metadata_bytes_per_agent=0,
+                    metadata_bytes=0,
+                    total_bytes=total,
+                )
+                with mock.patch.dict(
+                    os.environ,
+                    {"PCR_PROMPT_HISTORY_PATH": str(history_path)},
+                ):
+                    app = tui_textual.PcrTextualApp(
+                        parse_args(["--workspace", str(workspace), "-n", "2"])
+                    )
+                with mock.patch.object(
+                    tui_textual,
+                    "list_resume_sessions",
+                    return_value=[],
+                ), mock.patch.object(
+                    tui_textual,
+                    "estimate_staged_run_storage",
+                    return_value=estimate,
+                ) as estimate_storage, mock.patch.object(
+                    tui_textual,
+                    "available_storage_bytes",
+                    return_value=total * 4,
+                ) as available_storage, mock.patch.object(
+                    app,
+                    "_start_run",
+                    return_value=True,
+                ) as start_run:
+                    async with app.run_test(size=(90, 32)) as pilot:
+                        self.assertTrue(app._submit_task_prompt("first question"))
+                        for _ in range(100):
+                            await pilot.pause()
+                            if isinstance(
+                                app.screen,
+                                tui_textual.StorageWarningScreen,
+                            ):
+                                break
+
+                        self.assertIsInstance(
+                            app.screen,
+                            tui_textual.StorageWarningScreen,
+                        )
+                        await pilot.click("#storage-continue")
+                        for _ in range(30):
+                            await pilot.pause()
+                            if start_run.call_count == 1:
+                                break
+
+                        app.follow_up_queue.append(
+                            tui_textual.QueuedFollowUp(
+                                "follow-up question",
+                                True,
+                            )
+                        )
+                        self.assertTrue(
+                            app._request_run_with_storage_check(
+                                "follow-up question",
+                                record_history=True,
+                                from_follow_up_queue=True,
+                            )
+                        )
+                        for _ in range(100):
+                            await pilot.pause()
+                            if start_run.call_count == 2:
+                                break
+
+                        self.assertEqual(start_run.call_count, 2)
+                        self.assertNotIsInstance(
+                            app.screen,
+                            tui_textual.StorageWarningScreen,
+                        )
+                        self.assertEqual(app.follow_up_queue, [])
+
+                self.assertEqual(estimate_storage.call_count, 2)
+                self.assertEqual(available_storage.call_count, 2)
 
         asyncio.run(run())
 
