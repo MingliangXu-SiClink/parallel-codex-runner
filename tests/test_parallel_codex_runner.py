@@ -3704,6 +3704,72 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_saved_resume_populates_full_dropdown_on_mount(self) -> None:
+        async def run() -> None:
+            class NonHeadlessPcrApp(tui_textual.PcrTextualApp):
+                @property
+                def is_headless(self) -> bool:
+                    return False
+
+            with tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp) / "workspace"
+                workspace.mkdir()
+                app = NonHeadlessPcrApp(
+                    parse_args(
+                        [
+                            "--workspace",
+                            str(workspace),
+                            "--resume-session-id",
+                            "session-current",
+                        ]
+                    )
+                )
+                sessions = [
+                    app_core.ResumeSession(
+                        session_id="session-current",
+                        title="current conversation",
+                        cwd=str(workspace),
+                        updated_at=2,
+                    ),
+                    app_core.ResumeSession(
+                        session_id="session-older",
+                        title="older conversation",
+                        cwd=str(workspace),
+                        updated_at=1,
+                    ),
+                ]
+                with mock.patch.object(
+                    tui_textual,
+                    "list_resume_sessions",
+                    return_value=sessions,
+                ) as list_sessions:
+                    with mock.patch.object(app, "_select_resume_session") as select_resume:
+                        async with app.run_test() as pilot:
+                            for _ in range(30):
+                                await pilot.pause()
+                                if app.resume_choices_loaded:
+                                    break
+
+                            resume = app.query_one("#config-resume")
+                            option_values = {
+                                value for _label, value in app.resume_choices
+                            }
+
+                list_sessions.assert_called_once_with(
+                    workspace.resolve(),
+                    include_non_interactive=True,
+                )
+                select_resume.assert_called_once_with("session-current")
+                self.assertTrue(app.resume_choices_loaded)
+                self.assertEqual(resume.value, "session-current")
+                self.assertEqual(
+                    option_values,
+                    {"", "session-current", "session-older"},
+                )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_resume_loads_previous_conversation_into_detail(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:

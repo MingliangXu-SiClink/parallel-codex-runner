@@ -1685,18 +1685,16 @@ else:
                 RECOMMEND_BORDER_REFRESH_SECONDS,
                 self._advance_recommend_border,
             )
-            if (
-                not self.is_headless
-                and not getattr(self.args, "resume", False)
-                and not self.resume_session_id
-            ):
-                self._refresh_resume_control()
             if getattr(self.args, "resume", False) and not self.resume_session_id:
                 self._handle_resume([])
             elif self.resume_session_id:
                 self._select_resume_session(self.resume_session_id)
             else:
                 self._sync()
+            # Restoring the selected session must not suppress discovery of
+            # other sessions in the picker.
+            if not self.is_headless:
+                self._refresh_resume_control()
             self.query_one("#prompt", PromptEditor).focus()
 
         def _current_prompt_history_context(self) -> tuple[str, str]:
