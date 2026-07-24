@@ -3046,6 +3046,184 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_sync_preserves_an_uncommitted_model_selection(self) -> None:
+        async def run() -> None:
+            args = parse_args(["--model", "gpt-5.6-luna", "--effort", "max"])
+            app = tui_textual.PcrTextualApp(args)
+            app.model_registry = CodexModelRegistry(
+                models={
+                    "gpt-5.6-luna": CodexModelInfo(
+                        "gpt-5.6-luna",
+                        "max",
+                        ("medium", "high", "max"),
+                    ),
+                    "gpt-5.6-sol": CodexModelInfo(
+                        "gpt-5.6-sol",
+                        "ultra",
+                        ("medium", "high", "max", "ultra"),
+                    ),
+                }
+            )
+            app.model_choices = app.model_registry.model_options(args.model)
+            app.effort_choices = app.model_registry.effort_options(
+                args.model,
+                args.effort,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    model = app.query_one("#config-model")
+                    model.focus()
+                    model.value = "gpt-5.6-sol"
+
+                    self.assertEqual(app.args.model, "gpt-5.6-luna")
+                    app._sync_runner_panel()
+
+                    self.assertEqual(model.value, "gpt-5.6-sol")
+                    self.assertIn(
+                        "ultra",
+                        {value for _label, value in app.effort_choices},
+                    )
+                    await pilot.pause()
+                    self.assertEqual(app.args.model, "gpt-5.6-sol")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_effort_selection_commits_the_visible_model_first(self) -> None:
+        async def run() -> None:
+            args = parse_args(["--model", "gpt-5.6-luna", "--effort", "max"])
+            app = tui_textual.PcrTextualApp(args)
+            app.model_registry = CodexModelRegistry(
+                models={
+                    "gpt-5.6-luna": CodexModelInfo(
+                        "gpt-5.6-luna",
+                        "max",
+                        ("medium", "high", "max"),
+                    ),
+                    "gpt-5.6-sol": CodexModelInfo(
+                        "gpt-5.6-sol",
+                        "ultra",
+                        ("medium", "high", "max", "ultra"),
+                    ),
+                }
+            )
+            app.model_choices = app.model_registry.model_options(args.model)
+            app.effort_choices = app.model_registry.effort_options(
+                args.model,
+                args.effort,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test():
+                    model = app.query_one("#config-model")
+                    effort = app.query_one("#config-effort")
+                    model.value = "gpt-5.6-sol"
+                    app._sync_runner_panel()
+                    effort.value = "ultra"
+
+                    self.assertEqual(app.args.model, "gpt-5.6-luna")
+                    app._on_effort_selected(
+                        tui_textual.Select.Changed(effort, "ultra")
+                    )
+
+                    self.assertEqual(app.args.model, "gpt-5.6-sol")
+                    self.assertEqual(app.args.effort, "ultra")
+                    self.assertEqual(model.value, "gpt-5.6-sol")
+                    self.assertEqual(effort.value, "ultra")
+                    self.assertNotIn("not supported", app.status)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_next_run_commits_visible_model_and_effort_after_completed_run(self) -> None:
+        async def run() -> None:
+            args = parse_args(["--model", "gpt-5.6-luna", "--effort", "max"])
+            app = tui_textual.PcrTextualApp(args)
+            app.model_registry = CodexModelRegistry(
+                models={
+                    "gpt-5.6-luna": CodexModelInfo(
+                        "gpt-5.6-luna",
+                        "max",
+                        ("medium", "high", "max"),
+                    ),
+                    "gpt-5.6-sol": CodexModelInfo(
+                        "gpt-5.6-sol",
+                        "ultra",
+                        ("medium", "high", "max", "ultra"),
+                    ),
+                }
+            )
+            app.model_choices = app.model_registry.model_options(args.model)
+            app.effort_choices = app.model_registry.effort_options(
+                args.model,
+                args.effort,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test():
+                    app.pending_run_root = Path("/tmp/pcr-test/completed")
+                    app.pending_workspaces_root = (
+                        app.pending_run_root / "workspaces"
+                    )
+                    app.pending_workspace = app.workspace
+                    app.pending_no_sync_back = False
+                    app.pending_keep_workspaces = False
+                    app.recommended_agent = 1
+                    app.selected_agent = 1
+                    app.agents[1].result = make_agent_result_data(
+                        1,
+                        app.pending_workspaces_root / "agent_001",
+                    )
+
+                    model = app.query_one("#config-model")
+                    effort = app.query_one("#config-effort")
+                    model.value = "gpt-5.6-sol"
+                    app._sync_runner_panel()
+                    effort.value = "ultra"
+                    app._sync_runner_panel()
+                    app.query_one("#config-agents").value = "2"
+
+                    self.assertEqual(model.value, "gpt-5.6-sol")
+                    self.assertEqual(effort.value, "ultra")
+                    self.assertEqual(app.args.model, "gpt-5.6-luna")
+                    self.assertEqual(app.args.effort, "max")
+
+                    def finalize_completed_agent(
+                        _idx: int,
+                        **_kwargs: object,
+                    ) -> bool:
+                        app.resume_session_id = "session-1"
+                        app.args.resume_session_id = "session-1"
+                        app._clear_pending_run()
+                        return True
+
+                    with mock.patch.object(
+                        app,
+                        "_finalize_agent",
+                        side_effect=finalize_completed_agent,
+                    ) as finalize:
+                        with mock.patch.object(tui_textual.threading, "Thread"):
+                            self.assertTrue(app._start_run("next question"))
+
+                    finalize.assert_called_once_with(
+                        1,
+                        archive_detail=True,
+                    )
+                    self.assertEqual(app.args.model, "gpt-5.6-sol")
+                    self.assertEqual(app.args.effort, "ultra")
+                    self.assertEqual(app.num_agents, 2)
+                    self.assertEqual(
+                        app.pending_execution_args.model,
+                        "gpt-5.6-sol",
+                    )
+                    self.assertEqual(
+                        app.pending_execution_args.effort,
+                        "ultra",
+                    )
+                    app.running = False
+                    app.runner_thread = None
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_command_output_appends_after_conversation(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args([]))
         app._sync = lambda: None

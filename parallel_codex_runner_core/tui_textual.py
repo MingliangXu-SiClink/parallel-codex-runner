@@ -1339,6 +1339,10 @@ else:
             self._follow_up_queue_refresh_deferred = False
             self._updating_controls = False
             self._latest_select_event_time: dict[str, float] = {}
+            self._committed_model_effort_values: dict[str, str] = {
+                "config-model": str(getattr(self.args, "model", None) or ""),
+                "config-effort": str(getattr(self.args, "effort", None) or ""),
+            }
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
                 "config-synthesis-agents": str(self.synthesis_agents),
@@ -2219,7 +2223,101 @@ else:
             self._set_committed_input_value(control, display_value)
             return applied
 
+        def _model_effort_control_has_pending_value(
+            self,
+            control: Select,
+        ) -> bool:
+            control_id = control.id
+            if control_id not in self._committed_model_effort_values:
+                return False
+            return str(control.value or "") != self._committed_model_effort_values[
+                control_id
+            ]
+
+        def _mark_model_effort_control_committed(
+            self,
+            control: Select,
+        ) -> None:
+            if control.id in self._committed_model_effort_values:
+                self._committed_model_effort_values[control.id] = str(
+                    control.value or ""
+                )
+
+        def _commit_model_control(self) -> bool:
+            try:
+                control = self.query_one("#config-model", Select)
+            except Exception:
+                return True
+            requested = str(control.value or "").strip()
+            current = str(getattr(self.args, "model", None) or "").strip()
+            if requested != current:
+                self._handle_model([requested or "clear"])
+                current = str(getattr(self.args, "model", None) or "").strip()
+            if current != requested:
+                control.focus()
+                return False
+            self._mark_model_effort_control_committed(control)
+            return True
+
+        def _commit_effort_control(self) -> bool:
+            # MODEL and EFFORT are one logical setting. Textual may deliver the
+            # EFFORT event first, so commit the model currently shown beside it
+            # before validating the requested effort.
+            if not self._commit_model_control():
+                return False
+            try:
+                control = self.query_one("#config-effort", Select)
+            except Exception:
+                return True
+            requested = str(control.value or "").strip().lower()
+            current = str(getattr(self.args, "effort", None) or "").strip().lower()
+            if requested != current:
+                self._handle_effort([requested or "auto"])
+                current = (
+                    str(getattr(self.args, "effort", None) or "").strip().lower()
+                )
+            if current != requested:
+                control.focus()
+                return False
+            self._mark_model_effort_control_committed(control)
+            return True
+
+        def _commit_model_effort_controls(self) -> bool:
+            try:
+                model_control = self.query_one("#config-model", Select)
+                effort_control = self.query_one("#config-effort", Select)
+            except Exception:
+                return True
+            model = str(model_control.value or "").strip() or None
+            effort = str(effort_control.value or "").strip().lower() or None
+
+            # Do not route this snapshot through the command handlers: they
+            # repaint the panel and could overwrite another unsubmitted input
+            # before _commit_runner_inputs has read it.
+            self.args.model = model
+            self._mark_model_effort_control_committed(model_control)
+            if self._effort_model_is_known():
+                try:
+                    self.model_registry.validate_effort(
+                        self._model_for_effort(),
+                        effort,
+                    )
+                except ValueError as exc:
+                    self.status = str(exc)
+                    self.run_info_rows = self._base_info_rows()
+                    effort_control.focus()
+                    return False
+
+            self.args.effort = effort
+            self._mark_model_effort_control_committed(effort_control)
+            self.run_info_rows = self._base_info_rows()
+            return True
+
         def _commit_runner_inputs(self) -> bool:
+            # Select.Changed is queued. Commit the visible MODEL/EFFORT pair
+            # before numeric handlers can trigger a repaint from stale args.
+            if not self._commit_model_effort_controls():
+                return False
             if not self._commit_agents_control():
                 self.query_one("#config-agents", Input).focus()
                 return False
@@ -2324,19 +2422,21 @@ else:
 
         @on(Select.Changed, "#config-model")
         def _on_model_selected(self, event: Select.Changed) -> None:
-            if not self._accept_select_event(event):
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
                 return
-            value = str(event.value)
-            if value != str(getattr(self.args, "model", None) or ""):
-                self._handle_model([value or "clear"])
+            self._commit_model_control()
 
         @on(Select.Changed, "#config-effort")
         def _on_effort_selected(self, event: Select.Changed) -> None:
-            if not self._accept_select_event(event):
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
                 return
-            value = str(event.value)
-            if value != str(getattr(self.args, "effort", None) or ""):
-                self._handle_effort([value or "auto"])
+            self._commit_effort_control()
 
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
@@ -4839,6 +4939,8 @@ else:
             control: Select,
             value: Any,
             options: list[tuple[Any, Any]] | None = None,
+            *,
+            mark_committed: bool = True,
         ) -> None:
             # Select posts Changed from its reactive watcher. Prevent it at the
             # control so delayed programmatic events cannot look like user input.
@@ -4847,6 +4949,25 @@ else:
                     control.set_options(options)
                 if control.value != value:
                     control.value = value
+            if mark_committed:
+                self._mark_model_effort_control_committed(control)
+
+        def _sync_model_effort_control(
+            self,
+            control: Select,
+            value: Any,
+            options: list[tuple[Any, Any]] | None = None,
+        ) -> None:
+            if self._model_effort_control_has_pending_value(control):
+                pending_value = control.value
+                self._set_select_control(
+                    control,
+                    pending_value,
+                    options,
+                    mark_committed=False,
+                )
+                return
+            self._set_select_control(control, value, options)
 
         def _apply_resume_choices(self, entries: list[Any]) -> None:
             self.resume_entries = entries
@@ -4887,14 +5008,39 @@ else:
             if recommended_visible:
                 recommended_value.update(f"agent_{self.recommended_agent:03d}")
 
+            model_select = self.query_one("#config-model", Select)
+            effort_select = self.query_one("#config-effort", Select)
             current_model = str(getattr(self.args, "model", None) or "")
+            display_model = (
+                str(model_select.value or "")
+                if self._model_effort_control_has_pending_value(model_select)
+                else current_model
+            )
             model_options = None
-            if current_model not in {value for _label, value in self.model_choices}:
-                self.model_choices = self.model_registry.model_options(current_model)
+            if display_model not in {
+                value for _label, value in self.model_choices
+            }:
+                self.model_choices = self.model_registry.model_options(display_model)
                 model_options = self.model_choices
             current_effort = str(getattr(self.args, "effort", None) or "")
+            display_effort = (
+                str(effort_select.value or "")
+                if self._model_effort_control_has_pending_value(effort_select)
+                else current_effort
+            )
             current_subagents = bool(getattr(self.args, "subagents", False))
-            desired_effort_choices = self._effort_options_for_context()
+            if display_model:
+                effort_model = display_model
+            elif self.resume_session_id:
+                effort_model = (
+                    self._resume_model_for_effort() or UNKNOWN_RESUME_MODEL
+                )
+            else:
+                effort_model = None
+            desired_effort_choices = self.model_registry.effort_options(
+                effort_model,
+                display_effort,
+            )
             effort_options = None
             if desired_effort_choices != self.effort_choices:
                 self.effort_choices = desired_effort_choices
@@ -4910,8 +5056,6 @@ else:
             execution_select = self.query_one("#config-execution", Select)
             subagents_select = self.query_one("#config-subagents", Select)
             recommend_by_select = self.query_one("#config-recommend-by", Select)
-            model_select = self.query_one("#config-model", Select)
-            effort_select = self.query_one("#config-effort", Select)
             sync_back_select = self.query_one("#config-sync-back", Select)
             keep_workspaces_select = self.query_one("#config-keep-workspaces", Select)
             resume_select = self.query_one("#config-resume", Select)
@@ -4985,8 +5129,12 @@ else:
                         )
                     ),
                 )
-                self._set_select_control(model_select, current_model, model_options)
-                self._set_select_control(
+                self._sync_model_effort_control(
+                    model_select,
+                    current_model,
+                    model_options,
+                )
+                self._sync_model_effort_control(
                     effort_select,
                     current_effort,
                     effort_options,
