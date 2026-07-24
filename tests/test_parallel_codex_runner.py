@@ -372,6 +372,173 @@ class WorkspaceCopyTests(unittest.TestCase):
                 cleanup_workspace_copy(workspace, dst)
 
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_workspace_copy_isolates_and_syncs_initialized_submodules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested_origin = root / "nested-origin"
+            submodule_origin = root / "submodule-origin"
+            workspace = root / "workspace"
+            self._init_git_workspace(nested_origin, {"nested.txt": "base"})
+            self._init_git_workspace(submodule_origin, {"child.txt": "base"})
+            self._git(
+                submodule_origin,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(nested_origin),
+                "nested/grandchild",
+            )
+            self._git(submodule_origin, "commit", "-am", "add nested submodule")
+            self._init_git_workspace(workspace, {"parent.txt": "base"})
+            self._git(
+                workspace,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(submodule_origin),
+                "deps/child",
+            )
+            self._git(workspace, "commit", "-am", "add submodule")
+            self._git(
+                workspace,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            )
+            # Discovery must come from the Git index. A dirty or deleted
+            # .gitmodules file must not turn an initialized gitlink into a
+            # plain directory in the agent workspace.
+            (workspace / ".gitmodules").unlink()
+            source_submodule = workspace / "deps" / "child"
+            source_nested = source_submodule / "nested" / "grandchild"
+            self._git(source_submodule, "config", "user.name", "Test User")
+            self._git(source_submodule, "config", "user.email", "test@example.com")
+
+            (source_submodule / "child.txt").write_text("staged", encoding="utf-8")
+            self._git(source_submodule, "add", "child.txt")
+            (source_submodule / "child.txt").write_text("dirty", encoding="utf-8")
+            (source_submodule / "untracked.txt").write_text(
+                "untracked",
+                encoding="utf-8",
+            )
+            source_status = self._git(
+                source_submodule,
+                "status",
+                "--porcelain=v1",
+            ).stdout
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            agent_submodule = agent / "deps" / "child"
+            agent_nested = agent_submodule / "nested" / "grandchild"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                self.assertFalse((agent / ".gitmodules").exists())
+                self.assertTrue((agent_submodule / ".git").is_file())
+                self.assertTrue((agent_nested / ".git").is_file())
+                self.assertEqual(
+                    Path(
+                        self._git(
+                            agent_submodule,
+                            "rev-parse",
+                            "--show-toplevel",
+                        ).stdout.strip()
+                    ).resolve(),
+                    agent_submodule.resolve(),
+                )
+                self.assertEqual(
+                    Path(
+                        self._git(
+                            agent_nested,
+                            "rev-parse",
+                            "--show-toplevel",
+                        ).stdout.strip()
+                    ).resolve(),
+                    agent_nested.resolve(),
+                )
+                self.assertEqual(
+                    self._git(
+                        agent_submodule,
+                        "status",
+                        "--porcelain=v1",
+                    ).stdout,
+                    source_status,
+                )
+
+                self._git(agent_submodule, "add", "-A")
+                self._git(agent_submodule, "commit", "-m", "agent submodule commit")
+                (agent_submodule / "child.txt").write_text(
+                    "dirty after commit",
+                    encoding="utf-8",
+                )
+                self._git(agent, "add", "deps/child")
+                self._git(agent, "commit", "-m", "update submodule")
+                agent_submodule_head = self._git(
+                    agent_submodule,
+                    "rev-parse",
+                    "HEAD",
+                ).stdout.strip()
+                agent_submodule_status = self._git(
+                    agent_submodule,
+                    "status",
+                    "--porcelain=v1",
+                ).stdout
+                agent_status = self._git(
+                    agent,
+                    "status",
+                    "--porcelain=v1",
+                ).stdout
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(source_submodule, "rev-parse", "HEAD").stdout.strip(),
+                    agent_submodule_head,
+                )
+                self.assertEqual(
+                    self._git(
+                        source_submodule,
+                        "status",
+                        "--porcelain=v1",
+                    ).stdout,
+                    agent_submodule_status,
+                )
+                self.assertEqual(
+                    self._git(workspace, "status", "--porcelain=v1").stdout,
+                    agent_status,
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+            self.assertNotIn(
+                str(agent.resolve()),
+                self._git(workspace, "worktree", "list", "--porcelain").stdout,
+            )
+            self.assertNotIn(
+                str(agent_submodule.resolve()),
+                self._git(
+                    source_submodule,
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                ).stdout,
+            )
+            self.assertNotIn(
+                str(agent_nested.resolve()),
+                self._git(
+                    source_nested,
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                ).stdout,
+            )
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_git_workspace_copy_holds_index_lock_while_syncing_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1202,6 +1369,84 @@ class RunOnceCleanupTests(unittest.TestCase):
 
             self.assertFalse(any(path.exists() for path in runs.glob("*/workspaces")))
 
+    def test_run_once_sync_failure_still_cleans_and_writes_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            runs = root / "runs"
+            codex_home = root / "codex-home"
+            workspace.mkdir()
+            codex_home.mkdir()
+            (workspace / "file.txt").write_text("content", encoding="utf-8")
+            args = parse_args(
+                [
+                    "prompt",
+                    "--workspace",
+                    str(workspace),
+                    "--runs-dir",
+                    str(runs),
+                    "-n",
+                    "1",
+                ]
+            )
+            args.cancel_event = threading.Event()
+            events: list[dict[str, object]] = []
+            cleanup_copies = app_core.cleanup_workspace_copies
+            cleanup_homes = app_core.remove_agent_codex_homes
+
+            with mock.patch.object(
+                app_core,
+                "get_codex_home",
+                return_value=codex_home,
+            ), mock.patch.object(
+                app_core,
+                "resolve_resume_session",
+                return_value=None,
+            ), mock.patch.object(
+                app_core,
+                "read_codex_exec_help",
+                return_value="Usage: codex exec\n  --json",
+            ), mock.patch.object(
+                app_core,
+                "build_codex_command",
+                return_value=([sys.executable, "-c", "pass"], {}),
+            ), mock.patch.object(
+                app_core,
+                "sync_best_workspace_back",
+                side_effect=RuntimeError("sync failed"),
+            ), mock.patch.object(
+                app_core,
+                "cleanup_workspace_copies",
+                wraps=cleanup_copies,
+            ) as cleanup_workspaces_mock, mock.patch.object(
+                app_core,
+                "remove_agent_codex_homes",
+                wraps=cleanup_homes,
+            ) as cleanup_homes_mock:
+                with self.assertRaisesRegex(RuntimeError, "sync failed"):
+                    app_core.run_once(
+                        args,
+                        "prompt",
+                        progress_callback=events.append,
+                        print_output=False,
+                    )
+
+            run_root = next(runs.iterdir())
+            summary = json.loads(
+                (run_root / "summary.json").read_text(encoding="utf-8")
+            )
+            cleanup_workspaces_mock.assert_called_once()
+            cleanup_homes_mock.assert_called_once()
+            self.assertFalse((run_root / "workspaces").exists())
+            self.assertEqual(summary["finalization_error"], "sync failed")
+            self.assertEqual(
+                summary["finalization_errors"],
+                [{"stage": "workspace sync", "message": "sync failed"}],
+            )
+            self.assertEqual(summary["workspaces_deleted"], True)
+            self.assertEqual(events[-1]["type"], "run_failed")
+            self.assertIn("sync failed", str(events[-1]["message"]))
+
     def test_run_once_launches_synthesis_agents_after_candidates_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1562,6 +1807,191 @@ class RunOnceCleanupTests(unittest.TestCase):
                 event for event in events if event.get("type") == "synthesis_finished"
             )
             self.assertIn("config/read unavailable", str(synthesis_finished["error"]))
+
+
+class LiveRetryTests(unittest.TestCase):
+    def test_live_retry_uses_open_candidate_slot_and_replaces_failed_result(
+        self,
+    ) -> None:
+        async def scenario() -> tuple[list[AgentResult], list[int], int, list[bool]]:
+            coordinator = app_core.LiveRetryCoordinator()
+            first_failure = asyncio.Event()
+            call_counts = {1: 0, 2: 0}
+            prepared: list[int] = []
+            retry_overlapped_agent_two: list[bool] = []
+            active = 0
+            max_active = 0
+            agent_two_finished = False
+
+            async def fake_run_one_agent(**kwargs: object) -> AgentResult:
+                nonlocal active, max_active, agent_two_finished
+                idx = int(kwargs["idx"])
+                call_counts[idx] += 1
+                active += 1
+                max_active = max(max_active, active)
+                try:
+                    if idx == 1 and call_counts[idx] == 1:
+                        await asyncio.sleep(0.01)
+                        first_failure.set()
+                        status = "failed"
+                    elif idx == 1:
+                        retry_overlapped_agent_two.append(not agent_two_finished)
+                        await asyncio.sleep(0.01)
+                        status = "success"
+                    else:
+                        await asyncio.sleep(0.15)
+                        agent_two_finished = True
+                        status = "success"
+                finally:
+                    active -= 1
+                return AgentResult(
+                    idx=idx,
+                    workspace_dir=f"/tmp/agent_{idx:03d}",
+                    meta_dir=f"/tmp/meta_{idx:03d}",
+                    codex_home=f"/tmp/home_{idx:03d}",
+                    stdout_log="",
+                    stderr_log="",
+                    final_message="",
+                    command=[],
+                    returncode=0 if status == "success" else 1,
+                    status=status,
+                    seconds=0.01,
+                )
+
+            def prepare_retry(idx: int) -> tuple[list[str], Path]:
+                prepared.append(idx)
+                return ["codex"], Path(f"/tmp/home_{idx:03d}")
+
+            with mock.patch.object(
+                app_core,
+                "run_one_agent",
+                side_effect=fake_run_one_agent,
+            ):
+                runner = asyncio.create_task(
+                    app_core.run_all_agents(
+                        n=2,
+                        workspaces_root=Path("/tmp/workspaces"),
+                        meta_root=Path("/tmp/meta"),
+                        prompt="prompt",
+                        command_by_agent={1: ["codex"], 2: ["codex"]},
+                        codex_home_by_agent={
+                            1: Path("/tmp/home_001"),
+                            2: Path("/tmp/home_002"),
+                        },
+                        max_parallel=2,
+                        progress_callback=lambda _payload: None,
+                        agent_cancel_events={
+                            1: threading.Event(),
+                            2: threading.Event(),
+                        },
+                        live_retry_coordinator=coordinator,
+                        retry_agent_preparer=prepare_retry,
+                    )
+                )
+                await first_failure.wait()
+                await asyncio.sleep(0.02)
+                self.assertTrue(coordinator.request(1))
+                results = await runner
+
+            return results, prepared, max_active, retry_overlapped_agent_two
+
+        results, prepared, max_active, overlap = asyncio.run(scenario())
+
+        self.assertEqual(prepared, [1])
+        self.assertEqual(max_active, 2)
+        self.assertEqual(overlap, [True])
+        self.assertEqual(
+            {result.idx: result.status for result in results},
+            {1: "success", 2: "success"},
+        )
+
+    def test_live_retry_preparation_failure_does_not_abort_candidate_stage(
+        self,
+    ) -> None:
+        async def scenario(root: Path) -> tuple[list[AgentResult], list[dict[str, object]]]:
+            coordinator = app_core.LiveRetryCoordinator()
+            first_failure = asyncio.Event()
+            events: list[dict[str, object]] = []
+
+            async def fake_run_one_agent(**kwargs: object) -> AgentResult:
+                idx = int(kwargs["idx"])
+                if idx == 1:
+                    first_failure.set()
+                    status = "failed"
+                else:
+                    await asyncio.sleep(0.1)
+                    status = "success"
+                return AgentResult(
+                    idx=idx,
+                    workspace_dir=str(root / "workspaces" / f"agent_{idx:03d}"),
+                    meta_dir=str(root / "meta" / f"agent_{idx:03d}"),
+                    codex_home=str(root / "meta" / f"agent_{idx:03d}" / "codex_home"),
+                    stdout_log="",
+                    stderr_log="",
+                    final_message="",
+                    command=[],
+                    returncode=0 if status == "success" else 1,
+                    status=status,
+                    seconds=0.01,
+                )
+
+            def fail_retry(_idx: int) -> tuple[list[str], Path]:
+                raise RuntimeError("copy unavailable")
+
+            with mock.patch.object(
+                app_core,
+                "run_one_agent",
+                side_effect=fake_run_one_agent,
+            ):
+                runner = asyncio.create_task(
+                    app_core.run_all_agents(
+                        n=2,
+                        workspaces_root=root / "workspaces",
+                        meta_root=root / "meta",
+                        prompt="prompt",
+                        command_by_agent={1: ["codex"], 2: ["codex"]},
+                        codex_home_by_agent={
+                            1: root / "home_001",
+                            2: root / "home_002",
+                        },
+                        max_parallel=2,
+                        progress_callback=events.append,
+                        agent_cancel_events={
+                            1: threading.Event(),
+                            2: threading.Event(),
+                        },
+                        live_retry_coordinator=coordinator,
+                        retry_agent_preparer=fail_retry,
+                    )
+                )
+                await first_failure.wait()
+                await asyncio.sleep(0.02)
+                self.assertTrue(coordinator.request(1))
+                return await runner, events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results, events = asyncio.run(scenario(root))
+            status = json.loads(
+                (root / "meta" / "agent_001" / "status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(
+            {result.idx: result.status for result in results},
+            {1: "error", 2: "success"},
+        )
+        self.assertIn("copy unavailable", str(status["error"]))
+        self.assertTrue(
+            any(
+                event.get("type") == "agent_finished"
+                and event.get("idx") == 1
+                and isinstance(event.get("result"), dict)
+                and event["result"].get("status") == "error"
+                for event in events
+            )
+        )
 
 
 class AdditionalAgentTests(unittest.TestCase):
@@ -2362,6 +2792,36 @@ class TuiCommandTests(unittest.TestCase):
         self.assertNotIn(6, app.agents)
         self.assertEqual(app.agents[2].status, "killed")
         self.assertEqual(app.selected_agent, 3)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_retry_joins_active_candidate_stage(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "3", "--max-parallel", "2"])
+        )
+        app._sync = lambda: None
+        app.running = True
+        app.pending_prompt = "current question"
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.live_retry_coordinator = app_core.LiveRetryCoordinator()
+        app.live_retry_coordinator.activate()
+        app.agents[1].status = "running"
+        app.agents[2].status = "failed"
+        app.agents[2].result = make_agent_result_data(
+            2,
+            Path("/tmp/agent-2"),
+            status="failed",
+        )
+        app.selected_agent = 2
+
+        app._handle_command("/retry")
+
+        self.assertEqual(app.candidate_batches, [])
+        self.assertEqual(app.live_retry_indices, {2})
+        self.assertEqual(app.agents[2].status, "queued")
+        self.assertIsNone(app.agents[2].result)
+        self.assertEqual(app.live_retry_coordinator.drain(), [2])
+        self.assertIn("Retrying AGENT-002 now", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_retry_preserves_synthesis_role_and_internal_instructions(self) -> None:
@@ -4306,6 +4766,133 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app._follow_up_countdown_second, 59)
         self.assertIn("in 59s", app.status)
         self.assertIn("next in 59s", queue_text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_switching_agent_restarts_follow_up_countdown(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question", True)
+        )
+        app.follow_up_continue_at = 105.0
+        app._follow_up_countdown_second = 5
+        app.selected_agent = 1
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            app._switch_agent(1)
+
+        self.assertEqual(app.selected_agent, 2)
+        self.assertEqual(app.follow_up_continue_at, 160.0)
+        self.assertEqual(app._follow_up_countdown_second, 60)
+        self.assertIn("AGENT-002 in 60s", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_switching_agent_restarts_expired_follow_up_review(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question", True)
+        )
+        app.follow_up_ready = True
+        app.selected_agent = 1
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            app._switch_agent(1)
+
+        self.assertEqual(app.follow_up_continue_at, 160.0)
+        self.assertFalse(app.follow_up_ready)
+        self.assertEqual(app._follow_up_countdown_second, 60)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_context_change_clears_bound_follow_ups_after_finalize(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp(
+                "old-context question",
+                context=app._follow_up_context(),
+            )
+        )
+        app.follow_up_continue_at = 100.0
+        app.follow_up_ready = True
+        app.follow_up_source_finalized = True
+        app._follow_up_countdown_second = 12
+
+        with mock.patch.object(
+            app,
+            "_finalize_displayed_pending",
+            return_value=True,
+        ):
+            self.assertTrue(app._prepare_context_change("workspace"))
+
+        self.assertEqual(app.follow_up_queue, [])
+        self.assertIsNone(app.follow_up_continue_at)
+        self.assertFalse(app.follow_up_ready)
+        self.assertFalse(app.follow_up_source_finalized)
+        self.assertIsNone(app._follow_up_countdown_second)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_failed_context_change_keeps_bound_follow_ups(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        queued = tui_textual.QueuedFollowUp(
+            "old-context question",
+            context=app._follow_up_context(),
+        )
+        app.follow_up_queue.append(queued)
+
+        with mock.patch.object(
+            app,
+            "_finalize_displayed_pending",
+            return_value=False,
+        ):
+            self.assertFalse(app._prepare_context_change("workspace"))
+
+        self.assertEqual(app.follow_up_queue, [queued])
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_finalize_rebinds_remaining_queue_to_promoted_session(
+        self,
+    ) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "1", "--resume-session-id", "old-session"])
+        )
+        app._sync = lambda: None
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.pending_no_sync_back = False
+        old_context = app._follow_up_context()
+        app.follow_up_queue.extend(
+            [
+                tui_textual.QueuedFollowUp("first", context=old_context),
+                tui_textual.QueuedFollowUp("second", context=old_context),
+            ]
+        )
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+        )
+
+        def finalize(_idx: int, archive_detail: bool = False) -> bool:
+            self.assertTrue(archive_detail)
+            app.resume_session_id = "promoted-session"
+            return True
+
+        with mock.patch.object(app, "_finalize_agent", side_effect=finalize):
+            with mock.patch.object(
+                app,
+                "_request_run_with_storage_check",
+                return_value=True,
+            ):
+                self.assertTrue(app._dispatch_follow_up())
+
+        expected_context = (
+            str(app.workspace.expanduser().resolve()),
+            "promoted-session",
+        )
+        self.assertEqual(
+            [item.context for item in app.follow_up_queue],
+            [expected_context, expected_context],
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_follow_up_countdown_updates_visible_status(self) -> None:

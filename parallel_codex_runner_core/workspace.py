@@ -173,6 +173,60 @@ def _git_output(workspace: Path, *args: str) -> Optional[str]:
     return result.stdout.strip()
 
 
+def _tracked_submodule_paths(workspace: Path) -> List[Path]:
+    """Return direct gitlinks from the current index, including dirty checkouts."""
+    if git_workspace_toplevel(workspace) is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "ls-files", "--stage", "-z"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"failed to read Git submodules in {workspace}: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to read Git submodules in {workspace}: "
+            f"{os.fsdecode(result.stderr).strip() or 'unknown Git error'}"
+        )
+
+    paths: List[Path] = []
+    workspace_resolved = workspace.resolve()
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        if not separator or metadata.split(b" ", 1)[0] != b"160000":
+            continue
+        relative = Path(os.fsdecode(raw_path))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or not is_relative_to((workspace / relative).resolve(), workspace_resolved)
+        ):
+            raise RuntimeError(
+                f"unsafe Git submodule path in {workspace}: {os.fsdecode(raw_path)!r}"
+            )
+        if relative not in paths:
+            paths.append(relative)
+    return sorted(paths, key=lambda path: path.as_posix())
+
+
+def _initialized_submodule_paths(workspace: Path) -> List[Path]:
+    initialized: List[Path] = []
+    for relative in _tracked_submodule_paths(workspace):
+        submodule = workspace / relative
+        if (
+            (submodule / ".git").exists()
+            and git_workspace_toplevel(submodule) == submodule.resolve()
+        ):
+            initialized.append(relative)
+    return initialized
+
+
 def _resolved_git_path(workspace: Path, *args: str) -> Optional[Path]:
     value = _git_output(workspace, "rev-parse", *args)
     if not value:
@@ -392,20 +446,46 @@ def _locked_git_index(
         lock_path.unlink(missing_ok=True)
 
 
-def _copy_git_worktree_state(source_workspace: Path, destination_workspace: Path) -> None:
+def _copy_git_worktree_state(
+    source_workspace: Path,
+    destination_workspace: Path,
+    excluded_paths: Sequence[Path] = (),
+) -> None:
     with _prepared_git_index(source_workspace, destination_workspace) as (source_index, destination_index):
         with _locked_git_index(source_index, destination_index) as locked_index:
             # Keep Git/status watchers out until files and the copied index agree.
-            sync_back_with_python(source_workspace, destination_workspace)
+            if excluded_paths:
+                sync_back_with_python(
+                    source_workspace,
+                    destination_workspace,
+                    excluded_paths=excluded_paths,
+                )
+            else:
+                sync_back_with_python(
+                    source_workspace,
+                    destination_workspace,
+                )
             os.replace(locked_index, destination_index)
 
 
-def _record_worktree_base_state(workspace: Path, base_head: str, base_ref: Optional[str]) -> None:
+def _record_worktree_base_state(
+    workspace: Path,
+    base_head: str,
+    base_ref: Optional[str],
+    submodule_paths: Sequence[Path] = (),
+) -> None:
     marker = _worktree_base_state_path(workspace)
     if marker is None:
         raise RuntimeError("could not locate the Git worktree metadata directory")
     marker.write_text(
-        json.dumps({"head": base_head, "ref": base_ref}, ensure_ascii=False),
+        json.dumps(
+            {
+                "head": base_head,
+                "ref": base_ref,
+                "submodules": [path.as_posix() for path in submodule_paths],
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
 
@@ -423,6 +503,38 @@ def _read_worktree_base_state(workspace: Path) -> Optional[Tuple[str, Optional[s
     if not isinstance(head, str) or not head:
         return None
     return head, ref if isinstance(ref, str) else None
+
+
+def _read_worktree_submodule_paths(workspace: Path) -> List[Path]:
+    if git_workspace_toplevel(workspace) != workspace.resolve():
+        return []
+    marker = _worktree_base_state_path(workspace)
+    if marker is not None and marker.is_file():
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        values = payload.get("submodules") if isinstance(payload, dict) else None
+        if isinstance(values, list):
+            paths = []
+            workspace_resolved = workspace.resolve()
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                relative = Path(value)
+                if (
+                    relative.is_absolute()
+                    or not relative.parts
+                    or ".." in relative.parts
+                    or not is_relative_to(
+                        (workspace / relative).resolve(),
+                        workspace_resolved,
+                    )
+                ):
+                    continue
+                paths.append(relative)
+            return sorted(set(paths), key=lambda path: path.as_posix())
+    return _initialized_submodule_paths(workspace)
 
 
 def _is_git_ancestor(workspace: Path, ancestor: str, descendant: str) -> bool:
@@ -465,6 +577,13 @@ def prune_git_worktrees(original_workspace: Path) -> None:
         text=True,
         check=False,
     )
+    try:
+        submodule_paths = _initialized_submodule_paths(original_workspace)
+    except RuntimeError as exc:
+        _debug("could not enumerate submodules while pruning worktrees: {}", exc)
+        return
+    for relative in submodule_paths:
+        prune_git_worktrees(original_workspace / relative)
 
 
 def ensure_removed(path: Path) -> None:
@@ -480,8 +599,86 @@ def remove_tree_checked(path: Path) -> None:
     ensure_removed(path)
 
 
+def _remove_linked_git_worktree(workspace_copy: Path) -> bool:
+    if not (workspace_copy / ".git").is_file():
+        return False
+    common_dir = _git_common_dir(workspace_copy)
+    if common_dir is None:
+        return False
+    result = subprocess.run(
+        [
+            "git",
+            f"--git-dir={common_dir}",
+            "worktree",
+            "remove",
+            "--force",
+            "--force",
+            str(workspace_copy),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", f"--git-dir={common_dir}", "worktree", "prune", "--expire", "now"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    ensure_removed(workspace_copy)
+    return True
+
+
+def _cleanup_nested_git_worktrees(
+    workspace_copy: Path,
+    original_workspace: Optional[Path] = None,
+) -> None:
+    for relative in reversed(_read_worktree_submodule_paths(workspace_copy)):
+        submodule = workspace_copy / relative
+        original_submodule = (
+            original_workspace / relative
+            if original_workspace is not None
+            else None
+        )
+        if not submodule.exists() and not submodule.is_symlink():
+            if (
+                original_submodule is not None
+                and git_workspace_toplevel(original_submodule)
+                == original_submodule.resolve()
+            ):
+                prune_git_worktrees(original_submodule)
+            continue
+        _cleanup_nested_git_worktrees(submodule, original_submodule)
+        common_dir = _git_common_dir(submodule)
+        if not _remove_linked_git_worktree(submodule):
+            remove_tree_checked(submodule)
+            if common_dir is not None:
+                subprocess.run(
+                    [
+                        "git",
+                        f"--git-dir={common_dir}",
+                        "worktree",
+                        "prune",
+                        "--expire",
+                        "now",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+
+
 def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> None:
     if not workspace_copy.exists() and not workspace_copy.is_symlink():
+        return
+    _cleanup_nested_git_worktrees(workspace_copy, original_workspace)
+    if _remove_linked_git_worktree(workspace_copy):
+        prune_git_worktrees(original_workspace)
         return
     if (workspace_copy / ".git").is_file() and git_workspace_toplevel(original_workspace) is not None:
         result = subprocess.run(
@@ -543,8 +740,30 @@ def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
         return False
 
     try:
-        _copy_git_worktree_state(workspace, dst)
-        _record_worktree_base_state(dst, base_head, base_ref)
+        submodule_paths = _initialized_submodule_paths(workspace)
+        _copy_git_worktree_state(
+            workspace,
+            dst,
+            excluded_paths=submodule_paths,
+        )
+        for relative in submodule_paths:
+            source_submodule = workspace / relative
+            destination_submodule = dst / relative
+            remove_existing_path(destination_submodule)
+            destination_submodule.parent.mkdir(parents=True, exist_ok=True)
+            if not copy_workspace_with_git_worktree(
+                source_submodule,
+                destination_submodule,
+            ):
+                raise RuntimeError(
+                    f"could not isolate initialized Git submodule: {relative}"
+                )
+        _record_worktree_base_state(
+            dst,
+            base_head,
+            base_ref,
+            submodule_paths,
+        )
     except Exception as exc:
         _debug("git worktree copy failed: {}", exc)
         cleanup_workspace_copy(workspace, dst)
@@ -589,6 +808,13 @@ def should_skip_rel(path: Path, excluded_names: Set[str] = EXCLUDE_NAMES) -> boo
     return any(part in excluded_names for part in path.parts)
 
 
+def _is_excluded_relative(path: Path, excluded_paths: Sequence[Path]) -> bool:
+    return any(
+        path == excluded or excluded in path.parents
+        for excluded in excluded_paths
+    )
+
+
 def remove_existing_path(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
@@ -596,19 +822,34 @@ def remove_existing_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def sync_back_with_python(src: Path, dst: Path) -> None:
+def sync_back_with_python(
+    src: Path,
+    dst: Path,
+    excluded_paths: Sequence[Path] = (),
+) -> None:
     src = src.resolve()
     dst = dst.resolve()
+    normalized_excluded = tuple(
+        path
+        for path in excluded_paths
+        if not path.is_absolute() and ".." not in path.parts
+    )
 
     for root, dirs, files in os.walk(dst, topdown=False):
         root_p = Path(root)
         rel_root = root_p.relative_to(dst)
-        if should_skip_rel(rel_root, SYNC_EXCLUDE_NAMES):
+        if (
+            should_skip_rel(rel_root, SYNC_EXCLUDE_NAMES)
+            or _is_excluded_relative(rel_root, normalized_excluded)
+        ):
             continue
 
         for fname in files:
             rel = rel_root / fname
-            if should_skip_rel(rel, SYNC_EXCLUDE_NAMES):
+            if (
+                should_skip_rel(rel, SYNC_EXCLUDE_NAMES)
+                or _is_excluded_relative(rel, normalized_excluded)
+            ):
                 continue
             src_equiv = src / rel
             dst_equiv = dst / rel
@@ -617,7 +858,10 @@ def sync_back_with_python(src: Path, dst: Path) -> None:
 
         for dname in dirs:
             rel = rel_root / dname
-            if should_skip_rel(rel, SYNC_EXCLUDE_NAMES):
+            if (
+                should_skip_rel(rel, SYNC_EXCLUDE_NAMES)
+                or _is_excluded_relative(rel, normalized_excluded)
+            ):
                 continue
             src_equiv = src / rel
             dst_equiv = dst / rel
@@ -627,7 +871,10 @@ def sync_back_with_python(src: Path, dst: Path) -> None:
     for root, dirs, files in os.walk(src):
         root_p = Path(root)
         rel_root = root_p.relative_to(src)
-        if should_skip_rel(rel_root, SYNC_EXCLUDE_NAMES):
+        if (
+            should_skip_rel(rel_root, SYNC_EXCLUDE_NAMES)
+            or _is_excluded_relative(rel_root, normalized_excluded)
+        ):
             dirs[:] = []
             continue
 
@@ -636,7 +883,10 @@ def sync_back_with_python(src: Path, dst: Path) -> None:
 
         for dname in list(dirs):
             rel = rel_root / dname
-            if should_skip_rel(rel, SYNC_EXCLUDE_NAMES):
+            if (
+                should_skip_rel(rel, SYNC_EXCLUDE_NAMES)
+                or _is_excluded_relative(rel, normalized_excluded)
+            ):
                 dirs.remove(dname)
                 continue
             src_dir = src / rel
@@ -653,7 +903,10 @@ def sync_back_with_python(src: Path, dst: Path) -> None:
 
         for fname in files:
             rel = rel_root / fname
-            if should_skip_rel(rel, SYNC_EXCLUDE_NAMES):
+            if (
+                should_skip_rel(rel, SYNC_EXCLUDE_NAMES)
+                or _is_excluded_relative(rel, normalized_excluded)
+            ):
                 continue
             src_file = src / rel
             dst_file = dst / rel
@@ -668,9 +921,15 @@ def sync_back_with_python(src: Path, dst: Path) -> None:
                 shutil.copy2(src_file, dst_file)
 
 
-def _sync_workspace_files(src: Path, dst: Path) -> None:
-    if _rsync_available():
+def _sync_workspace_files(
+    src: Path,
+    dst: Path,
+    excluded_paths: Sequence[Path] = (),
+) -> None:
+    if _rsync_available() and not excluded_paths:
         sync_back_with_rsync(src, dst)
+    elif excluded_paths:
+        sync_back_with_python(src, dst, excluded_paths=excluded_paths)
     else:
         sync_back_with_python(src, dst)
 
@@ -706,9 +965,49 @@ def _sync_git_workspace_back(src: Path, dst: Path) -> bool:
             "its HEAD is not based on the original workspace HEAD"
         )
 
+    submodule_paths = _read_worktree_submodule_paths(src_top)
+    for relative in submodule_paths:
+        src_submodule = src_top / relative
+        dst_submodule = dst_top / relative
+        src_submodule_top = git_workspace_toplevel(src_submodule)
+        if src_submodule_top is not None:
+            if git_workspace_toplevel(dst_submodule) is None:
+                raise RuntimeError(
+                    "original initialized Git submodule is unavailable during sync: "
+                    f"{relative}"
+                )
+            if not _sync_git_workspace_back(src_submodule, dst_submodule):
+                raise RuntimeError(f"could not sync Git submodule: {relative}")
+        elif not src_submodule.exists() and dst_submodule.exists():
+            destination_common_dir = _git_common_dir(dst_submodule)
+            remove_existing_path(dst_submodule)
+            if destination_common_dir is not None:
+                subprocess.run(
+                    [
+                        "git",
+                        f"--git-dir={destination_common_dir}",
+                        "worktree",
+                        "prune",
+                        "--expire",
+                        "now",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+        elif src_submodule.exists():
+            raise RuntimeError(
+                f"isolated Git metadata is missing for submodule: {relative}"
+            )
+
     with _prepared_git_index(src_top, dst_top) as (source_index, destination_index):
         with _locked_git_index(source_index, destination_index) as locked_index:
-            _sync_workspace_files(src_top, dst_top)
+            _sync_workspace_files(
+                src_top,
+                dst_top,
+                excluded_paths=submodule_paths,
+            )
 
             # Move the checked-out branch (or detached HEAD) without touching the synced files.
             result = subprocess.run(

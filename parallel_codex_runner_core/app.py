@@ -133,6 +133,60 @@ class RunStorageEstimate:
     metadata_bytes: int
     total_bytes: int
 
+
+class LiveRetryCoordinator:
+    """Thread-safe handoff for retries that must finish before synthesis."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = False
+        self._pending: List[int] = []
+        self._pending_set: Set[int] = set()
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def activate(self) -> None:
+        with self._lock:
+            self._active = True
+            self._pending.clear()
+            self._pending_set.clear()
+
+    def request(self, idx: int) -> bool:
+        with self._lock:
+            if not self._active or idx in self._pending_set:
+                return False
+            self._pending.append(idx)
+            self._pending_set.add(idx)
+            return True
+
+    def drain(self) -> List[int]:
+        with self._lock:
+            pending = list(self._pending)
+            self._pending.clear()
+            self._pending_set.clear()
+            return pending
+
+    def close_if_idle(self) -> Optional[List[int]]:
+        """Atomically close, unless a request arrived before the stage ended."""
+        with self._lock:
+            if self._pending:
+                pending = list(self._pending)
+                self._pending.clear()
+                self._pending_set.clear()
+                return pending
+            self._active = False
+            return None
+
+    def deactivate(self) -> None:
+        with self._lock:
+            self._active = False
+            self._pending.clear()
+            self._pending_set.clear()
+
+
 # Conda's SQLite build can deadlock inside the macOS VFS when separate Python
 # threads open or close databases concurrently. PCR's SQLite sections are
 # short, so serialize them process-wide and keep file/JSON work outside.
@@ -2381,23 +2435,86 @@ async def run_all_agents(
     agent_cancel_events: Optional[Dict[int, Any]] = None,
     agent_indices: Optional[Sequence[int]] = None,
     agent_role: str = AGENT_ROLE_CANDIDATE,
+    live_retry_coordinator: Optional[LiveRetryCoordinator] = None,
+    retry_agent_preparer: Optional[
+        Callable[[int], Tuple[List[str], Path]]
+    ] = None,
 ) -> List[AgentResult]:
     agent_role = normalize_agent_role(agent_role)
     results: List[AgentResult] = []
     semaphore = asyncio.Semaphore(max_parallel)
     indices = list(agent_indices) if agent_indices is not None else list(range(1, n + 1))
 
-    async def run_limited(idx: int) -> AgentResult:
+    def retry_preparation_failure(
+        idx: int,
+        command: List[str],
+        codex_home: Path,
+        exc: Exception,
+    ) -> AgentResult:
+        agent_workspace = workspaces_root / f"agent_{idx:03d}"
+        meta_dir = meta_root / f"agent_{idx:03d}"
+        result = AgentResult(
+            idx=idx,
+            workspace_dir=str(agent_workspace),
+            meta_dir=str(meta_dir),
+            codex_home=str(codex_home),
+            stdout_log=str(meta_dir / "stdout.log"),
+            stderr_log=str(meta_dir / "stderr.log"),
+            final_message=str(meta_dir / "final_message.md"),
+            command=command,
+            returncode=None,
+            status="error",
+            seconds=0.0,
+            role=agent_role,
+            error=f"retry preparation failed: {exc}",
+        )
+        try:
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            (meta_dir / "status.json").write_text(
+                json.dumps(asdict(result), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "type": "agent_finished",
+                    "idx": idx,
+                    "role": agent_role,
+                    "result": asdict(result),
+                }
+            )
+        return result
+
+    async def run_limited(idx: int, retry: bool = False) -> AgentResult:
         agent_cancel_event = (agent_cancel_events or {}).get(idx)
 
         async def execute() -> AgentResult:
+            command = command_by_agent[idx]
+            codex_home = codex_home_by_agent[idx]
+            if retry:
+                if retry_agent_preparer is None:
+                    raise RuntimeError("live retry preparation is unavailable")
+                try:
+                    command, codex_home = await asyncio.to_thread(
+                        retry_agent_preparer,
+                        idx,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return retry_preparation_failure(
+                        idx,
+                        command,
+                        codex_home,
+                        exc,
+                    )
             return await run_one_agent(
                 idx=idx,
                 agent_workspace=workspaces_root / f"agent_{idx:03d}",
                 meta_dir=meta_root / f"agent_{idx:03d}",
-                codex_home=codex_home_by_agent[idx],
+                codex_home=codex_home,
                 prompt=prompt,
-                command=command_by_agent[idx],
+                command=command,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 agent_cancel_event=agent_cancel_event,
@@ -2433,6 +2550,42 @@ async def run_all_agents(
 
     tasks = [asyncio.create_task(run_limited(idx)) for idx in indices]
     total = len(tasks)
+
+    if live_retry_coordinator is not None:
+        if retry_agent_preparer is None:
+            raise ValueError(
+                "retry_agent_preparer is required with live_retry_coordinator"
+            )
+        active_tasks = set(tasks)
+        results_by_index: Dict[int, AgentResult] = {}
+        live_retry_coordinator.activate()
+        try:
+            while True:
+                for retry_idx in live_retry_coordinator.drain():
+                    active_tasks.add(
+                        asyncio.create_task(run_limited(retry_idx, retry=True))
+                    )
+                if not active_tasks:
+                    trailing = live_retry_coordinator.close_if_idle()
+                    if trailing is None:
+                        break
+                    for retry_idx in trailing:
+                        active_tasks.add(
+                            asyncio.create_task(run_limited(retry_idx, retry=True))
+                        )
+                    continue
+
+                finished, active_tasks = await asyncio.wait(
+                    active_tasks,
+                    timeout=0.1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in finished:
+                    result = await task
+                    results_by_index[result.idx] = result
+        finally:
+            live_retry_coordinator.deactivate()
+        return list(results_by_index.values())
 
     if HAS_RICH and progress_callback is None:
         assert Progress is not None
@@ -2721,6 +2874,8 @@ def write_run_files(
     resume_session: Optional[ResumeSession] = None,
     codex_session_promotion: Optional[CodexSessionPromotion] = None,
     synthesis_info: Optional[Dict[str, Any]] = None,
+    finalization_error: Optional[str] = None,
+    finalization_errors: Optional[Sequence[Dict[str, str]]] = None,
 ) -> None:
     (run_root / "prompt.txt").write_text(prompt, encoding="utf-8")
     summary = {
@@ -2735,8 +2890,11 @@ def write_run_files(
         "codex_session_promotion": asdict(codex_session_promotion) if codex_session_promotion else None,
         "synced_back_to_workspace": str(workspace) if synced else None,
         "workspaces_deleted": workspaces_deleted,
+        "finalization_error": finalization_error,
         "results": [asdict(r) for r in sorted(results, key=lambda x: x.idx)],
     }
+    if finalization_errors:
+        summary["finalization_errors"] = list(finalization_errors)
     if synthesis_info is not None:
         normalized_synthesis = dict(synthesis_info)
         normalized_synthesis["launched_agents"] = [
@@ -2854,6 +3012,16 @@ def refresh_run_result_files(
             if isinstance(summary.get("synthesis"), dict)
             else None
         ),
+        finalization_error=(
+            str(summary["finalization_error"])
+            if summary.get("finalization_error")
+            else None
+        ),
+        finalization_errors=(
+            summary.get("finalization_errors")
+            if isinstance(summary.get("finalization_errors"), list)
+            else None
+        ),
     )
 
 
@@ -2865,6 +3033,87 @@ def _archive_retry_metadata(run_root: Path, meta_dir: Path, idx: int) -> None:
     retry_root.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     shutil.move(str(meta_dir), str(retry_root / stamp))
+
+
+def _prepare_additional_agent(
+    *,
+    args: argparse.Namespace,
+    idx: int,
+    run_root: Path,
+    workspace: Path,
+    workspaces_root: Path,
+    meta_root: Path,
+    help_text: str,
+    real_codex_home: Path,
+    effective_effort: Optional[str],
+    resume_session_id: Optional[str],
+    retry: bool,
+    progress_callback: ProgressCallback,
+    agent_role: str,
+    developer_instructions: Optional[str],
+) -> Tuple[List[str], Path]:
+    agent_workspace = workspaces_root / f"agent_{idx:03d}"
+    agent_meta_dir = meta_root / f"agent_{idx:03d}"
+    agent_codex_home = agent_meta_dir / "codex_home"
+    try:
+        if retry:
+            cleanup_workspace_copy(workspace, agent_workspace)
+            _archive_retry_metadata(run_root, agent_meta_dir, idx)
+        elif agent_workspace.exists() or agent_workspace.is_symlink():
+            raise FileExistsError(f"agent workspace already exists: {agent_workspace}")
+
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "type": "agent_status",
+                    "idx": idx,
+                    "status": "copying",
+                    "role": agent_role,
+                }
+            )
+        copy_workspace(workspace, agent_workspace, run_base=run_root.parent)
+        prepare_agent_codex_home(
+            real_codex_home,
+            agent_codex_home,
+            agent_workspace,
+            resume_session_id,
+        )
+        effective_developer_instructions = (
+            merge_codex_developer_instructions(
+                read_effective_codex_developer_instructions(
+                    args.codex_bin,
+                    agent_codex_home,
+                    agent_workspace,
+                ),
+                developer_instructions,
+            )
+            if developer_instructions
+            else None
+        )
+        command, _caps = build_codex_command(
+            args.codex_bin,
+            help_text,
+            agent_meta_dir / "final_message.md",
+            model=args.model,
+            effort=effective_effort,
+            resume_session_id=resume_session_id,
+            developer_instructions=effective_developer_instructions,
+            subagents=bool(getattr(args, "subagents", False)),
+            subagents_limit=int(
+                getattr(args, "subagents_limit", DEFAULT_SUBAGENTS_LIMIT)
+            ),
+        )
+        return command, agent_codex_home
+    except BaseException:
+        try:
+            scrub_codex_home_support_entries(agent_codex_home)
+        except BaseException:
+            pass
+        try:
+            cleanup_workspace_copy(workspace, agent_workspace)
+        except BaseException:
+            pass
+        raise
 
 
 def run_additional_agents(
@@ -2917,56 +3166,22 @@ def run_additional_agents(
         for idx in indices:
             if cancel_requested(cancel_event):
                 break
-            agent_workspace = workspaces_root / f"agent_{idx:03d}"
-            agent_meta_dir = meta_root / f"agent_{idx:03d}"
-            if idx in retries:
-                cleanup_workspace_copy(workspace, agent_workspace)
-                _archive_retry_metadata(run_root, agent_meta_dir, idx)
-            elif agent_workspace.exists() or agent_workspace.is_symlink():
-                raise FileExistsError(f"agent workspace already exists: {agent_workspace}")
             touched.append(idx)
-
-            if progress_callback is not None:
-                progress_callback(
-                    {
-                        "type": "agent_status",
-                        "idx": idx,
-                        "status": "copying",
-                        "role": agent_role,
-                    }
-                )
-            copy_workspace(workspace, agent_workspace, run_base=run_root.parent)
-            agent_codex_home = agent_meta_dir / "codex_home"
-            prepare_agent_codex_home(
-                real_codex_home,
-                agent_codex_home,
-                agent_workspace,
-                resume_session_id,
-            )
-            effective_developer_instructions = (
-                merge_codex_developer_instructions(
-                    read_effective_codex_developer_instructions(
-                        args.codex_bin,
-                        agent_codex_home,
-                        agent_workspace,
-                    ),
-                    developer_instructions,
-                )
-                if developer_instructions
-                else None
-            )
-            command, _caps = build_codex_command(
-                args.codex_bin,
-                help_text,
-                agent_meta_dir / "final_message.md",
-                model=args.model,
-                effort=effective_effort,
+            command, agent_codex_home = _prepare_additional_agent(
+                args=args,
+                idx=idx,
+                run_root=run_root,
+                workspace=workspace,
+                workspaces_root=workspaces_root,
+                meta_root=meta_root,
+                help_text=help_text,
+                real_codex_home=real_codex_home,
+                effective_effort=effective_effort,
                 resume_session_id=resume_session_id,
-                developer_instructions=effective_developer_instructions,
-                subagents=bool(getattr(args, "subagents", False)),
-                subagents_limit=int(
-                    getattr(args, "subagents_limit", DEFAULT_SUBAGENTS_LIMIT)
-                ),
+                retry=idx in retries,
+                progress_callback=progress_callback,
+                agent_role=agent_role,
+                developer_instructions=developer_instructions,
             )
             command_by_agent[idx] = command
             codex_home_by_agent[idx] = agent_codex_home
@@ -3469,6 +3684,30 @@ def run_once(
         args.num_agents,
         max_parallel,
     )
+    live_retry_coordinator = getattr(args, "live_retry_coordinator", None)
+    if not isinstance(live_retry_coordinator, LiveRetryCoordinator):
+        live_retry_coordinator = None
+
+    def prepare_live_retry(idx: int) -> Tuple[List[str], Path]:
+        if idx not in command_by_agent:
+            raise ValueError(f"cannot retry unknown first-stage agent: {idx}")
+        return _prepare_additional_agent(
+            args=args,
+            idx=idx,
+            run_root=run_root,
+            workspace=workspace,
+            workspaces_root=workspaces_root,
+            meta_root=meta_root,
+            help_text=help_text,
+            real_codex_home=real_codex_home,
+            effective_effort=effective_effort,
+            resume_session_id=resume_session_id,
+            retry=True,
+            progress_callback=progress_callback,
+            agent_role=AGENT_ROLE_CANDIDATE,
+            developer_instructions=None,
+        )
+
     try:
         results = asyncio.run(
             run_all_agents(
@@ -3482,6 +3721,12 @@ def run_once(
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 agent_cancel_events=agent_cancel_events,
+                live_retry_coordinator=live_retry_coordinator,
+                retry_agent_preparer=(
+                    prepare_live_retry
+                    if live_retry_coordinator is not None
+                    else None
+                ),
             )
         )
     except BaseException:
@@ -3603,58 +3848,133 @@ def run_once(
                     }
                 )
 
-    scrub_agent_codex_homes(meta_root)
-
     cancelled = cancel_requested(cancel_event)
     successes = [] if cancelled else [r for r in results if r.status == "success"]
     best = select_best_result(successes, args.recommend_by)
 
     synced = False
     codex_session_promotion: Optional[CodexSessionPromotion] = None
-    if cancelled:
-        log("warning", "run cancelled; original workspace was not modified")
-    elif best is not None and not args.no_sync_back:
-        log("info", "syncing selected workspace back to original workspace")
-        sync_best_workspace_back(Path(best.workspace_dir), workspace)
-        synced = True
-        log("info", "sync complete: {} -> {}", best.workspace_dir, workspace)
-        try:
-            codex_session_promotion = promote_best_codex_session_to_workspace(best, workspace)
-            if codex_session_promotion is None:
-                log("warning", "could not identify a Codex session id for the selected agent; --resume may not show this run.")
-            elif codex_session_promotion.error:
-                log("warning", "Codex session promotion partially failed: {}", codex_session_promotion.error)
-            else:
-                log("info", "Codex session {} is now resumable from {}", codex_session_promotion.session_id, workspace)
-        except Exception as exc:  # noqa: BLE001
-            log("warning", "Codex session promotion failed: {}", exc)
-    elif best is not None and args.no_sync_back:
-        log("warning", "--no-sync-back set; original workspace was not modified")
-    else:
-        log("error", "no successful agent; original workspace was not modified")
-
     workspaces_deleted = False
-    if not args.keep_workspaces:
-        # Safety check before recursive delete.
-        if is_relative_to(workspaces_root, workspace):
-            raise SystemExit(f"拒绝删除：workspaces_root 位于 workspace 内部：{workspaces_root}")
-        cleanup_workspace_copies(workspace, workspaces_root)
-        workspaces_deleted = not workspaces_root.exists()
-        remove_agent_codex_homes(meta_root)
+    finalization_error: Optional[BaseException] = None
+    finalization_traceback: Any = None
+    finalization_failures: List[Tuple[str, BaseException]] = []
 
-    write_run_files(
-        run_root,
-        workspace,
-        prompt,
-        results,
-        best,
-        args.recommend_by,
-        synced,
-        workspaces_deleted,
-        resume_session,
-        codex_session_promotion,
-        synthesis_info,
-    )
+    def remember_finalization_error(stage: str, exc: BaseException) -> None:
+        nonlocal finalization_error, finalization_traceback
+        finalization_failures.append((stage, exc))
+        if finalization_error is None:
+            finalization_error = exc
+            finalization_traceback = exc.__traceback__
+        else:
+            log("error", "{} also failed during run finalization: {}", stage, exc)
+
+    try:
+        try:
+            scrub_agent_codex_homes(meta_root)
+        except BaseException as exc:  # noqa: BLE001
+            remember_finalization_error("Codex home scrubbing", exc)
+
+        try:
+            if cancelled:
+                log("warning", "run cancelled; original workspace was not modified")
+            elif best is not None and not args.no_sync_back:
+                log("info", "syncing selected workspace back to original workspace")
+                sync_best_workspace_back(Path(best.workspace_dir), workspace)
+                synced = True
+                log("info", "sync complete: {} -> {}", best.workspace_dir, workspace)
+                try:
+                    codex_session_promotion = promote_best_codex_session_to_workspace(
+                        best,
+                        workspace,
+                    )
+                    if codex_session_promotion is None:
+                        log(
+                            "warning",
+                            "could not identify a Codex session id for the selected "
+                            "agent; --resume may not show this run.",
+                        )
+                    elif codex_session_promotion.error:
+                        log(
+                            "warning",
+                            "Codex session promotion partially failed: {}",
+                            codex_session_promotion.error,
+                        )
+                    else:
+                        log(
+                            "info",
+                            "Codex session {} is now resumable from {}",
+                            codex_session_promotion.session_id,
+                            workspace,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log("warning", "Codex session promotion failed: {}", exc)
+            elif best is not None and args.no_sync_back:
+                log("warning", "--no-sync-back set; original workspace was not modified")
+            else:
+                log("error", "no successful agent; original workspace was not modified")
+        except BaseException as exc:  # noqa: BLE001
+            remember_finalization_error("workspace sync", exc)
+
+    finally:
+        if not args.keep_workspaces:
+            try:
+                # Safety check before recursive delete.
+                if is_relative_to(workspaces_root, workspace):
+                    raise SystemExit(
+                        "拒绝删除：workspaces_root 位于 workspace 内部："
+                        f"{workspaces_root}"
+                    )
+                cleanup_workspace_copies(workspace, workspaces_root)
+                workspaces_deleted = not workspaces_root.exists()
+            except BaseException as exc:  # noqa: BLE001
+                remember_finalization_error("workspace cleanup", exc)
+            try:
+                remove_agent_codex_homes(meta_root)
+            except BaseException as exc:  # noqa: BLE001
+                remember_finalization_error("Codex home cleanup", exc)
+
+        try:
+            try:
+                write_run_files(
+                    run_root,
+                    workspace,
+                    prompt,
+                    results,
+                    best,
+                    args.recommend_by,
+                    synced,
+                    workspaces_deleted,
+                    resume_session,
+                    codex_session_promotion,
+                    synthesis_info,
+                    str(finalization_error) if finalization_error is not None else None,
+                    [
+                        {"stage": stage, "message": str(exc)}
+                        for stage, exc in finalization_failures
+                    ],
+                )
+            except BaseException as exc:  # noqa: BLE001
+                remember_finalization_error("result file writing", exc)
+        finally:
+            restore_cancel_signals()
+
+    if finalization_error is not None:
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    {
+                        "type": "run_failed",
+                        "message": "run finalization failed: "
+                        + "; ".join(
+                            f"{stage}: {exc}"
+                            for stage, exc in finalization_failures
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                log("warning", "run_failed callback failed: {}", exc)
+        raise finalization_error.with_traceback(finalization_traceback)
+
     if progress_callback is not None:
         progress_callback(
             {
@@ -3678,7 +3998,6 @@ def run_once(
             codex_session_promotion,
         )
 
-    restore_cancel_signals()
     return 130 if cancelled else (0 if best is not None else 2)
 
 

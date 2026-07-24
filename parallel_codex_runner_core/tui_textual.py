@@ -122,7 +122,8 @@ TUI_TIPS: tuple[str, ...] = (
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
-    "输入 /retry 可重跑失败或被终止的 Agent，/more 3 可追加 3 个候选 Agent。",
+    "输入 /retry 可重跑失败或被终止的 Agent；候选阶段有空闲并发位时会立即重跑。",
+    "输入 /more 3 可为当前问题追加 3 个候选 Agent。",
     "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
     "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
@@ -506,6 +507,7 @@ except (ModuleNotFoundError, RuntimeError) as exc:
 else:
     from .app import (
         LARGE_RUN_STORAGE_WARNING_BYTES,
+        LiveRetryCoordinator,
         RunStorageEstimate,
         available_storage_bytes,
         estimate_staged_run_storage,
@@ -690,6 +692,7 @@ else:
     class QueuedFollowUp:
         prompt: str
         record_history: bool = False
+        context: tuple[str, str] | None = None
 
 
     class RunnerEvent(Message):
@@ -1300,6 +1303,8 @@ else:
             self.pending_execution_args: argparse.Namespace | None = None
             self.candidate_batches: list[CandidateBatch] = []
             self.active_batch_indices: set[int] = set()
+            self.live_retry_indices: set[int] = set()
+            self.live_retry_coordinator: LiveRetryCoordinator | None = None
             self.pending_accept_agent: int | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.command_history: list[tuple[str, str, str]] = []
@@ -2502,13 +2507,26 @@ else:
                 self._sync()
                 return
             last_agent = max(self.agents, default=self.num_agents)
+            previous_agent = self.selected_agent
             self.selected_agent = min(last_agent, max(1, self.selected_agent + delta))
-            if self.follow_up_continue_at is not None:
-                remaining = max(
-                    0,
-                    int(self.follow_up_continue_at - time.monotonic() + 0.999),
+            if (
+                self.selected_agent != previous_agent
+                and self.follow_up_queue
+                and not self.running
+                and not self.follow_up_source_finalized
+                and (
+                    self.follow_up_continue_at is not None
+                    or self.follow_up_ready
                 )
-                self._set_follow_up_countdown_status(remaining)
+            ):
+                self.follow_up_continue_at = (
+                    time.monotonic() + FOLLOW_UP_DELAY_SECONDS
+                )
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = int(FOLLOW_UP_DELAY_SECONDS)
+                self._set_follow_up_countdown_status(
+                    self._follow_up_countdown_second
+                )
             self._sync()
 
         def _agent_kill_requested(self, idx: int) -> bool:
@@ -2626,6 +2644,7 @@ else:
                 pane.append(text, category)
                 self._mark_detail_dirty(pane)
             elif kind == "agent_finished" and pane is not None:
+                self.live_retry_indices.discard(idx)
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 pane.role = normalize_agent_role(result.get("role", role))
                 pane.result = result
@@ -2690,6 +2709,7 @@ else:
                 self.running = False
                 self.cancel_event = None
                 self.active_batch_indices.clear()
+                self.live_retry_indices.clear()
                 if self.pending_accept_agent is not None or (
                     self.queued_prompt and self.queued_agent is not None
                 ):
@@ -2935,11 +2955,7 @@ else:
             if self.storage_preflight_inflight:
                 self.storage_preflight_request += 1
                 self.storage_preflight_inflight = False
-            self.follow_up_queue.clear()
-            self.follow_up_continue_at = None
-            self.follow_up_ready = False
-            self.follow_up_source_finalized = False
-            self._follow_up_countdown_second = None
+            self._clear_follow_up_queue()
             if self.running:
                 self.queued_prompt = ""
                 self.queued_agent = None
@@ -3103,6 +3119,7 @@ else:
             accepted_idx = self.selected_agent
             if self._finalize_agent(accepted_idx, archive_detail=True):
                 if self.follow_up_queue:
+                    self._rebind_follow_up_queue()
                     self.follow_up_source_finalized = True
                     self._dispatch_follow_up()
                 else:
@@ -3164,6 +3181,26 @@ else:
                 return
             if not self.running and not self.candidate_batches:
                 self.completion_notification_sent = False
+            live_retry = (
+                self.running
+                and pane.role == AGENT_ROLE_CANDIDATE
+                and self.live_retry_coordinator is not None
+                and self.live_retry_coordinator.request(idx)
+            )
+            if live_retry:
+                running_before_retry = self._active_agent_count()
+                self.live_retry_indices.add(idx)
+                self._prepare_retry_pane(pane)
+                if running_before_retry < self._current_parallel_limit():
+                    self.status = f"Retrying AGENT-{idx:03d} now"
+                else:
+                    self.status = (
+                        f"Retry queued for AGENT-{idx:03d} in the current "
+                        "candidate stage"
+                    )
+                self._sync()
+                return
+
             self.candidate_batches.append(
                 CandidateBatch(
                     [idx],
@@ -3346,10 +3383,42 @@ else:
                 self.status = f"Cannot change {label} while running"
                 self._sync()
                 return False
-            if self._finalize_displayed_pending(require_resume=False, archive_detail=True):
+            if self._finalize_displayed_pending(
+                require_resume=False,
+                archive_detail=True,
+            ):
+                self._clear_follow_up_queue()
                 return True
             self._sync()
             return False
+
+        def _follow_up_context(self) -> tuple[str, str]:
+            return (
+                str(self.workspace.expanduser().resolve()),
+                self.resume_session_id.strip(),
+            )
+
+        def _clear_follow_up_queue(self) -> None:
+            self.follow_up_queue.clear()
+            self.follow_up_continue_at = None
+            self.follow_up_ready = False
+            self.follow_up_source_finalized = False
+            self._follow_up_countdown_second = None
+            self._follow_up_queue_cache = ""
+            self._follow_up_queue_items_cache = ()
+            self._follow_up_queue_refresh_deferred = False
+            self._refresh_follow_up_queue()
+
+        def _rebind_follow_up_queue(self) -> None:
+            context = self._follow_up_context()
+            self.follow_up_queue = [
+                QueuedFollowUp(
+                    item.prompt,
+                    record_history=item.record_history,
+                    context=context,
+                )
+                for item in self.follow_up_queue
+            ]
 
         def _finalize_displayed_pending(
             self,
@@ -3836,11 +3905,7 @@ else:
                 self._sync()
                 return
             if args and args[0].lower() in {"clear", "new"}:
-                if not self._finalize_displayed_pending(
-                    require_resume=False,
-                    archive_detail=True,
-                ):
-                    self._sync()
+                if not self._prepare_context_change("resume session"):
                     return
                 self.resume_session_id = ""
                 self.args.resume_session_id = None
@@ -3984,9 +4049,28 @@ else:
             )
 
         def _agent_has_pending_batch(self, idx: int) -> bool:
-            return idx in self.active_batch_indices or any(
-                idx in batch.indices for batch in self.candidate_batches
+            return (
+                idx in self.active_batch_indices
+                or idx in self.live_retry_indices
+                or any(
+                    idx in batch.indices for batch in self.candidate_batches
+                )
             )
+
+        def _active_agent_count(self) -> int:
+            return sum(
+                pane.status in {"copying", "running", "stopping"}
+                for pane in self.agents.values()
+            )
+
+        def _current_parallel_limit(self) -> int:
+            args = self.pending_execution_args or self.args
+            if bool(getattr(args, "serial", False)):
+                return 1
+            configured = getattr(args, "max_parallel", None)
+            if configured is not None:
+                return max(1, int(configured))
+            return max(1, int(getattr(args, "num_agents", self.num_agents)))
 
         def _discard_queued_candidate_batches(self) -> None:
             for batch in self.candidate_batches:
@@ -4131,6 +4215,7 @@ else:
                 self.pending_accept_agent = None
                 if self._finalize_agent(idx, archive_detail=True):
                     if self.follow_up_queue and not self.exit_after_run:
+                        self._rebind_follow_up_queue()
                         self.follow_up_source_finalized = True
                         self._dispatch_follow_up()
                     else:
@@ -4190,6 +4275,8 @@ else:
             self.pending_accept_agent = None
             self.candidate_batches.clear()
             self.active_batch_indices.clear()
+            self.live_retry_indices.clear()
+            self.live_retry_coordinator = LiveRetryCoordinator()
             self.cancel_event = threading.Event()
             self.recommended_agent = None
             self.started_at = time.monotonic()
@@ -4230,6 +4317,7 @@ else:
             run_args.keep_workspaces = True
             run_args.cancel_event = self.cancel_event
             run_args.agent_cancel_events = self.agent_cancel_events
+            run_args.live_retry_coordinator = self.live_retry_coordinator
             self.pending_execution_args = argparse.Namespace(**vars(run_args))
             # Keep the configured limit, not the first batch's effective limit.
             # This preserves max-parallel=auto and larger explicit limits for /more.
@@ -4269,7 +4357,11 @@ else:
                 self._sync()
                 return False
             self.follow_up_queue.append(
-                QueuedFollowUp(prompt, record_history=record_history)
+                QueuedFollowUp(
+                    prompt,
+                    record_history=record_history,
+                    context=self._follow_up_context(),
+                )
             )
             if self.running:
                 self.follow_up_continue_at = None
@@ -4391,6 +4483,14 @@ else:
             ):
                 return False
             item = self.follow_up_queue[0]
+            if item.context is not None and item.context != self._follow_up_context():
+                self._clear_follow_up_queue()
+                self.status = (
+                    "Queued follow-up discarded because its workspace or resume "
+                    "session changed"
+                )
+                self._sync()
+                return False
             self.follow_up_continue_at = None
             self.follow_up_ready = False
             self._follow_up_countdown_second = None
@@ -4416,6 +4516,7 @@ else:
                 ):
                     self._sync()
                     return False
+                self._rebind_follow_up_queue()
                 self.follow_up_source_finalized = True
 
             self._archive_command_history()
@@ -4446,6 +4547,7 @@ else:
                 except Exception:
                     pass
                 return
+            self._rebind_follow_up_queue()
             self._archive_command_history()
             if self.follow_up_queue:
                 started = self._request_run_with_storage_check(
@@ -4502,6 +4604,8 @@ else:
             self.pending_prompt_records_history = False
             self.pending_execution_args = None
             self.active_batch_indices.clear()
+            self.live_retry_indices.clear()
+            self.live_retry_coordinator = None
             self.pending_accept_agent = None
 
         def _pending_sync_disabled(self) -> bool:
