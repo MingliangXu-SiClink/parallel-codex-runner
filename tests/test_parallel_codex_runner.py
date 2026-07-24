@@ -2990,6 +2990,62 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_delayed_model_event_cannot_restore_an_older_selection(self) -> None:
+        async def run() -> None:
+            args = parse_args(["--model", "gpt-5.6-sol", "--effort", "ultra"])
+            app = tui_textual.PcrTextualApp(args)
+            app.model_registry = CodexModelRegistry(
+                models={
+                    "gpt-5.6-luna": CodexModelInfo(
+                        "gpt-5.6-luna",
+                        "max",
+                        ("medium", "high", "max"),
+                    ),
+                    "gpt-5.6-sol": CodexModelInfo(
+                        "gpt-5.6-sol",
+                        "ultra",
+                        ("medium", "high", "max", "ultra"),
+                    ),
+                }
+            )
+            app.model_choices = app.model_registry.model_options(args.model)
+            app.effort_choices = app.model_registry.effort_options(
+                args.model,
+                args.effort,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test():
+                    model = app.query_one("#config-model")
+                    app._set_select_control(
+                        model,
+                        "gpt-5.6-sol",
+                        app.model_choices,
+                    )
+                    latest = app._latest_select_event_time.get(
+                        "config-model",
+                        time.monotonic(),
+                    )
+                    delayed_luna = tui_textual.Select.Changed(
+                        model,
+                        "gpt-5.6-luna",
+                    )
+                    current_sol = tui_textual.Select.Changed(
+                        model,
+                        "gpt-5.6-sol",
+                    )
+                    delayed_luna.time = latest + 1
+                    current_sol.time = latest + 2
+
+                    app._on_model_selected(current_sol)
+                    app._on_model_selected(delayed_luna)
+
+                    self.assertEqual(model.value, "gpt-5.6-sol")
+                    self.assertEqual(app.args.model, "gpt-5.6-sol")
+                    self.assertEqual(app.args.effort, "ultra")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_command_output_appends_after_conversation(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args([]))
         app._sync = lambda: None
@@ -3607,6 +3663,24 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(display_line_from_output("agent_reasoning:thinking"), "thinking")
         self.assertEqual(display_line_from_output("2026-07-07 ERROR codex_models_manager: timeout"), "")
         self.assertEqual(display_line_from_output("2026-07-07 ERROR codex models_manager: timeout"), "")
+        model_warning = (
+            "This session was recorded with model `gpt-5.6-luna` "
+            "but is resuming with `gpt-5.6-sol`."
+        )
+        self.assertEqual(
+            display_line_from_output(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "error",
+                            "message": model_warning,
+                        },
+                    }
+                )
+            ),
+            model_warning,
+        )
         self.assertEqual(display_line_from_output("error=apply_patch verification failed"), "")
         self.assertEqual(display_line_from_output("Failed to find expected lines"), "")
         self.assertEqual(display_line_from_output("Run result:"), "")
@@ -5735,6 +5809,115 @@ class ResumeSessionTests(unittest.TestCase):
 
             self.assertEqual(row, (str(agent_workspace), str(missing_rollout)))
 
+    def test_prepare_agent_codex_home_rebinds_all_rollout_execution_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real"
+            agent_home = root / "agent"
+            agent_workspace = root / "workspaces" / "agent_001"
+            real_home.mkdir()
+            agent_workspace.mkdir(parents=True)
+
+            session_id = "019f-rollout-context"
+            old_workspace = "/tmp/removed-pcr-worktree"
+            rollout = real_home / "sessions" / "2026" / "07" / f"rollout-{session_id}.jsonl"
+            rollout.parent.mkdir(parents=True)
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "session_id": session_id,
+                        "cwd": old_workspace,
+                    },
+                },
+                {
+                    "type": "turn_context",
+                    "payload": {
+                        "cwd": old_workspace,
+                        "workspace_roots": [old_workspace],
+                        "permission_profile": {
+                            "file_system": {
+                                "entries": [
+                                    {"path": {"type": "path", "path": old_workspace}},
+                                    {"path": {"type": "path", "path": old_workspace + "/.git"}},
+                                ]
+                            }
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "thread_settings": {
+                            "cwd": old_workspace,
+                            "permission_profile": {
+                                "file_system": {
+                                    "entries": [
+                                        {"path": {"type": "path", "path": old_workspace + "/.codex"}}
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                },
+                {
+                    "type": "world_state",
+                    "payload": {
+                        "state": {
+                            "environments": {
+                                "environments": {
+                                    "local": {
+                                        "cwd": old_workspace,
+                                        "status": "available",
+                                    }
+                                },
+                                "filesystem": f"<path>{old_workspace}</path>",
+                            }
+                        }
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            conn = sqlite3.connect(real_home / "state_5.sqlite")
+            try:
+                conn.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    (session_id, old_workspace, str(rollout)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            prepare_agent_codex_home(real_home, agent_home, agent_workspace, session_id)
+
+            isolated_rollout = agent_home / "sessions" / "2026" / "07" / f"rollout-{session_id}.jsonl"
+            isolated_records = [json.loads(line) for line in isolated_rollout.read_text(encoding="utf-8").splitlines()]
+            target = str(agent_workspace)
+            self.assertEqual(isolated_records[0]["payload"]["cwd"], target)
+            self.assertEqual(isolated_records[1]["payload"]["cwd"], target)
+            self.assertEqual(isolated_records[1]["payload"]["workspace_roots"], [target])
+            self.assertEqual(
+                isolated_records[1]["payload"]["permission_profile"]["file_system"]["entries"][1]["path"]["path"],
+                target + "/.git",
+            )
+            self.assertEqual(isolated_records[2]["payload"]["thread_settings"]["cwd"], target)
+            self.assertEqual(
+                isolated_records[2]["payload"]["thread_settings"]["permission_profile"]["file_system"]["entries"][0]["path"]["path"],
+                target + "/.codex",
+            )
+            environment = isolated_records[3]["payload"]["state"]["environments"]
+            self.assertEqual(environment["environments"]["local"]["cwd"], target)
+            self.assertEqual(environment["filesystem"], f"<path>{target}</path>")
+            self.assertIn(old_workspace, rollout.read_text(encoding="utf-8"))
+
     def test_promote_codex_session_rebinds_state_and_rollout_to_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5749,18 +5932,31 @@ class ResumeSessionTests(unittest.TestCase):
             session_id = "019f-promote-test"
             rollout = sessions_dir / f"rollout-2026-07-07T00-00-00-{session_id}.jsonl"
             rollout.write_text(
-                json.dumps(
-                    {
-                        "type": "session_meta",
-                        "payload": {
-                            "session_id": session_id,
-                            "id": session_id,
-                            "cwd": str(agent_workspace),
-                            "source": "exec",
-                            "originator": "codex_exec",
-                            "thread_source": "user",
-                        },
-                    }
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "session_id": session_id,
+                                    "id": session_id,
+                                    "cwd": str(agent_workspace),
+                                    "source": "exec",
+                                    "originator": "codex_exec",
+                                    "thread_source": "user",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn_context",
+                                "payload": {
+                                    "cwd": str(agent_workspace),
+                                    "workspace_roots": [str(agent_workspace)],
+                                },
+                            }
+                        ),
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
@@ -5808,10 +6004,13 @@ class ResumeSessionTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(row, (str(workspace.resolve()), "cli", 20, 20000))
 
-            meta = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])["payload"]
+            rollout_records = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
+            meta = rollout_records[0]["payload"]
             self.assertEqual(meta["cwd"], str(workspace.resolve()))
             self.assertEqual(meta["source"], "cli")
             self.assertEqual(meta["originator"], "codex-tui")
+            self.assertEqual(rollout_records[1]["payload"]["cwd"], str(workspace.resolve()))
+            self.assertEqual(rollout_records[1]["payload"]["workspace_roots"], [str(workspace.resolve())])
 
     def test_import_codex_session_from_isolated_home_to_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

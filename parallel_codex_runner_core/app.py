@@ -459,6 +459,158 @@ def copy_file_atomic(src: Path, dst: Path) -> None:
     os.replace(tmp_path, dst)
 
 
+def _replace_workspace_path_prefix(value: Any, old_workspace: str, new_workspace: str) -> Any:
+    """Replace a recorded workspace path without touching unrelated text."""
+    if not isinstance(value, str) or not old_workspace:
+        return value
+    old_workspace = old_workspace.rstrip("/")
+    new_workspace = new_workspace.rstrip("/")
+    if value == old_workspace:
+        return new_workspace
+    prefix = old_workspace + "/"
+    if value.startswith(prefix):
+        return new_workspace + value[len(old_workspace) :]
+    return value
+
+
+def _replace_known_workspace_paths(
+    value: Any,
+    old_workspaces: Iterable[str],
+    new_workspace: str,
+) -> Any:
+    """Replace paths from any workspace recorded in an older turn."""
+    if not isinstance(value, str):
+        return value
+    for old_workspace in sorted(
+        {item.rstrip("/") for item in old_workspaces if isinstance(item, str) and item},
+        key=len,
+        reverse=True,
+    ):
+        replaced = _replace_workspace_path_prefix(value, old_workspace, new_workspace)
+        if replaced != value:
+            return replaced
+    return value
+
+
+def _replace_known_workspace_text(
+    value: Any,
+    old_workspaces: Iterable[str],
+    new_workspace: str,
+) -> Any:
+    """Replace workspace paths embedded in Codex's serialized environment text."""
+    if not isinstance(value, str):
+        return value
+    for old_workspace in sorted(
+        {item.rstrip("/") for item in old_workspaces if isinstance(item, str) and item},
+        key=len,
+        reverse=True,
+    ):
+        value = value.replace(old_workspace, new_workspace.rstrip("/"))
+    return value
+
+
+def _rebind_permission_profile_paths(
+    profile: Any,
+    old_workspaces: Iterable[str],
+    new_workspace: str,
+) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    file_system = profile.get("file_system")
+    entries = file_system.get("entries") if isinstance(file_system, dict) else None
+    if not isinstance(entries, list):
+        return False
+
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path_value = entry.get("path")
+        if not isinstance(path_value, dict) or path_value.get("type") != "path":
+            continue
+        old_path = path_value.get("path")
+        new_path = _replace_known_workspace_paths(old_path, old_workspaces, new_workspace)
+        if new_path != old_path:
+            path_value["path"] = new_path
+            changed = True
+    return changed
+
+
+def _rebind_rollout_record_workspace(
+    obj: Dict[str, Any],
+    target_workspace: str,
+    old_workspaces: Set[str],
+) -> bool:
+    """Rebind one persisted Codex execution-context record.
+
+    A resumed rollout contains more than ``session_meta.cwd``. Codex also
+    restores the most recent ``turn_context``, ``thread_settings`` and
+    ``world_state`` records. If those records still point at a removed PCR
+    worktree, a later ``exec_command`` can fail inside Codex with ENOENT even
+    though PCR launched the process with a valid cwd.
+    """
+    record_type = obj.get("type")
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return False
+
+    changed = False
+    if record_type == "turn_context":
+        old_workspace = str(payload.get("cwd") or "").rstrip("/")
+        if old_workspace:
+            old_workspaces.add(old_workspace)
+        if old_workspace and old_workspace != target_workspace:
+            payload["cwd"] = target_workspace
+            changed = True
+        roots = payload.get("workspace_roots")
+        if isinstance(roots, list):
+            for index, root in enumerate(roots):
+                new_root = _replace_known_workspace_paths(root, old_workspaces, target_workspace)
+                if new_root != root:
+                    roots[index] = new_root
+                    changed = True
+        for key in ("permission_profile", "active_permission_profile"):
+            if _rebind_permission_profile_paths(payload.get(key), old_workspaces, target_workspace):
+                changed = True
+
+    elif record_type == "event_msg":
+        settings = payload.get("thread_settings")
+        if isinstance(settings, dict):
+            old_workspace = str(settings.get("cwd") or "").rstrip("/")
+            if old_workspace:
+                old_workspaces.add(old_workspace)
+            if old_workspace and old_workspace != target_workspace:
+                settings["cwd"] = target_workspace
+                changed = True
+            for key in ("permission_profile", "active_permission_profile"):
+                if _rebind_permission_profile_paths(settings.get(key), old_workspaces, target_workspace):
+                    changed = True
+
+    elif record_type == "world_state":
+        state = payload.get("state")
+        environments = state.get("environments") if isinstance(state, dict) else None
+        environment_map = environments.get("environments") if isinstance(environments, dict) else None
+        local = environment_map.get("local") if isinstance(environment_map, dict) else None
+        if isinstance(local, dict):
+            old_workspace = str(local.get("cwd") or "").rstrip("/")
+            if old_workspace:
+                old_workspaces.add(old_workspace)
+            if old_workspace and old_workspace != target_workspace:
+                local["cwd"] = target_workspace
+                changed = True
+        filesystem = environments.get("filesystem") if isinstance(environments, dict) else None
+        new_filesystem = _replace_known_workspace_text(
+            filesystem,
+            old_workspaces,
+            target_workspace,
+        )
+        if new_filesystem != filesystem and isinstance(environments, dict):
+            environments["filesystem"] = new_filesystem
+            changed = True
+
+    return changed
+
+
 def prepare_agent_codex_home(
     real_codex_home: Path,
     agent_codex_home: Path,
@@ -480,6 +632,12 @@ def prepare_agent_codex_home(
     if rollout_path is not None and rollout_path.exists():
         isolated_rollout = agent_codex_home / relative_path_or_import_path(rollout_path, real_codex_home)
         copy_file_atomic(rollout_path, isolated_rollout)
+        _rewrite_rollout_session(
+            isolated_rollout,
+            resume_session_id,
+            agent_workspace,
+            promote_source=False,
+        )
 
     with _CODEX_SQLITE_LOCK:
         conn: Optional[sqlite3.Connection] = None
@@ -1272,15 +1430,19 @@ def format_subagent_resume_error(session_id: str, parent_thread_id: str) -> str:
     return f"Codex multi-agent v2 子线程不能直接 resume：{session_id}{parent_hint}。"
 
 
-def update_rollout_session_meta(
+def _rewrite_rollout_session(
     rollout_path: Path,
     session_id: str,
     workspace: Path,
+    *,
+    promote_source: bool,
 ) -> Tuple[bool, bool]:
-    """Rewrite a rollout's session_meta so fallback resume discovery sees it."""
+    """Rewrite a rollout's session and persisted execution context."""
     target_cwd = str(workspace)
     changed = False
     source_promoted = False
+    session_found = False
+    old_workspaces: Set[str] = set()
     tmp_path = rollout_path.with_name(f".{rollout_path.name}.pcr-tmp-{os.getpid()}")
 
     try:
@@ -1299,6 +1461,10 @@ def update_rollout_session_meta(
                 payload = obj.get("payload")
                 if obj.get("type") == "session_meta" and isinstance(payload, dict):
                     if session_meta_thread_id(payload) == session_id:
+                        session_found = True
+                        old_workspace = str(payload.get("cwd") or "").rstrip("/")
+                        if old_workspace:
+                            old_workspaces.add(old_workspace)
                         parent = codex_subagent_parent_thread_id(
                             payload.get("source"),
                             payload.get("thread_source"),
@@ -1309,18 +1475,21 @@ def update_rollout_session_meta(
                         if payload.get("cwd") != target_cwd:
                             payload["cwd"] = target_cwd
                             changed = True
-                        if payload.get("source") == "exec":
+                        if promote_source and payload.get("source") == "exec":
                             payload["source"] = "cli"
                             changed = True
                             source_promoted = True
-                        if payload.get("originator") == "codex_exec":
+                        if promote_source and payload.get("originator") == "codex_exec":
                             payload["originator"] = "codex-tui"
                             changed = True
                             source_promoted = True
-                        if not payload.get("thread_source"):
+                        if promote_source and not payload.get("thread_source"):
                             payload["thread_source"] = "user"
                             changed = True
                         rewritten = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+                elif session_found and _rebind_rollout_record_workspace(obj, target_cwd, old_workspaces):
+                    changed = True
+                    rewritten = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
                 dst.write(rewritten)
 
         if changed:
@@ -1336,6 +1505,20 @@ def update_rollout_session_meta(
         raise
 
     return changed, source_promoted
+
+
+def update_rollout_session_meta(
+    rollout_path: Path,
+    session_id: str,
+    workspace: Path,
+) -> Tuple[bool, bool]:
+    """Rewrite a rollout so resume discovery and execution use ``workspace``."""
+    return _rewrite_rollout_session(
+        rollout_path,
+        session_id,
+        workspace,
+        promote_source=True,
+    )
 
 
 def promote_codex_session_to_workspace(

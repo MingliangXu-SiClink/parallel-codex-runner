@@ -1338,6 +1338,7 @@ else:
             self._follow_up_queue_items_cache: tuple[str, ...] = ()
             self._follow_up_queue_refresh_deferred = False
             self._updating_controls = False
+            self._latest_select_event_time: dict[str, float] = {}
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
                 "config-synthesis-agents": str(self.synthesis_agents),
@@ -2283,9 +2284,20 @@ else:
             if not self._updating_controls:
                 self._commit_subagents_limit_control()
 
+        def _accept_select_event(self, event: Select.Changed) -> bool:
+            """Ignore delayed Select messages that predate the current choice."""
+            if self._updating_controls:
+                return False
+            control_key = event.select.id or str(id(event.select))
+            previous_time = self._latest_select_event_time.get(control_key)
+            if previous_time is not None and event.time < previous_time:
+                return False
+            self._latest_select_event_time[control_key] = event.time
+            return True
+
         @on(Select.Changed, "#config-execution")
         def _on_execution_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             serial = str(event.value) == "serial"
             current_serial = dict(self._tree_rows()).get("EXECUTION") == "serial"
@@ -2294,7 +2306,7 @@ else:
 
         @on(Select.Changed, "#config-subagents")
         def _on_subagents_toggled(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             value = bool(event.value)
             if value != bool(getattr(self.args, "subagents", False)):
@@ -2302,7 +2314,7 @@ else:
 
         @on(Select.Changed, "#config-recommend-by")
         def _on_recommend_by_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             value = str(event.value)
             if value != str(
@@ -2312,7 +2324,7 @@ else:
 
         @on(Select.Changed, "#config-model")
         def _on_model_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             value = str(event.value)
             if value != str(getattr(self.args, "model", None) or ""):
@@ -2320,7 +2332,7 @@ else:
 
         @on(Select.Changed, "#config-effort")
         def _on_effort_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             value = str(event.value)
             if value != str(getattr(self.args, "effort", None) or ""):
@@ -2328,7 +2340,7 @@ else:
 
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             current = not bool(getattr(self.args, "no_sync_back", False))
             value = bool(event.value)
@@ -2337,7 +2349,7 @@ else:
 
         @on(Select.Changed, "#config-keep-workspaces")
         def _on_keep_workspaces_toggled(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             current = bool(getattr(self.args, "keep_workspaces", False))
             value = bool(event.value)
@@ -2346,7 +2358,7 @@ else:
 
         @on(Select.Changed, "#config-resume")
         def _on_resume_selected(self, event: Select.Changed) -> None:
-            if self._updating_controls:
+            if not self._accept_select_event(event):
                 return
             session_id = str(event.value)
             if session_id == self.resume_session_id:
