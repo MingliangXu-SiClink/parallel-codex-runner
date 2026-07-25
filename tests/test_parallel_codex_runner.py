@@ -990,6 +990,27 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("--config", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
 
+    def test_isolated_agents_disable_codex_memories(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+        )
+
+        self.assertTrue(caps["memories_disabled"])
+        self.assertIn("features.memories=false", cmd)
+
+    def test_memory_disable_uses_disable_flag_without_config_support(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  --disable <FEATURE>\n",
+            Path("final.md"),
+        )
+
+        self.assertTrue(caps["memories_disabled"])
+        self.assertIn("--disable", cmd)
+        self.assertIn("memories", cmd)
+
     def test_codex_config_accepts_one_second_multi_agent_waits(self) -> None:
         cmd, caps = build_codex_command(
             "codex",

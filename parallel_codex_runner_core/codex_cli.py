@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS = 1_000
+CODEX_ISOLATED_AGENT_MEMORY_CONFIG = "features.memories=false"
 
 
 def _warn(message: str, *args: object) -> None:
@@ -292,10 +293,22 @@ def build_codex_command(
     caps["multi_agent_wait_timeout"] = caps["config"]
     caps["subagents"] = caps["config"] or flag_supported(help_text, "--disable")
     caps["subagents_limit"] = caps["config"]
+    caps["memories_disabled"] = caps["config"] or flag_supported(
+        help_text,
+        "--disable",
+    )
 
     def append_config(value: str) -> None:
         assert config_flag is not None
         cmd.extend([config_flag, value])
+
+    # Agent CODEX_HOMEs are temporary and do not inherit the user's memory
+    # workspace. Consolidation would duplicate work in every candidate, and its
+    # internal writer inherits PCR's project-workspace-only instructions.
+    if config_flag is not None:
+        append_config(CODEX_ISOLATED_AGENT_MEMORY_CONFIG)
+    elif flag_supported(help_text, "--disable"):
+        cmd.extend(["--disable", "memories"])
 
     if subagents is False:
         if config_flag is not None:
