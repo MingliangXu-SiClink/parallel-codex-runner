@@ -533,7 +533,7 @@ else:
         CodexHistoryEntry,
         normalize_agent_role,
     )
-    from .paths import absolute_path_for_display, choose_run_base, default_run_anchor, is_relative_to
+    from .paths import absolute_path_for_display, choose_run_base, is_relative_to
     from .workspace import (
         cleanup_workspace_copies,
         estimate_path_storage_bytes,
@@ -1766,10 +1766,7 @@ else:
             return source_workspace, resume_session_id, resume_codex_home
 
         def _storage_run_base(self) -> Path:
-            module_dir = Path(__file__).resolve().parent
-            run_anchor = default_run_anchor(module_dir, self.workspace)
             return choose_run_base(
-                run_anchor,
                 self.workspace,
                 getattr(self.args, "runs_dir", None),
             )
@@ -3754,8 +3751,7 @@ else:
                 return
             value = None if args[0].lower() in {"clear", "default", "auto", "none"} else str(Path(args[0]).expanduser())
             try:
-                module_dir = Path(__file__).resolve().parent
-                choose_run_base(default_run_anchor(module_dir, self.workspace), self.workspace, value)
+                choose_run_base(self.workspace, value)
             except SystemExit as exc:
                 self.status = str(exc)
                 self._sync()
@@ -5326,7 +5322,7 @@ else:
             return rows
 
         def _visible_info_rows(self, rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
-            hidden = {"MODULE_DIR", "RUN_ANCHOR", "METADATA", "WORKSPACE COPIES"}
+            hidden = {"METADATA", "WORKSPACE COPIES"}
             return [(label, value) for label, value in rows if label not in hidden]
 
         def _base_info_rows(self) -> list[tuple[str, str]]:
@@ -5336,9 +5332,10 @@ else:
                 else min(getattr(self.args, "max_parallel", None) or self.num_agents, self.num_agents)
             )
             execution = "serial" if max_parallel == 1 else "parallel"
-            module_dir = Path(__file__).resolve().parent
-            run_anchor = default_run_anchor(module_dir, self.workspace)
-            run_base = choose_run_base(run_anchor, self.workspace, getattr(self.args, "runs_dir", None))
+            run_base = choose_run_base(
+                self.workspace,
+                getattr(self.args, "runs_dir", None),
+            )
             return [
                 ("CODEX_BIN", str(getattr(self.args, "codex_bin", "codex"))),
                 ("WORKSPACE", absolute_path_for_display(self.workspace)),

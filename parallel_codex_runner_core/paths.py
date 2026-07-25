@@ -32,7 +32,31 @@ def safe_tail(path: Path, max_chars: int = 5000) -> str:
         return ""
 
 
-def choose_run_base(default_anchor: Path, workspace: Path, explicit_runs_dir: Optional[str]) -> Path:
+RUNS_DIRECTORY_NAME = ".codex_parallel_runs"
+
+
+def _path_device(path: Path) -> int:
+    return int(path.stat().st_dev)
+
+
+def filesystem_mount_root(path: Path) -> Path:
+    """Return the highest ancestor that remains on path's filesystem."""
+    current = path.expanduser().resolve()
+    device = _path_device(current)
+    while current.parent != current:
+        parent = current.parent
+        if _path_device(parent) != device:
+            break
+        current = parent
+    return current
+
+
+def choose_run_base(
+    workspace: Path,
+    explicit_runs_dir: Optional[str],
+    *,
+    system_home: Optional[Path] = None,
+) -> Path:
     workspace = workspace.resolve()
 
     if explicit_runs_dir:
@@ -45,17 +69,31 @@ def choose_run_base(default_anchor: Path, workspace: Path, explicit_runs_dir: Op
             )
         return run_base
 
-    parent = default_anchor.resolve()
-    run_base = parent / ".codex_parallel_runs"
-    if not is_relative_to(run_base, workspace):
-        return run_base
+    home = (system_home or Path.home()).expanduser().resolve()
+    system_root = Path(home.anchor).resolve()
+    try:
+        workspace_device = _path_device(workspace)
+        system_devices = {
+            _path_device(home),
+            _path_device(system_root),
+        }
+        anchor = (
+            home
+            if workspace_device in system_devices
+            else filesystem_mount_root(workspace)
+        )
+    except OSError as exc:
+        raise SystemExit(f"无法确定 workspace 所在磁盘：{workspace}\n  {exc}") from exc
 
-    while is_relative_to(parent, workspace):
-        if parent.parent == parent:
-            raise SystemExit("无法找到 workspace 外部的运行目录。请显式指定 --runs-dir。")
-        parent = parent.parent
-
-    return parent / ".codex_parallel_runs"
+    run_base = anchor / RUNS_DIRECTORY_NAME
+    if is_relative_to(run_base, workspace):
+        raise SystemExit(
+            "默认运行目录不能位于 workspace 内部。请通过 --runs-dir "
+            "指定 workspace 外部目录：\n"
+            f"  runs_dir = {run_base}\n"
+            f"  workspace = {workspace}"
+        )
+    return run_base
 
 
 def create_unique_run_root(run_base: Path, timestamp: Optional[str] = None) -> Path:
@@ -70,13 +108,3 @@ def create_unique_run_root(run_base: Path, timestamp: Optional[str] = None) -> P
         except FileExistsError:
             continue
     raise SystemExit(f"无法创建唯一运行目录：{run_base / name}")
-
-
-def is_site_package_dir(path: Path) -> bool:
-    return any(part in {"site-packages", "dist-packages"} for part in path.resolve().parts)
-
-
-def default_run_anchor(module_dir: Path, workspace: Path) -> Path:
-    if is_site_package_dir(module_dir):
-        return workspace
-    return module_dir

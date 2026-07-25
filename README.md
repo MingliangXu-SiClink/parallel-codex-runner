@@ -298,7 +298,10 @@ pcr --prompt-file /tmp/prompt.txt -n 8
 
 ## Workspaces and Sync-back
 
-PCR creates run data outside the target workspace:
+PCR creates run data outside the target workspace. Projects on the system
+filesystem use `~/.codex_parallel_runs`; projects on another filesystem use
+`.codex_parallel_runs` at that filesystem's mount root. `--runs-dir` overrides
+this default.
 
 ```text
 .codex_parallel_runs/<timestamp>/

@@ -293,7 +293,9 @@ pcr --prompt-file /tmp/prompt.txt -n 8
 
 ## 工作区与回写
 
-PCR 会在目标工作区外创建本轮运行目录：
+PCR 会在目标工作区外创建本轮运行目录。系统盘中的项目统一保存到
+`~/.codex_parallel_runs`；其他磁盘中的项目保存到该磁盘挂载根目录下的
+`.codex_parallel_runs`。`--runs-dir` 可以覆盖这个默认位置。
 
 ```text
 .codex_parallel_runs/<timestamp>/

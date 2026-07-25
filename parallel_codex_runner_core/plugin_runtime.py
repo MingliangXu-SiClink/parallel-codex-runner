@@ -35,7 +35,7 @@ from .app import (
 )
 from .codex_models import CodexModelRegistry
 from .models import AgentResult, DEFAULT_NUM_AGENTS
-from .paths import choose_run_base, default_run_anchor, is_relative_to
+from .paths import choose_run_base, is_relative_to
 from .workspace import cleanup_workspace_copies, sync_best_workspace_back
 from .plugin.artifacts import (
     ArtifactError,
@@ -566,10 +566,8 @@ class PluginRunManager:
 
     @staticmethod
     def _run_base(workspace: Path, runs_dir: Optional[str]) -> Path:
-        module_dir = Path(__file__).resolve().parent
-        anchor = default_run_anchor(module_dir, workspace)
         try:
-            return choose_run_base(anchor, workspace, runs_dir)
+            return choose_run_base(workspace, runs_dir)
         except SystemExit as exc:
             raise PluginRunError(str(exc)) from exc
 

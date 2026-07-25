@@ -104,7 +104,6 @@ from .paths import (
     absolute_path_for_display,
     choose_run_base,
     create_unique_run_root,
-    default_run_anchor,
     is_relative_to,
     safe_tail,
 )
@@ -3561,9 +3560,7 @@ def run_once(
         getattr(args, "effort", None),
     )
 
-    module_dir = Path(__file__).resolve().parent
-    run_anchor = default_run_anchor(module_dir, workspace)
-    run_base = choose_run_base(run_anchor, workspace, args.runs_dir)
+    run_base = choose_run_base(workspace, args.runs_dir)
     if is_relative_to(run_base, workspace):
         raise SystemExit(f"内部错误：run_base 位于 workspace 内部：{run_base}")
 
@@ -3579,8 +3576,6 @@ def run_once(
                 "type": "run_prepared",
                 "rows": [
                     ["WORKSPACE", absolute_path_for_display(workspace)],
-                    ["MODULE_DIR", absolute_path_for_display(module_dir)],
-                    ["RUN_ANCHOR", absolute_path_for_display(run_anchor)],
                     ["RUNS_ROOT", absolute_path_for_display(run_root)],
                     ["AGENTS", str(args.num_agents)],
                     ["SYNTHESIS_AGENTS", str(synthesis_agents)],
@@ -3621,8 +3616,6 @@ def run_once(
         overview.add_column(style="bold")
         overview.add_column()
         overview.add_row("WORKSPACE", absolute_path_for_display(workspace))
-        overview.add_row("MODULE_DIR", absolute_path_for_display(module_dir))
-        overview.add_row("RUN_ANCHOR", absolute_path_for_display(run_anchor))
         overview.add_row("RUNS_ROOT", absolute_path_for_display(run_root))
         overview.add_row("AGENTS", str(args.num_agents))
         overview.add_row("SYNTHESIS_AGENTS", str(synthesis_agents))
@@ -3645,8 +3638,6 @@ def run_once(
         )
     elif progress_callback is None:
         log("info", "workspace = {}", workspace)
-        log("info", "module_dir = {}", module_dir)
-        log("info", "run_anchor = {}", run_anchor)
         log("info", "runs_root = {}", run_root)
         log("info", "agents = {}", args.num_agents)
         log("info", "synthesis_agents = {}", synthesis_agents)

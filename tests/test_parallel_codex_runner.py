@@ -19,6 +19,7 @@ from pathlib import Path
 import parallel_codex_runner_core.tui_textual as tui_textual
 import parallel_codex_runner_core.app as app_core
 import parallel_codex_runner_core.codex_cli as codex_cli_core
+import parallel_codex_runner_core.paths as paths_core
 import parallel_codex_runner_core.workspace as workspace_core
 from parallel_codex_runner_core.codex_models import CodexModelInfo, CodexModelRegistry
 from parallel_codex_runner_core.diffing import build_workspace_diff_text
@@ -868,6 +869,91 @@ class RunStorageEstimateTests(unittest.TestCase):
 
 
 class RunRootTests(unittest.TestCase):
+    def test_default_run_base_uses_home_on_the_system_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "projects" / "demo"
+            home.mkdir()
+            workspace.mkdir(parents=True)
+
+            run_base = paths_core.choose_run_base(
+                workspace,
+                None,
+                system_home=home,
+            )
+
+        self.assertEqual(
+            run_base,
+            home.resolve() / ".codex_parallel_runs",
+        )
+
+    def test_default_run_base_uses_external_filesystem_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            mount_root = root / "external-volume"
+            workspace = mount_root / "projects" / "demo"
+            home.mkdir()
+            workspace.mkdir(parents=True)
+            external_paths = {
+                mount_root,
+                workspace.parent,
+                workspace,
+            }
+
+            def fake_device(path: Path) -> int:
+                return 2 if path.resolve() in external_paths else 1
+
+            with mock.patch.object(
+                paths_core,
+                "_path_device",
+                side_effect=fake_device,
+            ):
+                run_base = paths_core.choose_run_base(
+                    workspace,
+                    None,
+                    system_home=home,
+                )
+
+        self.assertEqual(
+            run_base,
+            mount_root / ".codex_parallel_runs",
+        )
+
+    def test_explicit_runs_dir_overrides_filesystem_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            explicit = root / "custom-runs"
+            workspace.mkdir()
+
+            with mock.patch.object(
+                paths_core,
+                "_path_device",
+                side_effect=AssertionError("device lookup should not run"),
+            ):
+                run_base = paths_core.choose_run_base(
+                    workspace,
+                    str(explicit),
+                )
+
+        self.assertEqual(run_base, explicit.resolve())
+
+    def test_default_runs_dir_must_stay_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+
+            with self.assertRaisesRegex(
+                SystemExit,
+                "默认运行目录不能位于 workspace 内部",
+            ):
+                paths_core.choose_run_base(
+                    workspace,
+                    None,
+                    system_home=workspace,
+                )
+
     def test_create_unique_run_root_adds_suffix_on_collision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_base = Path(tmp)
