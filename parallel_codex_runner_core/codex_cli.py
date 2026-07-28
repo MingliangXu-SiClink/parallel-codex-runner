@@ -11,8 +11,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS = 1_000
+CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS = 10_000
 CODEX_ISOLATED_AGENT_MEMORY_CONFIG = "features.memories=false"
+CODEX_AGENTS_ENABLED_CONFIG = "agents.enabled"
+CODEX_MULTI_AGENT_FEATURE_CONFIG = "features.multi_agent"
+CODEX_MULTI_AGENT_V2_ENABLED_CONFIG = "features.multi_agent_v2.enabled"
+CODEX_FAST_MODE_CONFIG = "features.fast_mode=true"
+CODEX_FAST_SERVICE_TIER = "fast"
+CODEX_STANDARD_SERVICE_TIER = "default"
+
+
+def format_fast_mode(value: Optional[bool]) -> str:
+    if value is True:
+        return "YES"
+    if value is False:
+        return "NO"
+    return "AUTO"
 
 
 def _warn(message: str, *args: object) -> None:
@@ -257,6 +271,7 @@ def build_codex_command(
     developer_instructions: Optional[str] = None,
     subagents: Optional[bool] = None,
     subagents_limit: Optional[int] = None,
+    fast: Optional[bool] = None,
 ) -> Tuple[List[str], Dict[str, bool]]:
     cmd: List[str] = [codex_bin, "exec"]
     if resume_session_id:
@@ -289,9 +304,10 @@ def build_codex_command(
     )
     caps["config"] = config_flag is not None
     caps["effort"] = caps["config"]
+    caps["fast"] = caps["config"]
     caps["developer_instructions"] = caps["config"]
     caps["multi_agent_wait_timeout"] = caps["config"]
-    caps["subagents"] = caps["config"] or flag_supported(help_text, "--disable")
+    caps["subagents"] = caps["config"]
     caps["subagents_limit"] = caps["config"]
     caps["memories_disabled"] = caps["config"] or flag_supported(
         help_text,
@@ -311,14 +327,15 @@ def build_codex_command(
         cmd.extend(["--disable", "memories"])
 
     if subagents is False:
-        if config_flag is not None:
-            append_config("features.multi_agent=false")
-        elif flag_supported(help_text, "--disable"):
-            cmd.extend(["--disable", "multi_agent"])
-        else:
+        if config_flag is None:
             raise RuntimeError(
-                "当前 Codex CLI 不支持 --config 或 --disable，无法禁用嵌套 Agent。"
+                "当前 Codex CLI 不支持 --config，无法可靠禁用嵌套 Agent。"
             )
+        # A feature flag is only a default. Resumed sessions and model metadata
+        # can still select a multi-agent backend unless agents.enabled is false.
+        append_config(f"{CODEX_AGENTS_ENABLED_CONFIG}=false")
+        append_config(f"{CODEX_MULTI_AGENT_FEATURE_CONFIG}=false")
+        append_config(f"{CODEX_MULTI_AGENT_V2_ENABLED_CONFIG}=false")
     elif subagents is True:
         if config_flag is None:
             raise RuntimeError(
@@ -330,7 +347,11 @@ def build_codex_command(
             or subagents_limit <= 0
         ):
             raise ValueError("subagents_limit must be a positive integer")
-        append_config("features.multi_agent=true")
+        append_config(f"{CODEX_AGENTS_ENABLED_CONFIG}=true")
+        append_config(f"{CODEX_MULTI_AGENT_FEATURE_CONFIG}=true")
+        # This authoritative override also re-enables collaboration when a
+        # resumed session previously recorded MultiAgentVersion::Disabled.
+        append_config(f"{CODEX_MULTI_AGENT_V2_ENABLED_CONFIG}=true")
         append_config(f"agents.max_threads={subagents_limit}")
         # Codex V2 counts the root thread as one concurrency slot, while PCR's
         # setting counts only nested subagents.
@@ -340,8 +361,8 @@ def build_codex_command(
         )
 
     if config_flag is not None and subagents is not False:
-        # Some Codex models poll wait_agent at one second even though the CLI's
-        # default router floor is ten seconds. Make that generated call valid.
+        # Keep the advertised wait_agent floor aligned with Codex's legal
+        # minimum so generated calls do not request an invalid shorter wait.
         append_config(
             "features.multi_agent_v2.min_wait_timeout_ms="
             f"{CODEX_MULTI_AGENT_MIN_WAIT_TIMEOUT_MS}"
@@ -356,6 +377,21 @@ def build_codex_command(
             _warn(
                 "当前 Codex CLI help 中未检测到 --config；忽略 --effort {}",
                 effort,
+            )
+
+    if fast is not None:
+        if config_flag is None:
+            raise RuntimeError(
+                "当前 Codex CLI 不支持 --config，无法设置 Fast 模式。"
+            )
+        if fast:
+            append_config(CODEX_FAST_MODE_CONFIG)
+            append_config(
+                f"service_tier={json.dumps(CODEX_FAST_SERVICE_TIER)}"
+            )
+        else:
+            append_config(
+                f"service_tier={json.dumps(CODEX_STANDARD_SERVICE_TIER)}"
             )
 
     if developer_instructions and developer_instructions.strip():

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._vendor import activate_textual
+from .codex_cli import format_fast_mode
 from .codex_models import CodexModelRegistry
 from .prompt_history import PromptHistoryNavigator, PromptHistoryStore
 from .workspace_config import WorkspaceConfigStore, WorkspaceSettings
@@ -47,6 +48,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/subagentslimit <n>", "limit nested Codex agents within each PCR agent"),
     ("/model <name|clear>", "set or clear the Codex model for the next run"),
     ("/effort <auto|level>", "set a model-supported reasoning effort for the next run"),
+    ("/fast <on|off|auto>", "select Fast, Standard, or inherited Codex speed"),
     ("/workspace <path>", "set the workspace PCR operates on"),
     ("/runsdir <path|clear>", "set or reset the directory used for run data"),
     ("/codexbin <path>", "set the Codex executable"),
@@ -118,6 +120,7 @@ TUI_TIPS: tuple[str, ...] = (
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
     "PCR 会按 workspace 记住顶部配置，下次打开同一目录时自动恢复。",
     "EFFORT 会随 MODEL 更新可选等级，auto 会选择兼容的推理等级。",
+    "FAST 会提高受支持模型的速度，同时更快消耗 credits。",
     "带 ★ 和彩虹边框的 Agent 是当前推荐结果。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
@@ -138,6 +141,23 @@ TUI_TIPS: tuple[str, ...] = (
     "SUBAGENTS 默认关闭；启用后可用 SUBAGENTS_LIMIT 控制每个 PCR Agent 的嵌套数量。",
     "当前 Agent 未完成时提交的新问题会排队，本轮结束后留出 60 秒选择续接的 Agent。",
 )
+
+
+def fast_control_value(value: bool | None) -> str:
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return "auto"
+
+
+def fast_value_from_control(value: Any) -> bool | None:
+    normalized = str(value or "").strip().lower()
+    if normalized == "on":
+        return True
+    if normalized == "off":
+        return False
+    return None
 
 
 def command_suggestions(value: str) -> list[str]:
@@ -1157,7 +1177,8 @@ else:
         #config-model {
             width: 36;
         }
-        #config-subagents, #config-sync-back, #config-keep-workspaces {
+        #config-subagents, #config-fast, #config-sync-back,
+        #config-keep-workspaces {
             width: 10;
         }
         #detail-frame {
@@ -1349,6 +1370,9 @@ else:
                 "config-model": str(getattr(self.args, "model", None) or ""),
                 "config-effort": str(getattr(self.args, "effort", None) or ""),
             }
+            self._committed_fast_value = fast_control_value(
+                getattr(self.args, "fast", None)
+            )
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
                 "config-synthesis-agents": str(self.synthesis_agents),
@@ -1635,6 +1659,21 @@ else:
                             allow_blank=False,
                             compact=True,
                             id="config-effort",
+                            classes="runner-control",
+                        )
+                        yield Static("FAST", classes="runner-key")
+                        yield Select(
+                            [
+                                ("AUTO", "auto"),
+                                ("YES", "on"),
+                                ("NO", "off"),
+                            ],
+                            value=fast_control_value(
+                                getattr(self.args, "fast", None)
+                            ),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-fast",
                             classes="runner-control",
                         )
                         yield Static("SYNC_BACK", classes="runner-key")
@@ -2261,6 +2300,13 @@ else:
                     control.value or ""
                 )
 
+        def _fast_control_has_pending_value(self, control: Select) -> bool:
+            return str(control.value or "") != self._committed_fast_value
+
+        def _mark_fast_control_committed(self, control: Select) -> None:
+            if control.id == "config-fast":
+                self._committed_fast_value = str(control.value or "auto")
+
         def _commit_model_control(self) -> bool:
             try:
                 control = self.query_one("#config-model", Select)
@@ -2331,10 +2377,32 @@ else:
             self.run_info_rows = self._base_info_rows()
             return True
 
+        def _commit_fast_control(self) -> bool:
+            try:
+                control = self.query_one("#config-fast", Select)
+            except Exception:
+                return True
+            requested_text = str(control.value or "").strip().lower()
+            values: dict[str, bool | None] = {
+                "auto": None,
+                "on": True,
+                "off": False,
+            }
+            if requested_text not in values:
+                self.status = "Usage: /fast <on|off|auto>"
+                control.focus()
+                return False
+            self.args.fast = values[requested_text]
+            self._mark_fast_control_committed(control)
+            self.run_info_rows = self._base_info_rows()
+            return True
+
         def _commit_runner_inputs(self) -> bool:
             # Select.Changed is queued. Commit the visible MODEL/EFFORT pair
             # before numeric handlers can trigger a repaint from stale args.
             if not self._commit_model_effort_controls():
+                return False
+            if not self._commit_fast_control():
                 return False
             if not self._commit_agents_control():
                 self.query_one("#config-agents", Input).focus()
@@ -2455,6 +2523,23 @@ else:
             ):
                 return
             self._commit_effort_control()
+
+        @on(Select.Changed, "#config-fast")
+        def _on_fast_selected(self, event: Select.Changed) -> None:
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
+                return
+            requested = fast_value_from_control(event.value)
+            current = getattr(self.args, "fast", None)
+            if requested is current:
+                self._mark_fast_control_committed(event.select)
+                return
+            if not self._prepare_config_change("Fast mode"):
+                return
+            if self._commit_fast_control():
+                self._show_setting(f"fast={fast_control_value(self.args.fast)}")
 
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
@@ -3048,6 +3133,9 @@ else:
                 return
             if name == "/effort":
                 self._handle_effort(args)
+                return
+            if name == "/fast":
+                self._handle_fast(args)
                 return
             if name == "/workspace":
                 self._handle_workspace(args)
@@ -3709,6 +3797,41 @@ else:
                 f"effort={self.model_registry.effort_display(self._model_for_effort(), value)}"
             )
 
+        def _handle_fast(self, args: list[str]) -> None:
+            current = getattr(self.args, "fast", None)
+            if not args or (
+                len(args) == 1 and args[0].strip().lower() == "status"
+            ):
+                self._show_setting(f"fast={fast_control_value(current)}")
+                return
+            if len(args) != 1:
+                self.status = "Usage: /fast <on|off|auto>"
+                self._sync()
+                return
+            requested = args[0].strip().lower()
+            values: dict[str, bool | None] = {
+                "auto": None,
+                "clear": None,
+                "default": None,
+                "inherit": None,
+                "none": None,
+                "on": True,
+                "yes": True,
+                "true": True,
+                "off": False,
+                "no": False,
+                "false": False,
+            }
+            if requested not in values:
+                self.status = "Usage: /fast <on|off|auto>"
+                self._sync()
+                return
+            if not self._prepare_config_change("Fast mode"):
+                return
+            self.args.fast = values[requested]
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(f"fast={fast_control_value(self.args.fast)}")
+
         def _handle_workspace(self, args: list[str]) -> None:
             if not args:
                 self._show_setting(f"workspace={absolute_path_for_display(self.workspace)}")
@@ -3734,6 +3857,18 @@ else:
             )
             self.args.synthesis_agents = self.synthesis_agents
             self.resume_session_id = (self.args.resume_session_id or "").strip()
+            self._committed_fast_value = fast_control_value(
+                getattr(self.args, "fast", None)
+            )
+            try:
+                fast_control = self.query_one("#config-fast", Select)
+            except Exception:
+                pass
+            else:
+                self._set_select_control(
+                    fast_control,
+                    self._committed_fast_value,
+                )
             self.model_choices = self.model_registry.model_options(
                 getattr(self.args, "model", None)
             )
@@ -5091,6 +5226,7 @@ else:
                     control.value = value
             if mark_committed:
                 self._mark_model_effort_control_committed(control)
+                self._mark_fast_control_committed(control)
 
         def _sync_model_effort_control(
             self,
@@ -5150,6 +5286,7 @@ else:
 
             model_select = self.query_one("#config-model", Select)
             effort_select = self.query_one("#config-effort", Select)
+            fast_select = self.query_one("#config-fast", Select)
             current_model = str(getattr(self.args, "model", None) or "")
             display_model = (
                 str(model_select.value or "")
@@ -5209,6 +5346,7 @@ else:
                 recommend_by_select,
                 model_select,
                 effort_select,
+                fast_select,
                 sync_back_select,
                 keep_workspaces_select,
                 resume_select,
@@ -5279,6 +5417,17 @@ else:
                     current_effort,
                     effort_options,
                 )
+                if self._fast_control_has_pending_value(fast_select):
+                    self._set_select_control(
+                        fast_select,
+                        fast_select.value,
+                        mark_committed=False,
+                    )
+                else:
+                    self._set_select_control(
+                        fast_select,
+                        fast_control_value(getattr(self.args, "fast", None)),
+                    )
                 self._set_select_control(
                     sync_back_select,
                     not bool(getattr(self.args, "no_sync_back", False)),
@@ -5381,6 +5530,7 @@ else:
                         getattr(self.args, "effort", None),
                     ),
                 ),
+                ("FAST", format_fast_mode(getattr(self.args, "fast", None))),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),

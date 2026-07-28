@@ -119,9 +119,9 @@ pcr
 TUI 顶部的配置项也可以直接修改。
 
 PCR 会为每个 workspace 独立记住这些 TUI 配置，包括 Agent 数量、综合 Agent
-数量、执行模式、并发数、嵌套 Agent 限制、推荐策略、模型、effort、是否回写、是否
-保留工作区以及当前选择的 resume 会话。配置保存在用户的 PCR 状态目录中，不会写入
-项目本身；如果启动命令显式传入这些选项，则以命令行选项为准。
+数量、执行模式、并发数、嵌套 Agent 限制、推荐策略、模型、effort、Fast 模式、
+是否回写、是否保留工作区以及当前选择的 resume 会话。配置保存在用户的 PCR 状态
+目录中，不会写入项目本身；如果启动命令显式传入这些选项，则以命令行选项为准。
 
 ## Codex App 插件
 
@@ -386,6 +386,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `--codex-bin` | Codex 可执行文件，默认为 `codex`。 |
 | `--model` | 指定 Codex 模型。 |
 | `--effort` | 选择当前模型支持的推理强度。 |
+| `--fast`、`--no-fast` | 强制使用 Fast 或 Standard；不传时继承 Codex 配置。Fast 仅对支持的模型生效，并会更快消耗 credits。 |
 | `--resume` | 交互选择可恢复的 Codex 会话。 |
 | `--resume-session-id` | 恢复指定会话 ID。 |
 | `--resume-include-non-interactive` | 在选择器中包含 `codex exec` 会话。 |
@@ -417,6 +418,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/recommendby <duration\|reasoning_tokens>` | 设置推荐方式。 |
 | `/model <name\|clear>` | 设置或清除模型。 |
 | `/effort <auto\|level>` | 选择模型支持的推理强度。 |
+| `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置。 |
 | `/workspace <path>` | 切换目标工作区。 |
 | `/runsdir <path\|clear>` | 设置或重置运行数据目录。 |
 | `/codexbin <path>` | 设置 Codex 可执行文件。 |

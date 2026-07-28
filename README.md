@@ -120,9 +120,9 @@ The settings at the top of the TUI are editable too.
 
 PCR remembers these TUI settings separately for each workspace, including the
 Agent counts, execution mode, nested-Agent limits, recommendation strategy,
-model, effort, sync-back, workspace retention, and selected resume session.
-They are stored in the user's PCR state directory rather than inside the
-project. Explicit command-line options take precedence over the remembered
+model, effort, Fast mode, sync-back, workspace retention, and selected resume
+session. They are stored in the user's PCR state directory rather than inside
+the project. Explicit command-line options take precedence over the remembered
 workspace values.
 
 ## Codex App Plugin
@@ -392,6 +392,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `--codex-bin` | Codex executable; default is `codex`. |
 | `--model` | Codex model name. |
 | `--effort` | Reasoning effort supported by the selected model. |
+| `--fast`, `--no-fast` | Force Fast or Standard mode; omitted inherits Codex configuration. Fast mode is model-dependent and consumes credits faster. |
 | `--resume` | Choose a resumable Codex session interactively. |
 | `--resume-session-id` | Resume a specific session ID. |
 | `--resume-include-non-interactive` | Include `codex exec` sessions in the picker. |
@@ -423,6 +424,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/recommendby <duration\|reasoning_tokens>` | Set the recommendation heuristic. |
 | `/model <name\|clear>` | Set or clear the model. |
 | `/effort <auto\|level>` | Select a supported reasoning effort. |
+| `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed. |
 | `/workspace <path>` | Change the target workspace. |
 | `/runsdir <path\|clear>` | Set or reset the run-data directory. |
 | `/codexbin <path>` | Set the Codex executable. |

@@ -40,6 +40,7 @@ class WorkspaceSettings:
     recommend_by: str | None = None
     model: str | None = None
     effort: str | None = None
+    fast: bool | None = None
     sync_back: bool | None = None
     keep_workspaces: bool | None = None
     resume_session_id: str | None = None
@@ -124,6 +125,7 @@ class WorkspaceSettings:
                 "RECOMMEND_BY": "recommend_by",
                 "MODEL": "model",
                 "EFFORT": "effort",
+                "FAST": "fast",
                 "SYNC_BACK": "sync_back",
                 "KEEP_WORKSPACES": "keep_workspaces",
                 "RESUME": "resume_session_id",
@@ -144,6 +146,7 @@ class WorkspaceSettings:
                 else optional_text(value.get("MODEL"))
             ),
             effort=effort.lower() if effort else None,
+            fast=optional_bool(value.get("FAST")),
             sync_back=optional_bool(value.get("SYNC_BACK")),
             keep_workspaces=optional_bool(value.get("KEEP_WORKSPACES")),
             resume_session_id=resume,
@@ -174,6 +177,9 @@ class WorkspaceSettings:
                 max_parallel = None
         model = str(getattr(args, "model", None) or "").strip() or None
         effort = str(getattr(args, "effort", None) or "").strip().lower() or None
+        fast = getattr(args, "fast", None)
+        if not isinstance(fast, bool):
+            fast = None
         return cls(
             agents=int(agents),
             synthesis_agents=int(synthesis_agents),
@@ -184,6 +190,7 @@ class WorkspaceSettings:
             recommend_by=str(getattr(args, "recommend_by", "reasoning_tokens")),
             model=model,
             effort=effort,
+            fast=fast,
             sync_back=not bool(getattr(args, "no_sync_back", False)),
             keep_workspaces=bool(getattr(args, "keep_workspaces", False)),
             resume_session_id=str(resume_session_id or "").strip() or None,
@@ -198,6 +205,7 @@ class WorkspaceSettings:
                     "recommend_by",
                     "model",
                     "effort",
+                    "fast",
                     "sync_back",
                     "keep_workspaces",
                     "resume_session_id",
@@ -216,6 +224,7 @@ class WorkspaceSettings:
             "RECOMMEND_BY": self.recommend_by,
             "MODEL": self.model or "",
             "EFFORT": self.effort or "auto",
+            "FAST": self.fast if self.fast is not None else "AUTO",
             "SYNC_BACK": self.sync_back,
             "KEEP_WORKSPACES": self.keep_workspaces,
             "RESUME": self.resume_session_id or "NO",
@@ -255,6 +264,8 @@ class WorkspaceSettings:
             args.model = self.model or None
         if present("effort") and "effort" not in explicit_settings:
             args.effort = self.effort or None
+        if present("fast") and "fast" not in explicit_settings:
+            args.fast = self.fast
         if present("sync_back") and self.sync_back is not None and "sync_back" not in explicit_settings:
             args.no_sync_back = not self.sync_back
         if present("keep_workspaces") and self.keep_workspaces is not None and "keep_workspaces" not in explicit_settings:

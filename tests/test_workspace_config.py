@@ -21,6 +21,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             recommend_by="reasoning_tokens",
             model=None,
             effort=None,
+            fast=None,
             no_sync_back=False,
             keep_workspaces=False,
             resume_session_id=None,
@@ -44,6 +45,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             args.recommend_by = "duration"
             args.model = "gpt-test"
             args.effort = "high"
+            args.fast = True
             args.no_sync_back = True
             args.keep_workspaces = True
             settings = WorkspaceSettings.from_runtime(7, 3, args, "session-a")
@@ -65,6 +67,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertEqual(restored.recommend_by, "duration")
             self.assertEqual(restored.model, "gpt-test")
             self.assertEqual(restored.effort, "high")
+            self.assertTrue(restored.fast)
             self.assertTrue(restored.no_sync_back)
             self.assertTrue(restored.keep_workspaces)
             self.assertEqual(restored.resume_session_id, "session-a")
@@ -81,12 +84,14 @@ class WorkspaceConfigTests(unittest.TestCase):
             restored = self._args()
             restored.model = "old-model"
             restored.effort = "high"
+            restored.fast = True
             restored.resume_session_id = "old-session"
             loaded = store.load(workspace)
             self.assertIsNotNone(loaded)
             loaded.apply_to_args(restored)
             self.assertIsNone(restored.model)
             self.assertIsNone(restored.effort)
+            self.assertIsNone(restored.fast)
             self.assertIsNone(restored.resume_session_id)
 
     def test_explicit_cli_settings_win_over_saved_values(self) -> None:
@@ -96,6 +101,7 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "EXECUTION": "serial",
                 "MAX_PARALLEL": 1,
                 "MODEL": "saved-model",
+                "FAST": True,
                 "RESUME": "saved-session",
             }
         )
@@ -103,10 +109,12 @@ class WorkspaceConfigTests(unittest.TestCase):
         args = self._args()
         args.num_agents = 5
         args.model = "cli-model"
+        args.fast = False
         args.resume_session_id = "cli-session"
-        saved.apply_to_args(args, {"agents", "model", "resume"})
+        saved.apply_to_args(args, {"agents", "model", "fast", "resume"})
         self.assertEqual(args.num_agents, 5)
         self.assertEqual(args.model, "cli-model")
+        self.assertFalse(args.fast)
         self.assertEqual(args.resume_session_id, "cli-session")
         self.assertTrue(args.serial)
 
@@ -119,6 +127,7 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "SUBAGENTS": "NO",
                 "MODEL": "default",
                 "EFFORT": "auto",
+                "FAST": "AUTO",
                 "SYNC_BACK": "YES",
                 "KEEP_WORKSPACES": "NO",
                 "RESUME": "NO",
@@ -128,6 +137,7 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertFalse(settings.subagents)
         self.assertIsNone(settings.model)
         self.assertIsNone(settings.effort)
+        self.assertIsNone(settings.fast)
         self.assertTrue(settings.sync_back)
         self.assertFalse(settings.keep_workspaces)
         self.assertIsNone(settings.resume_session_id)

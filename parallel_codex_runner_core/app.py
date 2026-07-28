@@ -66,6 +66,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
+import hashlib
 import json
 import os
 import signal
@@ -81,6 +82,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List,
 
 from .codex_cli import (
     build_codex_command,
+    format_fast_mode,
     merge_codex_developer_instructions,
     read_effective_codex_developer_instructions,
     read_codex_exec_help,
@@ -118,6 +120,49 @@ from .workspace import (
 )
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
+
+
+def _runtime_source_digest(package_root: Path) -> Optional[str]:
+    """Hash Python sources already imported by a long-running PCR process."""
+    package_root = package_root.expanduser().resolve()
+    sources = [
+        path
+        for path in package_root.rglob("*.py")
+        if "_vendor" not in path.relative_to(package_root).parts
+    ]
+    entrypoint = package_root.parent / "parallel_codex_runner.py"
+    if entrypoint.is_file():
+        sources.append(entrypoint)
+
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(sources, key=lambda item: str(item)):
+            digest.update(
+                str(path.relative_to(package_root.parent)).encode("utf-8")
+            )
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+_RUNTIME_SOURCE_ROOT = Path(__file__).resolve().parent
+_RUNTIME_SOURCE_DIGEST = _runtime_source_digest(_RUNTIME_SOURCE_ROOT)
+
+
+def ensure_runtime_sources_unchanged() -> None:
+    """Refuse new work when the TUI still has an older PCR version loaded."""
+    if _RUNTIME_SOURCE_DIGEST is None:
+        return
+    if _runtime_source_digest(_RUNTIME_SOURCE_ROOT) != _RUNTIME_SOURCE_DIGEST:
+        raise RuntimeError(
+            "PCR 源码在当前进程启动后发生了变化，当前 TUI 仍在使用旧代码。"
+            "请退出 TUI 并重新运行 `pcr`，再开始下一轮任务。"
+        )
+
+
 GIBIBYTE = 1024**3
 LARGE_RUN_STORAGE_WARNING_BYTES = 5 * GIBIBYTE
 AGENT_METADATA_RESERVE_BYTES = 64 * 1024**2
@@ -3213,6 +3258,7 @@ def _prepare_additional_agent(
             agent_meta_dir / "final_message.md",
             model=args.model,
             effort=effective_effort,
+            fast=getattr(args, "fast", None),
             resume_session_id=resume_session_id,
             developer_instructions=effective_developer_instructions,
             subagents=bool(getattr(args, "subagents", False)),
@@ -3248,6 +3294,7 @@ def run_additional_agents(
     refresh_result_files: bool = True,
     developer_instructions: Optional[str] = None,
 ) -> List[AgentResult]:
+    ensure_runtime_sources_unchanged()
     agent_role = normalize_agent_role(agent_role)
     indices = list(dict.fromkeys(int(idx) for idx in agent_indices))
     if not indices or any(idx <= 0 for idx in indices):
@@ -3368,6 +3415,8 @@ def _explicit_tui_settings(argv: Sequence[str]) -> set[str]:
         "--recommend-by": "recommend_by",
         "--model": "model",
         "--effort": "effort",
+        "--fast": "fast",
+        "--no-fast": "fast",
         "--no-sync-back": "sync_back",
         "--keep-workspaces": "keep_workspaces",
         "--resume": "resume",
@@ -3456,6 +3505,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional model reasoning effort. Supported values are validated against the Codex model cache.",
     )
     parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Force Codex Fast mode on or off. When omitted, inherit the "
+            "Codex service-tier configuration. Fast mode uses more credits."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Show Codex resume sessions for this workspace and run agents with the selected session.",
@@ -3504,6 +3562,10 @@ def validate_args(args: argparse.Namespace) -> None:
         if effort in {"", "auto", "clear", "default", "none"}
         else effort
     )
+    fast = getattr(args, "fast", None)
+    if fast is not None and not isinstance(fast, bool):
+        raise SystemExit("--fast / --no-fast 配置无效。")
+    args.fast = fast
     resume_requested = bool(
         getattr(args, "resume", False)
         or getattr(args, "resume_session_id", None)
@@ -3525,6 +3587,7 @@ def run_once(
     progress_callback: ProgressCallback = None,
     print_output: bool = True,
 ) -> int:
+    ensure_runtime_sources_unchanged()
     synthesis_agents = max(0, int(getattr(args, "synthesis_agents", 0) or 0))
     subagents = bool(getattr(args, "subagents", False))
     subagents_limit = int(
@@ -3555,6 +3618,7 @@ def run_once(
     effort_model = args.model or (resume_session.model if resume_session else None)
     model_registry = CodexModelRegistry.load(get_codex_home())
     model_display = model_registry.model_display(args.model)
+    fast_display = format_fast_mode(getattr(args, "fast", None))
     effective_effort = resolve_codex_reasoning_effort(
         effort_model,
         getattr(args, "effort", None),
@@ -3586,6 +3650,7 @@ def run_once(
                     ["RECOMMEND_BY", args.recommend_by],
                     ["MODEL", model_display],
                     ["EFFORT", effective_effort or "default"],
+                    ["FAST", fast_display],
                     ["CODEX_BIN", str(args.codex_bin)],
                     ["SYNC_BACK", "NO" if args.no_sync_back else "YES"],
                     ["KEEP_WORKSPACES", "YES" if args.keep_workspaces else "NO"],
@@ -3626,6 +3691,7 @@ def run_once(
         overview.add_row("RECOMMEND_BY", args.recommend_by)
         overview.add_row("MODEL", model_display)
         overview.add_row("EFFORT", effective_effort or "default")
+        overview.add_row("FAST", fast_display)
         overview.add_row("RESUME", resume_session_id or "NO")
         overview.add_row("METADATA", absolute_path_for_display(meta_root))
         overview.add_row("WORKSPACE COPIES", absolute_path_for_display(workspaces_root))
@@ -3648,6 +3714,7 @@ def run_once(
         log("info", "recommend_by = {}", args.recommend_by)
         log("info", "model = {}", model_display)
         log("info", "effort = {}", effective_effort or "default")
+        log("info", "fast = {}", fast_display)
         log("info", "resume = {}", resume_session_id or "NO")
 
     help_text = read_codex_exec_resume_help(args.codex_bin) if resume_session_id else read_codex_exec_help(args.codex_bin)
@@ -3711,6 +3778,7 @@ def run_once(
                         final_message_path,
                         model=args.model,
                         effort=effective_effort,
+                        fast=getattr(args, "fast", None),
                         resume_session_id=resume_session_id,
                         developer_instructions=effective_developer_instructions,
                         subagents=bool(getattr(args, "subagents", False)),
@@ -3759,6 +3827,7 @@ def run_once(
                     final_message_path,
                     model=args.model,
                     effort=effective_effort,
+                    fast=getattr(args, "fast", None),
                     resume_session_id=resume_session_id,
                     developer_instructions=effective_developer_instructions,
                     subagents=bool(getattr(args, "subagents", False)),

@@ -966,6 +966,34 @@ class RunRootTests(unittest.TestCase):
 
 
 class CommandBuildTests(unittest.TestCase):
+    def test_runtime_source_guard_rejects_stale_loaded_code(self) -> None:
+        with mock.patch.object(
+            app_core,
+            "_RUNTIME_SOURCE_DIGEST",
+            "loaded-source",
+        ), mock.patch.object(
+            app_core,
+            "_runtime_source_digest",
+            return_value="updated-source",
+        ), self.assertRaisesRegex(RuntimeError, "重新运行 `pcr`"):
+            app_core.ensure_runtime_sources_unchanged()
+
+    def test_runtime_source_digest_tracks_python_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "parallel_codex_runner_core"
+            package.mkdir()
+            source = package / "app.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            first = app_core._runtime_source_digest(package)
+
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            second = app_core._runtime_source_digest(package)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
     def test_model_uses_short_flag_when_only_short_flag_is_supported(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
@@ -990,6 +1018,49 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("--config", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
 
+    def test_fast_mode_uses_codex_service_tier_override(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            fast=True,
+        )
+
+        self.assertTrue(caps["fast"])
+        self.assertIn("features.fast_mode=true", cmd)
+        self.assertIn('service_tier="fast"', cmd)
+
+    def test_no_fast_forces_the_standard_service_tier(self) -> None:
+        cmd, caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+            fast=False,
+        )
+
+        self.assertTrue(caps["fast"])
+        self.assertIn('service_tier="default"', cmd)
+        self.assertNotIn("features.fast_mode=true", cmd)
+
+    def test_automatic_fast_mode_does_not_override_codex_config(self) -> None:
+        cmd, _caps = build_codex_command(
+            "codex",
+            "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
+            Path("final.md"),
+        )
+
+        self.assertFalse(any("service_tier=" in value for value in cmd))
+        self.assertNotIn("features.fast_mode=true", cmd)
+
+    def test_explicit_fast_mode_requires_codex_config_support(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Fast 模式"):
+            build_codex_command(
+                "codex",
+                "Usage: codex exec [OPTIONS]\n  --json\n",
+                Path("final.md"),
+                fast=True,
+            )
+
     def test_isolated_agents_disable_codex_memories(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
@@ -1011,7 +1082,7 @@ class CommandBuildTests(unittest.TestCase):
         self.assertIn("--disable", cmd)
         self.assertIn("memories", cmd)
 
-    def test_codex_config_accepts_one_second_multi_agent_waits(self) -> None:
+    def test_codex_config_uses_legal_multi_agent_wait_minimum(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
             "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
@@ -1020,7 +1091,7 @@ class CommandBuildTests(unittest.TestCase):
 
         self.assertTrue(caps["multi_agent_wait_timeout"])
         self.assertIn(
-            "features.multi_agent_v2.min_wait_timeout_ms=1000",
+            "features.multi_agent_v2.min_wait_timeout_ms=10000",
             cmd,
         )
 
@@ -1034,38 +1105,54 @@ class CommandBuildTests(unittest.TestCase):
         self.assertFalse(caps["multi_agent_wait_timeout"])
         self.assertFalse(any("min_wait_timeout_ms" in value for value in cmd))
 
-    def test_subagents_are_disabled_with_a_codex_config_override(self) -> None:
+    def test_resumed_sessions_hard_disable_stored_collaboration_mode(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
             "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
             Path("final.md"),
+            resume_session_id="019f3ae5-62ab-7203-a857-0a5f71a75fb9",
             subagents=False,
             subagents_limit=8,
         )
 
         self.assertTrue(caps["subagents"])
+        self.assertIn("resume", cmd)
+        self.assertIn("agents.enabled=false", cmd)
         self.assertIn("features.multi_agent=false", cmd)
+        self.assertIn("features.multi_agent_v2.enabled=false", cmd)
         self.assertFalse(any("max_threads" in value for value in cmd))
         self.assertFalse(any("min_wait_timeout_ms" in value for value in cmd))
 
-    def test_subagents_limit_supports_codex_v1_and_v2(self) -> None:
+    def test_disabling_subagents_requires_codex_config_support(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "可靠禁用嵌套 Agent"):
+            build_codex_command(
+                "codex",
+                "Usage: codex exec [OPTIONS]\n  --disable <FEATURE>\n",
+                Path("final.md"),
+                subagents=False,
+            )
+
+    def test_subagents_force_v2_over_a_resumed_disabled_mode(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
             "Usage: codex exec [OPTIONS]\n  -c, --config <key=value>\n",
             Path("final.md"),
+            resume_session_id="019f3ae5-62ab-7203-a857-0a5f71a75fb9",
             subagents=True,
             subagents_limit=8,
         )
 
         self.assertTrue(caps["subagents_limit"])
+        self.assertIn("agents.enabled=true", cmd)
         self.assertIn("features.multi_agent=true", cmd)
+        self.assertIn("features.multi_agent_v2.enabled=true", cmd)
         self.assertIn("agents.max_threads=8", cmd)
         self.assertIn(
             "features.multi_agent_v2.max_concurrent_threads_per_session=9",
             cmd,
         )
         self.assertIn(
-            "features.multi_agent_v2.min_wait_timeout_ms=1000",
+            "features.multi_agent_v2.min_wait_timeout_ms=10000",
             cmd,
         )
 
@@ -1429,6 +1516,17 @@ class ArgParseTests(unittest.TestCase):
         args = parse_args(["fix tests", "--effort", "xhigh"])
 
         self.assertEqual(args.effort, "xhigh")
+
+    def test_fast_mode_is_an_optional_cli_override(self) -> None:
+        automatic = parse_args(["fix tests"])
+        fast = parse_args(["fix tests", "--fast"])
+        standard = parse_args(["fix tests", "--no-fast"])
+
+        self.assertIsNone(automatic.fast)
+        self.assertTrue(fast.fast)
+        self.assertFalse(standard.fast)
+        self.assertIn("fast", fast._pcr_explicit_tui_settings)
+        self.assertIn("fast", standard._pcr_explicit_tui_settings)
 
     def test_synthesis_agents_are_configurable(self) -> None:
         args = parse_args(["fix tests", "--synthesis-agents", "3"])
@@ -2294,7 +2392,14 @@ class AdditionalAgentTests(unittest.TestCase):
             codex_home.mkdir()
             (workspace / "base.txt").write_text("baseline", encoding="utf-8")
             args = parse_args(
-                ["prompt", "--workspace", str(workspace), "--recommend-by", "duration"]
+                [
+                    "prompt",
+                    "--workspace",
+                    str(workspace),
+                    "--recommend-by",
+                    "duration",
+                    "--fast",
+                ]
             )
             command = [
                 sys.executable,
@@ -2313,7 +2418,7 @@ class AdditionalAgentTests(unittest.TestCase):
                         app_core,
                         "build_codex_command",
                         return_value=(command, {}),
-                    ):
+                    ) as build_command:
                         results = app_core.run_additional_agents(
                             args=args,
                             prompt="current question",
@@ -2357,6 +2462,9 @@ class AdditionalAgentTests(unittest.TestCase):
             self.assertEqual([result["idx"] for result in summary["results"]], [3, 4])
             started = [event["idx"] for event in events if event.get("type") == "agent_started"]
             self.assertEqual(started, [3, 4, 3])
+            self.assertTrue(
+                all(call.kwargs["fast"] is True for call in build_command.call_args_list)
+            )
 
     def test_additional_agents_scrub_codex_support_after_execution_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2502,6 +2610,10 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
         self.assertIn("/effort <auto|level>", "\n".join(command_suggestions("/effort")))
         self.assertIn(
+            "/fast <on|off|auto>",
+            "\n".join(command_suggestions("/fast")),
+        )
+        self.assertIn(
             "/subagents <on|off>",
             "\n".join(command_suggestions("/subagents")),
         )
@@ -2552,6 +2664,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(any("/accept" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/diff" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("SUBAGENTS" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("FAST" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("60 秒" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertEqual(tui_textual.FOLLOW_UP_DELAY_SECONDS, 60.0)
                     self.assertEqual(tips.region.height, 1)
@@ -2593,6 +2706,7 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/recommendby duration")
         app._handle_command("/model gpt-5")
         app._handle_command("/effort high")
+        app._handle_command("/fast on")
         app._handle_command("/syncback off")
         app._handle_command("/keepworkspaces on")
         app._handle_command("/resumeinclude off")
@@ -2608,6 +2722,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.args.recommend_by, "duration")
         self.assertEqual(app.args.model, "gpt-5")
         self.assertEqual(app.args.effort, "high")
+        self.assertTrue(app.args.fast)
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
         self.assertFalse(app.args.resume_include_non_interactive)
@@ -2617,11 +2732,14 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/subagents off")
         app._handle_command("/model clear")
         app._handle_command("/effort auto")
+        app._handle_command("/fast auto")
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertFalse(app.args.subagents)
         self.assertIsNone(app.args.model)
         self.assertIsNone(app.args.effort)
+        self.assertIsNone(app.args.fast)
+        self.assertEqual(dict(app._base_info_rows())["FAST"], "AUTO")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_prepared_rows_keep_codex_bin_visible(self) -> None:
@@ -3603,6 +3721,7 @@ class TuiCommandTests(unittest.TestCase):
                     for selector, value in (
                         ("#config-execution", "serial"),
                         ("#config-recommend-by", "duration"),
+                        ("#config-fast", "on"),
                         ("#config-sync-back", False),
                         ("#config-keep-workspaces", True),
                     ):
@@ -3628,6 +3747,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(app.args.recommend_by, "duration")
                     self.assertEqual(app.args.model, "gpt-test")
                     self.assertEqual(app.args.effort, "high")
+                    self.assertTrue(app.args.fast)
                     self.assertTrue(app.args.subagents)
                     self.assertEqual(app.args.subagents_limit, 12)
                     self.assertTrue(app.args.no_sync_back)
@@ -3675,6 +3795,8 @@ class TuiCommandTests(unittest.TestCase):
 
                     recommend_by = app.query_one("#config-recommend-by")
                     recommend_by.value = "duration"
+                    fast = app.query_one("#config-fast")
+                    fast.value = "on"
                     model = app.query_one("#config-model")
                     app._set_select_control(
                         model,
@@ -3707,6 +3829,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(captured_args[0].subagents_limit, 10)
                     self.assertEqual(captured_args[0].recommend_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
+                    self.assertTrue(captured_args[0].fast)
                     self.assertEqual(
                         set(captured_args[0].agent_cancel_events),
                         {1, 2, 3, 4, 5, 6},
