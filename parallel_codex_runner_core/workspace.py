@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -15,10 +16,12 @@ from .paths import is_relative_to
 
 EXCLUDE_NAMES: Set[str] = {".codex_parallel_runs", ".codex_parallel_meta", ".git"}
 SYNC_EXCLUDE_NAMES: Set[str] = EXCLUDE_NAMES | {".git"}
-WORKTREE_BASE_STATE_FILE = "pcr-base-state.json"
+GIT_BASE_STATE_FILE = "pcr-base-state.json"
 GIT_INDEX_LOCK_TIMEOUT_SECONDS = 5.0
 GIT_INDEX_LOCK_POLL_SECONDS = 0.05
 PCR_INDEX_LOCK_OWNER_SUFFIX = ".pcr-owner"
+PCR_INDEX_LOCK_OWNER_FILE_MARKER = ".pcr-lock-owner-"
+GIT_ISOLATION_KIND = "local-clone-v1"
 
 
 def _debug(message: str, *args: object) -> None:
@@ -45,7 +48,7 @@ def make_ignore_func(extra_excluded_abs: Sequence[Path]):
             except FileNotFoundError:
                 rp = candidate.absolute()
             for excluded in resolved_extra:
-                if rp == excluded or is_relative_to(rp, excluded):
+                if rp == excluded:
                     ignored.add(name)
                     break
         return ignored
@@ -116,8 +119,8 @@ def estimate_workspace_copy_bytes(workspace: Path) -> int:
                     pending.append(Path(entry.path))
 
     if git_workspace_toplevel(workspace) is not None:
-        # A worktree shares Git objects, but it still receives an index. Split
-        # indexes may be expanded while PCR mirrors the source worktree state.
+        # A same-filesystem local clone hard-links immutable source objects,
+        # but still receives independent Git administration data and an index.
         index_paths = {_git_index_path(workspace), _git_shared_index_path(workspace)}
         for index_path in index_paths:
             if index_path is None:
@@ -257,8 +260,8 @@ def _git_shared_index_path(workspace: Path) -> Optional[Path]:
     return _resolved_git_path(workspace, "--shared-index-path")
 
 
-def _worktree_base_state_path(workspace: Path) -> Optional[Path]:
-    return _resolved_git_path(workspace, "--git-path", WORKTREE_BASE_STATE_FILE)
+def _git_base_state_path(workspace: Path) -> Optional[Path]:
+    return _resolved_git_path(workspace, "--git-path", GIT_BASE_STATE_FILE)
 
 
 @contextmanager
@@ -282,7 +285,7 @@ def _prepared_git_index(
 
         env = os.environ.copy()
         env["GIT_INDEX_FILE"] = str(staged_index)
-        # Strip path-specific index caches before installing the index in another worktree.
+        # Strip path-specific index caches before installing the index elsewhere.
         result = subprocess.run(
             [
                 "git",
@@ -306,6 +309,7 @@ def _prepared_git_index(
 
 
 def _index_lock_owner_path(lock_path: Path) -> Path:
+    """Return the legacy sidecar path used by PCR versions before owner files."""
     return lock_path.with_name(f"{lock_path.name}{PCR_INDEX_LOCK_OWNER_SUFFIX}")
 
 
@@ -328,34 +332,124 @@ def _lock_identity(stat_result: os.stat_result) -> Tuple[int, int, int]:
     return int(stat_result.st_dev), int(stat_result.st_ino), int(ctime_ns)
 
 
-def _write_index_lock_owner(lock_path: Path) -> None:
-    owner_path = _index_lock_owner_path(lock_path)
-    temporary = owner_path.with_name(
-        f".{owner_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
-    )
+def _index_lock_owner_file_prefix(lock_path: Path) -> str:
+    return f".{lock_path.name}{PCR_INDEX_LOCK_OWNER_FILE_MARKER}"
+
+
+def _index_lock_owner_file(lock_path: Path) -> Path:
+    prefix = _index_lock_owner_file_prefix(lock_path)
+    for attempt in range(1000):
+        suffix = f"{os.getpid()}-{time.time_ns()}"
+        if attempt:
+            suffix += f"-{attempt}"
+        candidate = lock_path.with_name(prefix + suffix)
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise RuntimeError(f"could not allocate PCR Git index owner file: {lock_path}")
+
+
+def _index_lock_owner_pid(lock_path: Path, owner_path: Path) -> Optional[int]:
+    prefix = _index_lock_owner_file_prefix(lock_path)
+    if owner_path.parent != lock_path.parent or not owner_path.name.startswith(prefix):
+        return None
+    value = owner_path.name.removeprefix(prefix).split("-", 1)[0]
     try:
-        device, inode, ctime_ns = _lock_identity(lock_path.stat())
-        payload = {
-            "pid": os.getpid(),
-            "device": device,
-            "inode": inode,
-            "ctime_ns": ctime_ns,
-        }
-        owner_path.unlink(missing_ok=True)
-        temporary.write_text(json.dumps(payload), encoding="utf-8")
-        try:
-            temporary.chmod(0o600)
-        except OSError:
-            pass
-        os.replace(temporary, owner_path)
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
     except OSError:
+        return False
+    return (
+        int(left_stat.st_dev),
+        int(left_stat.st_ino),
+    ) == (
+        int(right_stat.st_dev),
+        int(right_stat.st_ino),
+    )
+
+
+def _file_inode_identity(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return int(stat_result.st_dev), int(stat_result.st_ino)
+
+
+def _owned_index_lock_file(lock_path: Path) -> Optional[Path]:
+    if lock_path.is_symlink():
         try:
-            temporary.unlink(missing_ok=True)
+            target = Path(os.readlink(lock_path))
+        except OSError:
+            return None
+        if target.is_absolute() or len(target.parts) != 1:
+            return None
+        owner_path = lock_path.parent / target
+        return (
+            owner_path
+            if _index_lock_owner_pid(lock_path, owner_path) is not None
+            else None
+        )
+
+    prefix = _index_lock_owner_file_prefix(lock_path)
+    for owner_path in lock_path.parent.glob(prefix + "*"):
+        if (
+            _index_lock_owner_pid(lock_path, owner_path) is not None
+            and _same_file(lock_path, owner_path)
+        ):
+            return owner_path
+    return None
+
+
+def _cleanup_orphaned_index_lock_owners(lock_path: Path) -> None:
+    prefix = _index_lock_owner_file_prefix(lock_path)
+    for owner_path in lock_path.parent.glob(prefix + "*"):
+        pid = _index_lock_owner_pid(lock_path, owner_path)
+        if pid is None or _process_is_alive(pid):
+            continue
+        if lock_path.exists() or lock_path.is_symlink():
+            if _owned_index_lock_file(lock_path) == owner_path:
+                continue
+        try:
+            owner_path.unlink(missing_ok=True)
         except OSError:
             pass
 
 
 def _remove_stale_pcr_index_lock(lock_path: Path) -> bool:
+    owner_file = _owned_index_lock_file(lock_path)
+    if owner_file is not None:
+        pid = _index_lock_owner_pid(lock_path, owner_file)
+        if pid is None or _process_is_alive(pid):
+            # A current atomic owner is authoritative. Never let a leftover
+            # legacy sidecar override proof that another PCR process owns it.
+            return False
+        try:
+            if _owned_index_lock_file(lock_path) != owner_file:
+                return False
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        try:
+            owner_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            _index_lock_owner_path(lock_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        _debug("removed stale PCR-owned Git index lock: {}", lock_path)
+        return True
+
+    # Recover locks created by PCR releases that used a JSON sidecar.
     owner_path = _index_lock_owner_path(lock_path)
     try:
         payload = json.loads(owner_path.read_text(encoding="utf-8"))
@@ -392,30 +486,57 @@ def _acquire_git_index_lock(
     lock_path: Path,
     timeout: float,
     poll_interval: float,
-) -> int:
+) -> Tuple[Path, Path]:
     mode = source_index.stat().st_mode & 0o777
     started = time.monotonic()
     deadline = started + max(0.0, timeout)
-    while True:
-        try:
-            descriptor = os.open(
-                lock_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                mode,
-            )
+    _cleanup_orphaned_index_lock_owners(lock_path)
+    owner_path = _index_lock_owner_file(lock_path)
+    descriptor = os.open(
+        owner_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        mode,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as target, source_index.open("rb") as source:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        while True:
+            try:
+                try:
+                    # A hard link makes lock ownership recoverable before the
+                    # lock becomes visible, eliminating the sidecar gap.
+                    os.link(owner_path, lock_path)
+                    install_path = lock_path
+                except FileExistsError:
+                    raise
+                except OSError:
+                    # A symlink retains the owner filename as its atomic proof
+                    # when hard links are unavailable.
+                    os.symlink(owner_path.name, lock_path)
+                    install_path = owner_path
+            except FileExistsError as exc:
+                if _remove_stale_pcr_index_lock(lock_path):
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Git index remained locked for "
+                        f"{max(0.0, timeout):.1f}s: {lock_path}"
+                    ) from exc
+                time.sleep(min(max(0.001, poll_interval), remaining))
+                continue
             waited = time.monotonic() - started
             if waited >= poll_interval:
                 _debug("waited {:.2f}s for Git index lock: {}", waited, lock_path)
-            return descriptor
-        except FileExistsError as exc:
-            if _remove_stale_pcr_index_lock(lock_path):
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"Git index remained locked for {max(0.0, timeout):.1f}s: {lock_path}"
-                ) from exc
-            time.sleep(min(max(0.001, poll_interval), remaining))
+            return owner_path, install_path
+    except BaseException:
+        try:
+            owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 @contextmanager
@@ -426,27 +547,35 @@ def _locked_git_index(
     poll_interval: float = GIT_INDEX_LOCK_POLL_SECONDS,
 ) -> Iterator[Path]:
     lock_path = destination_index.with_name(f"{destination_index.name}.lock")
-    owner_path = _index_lock_owner_path(lock_path)
-    descriptor = _acquire_git_index_lock(
+    owner_path, install_path = _acquire_git_index_lock(
         source_index,
         lock_path,
         timeout,
         poll_interval,
     )
+    owner_identity = _file_inode_identity(owner_path)
     try:
-        with os.fdopen(descriptor, "wb") as target, source_index.open("rb") as source:
-            shutil.copyfileobj(source, target)
-        _write_index_lock_owner(lock_path)
-        yield lock_path
+        yield install_path
     finally:
+        try:
+            symlink_owner = _owned_index_lock_file(lock_path)
+            if (
+                symlink_owner == owner_path
+                or (
+                    owner_identity is not None
+                    and _file_inode_identity(lock_path) == owner_identity
+                )
+            ):
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             owner_path.unlink(missing_ok=True)
         except OSError:
             pass
-        lock_path.unlink(missing_ok=True)
 
 
-def _copy_git_worktree_state(
+def _copy_git_workspace_state(
     source_workspace: Path,
     destination_workspace: Path,
     excluded_paths: Sequence[Path] = (),
@@ -468,36 +597,62 @@ def _copy_git_worktree_state(
             os.replace(locked_index, destination_index)
 
 
-def _record_worktree_base_state(
+def _git_source_identity(path: Path) -> str:
+    resolved = os.fsencode(str(path.expanduser().resolve()))
+    return hashlib.sha256(resolved).hexdigest()
+
+
+def _record_git_base_state(
     workspace: Path,
     base_head: str,
     base_ref: Optional[str],
     submodule_paths: Sequence[Path] = (),
+    *,
+    original_workspace: Optional[Path] = None,
 ) -> None:
-    marker = _worktree_base_state_path(workspace)
+    marker = _git_base_state_path(workspace)
     if marker is None:
-        raise RuntimeError("could not locate the Git worktree metadata directory")
-    marker.write_text(
-        json.dumps(
+        raise RuntimeError("could not locate the isolated Git metadata directory")
+    payload: dict[str, object] = {
+        "head": base_head,
+        "ref": base_ref,
+        "submodules": [path.as_posix() for path in submodule_paths],
+    }
+    if original_workspace is not None:
+        original_workspace = original_workspace.resolve()
+        original_common_dir = _git_common_dir(original_workspace)
+        if original_common_dir is None:
+            raise RuntimeError("could not locate the original Git metadata directory")
+        payload.update(
             {
-                "head": base_head,
-                "ref": base_ref,
-                "submodules": [path.as_posix() for path in submodule_paths],
-            },
-            ensure_ascii=False,
-        ),
+                "isolation": GIT_ISOLATION_KIND,
+                "original_workspace_id": _git_source_identity(
+                    original_workspace
+                ),
+                "original_common_dir_id": _git_source_identity(
+                    original_common_dir
+                ),
+            }
+        )
+    marker.write_text(
+        json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
 
 
-def _read_worktree_base_state(workspace: Path) -> Optional[Tuple[str, Optional[str]]]:
-    marker = _worktree_base_state_path(workspace)
+def _read_git_base_state_payload(workspace: Path) -> Optional[dict[str, object]]:
+    marker = _git_base_state_path(workspace)
     if marker is None or not marker.is_file():
         return None
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_git_base_state(workspace: Path) -> Optional[Tuple[str, Optional[str]]]:
+    payload = _read_git_base_state_payload(workspace)
     head = payload.get("head") if isinstance(payload, dict) else None
     ref = payload.get("ref") if isinstance(payload, dict) else None
     if not isinstance(head, str) or not head:
@@ -505,10 +660,10 @@ def _read_worktree_base_state(workspace: Path) -> Optional[Tuple[str, Optional[s
     return head, ref if isinstance(ref, str) else None
 
 
-def _read_worktree_submodule_paths(workspace: Path) -> List[Path]:
+def _read_git_submodule_paths(workspace: Path) -> List[Path]:
     if git_workspace_toplevel(workspace) != workspace.resolve():
         return []
-    marker = _worktree_base_state_path(workspace)
+    marker = _git_base_state_path(workspace)
     if marker is not None and marker.is_file():
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -633,11 +788,11 @@ def _remove_linked_git_worktree(workspace_copy: Path) -> bool:
     return True
 
 
-def _cleanup_nested_git_worktrees(
+def _cleanup_nested_git_workspaces(
     workspace_copy: Path,
     original_workspace: Optional[Path] = None,
 ) -> None:
-    for relative in reversed(_read_worktree_submodule_paths(workspace_copy)):
+    for relative in reversed(_read_git_submodule_paths(workspace_copy)):
         submodule = workspace_copy / relative
         original_submodule = (
             original_workspace / relative
@@ -652,7 +807,7 @@ def _cleanup_nested_git_worktrees(
             ):
                 prune_git_worktrees(original_submodule)
             continue
-        _cleanup_nested_git_worktrees(submodule, original_submodule)
+        _cleanup_nested_git_workspaces(submodule, original_submodule)
         common_dir = _git_common_dir(submodule)
         if not _remove_linked_git_worktree(submodule):
             remove_tree_checked(submodule)
@@ -676,7 +831,7 @@ def _cleanup_nested_git_worktrees(
 def cleanup_workspace_copy(original_workspace: Path, workspace_copy: Path) -> None:
     if not workspace_copy.exists() and not workspace_copy.is_symlink():
         return
-    _cleanup_nested_git_worktrees(workspace_copy, original_workspace)
+    _cleanup_nested_git_workspaces(workspace_copy, original_workspace)
     if _remove_linked_git_worktree(workspace_copy):
         prune_git_worktrees(original_workspace)
         return
@@ -709,7 +864,73 @@ def cleanup_workspace_copies(original_workspace: Path, workspaces_root: Path) ->
     prune_git_worktrees(original_workspace)
 
 
-def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
+def _copy_local_git_identity(source: Path, destination: Path) -> None:
+    for key in ("user.name", "user.email"):
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "config",
+                "--local",
+                "--null",
+                "--get-all",
+                key,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode == 1:
+            continue
+        if result.returncode != 0:
+            message = os.fsdecode(result.stderr).strip() or "unknown Git error"
+            raise RuntimeError(f"could not read local Git identity: {message}")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(destination),
+                "config",
+                "--local",
+                "--unset-all",
+                key,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        for raw_value in result.stdout.split(b"\0"):
+            if not raw_value:
+                continue
+            configured = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(destination),
+                    "config",
+                    "--local",
+                    "--add",
+                    key,
+                    os.fsdecode(raw_value),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if configured.returncode != 0:
+                message = (
+                    configured.stderr.strip()
+                    or configured.stdout.strip()
+                    or "unknown Git error"
+                )
+                raise RuntimeError(
+                    f"could not copy local Git identity into isolated workspace: {message}"
+                )
+
+
+def copy_workspace_with_isolated_git(workspace: Path, dst: Path) -> bool:
     if git_workspace_toplevel(workspace) is None:
         return False
 
@@ -718,30 +939,73 @@ def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
         return False
     base_ref = _git_head_ref(workspace)
 
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(workspace),
-            "worktree",
-            "add",
-            "--detach",
-            "--no-checkout",
-            str(dst),
-            "HEAD",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    result: Optional[subprocess.CompletedProcess[str]] = None
+    for locality in ("--local", "--no-local"):
+        result = subprocess.run(
+            [
+                "git",
+                "clone",
+                locality,
+                "--no-checkout",
+                "--no-recurse-submodules",
+                "--quiet",
+                str(workspace),
+                str(dst),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            break
+        if dst.exists() or dst.is_symlink():
+            remove_tree_checked(dst)
+    assert result is not None
     if result.returncode != 0:
-        cleanup_workspace_copy(workspace, dst)
-        return False
+        message = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+        raise RuntimeError(f"could not create an isolated Git workspace: {message}")
 
     try:
+        detach = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(dst),
+                "update-ref",
+                "--no-deref",
+                "HEAD",
+                base_head,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if detach.returncode != 0:
+            message = detach.stderr.strip() or detach.stdout.strip() or "unknown Git error"
+            raise RuntimeError(f"could not detach the isolated Git HEAD: {message}")
+
+        remove_origin = subprocess.run(
+            ["git", "-C", str(dst), "remote", "remove", "origin"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if remove_origin.returncode != 0:
+            message = (
+                remove_origin.stderr.strip()
+                or remove_origin.stdout.strip()
+                or "unknown Git error"
+            )
+            raise RuntimeError(
+                f"could not remove the isolated clone's source remote: {message}"
+            )
+        _copy_local_git_identity(workspace, dst)
+
         submodule_paths = _initialized_submodule_paths(workspace)
-        _copy_git_worktree_state(
+        _copy_git_workspace_state(
             workspace,
             dst,
             excluded_paths=submodule_paths,
@@ -751,21 +1015,22 @@ def copy_workspace_with_git_worktree(workspace: Path, dst: Path) -> bool:
             destination_submodule = dst / relative
             remove_existing_path(destination_submodule)
             destination_submodule.parent.mkdir(parents=True, exist_ok=True)
-            if not copy_workspace_with_git_worktree(
+            if not copy_workspace_with_isolated_git(
                 source_submodule,
                 destination_submodule,
             ):
                 raise RuntimeError(
                     f"could not isolate initialized Git submodule: {relative}"
                 )
-        _record_worktree_base_state(
+        _record_git_base_state(
             dst,
             base_head,
             base_ref,
             submodule_paths,
+            original_workspace=workspace,
         )
     except Exception as exc:
-        _debug("git worktree copy failed: {}", exc)
+        _debug("isolated Git copy failed: {}", exc)
         cleanup_workspace_copy(workspace, dst)
         raise
     return True
@@ -776,14 +1041,21 @@ def copy_workspace(workspace: Path, dst: Path, run_base: Path) -> None:
         raise FileExistsError(f"destination already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    if copy_workspace_with_git_worktree(workspace, dst):
+    if copy_workspace_with_isolated_git(workspace, dst):
         return
 
+    workspace_resolved = workspace.resolve()
+    run_base_resolved = run_base.resolve()
+    excluded_paths = (
+        [run_base_resolved]
+        if is_relative_to(run_base_resolved, workspace_resolved)
+        else []
+    )
     shutil.copytree(
         workspace,
         dst,
         symlinks=True,
-        ignore=make_ignore_func([run_base]),
+        ignore=make_ignore_func(excluded_paths),
         copy_function=shutil.copy2,
     )
 
@@ -934,6 +1206,127 @@ def _sync_workspace_files(
         sync_back_with_python(src, dst)
 
 
+def _isolated_git_source_matches_destination(
+    payload: dict[str, object],
+    destination_workspace: Path,
+    destination_common_dir: Path,
+) -> bool:
+    if payload.get("isolation") != GIT_ISOLATION_KIND:
+        return False
+    recorded_workspace_id = payload.get("original_workspace_id")
+    recorded_common_dir_id = payload.get("original_common_dir_id")
+    if not isinstance(recorded_workspace_id, str) or not isinstance(
+        recorded_common_dir_id,
+        str,
+    ):
+        raise RuntimeError("isolated Git workspace is missing original repository metadata")
+    if (
+        recorded_workspace_id != _git_source_identity(destination_workspace)
+        or recorded_common_dir_id != _git_source_identity(
+            destination_common_dir
+        )
+    ):
+        raise RuntimeError(
+            "isolated Git workspace belongs to a different original repository"
+        )
+    return True
+
+
+def _git_index_object_ids(workspace: Path) -> List[str]:
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "ls-files", "--stage", "-z"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = os.fsdecode(result.stderr).strip() or "unknown Git error"
+        raise RuntimeError(f"could not enumerate isolated Git index objects: {message}")
+
+    object_ids: Set[str] = set()
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, _raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) < 2 or fields[0] == b"160000":
+            continue
+        object_id = os.fsdecode(fields[1])
+        if object_id and set(object_id) != {"0"}:
+            object_ids.add(object_id)
+    return sorted(object_ids)
+
+
+def _import_isolated_git_objects(
+    source_workspace: Path,
+    destination_workspace: Path,
+    source_head: str,
+    base_head: str,
+) -> None:
+    revisions = [source_head, f"^{base_head}"]
+    revisions.extend(_git_index_object_ids(source_workspace))
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+
+    with tempfile.TemporaryFile() as pack_file:
+        packed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_workspace),
+                "pack-objects",
+                "--stdout",
+                "--revs",
+            ],
+            input=("\n".join(revisions) + "\n").encode("ascii"),
+            stdout=pack_file,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+        if packed.returncode != 0:
+            message = os.fsdecode(packed.stderr).strip() or "unknown Git error"
+            raise RuntimeError(f"could not export isolated Git objects: {message}")
+
+        pack_file.seek(0)
+        imported = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(destination_workspace),
+                "index-pack",
+                "--stdin",
+            ],
+            stdin=pack_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    if imported.returncode != 0:
+        message = imported.stderr.strip() or imported.stdout.strip() or "unknown Git error"
+        raise RuntimeError(f"could not import isolated Git objects: {message}")
+
+    verify = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(destination_workspace),
+            "cat-file",
+            "-e",
+            f"{source_head}^{{commit}}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    if verify.returncode != 0:
+        raise RuntimeError("isolated Git commit was not imported into the original repository")
+
+
 def _sync_git_workspace_back(src: Path, dst: Path) -> bool:
     src_top = git_workspace_toplevel(src)
     dst_top = git_workspace_toplevel(dst)
@@ -942,15 +1335,27 @@ def _sync_git_workspace_back(src: Path, dst: Path) -> bool:
 
     src_common = _git_common_dir(src_top)
     dst_common = _git_common_dir(dst_top)
-    if src_common is None or dst_common is None or src_common != dst_common:
+    if src_common is None or dst_common is None:
         return False
+    base_payload = _read_git_base_state_payload(src_top)
+    isolated_git = False
+    if src_common != dst_common:
+        if base_payload is None:
+            return False
+        isolated_git = _isolated_git_source_matches_destination(
+            base_payload,
+            dst_top,
+            dst_common,
+        )
+        if not isolated_git:
+            return False
 
     src_head = _git_head(src_top)
     dst_head = _git_head(dst_top)
     if src_head is None or dst_head is None:
         return False
 
-    base_state = _read_worktree_base_state(src_top)
+    base_state = _read_git_base_state(src_top)
     base_head = base_state[0] if base_state is not None else None
     if base_state is not None and _git_head_ref(dst_top) != base_state[1]:
         raise RuntimeError("original Git branch changed while agents were running")
@@ -965,7 +1370,7 @@ def _sync_git_workspace_back(src: Path, dst: Path) -> bool:
             "its HEAD is not based on the original workspace HEAD"
         )
 
-    submodule_paths = _read_worktree_submodule_paths(src_top)
+    submodule_paths = _read_git_submodule_paths(src_top)
     for relative in submodule_paths:
         src_submodule = src_top / relative
         dst_submodule = dst_top / relative
@@ -1000,6 +1405,16 @@ def _sync_git_workspace_back(src: Path, dst: Path) -> bool:
             raise RuntimeError(
                 f"isolated Git metadata is missing for submodule: {relative}"
             )
+
+    if isolated_git:
+        if base_head is None:
+            raise RuntimeError("isolated Git workspace is missing its base commit")
+        _import_isolated_git_objects(
+            src_top,
+            dst_top,
+            src_head,
+            base_head,
+        )
 
     with _prepared_git_index(src_top, dst_top) as (source_index, destination_index):
         with _locked_git_index(source_index, destination_index) as locked_index:

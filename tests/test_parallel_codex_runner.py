@@ -236,10 +236,10 @@ class WorkspaceCopyTests(unittest.TestCase):
                     timeout=1.0,
                     poll_interval=0.01,
                 ) as acquired:
-                    self.assertEqual(acquired, lock_path)
+                    self.assertEqual(acquired.read_bytes(), b"replacement index")
                     self.assertEqual(lock_path.read_bytes(), b"replacement index")
-                    self.assertTrue(
-                        workspace_core._index_lock_owner_path(lock_path).is_file()
+                    self.assertIsNotNone(
+                        workspace_core._owned_index_lock_file(lock_path)
                     )
                     os.replace(acquired, destination_index)
             finally:
@@ -247,9 +247,7 @@ class WorkspaceCopyTests(unittest.TestCase):
 
             self.assertGreaterEqual(time.monotonic() - started, 0.08)
             self.assertEqual(destination_index.read_bytes(), b"replacement index")
-            self.assertFalse(
-                workspace_core._index_lock_owner_path(lock_path).exists()
-            )
+            self.assertFalse(lock_path.exists())
 
     def test_git_index_lock_times_out_without_deleting_external_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,6 +304,122 @@ class WorkspaceCopyTests(unittest.TestCase):
             self.assertEqual(destination_index.read_bytes(), b"replacement index")
             self.assertFalse(owner_path.exists())
 
+    def test_git_index_lock_recovers_atomic_owner_without_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+            abandoned_owner = workspace_core._index_lock_owner_file(lock_path)
+            abandoned_owner.write_bytes(b"abandoned PCR index")
+            lock_path.symlink_to(abandoned_owner.name)
+
+            with mock.patch.object(
+                workspace_core,
+                "_process_is_alive",
+                return_value=False,
+            ):
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=0.1,
+                    poll_interval=0.01,
+                ) as acquired:
+                    self.assertEqual(acquired.read_bytes(), b"replacement index")
+                    os.replace(acquired, destination_index)
+
+            self.assertEqual(destination_index.read_bytes(), b"replacement index")
+            self.assertFalse(lock_path.exists())
+            self.assertFalse(abandoned_owner.exists())
+
+    def test_git_index_lock_recovers_hard_link_owner_without_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+            abandoned_owner = workspace_core._index_lock_owner_file(lock_path)
+            abandoned_owner.write_bytes(b"abandoned PCR index")
+            os.link(abandoned_owner, lock_path)
+
+            with mock.patch.object(
+                workspace_core,
+                "_process_is_alive",
+                return_value=False,
+            ):
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=0.1,
+                    poll_interval=0.01,
+                ) as acquired:
+                    os.replace(acquired, destination_index)
+
+            self.assertEqual(destination_index.read_bytes(), b"replacement index")
+            self.assertFalse(lock_path.exists())
+            self.assertFalse(abandoned_owner.exists())
+
+    def test_git_index_lock_owner_write_failure_never_publishes_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+
+            with mock.patch.object(
+                workspace_core.shutil,
+                "copyfileobj",
+                side_effect=OSError("owner write failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "owner write failed"):
+                    with workspace_core._locked_git_index(
+                        source_index,
+                        destination_index,
+                        timeout=0.1,
+                        poll_interval=0.01,
+                    ):
+                        self.fail("lock acquisition must fail")
+
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(
+                list(
+                    root.glob(
+                        workspace_core._index_lock_owner_file_prefix(lock_path)
+                        + "*"
+                    )
+                ),
+                [],
+            )
+
+    def test_git_index_lock_uses_recoverable_symlink_without_hard_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index = root / "source-index"
+            destination_index = root / "index"
+            lock_path = root / "index.lock"
+            source_index.write_bytes(b"replacement index")
+
+            with mock.patch.object(
+                workspace_core.os,
+                "link",
+                side_effect=OSError("hard links unavailable"),
+            ):
+                with workspace_core._locked_git_index(
+                    source_index,
+                    destination_index,
+                    timeout=0.1,
+                    poll_interval=0.01,
+                ) as acquired:
+                    self.assertTrue(lock_path.is_symlink())
+                    self.assertNotEqual(acquired, lock_path)
+                    os.replace(acquired, destination_index)
+
+            self.assertEqual(destination_index.read_bytes(), b"replacement index")
+            self.assertFalse(lock_path.exists())
+
     def test_git_index_lock_does_not_remove_lock_with_mismatched_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -341,8 +455,42 @@ class WorkspaceCopyTests(unittest.TestCase):
             self.assertEqual(lock_path.read_bytes(), b"external Git operation")
             self.assertTrue(owner_path.exists())
 
+    def test_atomic_index_lock_owner_takes_precedence_over_legacy_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "index.lock"
+            atomic_owner = workspace_core._index_lock_owner_file(lock_path)
+            legacy_owner = workspace_core._index_lock_owner_path(lock_path)
+            atomic_owner.write_bytes(b"active PCR index")
+            os.link(atomic_owner, lock_path)
+            device, inode, ctime_ns = workspace_core._lock_identity(lock_path.stat())
+            legacy_owner.write_text(
+                json.dumps(
+                    {
+                        "pid": 99999999,
+                        "device": device,
+                        "inode": inode,
+                        "ctime_ns": ctime_ns,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                workspace_core,
+                "_process_is_alive",
+                side_effect=lambda pid: pid == os.getpid(),
+            ):
+                self.assertFalse(
+                    workspace_core._remove_stale_pcr_index_lock(lock_path)
+                )
+
+            self.assertEqual(lock_path.read_bytes(), b"active PCR index")
+            self.assertTrue(atomic_owner.exists())
+            self.assertTrue(legacy_owner.exists())
+
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
-    def test_git_workspace_copy_uses_worktree_and_preserves_dirty_state(self) -> None:
+    def test_git_workspace_copy_uses_isolated_clone_and_preserves_dirty_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -363,7 +511,7 @@ class WorkspaceCopyTests(unittest.TestCase):
             dst = run_base / "workspaces" / "agent_001"
             copy_workspace(workspace, dst, run_base)
             try:
-                self.assertTrue((dst / ".git").is_file())
+                self.assertTrue((dst / ".git").is_dir())
                 self.assertEqual((dst / "keep.txt").read_text(encoding="utf-8"), "dirty")
                 self.assertFalse((dst / "delete.txt").exists())
                 self.assertEqual((dst / "untracked.txt").read_text(encoding="utf-8"), "untracked")
@@ -371,6 +519,121 @@ class WorkspaceCopyTests(unittest.TestCase):
                 self.assertEqual(copied_status, original_status)
             finally:
                 cleanup_workspace_copy(workspace, dst)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_workspace_copy_isolates_config_refs_tags_and_stash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+
+            copy_workspace(workspace, agent, run_base)
+            try:
+                original_head = self._git(workspace, "rev-parse", "HEAD").stdout.strip()
+                self.assertNotEqual(
+                    workspace_core._git_common_dir(agent),
+                    workspace_core._git_common_dir(workspace),
+                )
+                self.assertEqual(self._git(agent, "remote").stdout, "")
+                self.assertFalse(
+                    (agent / ".git" / "objects" / "info" / "alternates").exists()
+                )
+                self.assertEqual(
+                    self._git(agent, "config", "--local", "user.name").stdout.strip(),
+                    "Test User",
+                )
+                marker = (
+                    agent / ".git" / workspace_core.GIT_BASE_STATE_FILE
+                ).read_text(encoding="utf-8")
+                self.assertNotIn(str(workspace), marker)
+
+                self._git(agent, "config", "pcr.agent-only", "yes")
+                self._git(agent, "branch", "agent-only")
+                self._git(agent, "tag", "agent-only")
+                (agent / "agent-commit.txt").write_text("agent", encoding="utf-8")
+                self._git(agent, "add", "agent-commit.txt")
+                self._git(agent, "commit", "-m", "agent commit")
+                (agent / "tracked.txt").write_text("stash me", encoding="utf-8")
+                self._git(agent, "stash", "push", "-m", "agent-only")
+
+                original_config = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(workspace),
+                        "config",
+                        "--get",
+                        "pcr.agent-only",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(original_config.returncode, 1)
+                self.assertNotIn(
+                    "agent-only",
+                    self._git(workspace, "branch", "--list").stdout,
+                )
+                self.assertNotIn(
+                    "agent-only",
+                    self._git(workspace, "tag", "--list").stdout,
+                )
+                self.assertEqual(self._git(workspace, "stash", "list").stdout, "")
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    original_head,
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_isolated_git_copy_syncs_back_to_linked_source_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            workspace = root / "source-worktree"
+            self._init_git_workspace(repository, {"tracked.txt": "base"})
+            self._git(
+                repository,
+                "worktree",
+                "add",
+                "-b",
+                "source-branch",
+                str(workspace),
+                "HEAD",
+            )
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                self._git(agent, "add", ".")
+                self._git(agent, "commit", "-m", "agent commit")
+                agent_head = self._git(agent, "rev-parse", "HEAD").stdout.strip()
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    agent_head,
+                )
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "agent",
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+                self._git(
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(workspace),
+                )
 
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_git_workspace_copy_isolates_and_syncs_initialized_submodules(self) -> None:
@@ -440,8 +703,8 @@ class WorkspaceCopyTests(unittest.TestCase):
             copy_workspace(workspace, agent, run_base)
             try:
                 self.assertFalse((agent / ".gitmodules").exists())
-                self.assertTrue((agent_submodule / ".git").is_file())
-                self.assertTrue((agent_nested / ".git").is_file())
+                self.assertTrue((agent_submodule / ".git").is_dir())
+                self.assertTrue((agent_nested / ".git").is_dir())
                 self.assertEqual(
                     Path(
                         self._git(
@@ -557,8 +820,8 @@ class WorkspaceCopyTests(unittest.TestCase):
                 assert destination_index is not None
                 lock_path = destination_index.with_name(f"{destination_index.name}.lock")
                 observed_lock.append(lock_path.is_file())
-                self.assertTrue(
-                    workspace_core._index_lock_owner_path(lock_path).is_file()
+                self.assertIsNotNone(
+                    workspace_core._owned_index_lock_file(lock_path)
                 )
                 original_sync(src, destination)
 
@@ -754,11 +1017,31 @@ class WorkspaceCopyTests(unittest.TestCase):
             (workspace / ".git" / "config").write_text("private git data", encoding="utf-8")
             (workspace / "file.txt").write_text("content", encoding="utf-8")
 
-            with mock.patch.object(workspace_core, "copy_workspace_with_git_worktree", return_value=False):
+            with mock.patch.object(workspace_core, "copy_workspace_with_isolated_git", return_value=False):
                 copy_workspace(workspace, dst, root / "runs")
 
             self.assertEqual((dst / "file.txt").read_text(encoding="utf-8"), "content")
             self.assertFalse((dst / ".git").exists())
+
+    def test_plain_workspace_copy_works_when_runs_dir_is_an_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_base = Path(tmp) / "runs"
+            workspace = run_base / "workspace"
+            destination = run_base / "run-001" / "workspaces" / "agent_001"
+            workspace.mkdir(parents=True)
+            (workspace / "file.txt").write_text("content", encoding="utf-8")
+
+            with mock.patch.object(
+                workspace_core,
+                "copy_workspace_with_isolated_git",
+                return_value=False,
+            ):
+                copy_workspace(workspace, destination, run_base)
+
+            self.assertEqual(
+                (destination / "file.txt").read_text(encoding="utf-8"),
+                "content",
+            )
 
     def test_cleanup_workspace_copy_raises_when_delete_leaves_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -940,6 +1223,19 @@ class RunRootTests(unittest.TestCase):
 
         self.assertEqual(run_base, explicit.resolve())
 
+    def test_explicit_runs_dir_may_be_workspace_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit = Path(tmp) / "runs"
+            workspace = explicit / "projects" / "demo"
+            workspace.mkdir(parents=True)
+
+            run_base = paths_core.choose_run_base(
+                workspace,
+                str(explicit),
+            )
+
+        self.assertEqual(run_base, explicit.resolve())
+
     def test_default_runs_dir_must_stay_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp).resolve()
@@ -977,6 +1273,63 @@ class CommandBuildTests(unittest.TestCase):
             return_value="updated-source",
         ), self.assertRaisesRegex(RuntimeError, "重新运行 `pcr`"):
             app_core.ensure_runtime_sources_unchanged()
+
+    def test_runtime_source_guard_accepts_managed_self_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            package = workspace / "parallel_codex_runner_core"
+            package.mkdir()
+
+            with mock.patch.object(
+                app_core,
+                "_RUNTIME_SOURCE_ROOT",
+                package,
+            ), mock.patch.object(
+                app_core,
+                "_RUNTIME_SOURCE_DIGEST",
+                "loaded-source",
+            ), mock.patch.object(
+                app_core,
+                "_runtime_source_digest",
+                return_value="synced-source",
+            ):
+                self.assertTrue(
+                    app_core.acknowledge_runtime_source_sync(workspace)
+                )
+                app_core.ensure_runtime_sources_unchanged()
+                self.assertEqual(
+                    app_core._RUNTIME_SOURCE_DIGEST,
+                    "synced-source",
+                )
+
+    def test_runtime_source_guard_does_not_accept_unrelated_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_root = root / "runtime" / "parallel_codex_runner_core"
+            runtime_root.mkdir(parents=True)
+            workspace = root / "other-workspace"
+            workspace.mkdir()
+
+            with mock.patch.object(
+                app_core,
+                "_RUNTIME_SOURCE_ROOT",
+                runtime_root,
+            ), mock.patch.object(
+                app_core,
+                "_RUNTIME_SOURCE_DIGEST",
+                "loaded-source",
+            ), mock.patch.object(
+                app_core,
+                "_runtime_source_digest",
+            ) as digest:
+                self.assertFalse(
+                    app_core.acknowledge_runtime_source_sync(workspace)
+                )
+                self.assertEqual(
+                    app_core._RUNTIME_SOURCE_DIGEST,
+                    "loaded-source",
+                )
+                digest.assert_not_called()
 
     def test_runtime_source_digest_tracks_python_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1650,6 +2003,79 @@ class SynthesisTests(unittest.TestCase):
                 "original user request",
             )
 
+    def test_synthesis_refresh_replaces_source_snapshot_and_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            workspace = run_root / "workspace"
+            workspace.mkdir()
+            candidate_one = AgentResult(
+                **make_agent_result_data(1, run_root / "candidate-1")
+            )
+            stale_synthesis = AgentResult(
+                **make_agent_result_data(
+                    2,
+                    run_root / "synthesis-2",
+                    role="synthesis",
+                    reasoning_tokens=100,
+                )
+            )
+            app_core.write_run_files(
+                run_root=run_root,
+                workspace=workspace,
+                prompt="original request",
+                results=[candidate_one, stale_synthesis],
+                best=stale_synthesis,
+                recommend_by="reasoning_tokens",
+                synced=False,
+                workspaces_deleted=False,
+                synthesis_info={
+                    "requested_agents": 1,
+                    "source_agents": [1],
+                    "status": "completed",
+                },
+            )
+            candidate_three = AgentResult(
+                **make_agent_result_data(3, run_root / "candidate-3")
+            )
+            refreshed_synthesis = AgentResult(
+                **make_agent_result_data(
+                    2,
+                    run_root / "synthesis-2",
+                    role="synthesis",
+                    reasoning_tokens=200,
+                )
+            )
+
+            app_core.refresh_run_result_files(
+                run_root,
+                workspace,
+                "original request",
+                [candidate_three],
+                "reasoning_tokens",
+                recommendation_excluded_indices={2},
+            )
+            app_core.refresh_run_result_files(
+                run_root,
+                workspace,
+                "original request",
+                [refreshed_synthesis],
+                "reasoning_tokens",
+                synthesis_source_agents=[1, 3],
+            )
+
+            summary = json.loads(
+                (run_root / "summary.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(summary["synthesis"]["source_agents"], [1, 3])
+        self.assertEqual(summary["synthesis"]["launched_agents"], [2])
+        self.assertEqual(summary["synthesis"]["successful_agents"], [2])
+        self.assertEqual(summary["best_agent"], "agent_002")
+        self.assertEqual(
+            {result["idx"] for result in summary["results"]},
+            {1, 2, 3},
+        )
+
 
 class ReasoningEffortTests(unittest.TestCase):
     def test_auto_effort_falls_back_to_model_default_when_config_is_unsupported(self) -> None:
@@ -2195,12 +2621,83 @@ class RunOnceCleanupTests(unittest.TestCase):
             self.assertIn("config/read unavailable", str(synthesis_finished["error"]))
 
 
-class LiveRetryTests(unittest.TestCase):
+class LiveCandidateCoordinatorTests(unittest.TestCase):
+    def test_live_more_joins_candidate_stage_before_synthesis(self) -> None:
+        async def scenario() -> tuple[list[AgentResult], list[tuple[int, bool]]]:
+            coordinator = app_core.LiveCandidateCoordinator()
+            first_started = asyncio.Event()
+            prepared: list[tuple[int, bool]] = []
+
+            async def fake_run_one_agent(**kwargs: object) -> AgentResult:
+                idx = int(kwargs["idx"])
+                if idx == 1:
+                    first_started.set()
+                    await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(0.01)
+                return AgentResult(
+                    idx=idx,
+                    workspace_dir=f"/tmp/agent_{idx:03d}",
+                    meta_dir=f"/tmp/meta_{idx:03d}",
+                    codex_home=f"/tmp/home_{idx:03d}",
+                    stdout_log="",
+                    stderr_log="",
+                    final_message="",
+                    command=[],
+                    returncode=0,
+                    status="success",
+                    seconds=0.01,
+                )
+
+            def prepare_agent(idx: int, retry: bool) -> tuple[list[str], Path]:
+                prepared.append((idx, retry))
+                return ["codex"], Path(f"/tmp/home_{idx:03d}")
+
+            with mock.patch.object(
+                app_core,
+                "run_one_agent",
+                side_effect=fake_run_one_agent,
+            ):
+                coordinator.activate()
+                self.assertTrue(coordinator.request_additional([2]))
+                runner = asyncio.create_task(
+                    app_core.run_all_agents(
+                        n=1,
+                        workspaces_root=Path("/tmp/workspaces"),
+                        meta_root=Path("/tmp/meta"),
+                        prompt="prompt",
+                        command_by_agent={1: ["codex"]},
+                        codex_home_by_agent={1: Path("/tmp/home_001")},
+                        max_parallel=2,
+                        progress_callback=lambda _payload: None,
+                        agent_cancel_events={
+                            1: threading.Event(),
+                            2: threading.Event(),
+                            3: threading.Event(),
+                        },
+                        live_candidate_coordinator=coordinator,
+                        live_agent_preparer=prepare_agent,
+                    )
+                )
+                await first_started.wait()
+                self.assertTrue(coordinator.request_additional([3]))
+                results = await runner
+
+            return results, prepared
+
+        results, prepared = asyncio.run(scenario())
+
+        self.assertEqual(prepared, [(2, False), (3, False)])
+        self.assertEqual(
+            {result.idx: result.status for result in results},
+            {1: "success", 2: "success", 3: "success"},
+        )
+
     def test_live_retry_uses_open_candidate_slot_and_replaces_failed_result(
         self,
     ) -> None:
         async def scenario() -> tuple[list[AgentResult], list[int], int, list[bool]]:
-            coordinator = app_core.LiveRetryCoordinator()
+            coordinator = app_core.LiveCandidateCoordinator()
             first_failure = asyncio.Event()
             call_counts = {1: 0, 2: 0}
             prepared: list[int] = []
@@ -2244,7 +2741,8 @@ class LiveRetryTests(unittest.TestCase):
                     seconds=0.01,
                 )
 
-            def prepare_retry(idx: int) -> tuple[list[str], Path]:
+            def prepare_retry(idx: int, retry: bool) -> tuple[list[str], Path]:
+                self.assertTrue(retry)
                 prepared.append(idx)
                 return ["codex"], Path(f"/tmp/home_{idx:03d}")
 
@@ -2270,13 +2768,13 @@ class LiveRetryTests(unittest.TestCase):
                             1: threading.Event(),
                             2: threading.Event(),
                         },
-                        live_retry_coordinator=coordinator,
-                        retry_agent_preparer=prepare_retry,
+                        live_candidate_coordinator=coordinator,
+                        live_agent_preparer=prepare_retry,
                     )
                 )
                 await first_failure.wait()
                 await asyncio.sleep(0.02)
-                self.assertTrue(coordinator.request(1))
+                self.assertTrue(coordinator.request_retry(1))
                 results = await runner
 
             return results, prepared, max_active, retry_overlapped_agent_two
@@ -2295,7 +2793,7 @@ class LiveRetryTests(unittest.TestCase):
         self,
     ) -> None:
         async def scenario(root: Path) -> tuple[list[AgentResult], list[dict[str, object]]]:
-            coordinator = app_core.LiveRetryCoordinator()
+            coordinator = app_core.LiveCandidateCoordinator()
             first_failure = asyncio.Event()
             events: list[dict[str, object]] = []
 
@@ -2321,7 +2819,7 @@ class LiveRetryTests(unittest.TestCase):
                     seconds=0.01,
                 )
 
-            def fail_retry(_idx: int) -> tuple[list[str], Path]:
+            def fail_retry(_idx: int, _retry: bool) -> tuple[list[str], Path]:
                 raise RuntimeError("copy unavailable")
 
             with mock.patch.object(
@@ -2346,13 +2844,13 @@ class LiveRetryTests(unittest.TestCase):
                             1: threading.Event(),
                             2: threading.Event(),
                         },
-                        live_retry_coordinator=coordinator,
-                        retry_agent_preparer=fail_retry,
+                        live_candidate_coordinator=coordinator,
+                        live_agent_preparer=fail_retry,
                     )
                 )
                 await first_failure.wait()
                 await asyncio.sleep(0.02)
-                self.assertTrue(coordinator.request(1))
+                self.assertTrue(coordinator.request_retry(1))
                 return await runner, events
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3169,7 +3667,15 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/more 2")
 
         self.assertEqual(set(app.agents), {1, 2, 5, 6})
-        self.assertEqual(app.candidate_batches[0].indices, [5, 6])
+        self.assertEqual(app.candidate_batches, [])
+        self.assertEqual(app.live_candidate_indices, {5, 6})
+        self.assertEqual(
+            app.live_candidate_coordinator.drain(),
+            [
+                app_core.LiveCandidateRequest(idx=5, retry=False),
+                app_core.LiveCandidateRequest(idx=6, retry=False),
+            ],
+        )
         self.assertTrue({3, 4}.issubset(app.agent_cancel_events))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -3217,8 +3723,8 @@ class TuiCommandTests(unittest.TestCase):
         app.pending_prompt = "current question"
         app.pending_execution_args = argparse.Namespace(**vars(app.args))
         app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
-        app.live_retry_coordinator = app_core.LiveRetryCoordinator()
-        app.live_retry_coordinator.activate()
+        app.live_candidate_coordinator = app_core.LiveCandidateCoordinator()
+        app.live_candidate_coordinator.activate()
         app.agents[1].status = "running"
         app.agents[2].status = "failed"
         app.agents[2].result = make_agent_result_data(
@@ -3231,11 +3737,119 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/retry")
 
         self.assertEqual(app.candidate_batches, [])
-        self.assertEqual(app.live_retry_indices, {2})
+        self.assertEqual(app.live_candidate_indices, {2})
         self.assertEqual(app.agents[2].status, "queued")
         self.assertIsNone(app.agents[2].result)
-        self.assertEqual(app.live_retry_coordinator.drain(), [2])
+        self.assertEqual(
+            app.live_candidate_coordinator.drain(),
+            [app_core.LiveCandidateRequest(idx=2, retry=True)],
+        )
         self.assertIn("Retrying AGENT-002 now", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_more_joins_active_candidate_stage(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "2", "--synthesis-agents", "0"])
+        )
+        app._sync = lambda: None
+        app.running = True
+        app.pending_prompt = "current question"
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.pending_workspaces_root = Path("/tmp/pcr-test/workspaces")
+        app.live_candidate_coordinator = app_core.LiveCandidateCoordinator()
+        app.live_candidate_coordinator.activate()
+        app.agents[1].status = "running"
+
+        app._handle_command("/more 2")
+
+        self.assertEqual(app.candidate_batches, [])
+        self.assertEqual(app.live_candidate_indices, {3, 4})
+        self.assertEqual(app.candidate_revision, 1)
+        self.assertFalse(app.synthesis_refresh_needed)
+        self.assertEqual(
+            app.live_candidate_coordinator.drain(),
+            [
+                app_core.LiveCandidateRequest(idx=3, retry=False),
+                app_core.LiveCandidateRequest(idx=4, retry=False),
+            ],
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_late_candidate_marks_old_synthesis_stale_and_queues_refresh(
+        self,
+    ) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "1", "--synthesis-agents", "1"])
+        )
+        app._sync = lambda: None
+        app.pending_prompt = "current question"
+        app.pending_run_root = Path("/tmp/pcr-test/run")
+        app.pending_workspaces_root = app.pending_run_root / "workspaces"
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/candidate-1"),
+        )
+        app.agents[2] = tui_textual.AgentPane(
+            idx=2,
+            role="synthesis",
+            status="success",
+            result=make_agent_result_data(
+                2,
+                Path("/tmp/synthesis-2"),
+                role="synthesis",
+            ),
+        )
+        app.agent_cancel_events[2] = threading.Event()
+        app.active_batch_indices = {2}
+
+        app._record_candidate_change(live=False)
+
+        self.assertTrue(app.agents[2].stale_synthesis)
+        self.assertTrue(app.synthesis_refresh_needed)
+        self.assertTrue(app.agent_cancel_events[2].is_set())
+        app.active_batch_indices.clear()
+        with mock.patch.object(
+            tui_textual,
+            "create_synthesis_context",
+            return_value=(Path("/tmp/context.md"), "refresh instructions"),
+        ):
+            with mock.patch.object(tui_textual.threading, "Thread") as thread_cls:
+                self.assertTrue(app._launch_synthesis_refresh())
+
+        self.assertTrue(app.running)
+        self.assertEqual(app.active_batch_indices, {2})
+        self.assertEqual(app.agents[2].role, "synthesis")
+        self.assertEqual(app.agents[2].developer_instructions, "refresh instructions")
+        self.assertIsNone(app.agents[2].result)
+        self.assertFalse(app.synthesis_refresh_needed)
+        thread_cls.assert_called_once()
+
+        app._recompute_recommendation()
+        self.assertEqual(app.recommended_agent, 1)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_candidate_batch_runs_before_queued_stale_synthesis(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "1", "--synthesis-agents", "1"])
+        )
+        app.candidate_batches = [
+            tui_textual.CandidateBatch(
+                [2],
+                {2},
+                role="synthesis",
+            ),
+            tui_textual.CandidateBatch([3], role="candidate"),
+        ]
+
+        with mock.patch.object(
+            app,
+            "_launch_next_candidate_batch",
+            return_value=True,
+        ) as launch:
+            self.assertTrue(app._launch_next_pending_stage())
+
+        launch.assert_called_once_with(1)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_retry_preserves_synthesis_role_and_internal_instructions(self) -> None:
@@ -5029,15 +5643,22 @@ class TuiCommandTests(unittest.TestCase):
             with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
                 with mock.patch.object(tui_textual, "sync_best_workspace_back") as sync_back:
                     with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
-                        sync_back.side_effect = sync_side_effect
-                        promote.side_effect = promote_side_effect
+                        with mock.patch.object(
+                            tui_textual,
+                            "acknowledge_runtime_source_sync",
+                            return_value=True,
+                        ) as acknowledge_runtime:
+                            sync_back.side_effect = sync_side_effect
+                            promote.side_effect = promote_side_effect
 
-                        self.assertTrue(app._finalize_agent(2))
+                            self.assertTrue(app._finalize_agent(2))
 
             self.assertEqual(app.resume_session_id, "session-2")
             self.assertEqual(calls, ["sync", "promote"])
             sync_back.assert_called_once_with(candidate, workspace.resolve())
+            acknowledge_runtime.assert_called_once_with(workspace.resolve())
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
+            self.assertIn("source updates load after restart", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_start_run_continues_from_selected_not_recommended_agent(self) -> None:
@@ -6674,6 +7295,35 @@ class AgentCancelTests(unittest.TestCase):
                 [event.get("idx") for event in events if event.get("type") == "agent_started"],
                 [1, 2],
             )
+
+        asyncio.run(run())
+
+    def test_run_all_agents_honors_explicit_prestart_stage_cancellation(self) -> None:
+        async def run() -> None:
+            agent_cancel_event = threading.Event()
+            app_core.cancel_agent_including_queued(agent_cancel_event)
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspaces" / "agent_001"
+                codex_home = root / "codex_home"
+                workspace.mkdir(parents=True)
+                codex_home.mkdir()
+
+                results = await app_core.run_all_agents(
+                    n=1,
+                    workspaces_root=root / "workspaces",
+                    meta_root=root / "meta",
+                    prompt="",
+                    command_by_agent={
+                        1: [sys.executable, "-c", "print('must not run')"],
+                    },
+                    codex_home_by_agent={1: codex_home},
+                    max_parallel=1,
+                    progress_callback=lambda _event: None,
+                    agent_cancel_events={1: agent_cancel_event},
+                )
+
+            self.assertEqual(results[0].status, "killed")
 
         asyncio.run(run())
 

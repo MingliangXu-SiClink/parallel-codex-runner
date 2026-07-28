@@ -163,6 +163,25 @@ def ensure_runtime_sources_unchanged() -> None:
         )
 
 
+def acknowledge_runtime_source_sync(workspace: Path) -> bool:
+    """Accept a PCR-managed sync into the checkout that provides this runtime."""
+    global _RUNTIME_SOURCE_DIGEST
+
+    try:
+        workspace = workspace.expanduser().resolve()
+        owns_runtime = is_relative_to(_RUNTIME_SOURCE_ROOT, workspace)
+    except (OSError, RuntimeError):
+        return False
+    if not owns_runtime:
+        return False
+    current_digest = _runtime_source_digest(_RUNTIME_SOURCE_ROOT)
+    if current_digest is None:
+        return False
+    changed = current_digest != _RUNTIME_SOURCE_DIGEST
+    _RUNTIME_SOURCE_DIGEST = current_digest
+    return changed
+
+
 GIBIBYTE = 1024**3
 LARGE_RUN_STORAGE_WARNING_BYTES = 5 * GIBIBYTE
 AGENT_METADATA_RESERVE_BYTES = 64 * 1024**2
@@ -196,7 +215,7 @@ def workspace_isolation_developer_instructions(agent_workspace: Path) -> str:
         "project file reached through a symlink outside this workspace, even if "
         "resume history, prompts, Git metadata, logs, environment variables, or "
         "tool output reveal another path.\n"
-        "- Run Git commands from this workspace and target only this worktree. "
+        "- Run Git commands from this workspace and target only this repository. "
         "Do not manually edit another checkout or external Git metadata.\n"
         "- Explicitly supplied PCR metadata and synthesis candidate workspaces "
         "may be inspected when needed, but they are read-only."
@@ -260,13 +279,19 @@ class RunStorageEstimate:
     total_bytes: int
 
 
-class LiveRetryCoordinator:
-    """Thread-safe handoff for retries that must finish before synthesis."""
+@dataclass(frozen=True)
+class LiveCandidateRequest:
+    idx: int
+    retry: bool
+
+
+class LiveCandidateCoordinator:
+    """Thread-safe handoff for candidate changes that precede synthesis."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._active = False
-        self._pending: List[int] = []
+        self._pending: List[LiveCandidateRequest] = []
         self._pending_set: Set[int] = set()
 
     @property
@@ -277,25 +302,35 @@ class LiveRetryCoordinator:
     def activate(self) -> None:
         with self._lock:
             self._active = True
-            self._pending.clear()
-            self._pending_set.clear()
 
-    def request(self, idx: int) -> bool:
+    def request_retry(self, idx: int) -> bool:
         with self._lock:
             if not self._active or idx in self._pending_set:
                 return False
-            self._pending.append(idx)
+            self._pending.append(LiveCandidateRequest(idx=idx, retry=True))
             self._pending_set.add(idx)
             return True
 
-    def drain(self) -> List[int]:
+    def request_additional(self, indices: Sequence[int]) -> bool:
+        normalized = list(dict.fromkeys(int(idx) for idx in indices))
+        if not normalized or any(idx <= 0 for idx in normalized):
+            return False
+        with self._lock:
+            if not self._active or any(idx in self._pending_set for idx in normalized):
+                return False
+            for idx in normalized:
+                self._pending.append(LiveCandidateRequest(idx=idx, retry=False))
+                self._pending_set.add(idx)
+            return True
+
+    def drain(self) -> List[LiveCandidateRequest]:
         with self._lock:
             pending = list(self._pending)
             self._pending.clear()
             self._pending_set.clear()
             return pending
 
-    def close_if_idle(self) -> Optional[List[int]]:
+    def close_if_idle(self) -> Optional[List[LiveCandidateRequest]]:
         """Atomically close, unless a request arrived before the stage ended."""
         with self._lock:
             if self._pending:
@@ -321,6 +356,12 @@ _CODEX_SQLITE_LOCK = threading.RLock()
 
 def cancel_requested(cancel_event: Any = None) -> bool:
     return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def cancel_agent_including_queued(agent_cancel_event: Any) -> None:
+    """Request a stop that must not be cleared when a queued Agent starts."""
+    setattr(agent_cancel_event, "_pcr_cancel_before_start", True)
+    agent_cancel_event.set()
 
 
 def requested_agent_stop_status(
@@ -739,7 +780,7 @@ def _rebind_rollout_record_workspace(
     A resumed rollout contains more than ``session_meta.cwd``. Codex also
     restores the most recent ``turn_context``, ``thread_settings`` and
     ``world_state`` records. If those records still point at a removed PCR
-    worktree, a later ``exec_command`` can fail inside Codex with ENOENT even
+    workspace copy, a later ``exec_command`` can fail inside Codex with ENOENT even
     though PCR launched the process with a valid cwd.
     """
     record_type = obj.get("type")
@@ -2602,9 +2643,9 @@ async def run_all_agents(
     agent_cancel_events: Optional[Dict[int, Any]] = None,
     agent_indices: Optional[Sequence[int]] = None,
     agent_role: str = AGENT_ROLE_CANDIDATE,
-    live_retry_coordinator: Optional[LiveRetryCoordinator] = None,
-    retry_agent_preparer: Optional[
-        Callable[[int], Tuple[List[str], Path]]
+    live_candidate_coordinator: Optional[LiveCandidateCoordinator] = None,
+    live_agent_preparer: Optional[
+        Callable[[int, bool], Tuple[List[str], Path]]
     ] = None,
 ) -> List[AgentResult]:
     agent_role = normalize_agent_role(agent_role)
@@ -2612,7 +2653,7 @@ async def run_all_agents(
     semaphore = asyncio.Semaphore(max_parallel)
     indices = list(agent_indices) if agent_indices is not None else list(range(1, n + 1))
 
-    def retry_preparation_failure(
+    def live_preparation_failure(
         idx: int,
         command: List[str],
         codex_home: Path,
@@ -2633,7 +2674,7 @@ async def run_all_agents(
             status="error",
             seconds=0.0,
             role=agent_role,
-            error=f"retry preparation failed: {exc}",
+            error=f"candidate preparation failed: {exc}",
         )
         try:
             meta_dir.mkdir(parents=True, exist_ok=True)
@@ -2654,22 +2695,33 @@ async def run_all_agents(
             )
         return result
 
-    async def run_limited(idx: int, retry: bool = False) -> AgentResult:
+    async def run_limited(
+        idx: int,
+        *,
+        prepare: bool = False,
+        retry: bool = False,
+    ) -> AgentResult:
         agent_cancel_event = (agent_cancel_events or {}).get(idx)
 
         async def execute() -> AgentResult:
-            command = command_by_agent[idx]
-            codex_home = codex_home_by_agent[idx]
-            if retry:
-                if retry_agent_preparer is None:
-                    raise RuntimeError("live retry preparation is unavailable")
+            command = command_by_agent.get(idx, [])
+            codex_home = codex_home_by_agent.get(
+                idx,
+                meta_root / f"agent_{idx:03d}" / "codex_home",
+            )
+            if prepare:
+                if live_agent_preparer is None:
+                    raise RuntimeError("live candidate preparation is unavailable")
                 try:
                     command, codex_home = await asyncio.to_thread(
-                        retry_agent_preparer,
+                        live_agent_preparer,
                         idx,
+                        retry,
                     )
+                    command_by_agent[idx] = command
+                    codex_home_by_agent[idx] = codex_home
                 except Exception as exc:  # noqa: BLE001
-                    return retry_preparation_failure(
+                    return live_preparation_failure(
                         idx,
                         command,
                         codex_home,
@@ -2706,11 +2758,17 @@ async def run_all_agents(
             except asyncio.TimeoutError:
                 continue
         try:
-            # An individual kill applies only to a process that is already
-            # running. Ignore stale requests made while this agent was queued.
-            clear_agent_cancel = getattr(agent_cancel_event, "clear", None)
-            if callable(clear_agent_cancel):
-                clear_agent_cancel()
+            # Normal /kill requests made before a process starts are stale and
+            # must not suppress queued Agents. Stage cancellation is explicit.
+            preserve_prestart_cancel = bool(
+                getattr(agent_cancel_event, "_pcr_cancel_before_start", False)
+            )
+            if retry or not preserve_prestart_cancel:
+                clear_agent_cancel = getattr(agent_cancel_event, "clear", None)
+                if callable(clear_agent_cancel):
+                    clear_agent_cancel()
+                if preserve_prestart_cancel:
+                    delattr(agent_cancel_event, "_pcr_cancel_before_start")
             return await execute()
         finally:
             semaphore.release()
@@ -2718,27 +2776,39 @@ async def run_all_agents(
     tasks = [asyncio.create_task(run_limited(idx)) for idx in indices]
     total = len(tasks)
 
-    if live_retry_coordinator is not None:
-        if retry_agent_preparer is None:
+    if live_candidate_coordinator is not None:
+        if live_agent_preparer is None:
             raise ValueError(
-                "retry_agent_preparer is required with live_retry_coordinator"
+                "live_agent_preparer is required with live_candidate_coordinator"
             )
         active_tasks = set(tasks)
         results_by_index: Dict[int, AgentResult] = {}
-        live_retry_coordinator.activate()
+        live_candidate_coordinator.activate()
         try:
             while True:
-                for retry_idx in live_retry_coordinator.drain():
+                for request in live_candidate_coordinator.drain():
                     active_tasks.add(
-                        asyncio.create_task(run_limited(retry_idx, retry=True))
+                        asyncio.create_task(
+                            run_limited(
+                                request.idx,
+                                prepare=True,
+                                retry=request.retry,
+                            )
+                        )
                     )
                 if not active_tasks:
-                    trailing = live_retry_coordinator.close_if_idle()
+                    trailing = live_candidate_coordinator.close_if_idle()
                     if trailing is None:
                         break
-                    for retry_idx in trailing:
+                    for request in trailing:
                         active_tasks.add(
-                            asyncio.create_task(run_limited(retry_idx, retry=True))
+                            asyncio.create_task(
+                                run_limited(
+                                    request.idx,
+                                    prepare=True,
+                                    retry=request.retry,
+                                )
+                            )
                         )
                     continue
 
@@ -2751,7 +2821,7 @@ async def run_all_agents(
                     result = await task
                     results_by_index[result.idx] = result
         finally:
-            live_retry_coordinator.deactivate()
+            live_candidate_coordinator.deactivate()
         return list(results_by_index.values())
 
     if HAS_RICH and progress_callback is None:
@@ -3125,6 +3195,11 @@ def refresh_run_result_files(
     prompt: str,
     new_results: Sequence[AgentResult],
     recommend_by: str,
+    recommendation_excluded_indices: Optional[Set[int]] = None,
+    synthesis_source_agents: Optional[Sequence[int]] = None,
+    synthesis_status: Optional[str] = None,
+    synthesis_error: Optional[str] = None,
+    remove_result_indices: Optional[Set[int]] = None,
 ) -> None:
     recorded_prompt = prompt
     prompt_path = run_root / "prompt.txt"
@@ -3134,11 +3209,18 @@ def refresh_run_result_files(
         except OSError:
             pass
     recorded = _load_recorded_results(run_root)
+    for idx in remove_result_indices or set():
+        recorded.pop(int(idx), None)
     for result in new_results:
         recorded[result.idx] = result
     results = list(recorded.values())
+    excluded = recommendation_excluded_indices or set()
     best = select_best_result(
-        [result for result in results if result.status == "success"],
+        [
+            result
+            for result in results
+            if result.status == "success" and result.idx not in excluded
+        ],
         recommend_by,
     )
 
@@ -3163,6 +3245,41 @@ def refresh_run_result_files(
         except TypeError:
             promotion = None
 
+    synthesis_info = (
+        dict(summary["synthesis"])
+        if isinstance(summary.get("synthesis"), dict)
+        else None
+    )
+    if synthesis_source_agents is not None:
+        synthesis_info = synthesis_info or {}
+        requested_agents = sum(
+            result.role == AGENT_ROLE_SYNTHESIS
+            for result in new_results
+        )
+        if requested_agents == 0:
+            requested_agents = len(remove_result_indices or set()) or int(
+                synthesis_info.get("requested_agents", 0) or 0
+            )
+        synthesis_info.update(
+            {
+                "requested_agents": requested_agents,
+                "source_agents": list(
+                    dict.fromkeys(
+                        int(idx)
+                        for idx in synthesis_source_agents
+                        if int(idx) > 0
+                    )
+                ),
+                "context_path": str(run_root / "synthesis_context.md"),
+                "instructions_path": str(
+                    run_root / "synthesis_instructions.txt"
+                ),
+                "status": synthesis_status or "completed",
+                "reason": None,
+                "error": synthesis_error,
+            }
+        )
+
     write_run_files(
         run_root=run_root,
         workspace=workspace,
@@ -3174,11 +3291,7 @@ def refresh_run_result_files(
         workspaces_deleted=False,
         resume_session=resume_session,
         codex_session_promotion=promotion,
-        synthesis_info=(
-            summary.get("synthesis")
-            if isinstance(summary.get("synthesis"), dict)
-            else None
-        ),
+        synthesis_info=synthesis_info,
         finalization_error=(
             str(summary["finalization_error"])
             if summary.get("finalization_error")
@@ -3293,6 +3406,10 @@ def run_additional_agents(
     agent_role: str = AGENT_ROLE_CANDIDATE,
     refresh_result_files: bool = True,
     developer_instructions: Optional[str] = None,
+    recommendation_excluded_indices: Optional[Set[int]] = None,
+    synthesis_source_agents: Optional[Sequence[int]] = None,
+    synthesis_status: Optional[str] = None,
+    synthesis_error: Optional[str] = None,
 ) -> List[AgentResult]:
     ensure_runtime_sources_unchanged()
     agent_role = normalize_agent_role(agent_role)
@@ -3392,6 +3509,10 @@ def run_additional_agents(
             prompt=prompt,
             new_results=results,
             recommend_by=args.recommend_by,
+            recommendation_excluded_indices=recommendation_excluded_indices,
+            synthesis_source_agents=synthesis_source_agents,
+            synthesis_status=synthesis_status,
+            synthesis_error=synthesis_error,
         )
     return results
 
@@ -3881,12 +4002,12 @@ def run_once(
         args.num_agents,
         max_parallel,
     )
-    live_retry_coordinator = getattr(args, "live_retry_coordinator", None)
-    if not isinstance(live_retry_coordinator, LiveRetryCoordinator):
-        live_retry_coordinator = None
+    live_candidate_coordinator = getattr(args, "live_candidate_coordinator", None)
+    if not isinstance(live_candidate_coordinator, LiveCandidateCoordinator):
+        live_candidate_coordinator = None
 
-    def prepare_live_retry(idx: int) -> Tuple[List[str], Path]:
-        if idx not in command_by_agent:
+    def prepare_live_candidate(idx: int, retry: bool) -> Tuple[List[str], Path]:
+        if retry and idx not in command_by_agent:
             raise ValueError(f"cannot retry unknown first-stage agent: {idx}")
         return _prepare_additional_agent(
             args=args,
@@ -3899,7 +4020,7 @@ def run_once(
             real_codex_home=real_codex_home,
             effective_effort=effective_effort,
             resume_session_id=resume_session_id,
-            retry=True,
+            retry=retry,
             progress_callback=progress_callback,
             agent_role=AGENT_ROLE_CANDIDATE,
             developer_instructions=None,
@@ -3919,10 +4040,10 @@ def run_once(
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 agent_cancel_events=agent_cancel_events,
-                live_retry_coordinator=live_retry_coordinator,
-                retry_agent_preparer=(
-                    prepare_live_retry
-                    if live_retry_coordinator is not None
+                live_candidate_coordinator=live_candidate_coordinator,
+                live_agent_preparer=(
+                    prepare_live_candidate
+                    if live_candidate_coordinator is not None
                     else None
                 ),
             )

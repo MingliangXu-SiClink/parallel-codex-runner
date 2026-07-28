@@ -58,7 +58,7 @@ PCR is motivated by reports of Codex degradation between runs, including [openai
 
 - Python 3.10 or newer
 - An installed and authenticated [Codex CLI](https://github.com/openai/codex), available as `codex`
-- Git, which PCR uses to create isolated worktrees
+- Git, which PCR uses to create isolated local repositories
 - macOS or Linux is recommended for process control
 
 Textual is included in this repository, including PCR's Chinese input and terminal-width fixes. No separate TUI extra is required.
@@ -199,7 +199,7 @@ PCR starts two synthesis Agents by default. Set `SYNTHESIS_AGENTS` in the top pa
 
 After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
 
-Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results.
+Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results. Candidates added with `/more`, and candidate retries requested while the first stage is still open, join that stage before synthesis. If one arrives after synthesis has already started, PCR stops the now-stale synthesis Agents, runs the added candidate work first, then refreshes synthesis from the complete successful candidate set.
 
 If the installed Codex CLI cannot resolve or inject developer instructions safely, PCR marks the synthesis stage as failed and keeps the successful first-stage candidates available instead of silently changing prompt roles.
 
@@ -319,11 +319,9 @@ Each Agent receives its own working directory and temporary `CODEX_HOME`.
 
 ### When the workspace is a Git repository
 
-PCR creates detached Git worktrees and mirrors the source workspace's current files and index into them. This preserves committed files, staged and unstaged changes, deletions, and untracked files.
+PCR creates a detached local clone for each Agent and mirrors the source workspace's current files and index into it. The clone has its own Git config, refs, branches, tags, stash, index, object directory, and reflogs, and PCR removes the source repository as a Git remote. On the same filesystem, Git hard-links immutable committed objects to avoid duplicating their storage; if that is unavailable, PCR falls back to a full local clone. This preserves committed files, staged and unstaged changes, deletions, and untracked files without exposing the original repository's Git administration data to ordinary Agent Git commands.
 
-When an Agent is finalized, PCR performs consistency checks and applies that Agent's files, index, and `HEAD` to the original repository. If the Agent created commits, the original checked-out branch may advance to the selected commit. PCR refuses the sync when the original branch changed incompatibly during the run.
-
-Git worktrees share the repository's object database and some Git administration data. They isolate working trees, but they are not independent repository clones or security sandboxes.
+When an Agent is finalized, PCR performs consistency checks, imports the objects required by that Agent's selected `HEAD` and index, then applies its files, index, and `HEAD` to the original repository. If the Agent created commits, the original checked-out branch may advance to the selected commit. Agent-only branches, tags, stashes, reflogs, and local config are not copied back. PCR refuses the sync when the original branch changed incompatibly during the run.
 
 ### When the workspace is not a Git repository
 
@@ -364,7 +362,7 @@ If the estimate is over 5 GiB, PCR asks whether to continue. If you continue, it
 > Workspace isolation prevents Agents from editing the same working tree. It is not a container, virtual machine, or operating-system sandbox.
 
 - PCR requests Codex's full-access/approval-bypass mode when the installed CLI supports it.
-- Agents still share the host, network, Codex account, quota, and Git object database.
+- Agents still share the host, network, Codex account, and quota. Git clones may hard-link immutable committed objects on the same filesystem, while writable objects and all Git administration data remain per Agent.
 - Support credentials and configuration are copied into temporary Agent homes for execution, then scrubbed; resumable state remains in metadata.
 - Nested Codex Agents are disabled by default. When enabled, subagents within one candidate share that candidate's workspace and can multiply resource usage.
 - Sync-back includes deletions and may include the selected Agent's commits and index state.
@@ -478,6 +476,11 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 
 ## Development
 
+PCR can target its own editable checkout. A sync-back performed by PCR is
+recognized as an intentional source update, so it does not block a queued
+follow-up. The running TUI keeps its already-loaded implementation; restart
+`pcr` before testing the newly synced PCR behavior.
+
 Run the project checks:
 
 ```bash
@@ -503,7 +506,7 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | `parallel_codex_runner_core/app.py` | CLI orchestration, Agent execution, summaries, and session promotion. |
 | `parallel_codex_runner_core/synthesis.py` | Second-stage context generation and recommendation priority. |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive TUI and review workflow. |
-| `parallel_codex_runner_core/workspace.py` | Workspace estimation, worktrees, copying, cleanup, and sync-back. |
+| `parallel_codex_runner_core/workspace.py` | Workspace estimation, isolated Git clones, copying, cleanup, and sync-back. |
 | `parallel_codex_runner_core/codex_cli.py` | Codex capability detection and command construction. |
 | `parallel_codex_runner_core/codex_models.py` | Model cache and compatible effort selection. |
 | `parallel_codex_runner_core/prompt_history.py` | Persistent prompt history. |

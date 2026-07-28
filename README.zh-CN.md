@@ -58,7 +58,7 @@ PCR 把这种不确定性变成一个可以审查的流程：
 
 - Python 3.10 或更高版本
 - 已安装并完成认证、可以通过 `codex` 调用的 [Codex CLI](https://github.com/openai/codex)
-- Git，用于通过 Git worktree 隔离工作区
+- Git，用于创建相互隔离的本地 Git 仓库
 - 推荐使用 macOS 或 Linux，以获得完整的进程控制能力
 
 Textual 已包含在本仓库中，并带有 PCR 针对中文输入和终端宽度适配的修改，不需要额外安装 TUI 依赖。
@@ -194,7 +194,7 @@ PCR 默认启动 2 个综合 Agent。可以直接修改顶部的 `SYNTHESIS_AGEN
 
 第一阶段的候选全部结束后，PCR 会在干净的原始工作区副本中启动 3 个相互独立的综合 Agent。它们会获得所有成功候选工作区和最终回复的路径，并被明确要求只参考、不修改这些来源。如果本轮从已有 Codex 会话继续，综合 Agent 会与第一阶段候选及 `/more` 一样继承本轮开始前的会话。用户原始需求仍作为 Codex 记录中的用户消息；PCR 会先解析该工作区当前生效的 developer instructions，再在其后追加审核与整合流程，保留用户已有配置。对于代码修改任务，综合 Agent 会比较实际实现，在自己的工作区中整合兼容的优点并运行验证；对于回答型任务，它会消除候选回答中的冲突，给出一份完整答案。
 
-只要有综合 Agent 成功，`RECOMMEND_BY` 就会优先在这些结果中推荐；如果全部失败，则回退到第一阶段的成功候选。这只影响推荐，不限制你的选择：两个阶段中的任意成功 Agent 都可以继续对话或最终采用。`/more <n>` 共享同一本轮开始前的对话基线，但功能仍然不同：它只增加普通候选，不负责审核已有结果。
+只要有综合 Agent 成功，`RECOMMEND_BY` 就会优先在这些结果中推荐；如果全部失败，则回退到第一阶段的成功候选。这只影响推荐，不限制你的选择：两个阶段中的任意成功 Agent 都可以继续对话或最终采用。`/more <n>` 共享同一本轮开始前的对话基线，但功能仍然不同：它只增加普通候选，不负责审核已有结果。在第一阶段仍开放时追加的 `/more` 候选和候选重试，会直接加入本阶段并在综合前完成；如果请求发出时综合已经开始，PCR 会停止已经过期的综合 Agent，先完成新增候选，再基于完整的成功候选集合重新综合。
 
 如果已安装的 Codex CLI 无法安全解析或注入 developer instructions，PCR 会把综合阶段标记为失败并保留第一阶段的成功候选，而不会悄悄改变消息角色。
 
@@ -313,11 +313,9 @@ PCR 会在目标工作区外创建本轮运行目录。系统盘中的项目统�
 
 ### 原始工作区是 Git 仓库
 
-PCR 会创建 detached Git worktree，并把原始工作区当前的文件和索引状态镜像进去。因此，已提交文件、暂存和未暂存修改、删除内容以及未跟踪文件都可以保留。
+PCR 会为每个 Agent 创建 detached 本地克隆，并把原始工作区当前的文件和索引状态镜像进去。每个克隆都有独立的 Git 配置、refs、分支、标签、stash、索引、对象目录和 reflog；PCR 还会移除指向原始仓库的 Git remote。在同一文件系统中，Git 会用硬链接复用不可变的已提交对象，避免重复占用其存储空间；如果无法这样做，PCR 会回退到完整本地克隆。因此，已提交文件、暂存和未暂存修改、删除内容以及未跟踪文件都可以保留，而普通的 Agent Git 命令不会直接修改原始仓库的管理数据。
 
-采用某个 Agent 时，PCR 会先做一致性检查，再将该 Agent 的文件、索引和 `HEAD` 应用到原始仓库。如果 Agent 创建了提交，原始工作区当前分支可能会前进到该提交。如果运行期间原始分支发生了不兼容变化，PCR 会拒绝回写，避免覆盖新的工作。
-
-Git worktree 会共享仓库的对象数据库和部分 Git 管理数据。它可以隔离工作树，但不等于独立克隆，更不等于安全沙箱。
+采用某个 Agent 时，PCR 会先做一致性检查，把该 Agent 的 `HEAD` 和索引需要的对象导入原始仓库，再应用它的文件、索引和 `HEAD`。如果 Agent 创建了提交，原始工作区当前分支可能会前进到该提交；Agent 独有的分支、标签、stash、reflog 和本地 Git 配置不会回写。如果运行期间原始分支发生了不兼容变化，PCR 会拒绝回写，避免覆盖新的工作。
 
 ### 原始工作区不是 Git 仓库
 
@@ -358,7 +356,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 > 工作区隔离只能避免 Agent 修改同一个工作树。它不是容器、虚拟机或操作系统级沙箱。
 
 - 当 Codex CLI 支持时，PCR 会请求 Full Access/绕过审批模式。
-- Agent 仍然共享宿主机、网络、Codex 账户、配额和 Git 对象数据库。
+- Agent 仍然共享宿主机、网络、Codex 账户和配额。同一文件系统中的 Git 克隆可能用硬链接复用不可变的已提交对象，但可写对象和全部 Git 管理数据都彼此独立。
 - 执行所需的配置与凭据会复制到 Agent 的临时目录，并在运行后清除；用于恢复对话的状态会保留在元数据中。
 - Codex 嵌套 Agent 默认关闭。启用后，同一候选内的 Subagent 会共享该候选工作区，并可能成倍增加资源消耗。
 - 回写包括文件删除，也可能包括最终 Agent 的提交和索引状态。
@@ -472,6 +470,10 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 
 ## 开发
 
+PCR 可以把自己的可编辑安装目录作为目标 workspace。由 PCR 完成的回写会被识别为
+受控源码更新，不会阻断已排队的后续对话；当前 TUI 仍使用进程启动时已经加载的实现，
+需要验证刚刚回写的新版本时，请先重启 `pcr`。
+
 运行项目检查：
 
 ```bash
@@ -497,7 +499,7 @@ python3 -m unittest tests.test_vendored_textual
 | `parallel_codex_runner_core/app.py` | CLI 编排、Agent 执行、结果汇总与会话提升。 |
 | `parallel_codex_runner_core/synthesis.py` | 第二阶段上下文生成与推荐优先级。 |
 | `parallel_codex_runner_core/tui_textual.py` | 交互式 TUI 与候选审查流程。 |
-| `parallel_codex_runner_core/workspace.py` | 空间估算、worktree、复制、清理与回写。 |
+| `parallel_codex_runner_core/workspace.py` | 空间估算、隔离 Git 克隆、复制、清理与回写。 |
 | `parallel_codex_runner_core/codex_cli.py` | Codex 能力检测与命令构造。 |
 | `parallel_codex_runner_core/codex_models.py` | 模型缓存与兼容 Effort 选择。 |
 | `parallel_codex_runner_core/prompt_history.py` | 持久化输入历史。 |

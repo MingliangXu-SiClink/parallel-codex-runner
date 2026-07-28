@@ -527,9 +527,11 @@ except (ModuleNotFoundError, RuntimeError) as exc:
 else:
     from .app import (
         LARGE_RUN_STORAGE_WARNING_BYTES,
-        LiveRetryCoordinator,
+        LiveCandidateCoordinator,
         RunStorageEstimate,
+        acknowledge_runtime_source_sync,
         available_storage_bytes,
+        cancel_agent_including_queued,
         estimate_staged_run_storage,
         format_storage_bytes,
         get_codex_home,
@@ -538,6 +540,7 @@ else:
         load_codex_session_history,
         normalize_recommend_by,
         promote_best_codex_session_to_workspace,
+        refresh_run_result_files,
         remove_agent_codex_homes,
         run_additional_agents,
         run_once,
@@ -554,6 +557,7 @@ else:
         normalize_agent_role,
     )
     from .paths import absolute_path_for_display, choose_run_base, is_relative_to
+    from .synthesis import create_synthesis_context
     from .workspace import (
         cleanup_workspace_copies,
         estimate_path_storage_bytes,
@@ -626,6 +630,7 @@ else:
         role: str = AGENT_ROLE_CANDIDATE
         status: str = "idle"
         rejected: bool = False
+        stale_synthesis: bool = False
         reasoning_tokens: int | None = None
         reasoning_token_counts: dict[int, int] = field(default_factory=dict)
         input_text: str = ""
@@ -706,6 +711,8 @@ else:
         role: str = AGENT_ROLE_CANDIDATE
         prompt: str = ""
         developer_instructions: str = ""
+        synthesis_revision: int | None = None
+        synthesis_source_indices: list[int] = field(default_factory=list)
 
 
     @dataclass(frozen=True)
@@ -1324,8 +1331,11 @@ else:
             self.pending_execution_args: argparse.Namespace | None = None
             self.candidate_batches: list[CandidateBatch] = []
             self.active_batch_indices: set[int] = set()
-            self.live_retry_indices: set[int] = set()
-            self.live_retry_coordinator: LiveRetryCoordinator | None = None
+            self.live_candidate_indices: set[int] = set()
+            self.live_candidate_coordinator: LiveCandidateCoordinator | None = None
+            self.candidate_revision = 0
+            self.synthesis_refresh_needed = False
+            self.core_synthesis_revision: int | None = None
             self.pending_accept_agent: int | None = None
             self.detail_history: list[tuple[str, str, str]] = []
             self.command_history: list[tuple[str, str, str]] = []
@@ -2622,6 +2632,7 @@ else:
             idx = int(payload.get("idx") or 0)
             role = normalize_agent_role(payload.get("role"))
             if kind == "synthesis_started":
+                self.core_synthesis_revision = self.candidate_revision
                 raw_indices = payload.get("indices")
                 indices = (
                     [
@@ -2647,12 +2658,14 @@ else:
                             idx=synthesis_idx,
                             role=AGENT_ROLE_SYNTHESIS,
                             status="queued",
+                            stale_synthesis=self.synthesis_refresh_needed,
                             input_text=user_prompt,
                             execution_prompt=user_prompt,
                             developer_instructions=developer_instructions,
                         )
                     else:
                         pane.role = AGENT_ROLE_SYNTHESIS
+                        pane.stale_synthesis = self.synthesis_refresh_needed
                         pane.input_text = user_prompt
                         pane.execution_prompt = user_prompt
                         pane.developer_instructions = developer_instructions
@@ -2661,6 +2674,8 @@ else:
                         threading.Event(),
                     )
                 self.active_batch_indices = set(indices)
+                if self.synthesis_refresh_needed:
+                    self._cancel_stale_synthesis_agents()
                 self.status = f"Running {len(indices)} synthesis agents"
                 self._mark_detail_dirty()
             pane = self.agents.get(idx)
@@ -2726,7 +2741,7 @@ else:
                 pane.append(text, category)
                 self._mark_detail_dirty(pane)
             elif kind == "agent_finished" and pane is not None:
-                self.live_retry_indices.discard(idx)
+                self.live_candidate_indices.discard(idx)
                 result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 pane.role = normalize_agent_role(result.get("role", role))
                 pane.result = result
@@ -2751,6 +2766,25 @@ else:
                 error = str(payload.get("error") or "")
                 raw_indices = payload.get("indices")
                 indices = raw_indices if isinstance(raw_indices, list) else []
+                synthesis_indices = {
+                    int(value)
+                    for value in indices
+                    if isinstance(value, int) and value > 0
+                }
+                if (
+                    self.core_synthesis_revision is None
+                    or self.core_synthesis_revision != self.candidate_revision
+                    or self.synthesis_refresh_needed
+                ):
+                    self._mark_synthesis_results_stale(synthesis_indices)
+                    if self._configured_synthesis_agents() > 0:
+                        self.synthesis_refresh_needed = True
+                else:
+                    for value in synthesis_indices:
+                        current_pane = self.agents.get(value)
+                        if current_pane is not None:
+                            current_pane.stale_synthesis = False
+                self.core_synthesis_revision = None
                 unresolved_status = ""
                 if error:
                     unresolved_status = "error"
@@ -2783,7 +2817,7 @@ else:
                 else:
                     fallback = payload.get("best_agent") if isinstance(payload.get("best_agent"), int) else None
                     self._recompute_recommendation(fallback)
-                    if not self._launch_next_candidate_batch():
+                    if not self._launch_next_pending_stage():
                         self.status = self._completed_status()
                         self._notify_completion_if_background()
                         self._schedule_follow_up_after_completion()
@@ -2791,7 +2825,7 @@ else:
                 self.running = False
                 self.cancel_event = None
                 self.active_batch_indices.clear()
-                self.live_retry_indices.clear()
+                self.live_candidate_indices.clear()
                 if self.pending_accept_agent is not None or (
                     self.queued_prompt and self.queued_agent is not None
                 ):
@@ -2817,8 +2851,30 @@ else:
                 if payload.get("cancelled"):
                     self._finish_cancelled_runner()
                 else:
+                    batch_role = normalize_agent_role(payload.get("role"))
+                    raw_batch_indices = payload.get("indices")
+                    batch_indices = {
+                        int(value)
+                        for value in raw_batch_indices
+                        if isinstance(value, int) and value > 0
+                    } if isinstance(raw_batch_indices, list) else set()
+                    batch_revision = payload.get("synthesis_revision")
+                    if batch_role == AGENT_ROLE_SYNTHESIS:
+                        if (
+                            not isinstance(batch_revision, int)
+                            or batch_revision != self.candidate_revision
+                        ):
+                            self._mark_synthesis_results_stale(batch_indices)
+                            self.synthesis_refresh_needed = (
+                                self._configured_synthesis_agents() > 0
+                            )
+                        else:
+                            for value in batch_indices:
+                                synthesis_pane = self.agents.get(value)
+                                if synthesis_pane is not None:
+                                    synthesis_pane.stale_synthesis = False
                     self._recompute_recommendation()
-                    if not self._launch_next_candidate_batch():
+                    if not self._launch_next_pending_stage():
                         self.status = self._completed_status()
                         self._notify_completion_if_background()
                         self._schedule_follow_up_after_completion()
@@ -2835,7 +2891,7 @@ else:
                     self.queued_prompt and self.queued_agent is not None
                 ):
                     self._finish_cancelled_runner()
-                elif not self._launch_next_candidate_batch():
+                elif not self._launch_next_pending_stage():
                     self._recompute_recommendation()
                     self.status = f"Additional candidates failed: {payload.get('message') or ''}"
                     self._notify_completion_if_background()
@@ -3269,12 +3325,13 @@ else:
             live_retry = (
                 self.running
                 and pane.role == AGENT_ROLE_CANDIDATE
-                and self.live_retry_coordinator is not None
-                and self.live_retry_coordinator.request(idx)
+                and self.live_candidate_coordinator is not None
+                and self.live_candidate_coordinator.request_retry(idx)
             )
             if live_retry:
                 running_before_retry = self._active_agent_count()
-                self.live_retry_indices.add(idx)
+                self._record_candidate_change(live=True)
+                self.live_candidate_indices.add(idx)
                 self._prepare_retry_pane(pane)
                 if running_before_retry < self._current_parallel_limit():
                     self.status = f"Retrying AGENT-{idx:03d} now"
@@ -3286,6 +3343,8 @@ else:
                 self._sync()
                 return
 
+            if pane.role == AGENT_ROLE_CANDIDATE:
+                self._record_candidate_change(live=False)
             self.candidate_batches.append(
                 CandidateBatch(
                     [idx],
@@ -3301,7 +3360,7 @@ else:
                 self.status = f"Retry queued for AGENT-{idx:03d}"
                 self._sync()
             else:
-                self._launch_next_candidate_batch()
+                self._launch_next_pending_stage()
 
         def _handle_more(self, args: list[str]) -> None:
             if len(args) != 1:
@@ -3334,13 +3393,33 @@ else:
                 self.agent_cancel_events[idx] = threading.Event()
             if not self.running and not self.candidate_batches:
                 self.completion_notification_sent = False
+            live_more = (
+                self.running
+                and self.live_candidate_coordinator is not None
+                and self.live_candidate_coordinator.request_additional(indices)
+            )
+            self._record_candidate_change(live=live_more)
+            if live_more:
+                running = self._active_agent_count()
+                self.live_candidate_indices.update(indices)
+                self._mark_detail_dirty()
+                if running < self._current_parallel_limit():
+                    self.status = f"Starting {count} additional candidates"
+                else:
+                    self.status = (
+                        f"Queued {count} additional candidates in the current "
+                        "candidate stage"
+                    )
+                self._sync()
+                return
+
             self.candidate_batches.append(CandidateBatch(indices))
             self._mark_detail_dirty()
             if self.running:
                 self.status = f"Queued {count} additional candidates"
                 self._sync()
             else:
-                self._launch_next_candidate_batch()
+                self._launch_next_pending_stage()
 
         def _handle_diff(self, args: list[str]) -> None:
             if args and args != ["refresh"]:
@@ -4121,7 +4200,7 @@ else:
                 if not isinstance(result, dict) or result.get("status") != "success":
                     continue
                 saw_success = True
-                if pane.rejected:
+                if pane.rejected or pane.stale_synthesis:
                     continue
                 try:
                     candidates.append(AgentResult(**result))
@@ -4139,7 +4218,10 @@ else:
             elif fallback is not None:
                 pane = self.agents.get(fallback)
                 self.recommended_agent = (
-                    None if pane is not None and pane.rejected else fallback
+                    None
+                    if pane is not None
+                    and (pane.rejected or pane.stale_synthesis)
+                    else fallback
                 )
             else:
                 self.recommended_agent = None
@@ -4179,10 +4261,161 @@ else:
                 and (self.running or self._has_pending_run())
             )
 
+        def _configured_synthesis_agents(self) -> int:
+            args = self.pending_execution_args or self.args
+            return max(0, int(getattr(args, "synthesis_agents", 0) or 0))
+
+        def _mark_synthesis_results_stale(
+            self,
+            indices: set[int] | None = None,
+        ) -> None:
+            changed = False
+            for idx, pane in self.agents.items():
+                if (
+                    pane.role != AGENT_ROLE_SYNTHESIS
+                    or (indices is not None and idx not in indices)
+                ):
+                    continue
+                if not pane.stale_synthesis:
+                    pane.stale_synthesis = True
+                    changed = True
+                    self._mark_detail_dirty(pane)
+            if changed:
+                self._recompute_recommendation()
+
+        def _record_candidate_change(self, *, live: bool) -> None:
+            self.candidate_revision += 1
+            if live or self._configured_synthesis_agents() <= 0:
+                return
+            self.synthesis_refresh_needed = True
+            self._mark_synthesis_results_stale()
+            self._cancel_stale_synthesis_agents()
+
+        def _cancel_stale_synthesis_agents(self) -> None:
+            for idx in self.active_batch_indices:
+                pane = self.agents.get(idx)
+                if pane is None or pane.role != AGENT_ROLE_SYNTHESIS:
+                    continue
+                cancel_event = self.agent_cancel_events.get(idx)
+                if cancel_event is not None:
+                    cancel_agent_including_queued(cancel_event)
+
+        def _successful_candidate_results(self) -> list[AgentResult]:
+            results: list[AgentResult] = []
+            for pane in self.agents.values():
+                if pane.role != AGENT_ROLE_CANDIDATE:
+                    continue
+                result = pane.result
+                if not isinstance(result, dict) or result.get("status") != "success":
+                    continue
+                try:
+                    results.append(AgentResult(**result))
+                except (TypeError, ValueError):
+                    continue
+            return sorted(results, key=lambda item: item.idx)
+
+        def _configured_synthesis_indices(self) -> list[int]:
+            args = self.pending_execution_args or self.args
+            first = max(
+                0,
+                int(getattr(args, "num_agents", self.num_agents) or 0),
+            ) + 1
+            count = self._configured_synthesis_agents()
+            return list(range(first, first + count))
+
+        def _discard_queued_synthesis_batches(self) -> None:
+            retained: list[CandidateBatch] = []
+            for batch in self.candidate_batches:
+                if normalize_agent_role(batch.role) != AGENT_ROLE_SYNTHESIS:
+                    retained.append(batch)
+                    continue
+                for idx in batch.indices:
+                    pane = self.agents.get(idx)
+                    if pane is None or not isinstance(pane.result, dict):
+                        continue
+                    pane.status = str(pane.result.get("status") or "finished")
+                    pane.stale_synthesis = True
+                    self._mark_detail_dirty(pane)
+            self.candidate_batches = retained
+
+        def _launch_synthesis_refresh(self) -> bool:
+            count = self._configured_synthesis_agents()
+            if (
+                self.running
+                or not self.synthesis_refresh_needed
+                or count <= 0
+                or self.pending_run_root is None
+                or not self.pending_prompt
+                or any(
+                    normalize_agent_role(batch.role) == AGENT_ROLE_CANDIDATE
+                    for batch in self.candidate_batches
+                )
+            ):
+                return False
+
+            source_results = self._successful_candidate_results()
+            if not source_results:
+                self.synthesis_refresh_needed = False
+                return False
+            try:
+                _context_path, instructions = create_synthesis_context(
+                    self.pending_run_root,
+                    self.pending_prompt,
+                    source_results,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.synthesis_refresh_needed = False
+                self.status = f"Cannot refresh synthesis: {exc}"
+                return False
+
+            self._discard_queued_synthesis_batches()
+            indices = self._configured_synthesis_indices()
+            revision = self.candidate_revision
+            retries: set[int] = set()
+            for idx in indices:
+                pane = self.agents.get(idx)
+                if pane is None:
+                    pane = AgentPane(idx=idx)
+                    self.agents[idx] = pane
+                else:
+                    retries.add(idx)
+                pane.role = AGENT_ROLE_SYNTHESIS
+                pane.status = "queued"
+                pane.input_text = self.pending_prompt
+                pane.execution_prompt = self.pending_prompt
+                pane.developer_instructions = instructions
+                self.agent_cancel_events[idx] = threading.Event()
+            self.synthesis_refresh_needed = False
+            self.candidate_batches.append(
+                CandidateBatch(
+                    indices=indices,
+                    retry_indices=retries,
+                    role=AGENT_ROLE_SYNTHESIS,
+                    prompt=self.pending_prompt,
+                    developer_instructions=instructions,
+                    synthesis_revision=revision,
+                    synthesis_source_indices=[
+                        result.idx for result in source_results
+                    ],
+                )
+            )
+            self.completion_notification_sent = False
+            return self._launch_next_candidate_batch()
+
+        def _launch_next_pending_stage(self) -> bool:
+            if self.running:
+                return False
+            for batch_index, batch in enumerate(self.candidate_batches):
+                if normalize_agent_role(batch.role) == AGENT_ROLE_CANDIDATE:
+                    return self._launch_next_candidate_batch(batch_index)
+            if self._launch_synthesis_refresh():
+                return True
+            return self._launch_next_candidate_batch()
+
         def _agent_has_pending_batch(self, idx: int) -> bool:
             return (
                 idx in self.active_batch_indices
-                or idx in self.live_retry_indices
+                or idx in self.live_candidate_indices
                 or any(
                     idx in batch.indices for batch in self.candidate_batches
                 )
@@ -4226,6 +4459,7 @@ else:
             pane.attempt_history.append(("↻", "Retry", "yellow"))
             pane.status = "queued"
             pane.rejected = False
+            pane.stale_synthesis = False
             pane.reasoning_tokens = None
             pane.reasoning_token_counts.clear()
             pane.input_text = self.pending_prompt
@@ -4242,7 +4476,7 @@ else:
             pane.diff_request += 1
             self._mark_detail_dirty(pane)
 
-        def _launch_next_candidate_batch(self) -> bool:
+        def _launch_next_candidate_batch(self, batch_index: int = 0) -> bool:
             if self.running or not self.candidate_batches:
                 return False
             if (
@@ -4255,7 +4489,7 @@ else:
                 self._sync()
                 return False
 
-            batch = self.candidate_batches.pop(0)
+            batch = self.candidate_batches.pop(batch_index)
             self.follow_up_continue_at = None
             self.follow_up_ready = False
             self._follow_up_countdown_second = None
@@ -4287,12 +4521,24 @@ else:
             self.active_batch_indices = set(batch.indices)
             self.running = True
             self.started_at = time.monotonic()
-            self.status = (
-                f"Retrying AGENT-{batch.indices[0]:03d}"
-                if batch.retry_indices and len(batch.indices) == 1
-                else f"Running {len(batch.indices)} additional candidates"
-            )
+            if batch.role == AGENT_ROLE_SYNTHESIS:
+                self.status = (
+                    f"Running {len(batch.indices)} refreshed synthesis agents"
+                )
+            elif batch.retry_indices and len(batch.indices) == 1:
+                self.status = f"Retrying AGENT-{batch.indices[0]:03d}"
+            else:
+                self.status = f"Running {len(batch.indices)} additional candidates"
             self._sync()
+            recommendation_excluded_indices = {
+                idx
+                for idx, pane in self.agents.items()
+                if pane.rejected or pane.stale_synthesis
+            }
+            run_root = self.pending_run_root
+            workspace_path = self._pending_workspace_path()
+            original_prompt = self.pending_prompt
+            recommend_by = self._pending_recommend_by()
 
             def target() -> None:
                 previous_disable = logging.root.manager.disable
@@ -4303,8 +4549,8 @@ else:
                             args=run_args,
                             prompt=execution_prompt,
                             agent_indices=batch.indices,
-                            run_root=self.pending_run_root,
-                            workspace=self._pending_workspace_path(),
+                            run_root=run_root,
+                            workspace=workspace_path,
                             resume_session_id=getattr(
                                 run_args,
                                 "resume_session_id",
@@ -4318,16 +4564,53 @@ else:
                             developer_instructions=(
                                 batch.developer_instructions or None
                             ),
+                            recommendation_excluded_indices=(
+                                recommendation_excluded_indices
+                            ),
+                            synthesis_source_agents=(
+                                batch.synthesis_source_indices or None
+                            ),
                         )
                     self._post_progress(
                         {
                             "type": "candidate_batch_finished",
                             "cancelled": cancel_event.is_set(),
+                            "indices": list(batch.indices),
+                            "role": batch.role,
+                            "synthesis_revision": batch.synthesis_revision,
                         }
                     )
                 except BaseException as exc:  # noqa: BLE001
+                    if (
+                        batch.role == AGENT_ROLE_SYNTHESIS
+                        and batch.synthesis_source_indices
+                    ):
+                        with contextlib.suppress(Exception):
+                            refresh_run_result_files(
+                                run_root=run_root,
+                                workspace=workspace_path,
+                                prompt=original_prompt,
+                                new_results=[],
+                                recommend_by=recommend_by,
+                                recommendation_excluded_indices=(
+                                    recommendation_excluded_indices
+                                    | set(batch.indices)
+                                ),
+                                synthesis_source_agents=(
+                                    batch.synthesis_source_indices
+                                ),
+                                synthesis_status="failed",
+                                synthesis_error=str(exc),
+                                remove_result_indices=set(batch.indices),
+                            )
                     self._post_progress(
-                        {"type": "candidate_batch_failed", "message": str(exc)}
+                        {
+                            "type": "candidate_batch_failed",
+                            "message": str(exc),
+                            "indices": list(batch.indices),
+                            "role": batch.role,
+                            "synthesis_revision": batch.synthesis_revision,
+                        }
                     )
                 finally:
                     logging.disable(previous_disable)
@@ -4406,8 +4689,12 @@ else:
             self.pending_accept_agent = None
             self.candidate_batches.clear()
             self.active_batch_indices.clear()
-            self.live_retry_indices.clear()
-            self.live_retry_coordinator = LiveRetryCoordinator()
+            self.live_candidate_indices.clear()
+            self.live_candidate_coordinator = LiveCandidateCoordinator()
+            self.live_candidate_coordinator.activate()
+            self.candidate_revision = 0
+            self.synthesis_refresh_needed = False
+            self.core_synthesis_revision = None
             self.cancel_event = threading.Event()
             self.recommended_agent = None
             self.started_at = time.monotonic()
@@ -4448,7 +4735,7 @@ else:
             run_args.keep_workspaces = True
             run_args.cancel_event = self.cancel_event
             run_args.agent_cancel_events = self.agent_cancel_events
-            run_args.live_retry_coordinator = self.live_retry_coordinator
+            run_args.live_candidate_coordinator = self.live_candidate_coordinator
             self.pending_execution_args = argparse.Namespace(**vars(run_args))
             # Keep the configured limit, not the first batch's effective limit.
             # This preserves max-parallel=auto and larger explicit limits for /more.
@@ -4735,8 +5022,11 @@ else:
             self.pending_prompt_records_history = False
             self.pending_execution_args = None
             self.active_batch_indices.clear()
-            self.live_retry_indices.clear()
-            self.live_retry_coordinator = None
+            self.live_candidate_indices.clear()
+            self.live_candidate_coordinator = None
+            self.candidate_revision = 0
+            self.synthesis_refresh_needed = False
+            self.core_synthesis_revision = None
             self.pending_accept_agent = None
 
         def _pending_sync_disabled(self) -> bool:
@@ -4817,6 +5107,7 @@ else:
                         return False
 
                 sync_best_workspace_back(Path(result.workspace_dir), workspace)
+                runtime_source_updated = acknowledge_runtime_source_sync(workspace)
 
                 promotion = None
                 try:
@@ -4858,6 +5149,8 @@ else:
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = f"Continuing from AGENT-{idx:03d}"
+                if runtime_source_updated:
+                    self.status += "; PCR source updates load after restart"
                 return True
             except Exception as exc:  # noqa: BLE001
                 self.status = f"Cannot continue AGENT-{idx:03d}: {exc}"

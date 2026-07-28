@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 This directory turns [Parallel Codex Runner](../../README.md) into a local Codex App plugin. It lets Codex start several isolated candidates, follow their work, inspect complete patches, stop or retry attempts, and finalize only the branch you approve.
 
-The plugin is an adapter, not a second PCR implementation. Agent execution, Git worktrees, session promotion, sync-back, and cleanup remain in `parallel_codex_runner_core` at the repository root.
+The plugin is an adapter, not a second PCR implementation. Agent execution, isolated Git repositories, session promotion, sync-back, and cleanup remain in `parallel_codex_runner_core` at the repository root.
 
 ## Install
 
@@ -112,7 +112,7 @@ Finalization uses a durable journal. If PCR cannot prove whether a sync finished
 it will not sync a second time. Inspect the original workspace and resolve the
 run with `pcr_recover_finalization`.
 
-PCR isolates working trees, not host access. Agents still share the machine, network, Codex account, quota, and possibly the Git object database. Review a candidate's patch before accepting it.
+PCR isolates workspaces and Git administration data, not host access. Agents still share the machine, network, Codex account, and quota; same-filesystem Git clones may hard-link immutable objects. Review a candidate's patch before accepting it.
 
 ## Development
 

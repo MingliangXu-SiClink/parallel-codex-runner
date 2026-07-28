@@ -4,7 +4,7 @@
 
 这个目录把仓库根目录中的 [Parallel Codex Runner](../../README.zh-CN.md) 接入 Codex App。安装后，Codex 可以启动多个隔离候选、查看实时进展和完整代码差异、停止或重试 Agent，并且只在你确认后采用其中一条分支。
 
-插件只是接入层，不会复制一套 PCR 实现。Agent 执行、Git worktree、会话提升、回写与清理仍由仓库根目录的 `parallel_codex_runner_core` 统一负责。
+插件只是接入层，不会复制一套 PCR 实现。Agent 执行、隔离 Git 仓库、会话提升、回写与清理仍由仓库根目录的 `parallel_codex_runner_core` 统一负责。
 
 ## 安装
 
@@ -107,7 +107,7 @@ Agent；多个 Codex 窗口也可以共用插件状态目录。短时状态锁�
 采用过程使用持久化日志记录回写阶段。如果 PCR 无法确认回写是否已经完成，它不会
 自动再次回写，而是要求检查原工作区后通过 `pcr_recover_finalization` 明确处理。
 
-PCR 隔离的是工作树，不是宿主机权限。Agent 仍会共享机器、网络、Codex 账户、配额，并可能共享 Git 对象数据库。接受候选前请检查实际 Patch。
+PCR 隔离的是工作区和 Git 管理数据，不是宿主机权限。Agent 仍会共享机器、网络、Codex 账户和配额；同盘 Git 克隆可能以硬链接复用不可变对象。接受候选前请检查实际 Patch。
 
 ## 开发
 
