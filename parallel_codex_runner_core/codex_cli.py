@@ -21,12 +21,22 @@ CODEX_FAST_SERVICE_TIER = "fast"
 CODEX_STANDARD_SERVICE_TIER = "default"
 
 
-def format_fast_mode(value: Optional[bool]) -> str:
+def format_fast_mode(
+    value: Optional[bool],
+    configured_service_tier: Optional[str] = None,
+) -> str:
     if value is True:
         return "YES"
     if value is False:
         return "NO"
-    return "AUTO"
+    service_tier = str(configured_service_tier or "").strip().lower()
+    if service_tier in {"fast", "priority"}:
+        inherited = "FAST"
+    elif service_tier and service_tier != "default":
+        inherited = service_tier.upper()
+    else:
+        inherited = "STANDARD"
+    return f"AUTO ({inherited})"
 
 
 def _warn(message: str, *args: object) -> None:

@@ -3739,7 +3739,10 @@ def run_once(
     effort_model = args.model or (resume_session.model if resume_session else None)
     model_registry = CodexModelRegistry.load(get_codex_home())
     model_display = model_registry.model_display(args.model)
-    fast_display = format_fast_mode(getattr(args, "fast", None))
+    fast_display = format_fast_mode(
+        getattr(args, "fast", None),
+        model_registry.configured_service_tier,
+    )
     effective_effort = resolve_codex_reasoning_effort(
         effort_model,
         getattr(args, "effort", None),

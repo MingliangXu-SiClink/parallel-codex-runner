@@ -384,7 +384,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `--codex-bin` | Codex 可执行文件，默认为 `codex`。 |
 | `--model` | 指定 Codex 模型。 |
 | `--effort` | 选择当前模型支持的推理强度。 |
-| `--fast`、`--no-fast` | 强制使用 Fast 或 Standard；不传时继承 Codex 配置。Fast 仅对支持的模型生效，并会更快消耗 credits。 |
+| `--fast`、`--no-fast` | 强制使用 Fast 或 Standard；不传时继承 Codex 配置，并显示为 `AUTO (FAST)`、`AUTO (STANDARD)` 或其他已配置档位。Fast 仅对支持的模型生效，并会更快消耗 credits。 |
 | `--resume` | 交互选择可恢复的 Codex 会话。 |
 | `--resume-session-id` | 恢复指定会话 ID。 |
 | `--resume-include-non-interactive` | 在选择器中包含 `codex exec` 会话。 |
@@ -416,7 +416,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/recommendby <duration\|reasoning_tokens>` | 设置推荐方式。 |
 | `/model <name\|clear>` | 设置或清除模型。 |
 | `/effort <auto\|level>` | 选择模型支持的推理强度。 |
-| `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置。 |
+| `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置；`auto` 会在括号中显示继承的档位。 |
 | `/workspace <path>` | 切换目标工作区。 |
 | `/runsdir <path\|clear>` | 设置或重置运行数据目录。 |
 | `/codexbin <path>` | 设置 Codex 可执行文件。 |

@@ -1405,6 +1405,30 @@ class CommandBuildTests(unittest.TestCase):
         self.assertFalse(any("service_tier=" in value for value in cmd))
         self.assertNotIn("features.fast_mode=true", cmd)
 
+    def test_fast_mode_display_resolves_inherited_service_tier(self) -> None:
+        self.assertEqual(
+            codex_cli_core.format_fast_mode(None, None),
+            "AUTO (STANDARD)",
+        )
+        self.assertEqual(
+            codex_cli_core.format_fast_mode(None, "default"),
+            "AUTO (STANDARD)",
+        )
+        self.assertEqual(
+            codex_cli_core.format_fast_mode(None, "fast"),
+            "AUTO (FAST)",
+        )
+        self.assertEqual(
+            codex_cli_core.format_fast_mode(None, "priority"),
+            "AUTO (FAST)",
+        )
+        self.assertEqual(
+            codex_cli_core.format_fast_mode(None, "flex"),
+            "AUTO (FLEX)",
+        )
+        self.assertEqual(codex_cli_core.format_fast_mode(True, "default"), "YES")
+        self.assertEqual(codex_cli_core.format_fast_mode(False, "fast"), "NO")
+
     def test_explicit_fast_mode_requires_codex_config_support(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "Fast 模式"):
             build_codex_command(
@@ -3054,7 +3078,9 @@ class TuiCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "config.toml").write_text(
-                'model = "gpt-wide"\nmodel_reasoning_effort = "max"\n',
+                'model = "gpt-wide"\n'
+                'model_reasoning_effort = "max"\n'
+                'service_tier = "fast"\n',
                 encoding="utf-8",
             )
             (root / "models_cache.json").write_text(
@@ -3089,11 +3115,30 @@ class TuiCommandTests(unittest.TestCase):
             with mock.patch.object(tui_textual, "get_codex_home", return_value=root):
                 wide = tui_textual.codex_effort_options("gpt-wide", None)
                 narrow = tui_textual.codex_effort_options("gpt-narrow", None)
+                app = tui_textual.PcrTextualApp(
+                    parse_args(["--workspace", str(root)])
+                )
+            fast_display = dict(app._base_info_rows())["FAST"]
+            configured_service_tier = (
+                app.model_registry.configured_service_tier
+            )
 
         self.assertEqual(wide[0], ("auto (max)", ""))
         self.assertIn(("max", "max"), wide)
         self.assertEqual(narrow[0], ("auto (medium)", ""))
         self.assertNotIn(("max", "max"), narrow)
+        self.assertEqual(
+            configured_service_tier,
+            "fast",
+        )
+        self.assertEqual(fast_display, "AUTO (FAST)")
+        self.assertEqual(
+            tui_textual.fast_setting_value(
+                None,
+                configured_service_tier,
+            ),
+            "auto (fast)",
+        )
 
     def test_command_suggestions_only_for_slash_commands(self) -> None:
         self.assertEqual(command_suggestions("hello"), [])
@@ -3237,7 +3282,9 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIsNone(app.args.model)
         self.assertIsNone(app.args.effort)
         self.assertIsNone(app.args.fast)
-        self.assertEqual(dict(app._base_info_rows())["FAST"], "AUTO")
+        self.assertTrue(
+            dict(app._base_info_rows())["FAST"].startswith("AUTO (")
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_prepared_rows_keep_codex_bin_visible(self) -> None:

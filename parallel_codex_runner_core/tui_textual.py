@@ -120,7 +120,7 @@ TUI_TIPS: tuple[str, ...] = (
     "AGENTS、MODEL 等运行配置只作用于下一轮，不会选择当前 Agent。",
     "PCR 会按 workspace 记住顶部配置，下次打开同一目录时自动恢复。",
     "EFFORT 会随 MODEL 更新可选等级，auto 会选择兼容的推理等级。",
-    "FAST 会提高受支持模型的速度，同时更快消耗 credits。",
+    "FAST 的 AUTO 会在括号内显示继承的档位；Fast 会更快消耗 credits。",
     "带 ★ 和彩虹边框的 Agent 是当前推荐结果。",
     "退出或切换 WORKSPACE、RESUME 时，会采用当前显示的 Agent。",
     "输入 /accept 可立即采用当前 Agent。",
@@ -158,6 +158,15 @@ def fast_value_from_control(value: Any) -> bool | None:
     if normalized == "off":
         return False
     return None
+
+
+def fast_setting_value(
+    value: bool | None,
+    configured_service_tier: str | None,
+) -> str:
+    if value is not None:
+        return fast_control_value(value)
+    return format_fast_mode(None, configured_service_tier).lower()
 
 
 def command_suggestions(value: str) -> list[str]:
@@ -1674,7 +1683,13 @@ else:
                         yield Static("FAST", classes="runner-key")
                         yield Select(
                             [
-                                ("AUTO", "auto"),
+                                (
+                                    format_fast_mode(
+                                        None,
+                                        self.model_registry.configured_service_tier,
+                                    ),
+                                    "auto",
+                                ),
                                 ("YES", "on"),
                                 ("NO", "off"),
                             ],
@@ -2549,7 +2564,13 @@ else:
             if not self._prepare_config_change("Fast mode"):
                 return
             if self._commit_fast_control():
-                self._show_setting(f"fast={fast_control_value(self.args.fast)}")
+                self._show_setting(
+                    "fast="
+                    + fast_setting_value(
+                        self.args.fast,
+                        self.model_registry.configured_service_tier,
+                    )
+                )
 
         @on(Select.Changed, "#config-sync-back")
         def _on_sync_back_toggled(self, event: Select.Changed) -> None:
@@ -3881,7 +3902,13 @@ else:
             if not args or (
                 len(args) == 1 and args[0].strip().lower() == "status"
             ):
-                self._show_setting(f"fast={fast_control_value(current)}")
+                self._show_setting(
+                    "fast="
+                    + fast_setting_value(
+                        current,
+                        self.model_registry.configured_service_tier,
+                    )
+                )
                 return
             if len(args) != 1:
                 self.status = "Usage: /fast <on|off|auto>"
@@ -3909,7 +3936,13 @@ else:
                 return
             self.args.fast = values[requested]
             self.run_info_rows = self._base_info_rows()
-            self._show_setting(f"fast={fast_control_value(self.args.fast)}")
+            self._show_setting(
+                "fast="
+                + fast_setting_value(
+                    self.args.fast,
+                    self.model_registry.configured_service_tier,
+                )
+            )
 
         def _handle_workspace(self, args: list[str]) -> None:
             if not args:
@@ -5823,7 +5856,13 @@ else:
                         getattr(self.args, "effort", None),
                     ),
                 ),
-                ("FAST", format_fast_mode(getattr(self.args, "fast", None))),
+                (
+                    "FAST",
+                    format_fast_mode(
+                        getattr(self.args, "fast", None),
+                        self.model_registry.configured_service_tier,
+                    ),
+                ),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),

@@ -35,18 +35,20 @@ class CodexModelRegistry:
     models: dict[str, CodexModelInfo]
     configured_model: str | None = None
     configured_effort: str | None = None
+    configured_service_tier: str | None = None
 
     @classmethod
     def load(cls, codex_home: Path) -> "CodexModelRegistry":
         codex_home = codex_home.expanduser()
         models = _load_model_info(codex_home / "models_cache.json")
-        configured_model, configured_effort = _load_config_defaults(
-            codex_home / "config.toml"
+        configured_model, configured_effort, configured_service_tier = (
+            _load_config_defaults(codex_home / "config.toml")
         )
         return cls(
             models=models,
             configured_model=configured_model,
             configured_effort=configured_effort,
+            configured_service_tier=configured_service_tier,
         )
 
     def effective_model(self, model: str | None) -> str | None:
@@ -203,15 +205,18 @@ def _load_model_info(path: Path) -> dict[str, CodexModelInfo]:
     return models
 
 
-def _load_config_defaults(path: Path) -> tuple[str | None, str | None]:
+def _load_config_defaults(
+    path: Path,
+) -> tuple[str | None, str | None, str | None]:
     try:
         with path.open("rb") as config_file:
             payload = tomllib.load(config_file)
     except (OSError, tomllib.TOMLDecodeError):
-        return None, None
+        return None, None, None
     if not isinstance(payload, dict):
-        return None, None
+        return None, None, None
     return (
         _normalized_text(payload.get("model")),
         _normalized_effort(payload.get("model_reasoning_effort")),
+        _normalized_text(payload.get("service_tier")),
     )

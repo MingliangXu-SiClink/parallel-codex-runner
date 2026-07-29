@@ -390,7 +390,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `--codex-bin` | Codex executable; default is `codex`. |
 | `--model` | Codex model name. |
 | `--effort` | Reasoning effort supported by the selected model. |
-| `--fast`, `--no-fast` | Force Fast or Standard mode; omitted inherits Codex configuration. Fast mode is model-dependent and consumes credits faster. |
+| `--fast`, `--no-fast` | Force Fast or Standard mode; omitted inherits Codex configuration and is shown as `AUTO (FAST)`, `AUTO (STANDARD)`, or the configured tier. Fast mode is model-dependent and consumes credits faster. |
 | `--resume` | Choose a resumable Codex session interactively. |
 | `--resume-session-id` | Resume a specific session ID. |
 | `--resume-include-non-interactive` | Include `codex exec` sessions in the picker. |
@@ -422,7 +422,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/recommendby <duration\|reasoning_tokens>` | Set the recommendation heuristic. |
 | `/model <name\|clear>` | Set or clear the model. |
 | `/effort <auto\|level>` | Select a supported reasoning effort. |
-| `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed. |
+| `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed; `auto` shows the inherited tier in parentheses. |
 | `/workspace <path>` | Change the target workspace. |
 | `/runsdir <path\|clear>` | Set or reset the run-data directory. |
 | `/codexbin <path>` | Set the Codex executable. |
