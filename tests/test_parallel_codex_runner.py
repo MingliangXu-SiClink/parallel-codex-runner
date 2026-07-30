@@ -1658,8 +1658,13 @@ class CommandBuildTests(unittest.TestCase):
         self.assertNotIn(str(second_workspace.resolve()), first)
         self.assertLess(
             second.index("Review the candidate results."),
+            second.index("PCR custom tool lifecycle requirement:"),
+        )
+        self.assertLess(
+            second.index("PCR custom tool lifecycle requirement:"),
             second.index("PCR workspace isolation requirement:"),
         )
+        self.assertIn("bounded calls that return once", second)
         self.assertIn(str(second_workspace.resolve()), second)
         self.assertIn("Never modify the original workspace", second)
         self.assertTrue(second.endswith("but they are read-only."))
@@ -5465,6 +5470,13 @@ class TuiCommandTests(unittest.TestCase):
             ),
             model_warning,
         )
+        self.assertEqual(
+            display_line_from_output(
+                "2026-07-30T06:08:17Z ERROR codex_core::util: "
+                "Orphan custom tool call output for call id: call_example"
+            ),
+            "",
+        )
         self.assertEqual(display_line_from_output("error=apply_patch verification failed"), "")
         self.assertEqual(display_line_from_output("Failed to find expected lines"), "")
         self.assertEqual(display_line_from_output("Run result:"), "")
@@ -7138,6 +7150,36 @@ class StreamLogTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_stream_to_log_keeps_orphan_diagnostic_only_in_raw_log(self) -> None:
+        async def run() -> None:
+            raw_line = (
+                b"2026-07-30T06:08:17Z ERROR codex_core::util: "
+                b"Orphan custom tool call output for call id: call_example\n"
+            )
+            reader = asyncio.StreamReader(limit=8)
+            reader.feed_data(raw_line)
+            reader.feed_eof()
+            events = []
+            state = AgentState(idx=1)
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = Path(tmp) / "stderr.log"
+                await stream_to_log(
+                    reader,
+                    log_path,
+                    state,
+                    "stderr",
+                    events.append,
+                )
+
+                self.assertEqual(log_path.read_bytes(), raw_line)
+
+            self.assertEqual(state.stderr_lines, 1)
+            self.assertFalse(
+                any(event["type"] == "agent_line" for event in events)
+            )
+
+        asyncio.run(run())
+
 
 class AgentCancelTests(unittest.TestCase):
     def test_run_one_agent_scrubs_codex_support_entries_after_process_exit(self) -> None:
@@ -7164,6 +7206,70 @@ class AgentCancelTests(unittest.TestCase):
                 self.assertEqual(result.status, "success")
                 self.assertFalse((codex_home / "auth.json").exists())
                 self.assertTrue((codex_home / "state_5.sqlite").exists())
+
+        asyncio.run(run())
+
+    def test_run_one_agent_repairs_resumable_tool_history_on_exit(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                meta = root / "meta"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+                session_id = "session-tool-history"
+                rollout_text = "".join(
+                    json.dumps(record) + "\n"
+                    for record in [
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "custom_tool_call",
+                                "call_id": "call_old",
+                            },
+                        },
+                        {
+                            "type": "compacted",
+                            "payload": {"replacement_history": []},
+                        },
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call_old",
+                                "output": "late",
+                            },
+                        },
+                    ]
+                )
+                script = (
+                    "import json, os, sys\n"
+                    "from pathlib import Path\n"
+                    "sys.stdin.read()\n"
+                    "rollout = Path(os.environ['CODEX_HOME']) / "
+                    "'sessions' / 'rollout.jsonl'\n"
+                    "rollout.parent.mkdir(parents=True)\n"
+                    f"rollout.write_text({rollout_text!r}, encoding='utf-8')\n"
+                    f"print(json.dumps({{'type': 'thread.started', 'thread_id': {session_id!r}}}), flush=True)\n"
+                )
+
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=meta,
+                    codex_home=codex_home,
+                    prompt="hello",
+                    command=[sys.executable, "-c", script],
+                )
+                repaired = (
+                    codex_home
+                    / "sessions"
+                    / "rollout.jsonl"
+                ).read_text(encoding="utf-8")
+
+            self.assertEqual(result.status, "success")
+            self.assertNotIn("late", repaired)
 
         asyncio.run(run())
 
@@ -7437,6 +7543,217 @@ class AgentCancelTests(unittest.TestCase):
 
 
 class ResumeSessionTests(unittest.TestCase):
+    def test_rollout_sanitizer_removes_outputs_orphaned_by_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout-session.jsonl"
+            records = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call_stream",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_stream",
+                        "output": "initial",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_stream",
+                        "output": "notification before compaction",
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "payload": {
+                        "replacement_history": [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [],
+                            },
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call_nested_orphan",
+                                "output": "ignored",
+                            },
+                            {
+                                "type": "custom_tool_call",
+                                "name": "apply_patch",
+                                "call_id": "call_kept",
+                            },
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call_kept",
+                                "output": "done",
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_stream",
+                        "name": "exec",
+                        "output": "late notification",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "apply_patch",
+                        "call_id": "call_new",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_new",
+                        "output": "done",
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            removed = (
+                app_core.sanitize_rollout_orphan_custom_tool_outputs(
+                    rollout
+                )
+            )
+            sanitized = [
+                json.loads(line)
+                for line in rollout.read_text(encoding="utf-8").splitlines()
+            ]
+            rerun_removed = (
+                app_core.sanitize_rollout_orphan_custom_tool_outputs(
+                    rollout
+                )
+            )
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(rerun_removed, 0)
+        output_ids = [
+            record["payload"]["call_id"]
+            for record in sanitized
+            if record.get("type") == "response_item"
+            and record.get("payload", {}).get("type")
+            == "custom_tool_call_output"
+        ]
+        self.assertEqual(
+            output_ids,
+            ["call_stream", "call_stream", "call_new"],
+        )
+        replacement = next(
+            record["payload"]["replacement_history"]
+            for record in sanitized
+            if record.get("type") == "compacted"
+        )
+        self.assertEqual(
+            [
+                item.get("call_id")
+                for item in replacement
+                if item.get("type") == "custom_tool_call_output"
+            ],
+            ["call_kept"],
+        )
+
+    def test_prepare_agent_codex_home_repairs_only_the_isolated_rollout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real"
+            agent_home = root / "agent"
+            agent_workspace = root / "workspaces" / "agent_001"
+            sessions = real_home / "sessions" / "2026" / "07" / "30"
+            sessions.mkdir(parents=True)
+            agent_workspace.mkdir(parents=True)
+            session_id = "019f-orphan-output"
+            rollout = sessions / f"rollout-{session_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "cwd": "/old/workspace",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "call_id": "call_before_compaction",
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "payload": {"replacement_history": []},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_before_compaction",
+                        "output": "late orphan",
+                    },
+                },
+            ]
+            original_text = "".join(
+                json.dumps(record) + "\n" for record in records
+            )
+            rollout.write_text(original_text, encoding="utf-8")
+
+            conn = sqlite3.connect(real_home / "state_5.sqlite")
+            try:
+                conn.execute(
+                    "CREATE TABLE threads "
+                    "(id TEXT PRIMARY KEY, cwd TEXT NOT NULL, "
+                    "rollout_path TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    (session_id, "/old/workspace", str(rollout)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            prepare_agent_codex_home(
+                real_home,
+                agent_home,
+                agent_workspace,
+                session_id,
+            )
+
+            isolated_rollout = (
+                agent_home
+                / "sessions"
+                / "2026"
+                / "07"
+                / "30"
+                / rollout.name
+            )
+            isolated_text = isolated_rollout.read_text(encoding="utf-8")
+            source_text = rollout.read_text(encoding="utf-8")
+
+        self.assertEqual(source_text, original_text)
+        self.assertNotIn("late orphan", isolated_text)
+        self.assertIn(str(agent_workspace), isolated_text)
+
     def make_result(self, idx: int, workspace: Path, session_id: str) -> AgentResult:
         return AgentResult(
             idx=idx,

@@ -385,6 +385,7 @@ def is_detail_noise_line(text: str) -> bool:
     without_timestamp = " ".join(timestamp_stripped.replace("_", " ").replace("-", " ").split())
     return (
         re.search(r"\bcodex\s+models\s+manager\b", normalized) is not None
+        or "orphan custom tool call output for call id:" in normalized
         or "apply patch verification failed" in normalized
         or "failed to find expected lines" in normalized
         or without_timestamp in {"run result", "run result:"}

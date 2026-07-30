@@ -197,6 +197,9 @@ AGENT_ENV_PATH_KEYS_TO_CLEAR: Tuple[str, ...] = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_PREFIX",
 )
+ORPHAN_CUSTOM_TOOL_OUTPUT_MARKER = (
+    "orphan custom tool call output for call id:"
+)
 
 
 def workspace_isolation_developer_instructions(agent_workspace: Path) -> str:
@@ -219,6 +222,18 @@ def workspace_isolation_developer_instructions(agent_workspace: Path) -> str:
         "Do not manually edit another checkout or external Git metadata.\n"
         "- Explicitly supplied PCR metadata and synthesis candidate workspaces "
         "may be inspected when needed, but they are read-only."
+    )
+
+
+def custom_tool_lifecycle_developer_instructions() -> str:
+    """Keep long-running custom tools compatible with Codex compaction."""
+    return (
+        "PCR custom tool lifecycle requirement:\n"
+        "- Do not keep one code-mode or custom-tool call alive while repeatedly "
+        "emitting notify() or yield_control() outputs across multiple turns.\n"
+        "- For monitoring, event listening, or polling, use bounded calls that "
+        "return once, then start a new call for the next poll. This keeps every "
+        "tool output paired with a live call when Codex compacts context."
     )
 
 
@@ -260,6 +275,10 @@ class _AgentDeveloperInstructionResolver:
         instructions = merge_codex_developer_instructions(
             self.existing_instructions,
             additional_instructions,
+        )
+        instructions = merge_codex_developer_instructions(
+            instructions,
+            custom_tool_lifecycle_developer_instructions(),
         )
         instructions = merge_codex_developer_instructions(
             instructions,
@@ -888,6 +907,7 @@ def prepare_agent_codex_home(
             agent_workspace,
             promote_source=False,
         )
+        sanitize_rollout_orphan_custom_tool_outputs(isolated_rollout)
 
     with _CODEX_SQLITE_LOCK:
         conn: Optional[sqlite3.Connection] = None
@@ -1680,6 +1700,131 @@ def format_subagent_resume_error(session_id: str, parent_thread_id: str) -> str:
     return f"Codex multi-agent v2 子线程不能直接 resume：{session_id}{parent_hint}。"
 
 
+def _custom_tool_call_ids(items: Iterable[Any]) -> Set[str]:
+    return {
+        str(item.get("call_id"))
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "custom_tool_call"
+        and item.get("call_id")
+    }
+
+
+def _remove_orphan_custom_tool_outputs(items: List[Any]) -> int:
+    call_ids = _custom_tool_call_ids(items)
+    kept: List[Any] = []
+    removed = 0
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "custom_tool_call_output"
+            and item.get("call_id")
+            and str(item["call_id"]) not in call_ids
+        ):
+            removed += 1
+            continue
+        kept.append(item)
+    if removed:
+        items[:] = kept
+    return removed
+
+
+def sanitize_rollout_orphan_custom_tool_outputs(rollout_path: Path) -> int:
+    """Remove custom-tool outputs Codex already rejects after compaction.
+
+    Code-mode tools may emit several asynchronous outputs under one call ID. If
+    context compaction replaces the history without that call, later outputs
+    become permanently unpairable and Codex logs the same error on every
+    normalization pass. PCR repairs only its copied/imported rollout.
+    """
+    active_call_ids: Set[str] = set()
+    removed = 0
+    changed = False
+    tmp_path = rollout_path.with_name(
+        f".{rollout_path.name}.pcr-tool-history-{os.getpid()}"
+    )
+
+    try:
+        with rollout_path.open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as src, tmp_path.open("w", encoding="utf-8") as dst:
+            for line in src:
+                rewritten = line
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    dst.write(rewritten)
+                    continue
+                if not isinstance(obj, dict):
+                    dst.write(rewritten)
+                    continue
+
+                payload = obj.get("payload")
+                if obj.get("type") == "compacted":
+                    active_call_ids.clear()
+                    replacement_history = (
+                        payload.get("replacement_history")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    if isinstance(replacement_history, list):
+                        removed_here = _remove_orphan_custom_tool_outputs(
+                            replacement_history
+                        )
+                        removed += removed_here
+                        changed = changed or bool(removed_here)
+                        active_call_ids.update(
+                            _custom_tool_call_ids(replacement_history)
+                        )
+                        if removed_here:
+                            rewritten = (
+                                json.dumps(
+                                    obj,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                + "\n"
+                            )
+                elif (
+                    obj.get("type") == "response_item"
+                    and isinstance(payload, dict)
+                ):
+                    item_type = payload.get("type")
+                    call_id = payload.get("call_id")
+                    if item_type == "custom_tool_call" and call_id:
+                        active_call_ids.add(str(call_id))
+                    elif (
+                        item_type == "custom_tool_call_output"
+                        and call_id
+                        and str(call_id) not in active_call_ids
+                    ):
+                        removed += 1
+                        changed = True
+                        continue
+
+                dst.write(rewritten)
+
+        if changed:
+            try:
+                shutil.copystat(
+                    rollout_path,
+                    tmp_path,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+            os.replace(tmp_path, rollout_path)
+        else:
+            tmp_path.unlink(missing_ok=True)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return removed
+
+
 def _rewrite_rollout_session(
     rollout_path: Path,
     session_id: str,
@@ -1763,12 +1908,14 @@ def update_rollout_session_meta(
     workspace: Path,
 ) -> Tuple[bool, bool]:
     """Rewrite a rollout so resume discovery and execution use ``workspace``."""
-    return _rewrite_rollout_session(
+    changed, source_promoted = _rewrite_rollout_session(
         rollout_path,
         session_id,
         workspace,
         promote_source=True,
     )
+    removed = sanitize_rollout_orphan_custom_tool_outputs(rollout_path)
+    return changed or bool(removed), source_promoted
 
 
 def promote_codex_session_to_workspace(
@@ -2352,6 +2499,10 @@ def agent_line_for_progress(text: str, obj: Any = None) -> str:
     return text
 
 
+def is_orphan_custom_tool_output_diagnostic(text: str) -> bool:
+    return ORPHAN_CUSTOM_TOOL_OUTPUT_MARKER in text.casefold()
+
+
 async def stream_to_log(
     reader: Optional[asyncio.StreamReader],
     log_path: Path,
@@ -2382,7 +2533,10 @@ async def stream_to_log(
                 is_json = True
             except json.JSONDecodeError:
                 pass
-            if progress_callback is not None:
+            if progress_callback is not None and not (
+                stream_name == "stderr"
+                and is_orphan_custom_tool_output_diagnostic(text)
+            ):
                 progress_text = agent_line_for_progress(text, obj) if is_json else text
                 progress_callback({"type": "agent_line", "idx": state.idx, "stream": stream_name, "text": progress_text})
             if not is_json:
@@ -2593,6 +2747,24 @@ async def run_one_agent(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         rollout_monitor.poll(final=True)
+        if state.codex_thread_id and rollout_monitor.path is not None:
+            try:
+                removed_orphans = sanitize_rollout_orphan_custom_tool_outputs(
+                    rollout_monitor.path
+                )
+                if removed_orphans:
+                    logger.debug(
+                        "agent_{:03d} removed {} orphan custom tool outputs "
+                        "from resumable history",
+                        idx,
+                        removed_orphans,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_{:03d} could not sanitize custom tool history: {}",
+                    idx,
+                    exc,
+                )
         scrub_codex_home_support_entries(codex_home)
 
     seconds = time.perf_counter() - started
