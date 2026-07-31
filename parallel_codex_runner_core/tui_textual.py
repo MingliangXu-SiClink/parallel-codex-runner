@@ -1236,9 +1236,9 @@ else:
             text-overflow: clip;
         }
         #follow-up-queue-frame {
-            height: 1;
-            min-height: 1;
-            max-height: 6;
+            height: 2;
+            min-height: 2;
+            max-height: 4;
             margin: 0 1;
             background: #141b23;
             color: #d6e4f0;
@@ -1248,6 +1248,8 @@ else:
             width: 100%;
             height: auto;
             padding: 0 1;
+            text-wrap: wrap;
+            text-overflow: clip;
         }
         #prompt {
             height: 3;
@@ -5285,45 +5287,64 @@ else:
             self.tip_icon_index = (self.tip_icon_index + 1) % len(TIP_ICON_COLORS)
             self._refresh_tip()
 
-        def _follow_up_queue_text(self) -> str:
-            if not self.follow_up_queue:
-                return ""
+        def _follow_up_queue_state(self) -> tuple[str, str]:
             if self.running:
-                state = "waiting for current agents"
-            elif self.storage_preflight_inflight:
-                state = "preparing next run"
-            elif self.follow_up_continue_at is not None:
+                return "Agents running", "#f0c674"
+            if self.storage_preflight_inflight:
+                return "Checking storage", "#f0c674"
+            if self.follow_up_continue_at is not None:
                 remaining = max(
                     0,
                     int(self.follow_up_continue_at - time.monotonic() + 0.999),
                 )
-                state = (
-                    f"next in {remaining}s from "
-                    f"AGENT-{self.selected_agent:03d}"
+                return (
+                    f"AGENT-{self.selected_agent:03d} · starts in {remaining}s",
+                    "#7ec8e3",
                 )
-            elif self.follow_up_ready:
-                state = (
-                    f"ready from AGENT-{self.selected_agent:03d}; "
-                    "select a successful Agent"
-                )
-            elif self.follow_up_source_finalized:
-                state = "waiting to start from the finalized Agent"
-            else:
-                state = "waiting for a successful recommended Agent"
+            if self.follow_up_ready:
+                return "Choose a successful Agent", "#8bd49c"
+            if self.follow_up_source_finalized:
+                return "Ready from finalized Agent", "#8bd49c"
+            return "Waiting for recommendation", "#aebed3"
 
-            lines: list[str] = []
+        def _follow_up_queue_renderable(self) -> Text:
+            if not self.follow_up_queue:
+                return Text()
+
             count = len(self.follow_up_queue)
+            state, state_color = self._follow_up_queue_state()
+            content = Text()
+            content.append("◆ ", style="bold #5aa9bd")
+            content.append("QUEUE", style="bold #c8edf5")
+            content.append(" · ", style="#63778a")
+            content.append(
+                f"{count} {'item' if count == 1 else 'items'}",
+                style="bold #e9c46a",
+            )
+            content.append(" · ", style="#63778a")
+            content.append(state, style=state_color)
+
+            number_width = len(str(count))
             for index, item in enumerate(self.follow_up_queue, 1):
                 prompt_lines = item.prompt.splitlines() or [""]
-                prefix = (
-                    f"↳ QUEUE {count} · {state} · {index}  "
-                    if index == 1
-                    else f"  {index}  "
-                )
-                lines.append(prefix + prompt_lines[0])
-                continuation = " " * len(prefix)
-                lines.extend(continuation + line for line in prompt_lines[1:])
-            return "\n".join(lines)
+                if count == 1:
+                    prefix = "  › "
+                    continuation = "    "
+                else:
+                    prefix = f"  {index:>{number_width}} │ "
+                    continuation = f"  {'':>{number_width}} │ "
+
+                content.append("\n")
+                content.append(prefix, style="bold #6faec0")
+                content.append(prompt_lines[0], style="#edf5f7")
+                for line in prompt_lines[1:]:
+                    content.append("\n")
+                    content.append(continuation, style="#536b7a")
+                    content.append(line, style="#edf5f7")
+            return content
+
+        def _follow_up_queue_text(self) -> str:
+            return self._follow_up_queue_renderable().plain
 
         def _refresh_follow_up_queue(self) -> None:
             if self._selection_drag_active() or self._screen_selection_active():
@@ -5337,7 +5358,8 @@ else:
                 widget = self.query_one("#follow-up-queue", Static)
             except Exception:
                 return
-            text = self._follow_up_queue_text()
+            renderable = self._follow_up_queue_renderable()
+            text = renderable.plain
             frame.display = bool(text)
             if not text:
                 self._follow_up_queue_cache = ""
@@ -5350,17 +5372,17 @@ else:
                     or getattr(frame.size, "width", 0)
                     or 80
                 )
-                - 2,
+                - 3,
             )
             visible_lines = sum(
                 max(1, (cell_len(line) + content_width - 1) // content_width)
                 for line in text.splitlines()
             )
-            frame.styles.height = min(6, max(1, visible_lines))
+            frame.styles.height = min(4, max(2, visible_lines))
             item_key = tuple(item.prompt for item in self.follow_up_queue)
             items_changed = item_key != self._follow_up_queue_items_cache
             if text != self._follow_up_queue_cache:
-                widget.update(text)
+                widget.update(renderable)
                 self._follow_up_queue_cache = text
                 self._follow_up_queue_items_cache = item_key
             if items_changed:

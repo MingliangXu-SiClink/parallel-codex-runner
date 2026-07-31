@@ -5864,7 +5864,80 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(app._follow_up_countdown_second, 59)
         self.assertIn("in 59s", app.status)
-        self.assertIn("next in 59s", queue_text)
+        self.assertIn("starts in 59s", queue_text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_queue_separates_status_from_single_prompt(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app.running = True
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question\nwith details", True)
+        )
+
+        queue_text = app._follow_up_queue_text()
+        lines = queue_text.splitlines()
+
+        self.assertEqual(lines[0], "◆ QUEUE · 1 item · Agents running")
+        self.assertEqual(lines[1], "  › follow-up question")
+        self.assertEqual(lines[2], "    with details")
+        self.assertNotIn("· 1  follow-up", queue_text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_queue_numbers_multiple_prompts_consistently(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app.running = True
+        app.follow_up_queue.extend(
+            [
+                tui_textual.QueuedFollowUp("first", True),
+                tui_textual.QueuedFollowUp("second\ncontinued", True),
+            ]
+        )
+
+        lines = app._follow_up_queue_text().splitlines()
+
+        self.assertEqual(lines[0], "◆ QUEUE · 2 items · Agents running")
+        self.assertEqual(lines[1], "  1 │ first")
+        self.assertEqual(lines[2], "  2 │ second")
+        self.assertEqual(lines[3], "    │ continued")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_countdown_changes_header_without_moving_prompt(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app.selected_agent = 2
+        app.follow_up_continue_at = 160.0
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question", True)
+        )
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            first = app._follow_up_queue_text().splitlines()
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=101.0):
+            second = app._follow_up_queue_text().splitlines()
+
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(first[1:], second[1:])
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_queue_caps_long_content_height(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(70, 24)) as pilot:
+                    app.running = True
+                    app.follow_up_queue.append(
+                        tui_textual.QueuedFollowUp(
+                            "\n".join(f"line {index}" for index in range(1, 9)),
+                            True,
+                        )
+                    )
+                    app._refresh_follow_up_queue()
+                    await pilot.pause()
+
+                    frame = app.query_one("#follow-up-queue-frame")
+                    self.assertEqual(frame.region.height, 4)
+                    self.assertGreater(frame.max_scroll_y, 0)
+
+        asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_switching_agent_restarts_follow_up_countdown(self) -> None:
@@ -6026,7 +6099,7 @@ class TuiCommandTests(unittest.TestCase):
                         str(app.query_one("#runner-conversation").content),
                     )
                     self.assertIn(
-                        "next in 42s",
+                        "starts in 42s",
                         str(app.query_one("#follow-up-queue").content),
                     )
                     self.assertIn(
