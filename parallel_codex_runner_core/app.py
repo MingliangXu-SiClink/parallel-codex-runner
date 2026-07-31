@@ -66,7 +66,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
-import hashlib
 import json
 import os
 import signal
@@ -109,7 +108,15 @@ from .paths import (
     is_relative_to,
     safe_tail,
 )
-from .synthesis import create_synthesis_context, preferred_recommendation_pool
+from .synthesis import (
+    SYNTHESIS_INHERIT,
+    create_synthesis_context,
+    effective_synthesis_codex_settings,
+    normalize_synthesis_effort,
+    normalize_synthesis_fast,
+    normalize_synthesis_model,
+    preferred_recommendation_pool,
+)
 from .workspace import (
     cleanup_workspace_copy,
     cleanup_workspace_copies,
@@ -120,66 +127,6 @@ from .workspace import (
 )
 
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
-
-
-def _runtime_source_digest(package_root: Path) -> Optional[str]:
-    """Hash Python sources already imported by a long-running PCR process."""
-    package_root = package_root.expanduser().resolve()
-    sources = [
-        path
-        for path in package_root.rglob("*.py")
-        if "_vendor" not in path.relative_to(package_root).parts
-    ]
-    entrypoint = package_root.parent / "parallel_codex_runner.py"
-    if entrypoint.is_file():
-        sources.append(entrypoint)
-
-    digest = hashlib.sha256()
-    try:
-        for path in sorted(sources, key=lambda item: str(item)):
-            digest.update(
-                str(path.relative_to(package_root.parent)).encode("utf-8")
-            )
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-            digest.update(b"\0")
-    except OSError:
-        return None
-    return digest.hexdigest()
-
-
-_RUNTIME_SOURCE_ROOT = Path(__file__).resolve().parent
-_RUNTIME_SOURCE_DIGEST = _runtime_source_digest(_RUNTIME_SOURCE_ROOT)
-
-
-def ensure_runtime_sources_unchanged() -> None:
-    """Refuse new work when the TUI still has an older PCR version loaded."""
-    if _RUNTIME_SOURCE_DIGEST is None:
-        return
-    if _runtime_source_digest(_RUNTIME_SOURCE_ROOT) != _RUNTIME_SOURCE_DIGEST:
-        raise RuntimeError(
-            "PCR 源码在当前进程启动后发生了变化，当前 TUI 仍在使用旧代码。"
-            "请退出 TUI 并重新运行 `pcr`，再开始下一轮任务。"
-        )
-
-
-def acknowledge_runtime_source_sync(workspace: Path) -> bool:
-    """Accept a PCR-managed sync into the checkout that provides this runtime."""
-    global _RUNTIME_SOURCE_DIGEST
-
-    try:
-        workspace = workspace.expanduser().resolve()
-        owns_runtime = is_relative_to(_RUNTIME_SOURCE_ROOT, workspace)
-    except (OSError, RuntimeError):
-        return False
-    if not owns_runtime:
-        return False
-    current_digest = _runtime_source_digest(_RUNTIME_SOURCE_ROOT)
-    if current_digest is None:
-        return False
-    changed = current_digest != _RUNTIME_SOURCE_DIGEST
-    _RUNTIME_SOURCE_DIGEST = current_digest
-    return changed
 
 
 GIBIBYTE = 1024**3
@@ -3487,6 +3434,20 @@ def _archive_retry_metadata(run_root: Path, meta_dir: Path, idx: int) -> None:
     shutil.move(str(meta_dir), str(retry_root / stamp))
 
 
+def agent_role_execution_args(
+    args: argparse.Namespace,
+    agent_role: str,
+) -> argparse.Namespace:
+    if normalize_agent_role(agent_role) != AGENT_ROLE_SYNTHESIS:
+        return args
+    settings = effective_synthesis_codex_settings(args)
+    stage_args = argparse.Namespace(**vars(args))
+    stage_args.model = settings.model
+    stage_args.effort = settings.effort
+    stage_args.fast = settings.fast
+    return stage_args
+
+
 def _prepare_additional_agent(
     *,
     args: argparse.Namespace,
@@ -3583,8 +3544,8 @@ def run_additional_agents(
     synthesis_status: Optional[str] = None,
     synthesis_error: Optional[str] = None,
 ) -> List[AgentResult]:
-    ensure_runtime_sources_unchanged()
     agent_role = normalize_agent_role(agent_role)
+    execution_args = agent_role_execution_args(args, agent_role)
     indices = list(dict.fromkeys(int(idx) for idx in agent_indices))
     if not indices or any(idx <= 0 for idx in indices):
         raise ValueError("agent indices must contain positive integers")
@@ -3600,14 +3561,14 @@ def run_additional_agents(
 
     retries = set(retry_indices or set())
     help_text = (
-        read_codex_exec_resume_help(args.codex_bin)
+        read_codex_exec_resume_help(execution_args.codex_bin)
         if resume_session_id
-        else read_codex_exec_help(args.codex_bin)
+        else read_codex_exec_help(execution_args.codex_bin)
     )
     real_codex_home = get_codex_home()
     effective_effort = resolve_codex_reasoning_effort(
-        getattr(args, "model", None),
-        getattr(args, "effort", None),
+        getattr(execution_args, "model", None),
+        getattr(execution_args, "effort", None),
         real_codex_home,
     )
     command_by_agent: Dict[int, List[str]] = {}
@@ -3622,7 +3583,7 @@ def run_additional_agents(
                 break
             touched.append(idx)
             command, agent_codex_home = _prepare_additional_agent(
-                args=args,
+                args=execution_args,
                 idx=idx,
                 run_root=run_root,
                 workspace=workspace,
@@ -3652,7 +3613,11 @@ def run_additional_agents(
             scrub_codex_home_support_entries(codex_home_by_agent[idx])
         return []
 
-    max_parallel = 1 if args.serial else (args.max_parallel or len(prepared))
+    max_parallel = (
+        1
+        if execution_args.serial
+        else (execution_args.max_parallel or len(prepared))
+    )
     max_parallel = min(max_parallel, len(prepared))
     try:
         results = asyncio.run(
@@ -3680,7 +3645,7 @@ def run_additional_agents(
             workspace=workspace,
             prompt=prompt,
             new_results=results,
-            recommend_by=args.recommend_by,
+            recommend_by=execution_args.recommend_by,
             recommendation_excluded_indices=recommendation_excluded_indices,
             synthesis_source_agents=synthesis_source_agents,
             synthesis_status=synthesis_status,
@@ -3710,6 +3675,10 @@ def _explicit_tui_settings(argv: Sequence[str]) -> set[str]:
         "--effort": "effort",
         "--fast": "fast",
         "--no-fast": "fast",
+        "--synthesis-model": "synthesis_model",
+        "--synthesis-effort": "synthesis_effort",
+        "--synthesis-fast": "synthesis_fast",
+        "--no-synthesis-fast": "synthesis_fast",
         "--no-sync-back": "sync_back",
         "--keep-workspaces": "keep_workspaces",
         "--resume": "resume",
@@ -3807,6 +3776,43 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--synthesis-model",
+        type=normalize_synthesis_model,
+        default=SYNTHESIS_INHERIT,
+        metavar="MODEL",
+        help=(
+            "Codex model for synthesis agents. Defaults to inherit, which uses "
+            "--model. Use default to omit the model override."
+        ),
+    )
+    parser.add_argument(
+        "--synthesis-effort",
+        type=normalize_synthesis_effort,
+        default=SYNTHESIS_INHERIT,
+        metavar="LEVEL",
+        help=(
+            "Reasoning effort for synthesis agents. Defaults to inherit, which "
+            "uses --effort. Use auto to select the synthesis model's default."
+        ),
+    )
+    parser.add_argument(
+        "--synthesis-fast",
+        type=normalize_synthesis_fast,
+        default=SYNTHESIS_INHERIT,
+        metavar="{inherit,auto,on,off}",
+        help=(
+            "Fast mode for synthesis agents. inherit uses --fast and auto "
+            "uses the Codex service-tier default."
+        ),
+    )
+    parser.add_argument(
+        "--no-synthesis-fast",
+        dest="synthesis_fast",
+        action="store_const",
+        const=False,
+        help="Force Standard mode for synthesis agents.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Show Codex resume sessions for this workspace and run agents with the selected session.",
@@ -3859,6 +3865,18 @@ def validate_args(args: argparse.Namespace) -> None:
     if fast is not None and not isinstance(fast, bool):
         raise SystemExit("--fast / --no-fast 配置无效。")
     args.fast = fast
+    args.synthesis_model = normalize_synthesis_model(
+        getattr(args, "synthesis_model", SYNTHESIS_INHERIT)
+    )
+    args.synthesis_effort = normalize_synthesis_effort(
+        getattr(args, "synthesis_effort", SYNTHESIS_INHERIT)
+    )
+    try:
+        args.synthesis_fast = normalize_synthesis_fast(
+            getattr(args, "synthesis_fast", SYNTHESIS_INHERIT)
+        )
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
     resume_requested = bool(
         getattr(args, "resume", False)
         or getattr(args, "resume_session_id", None)
@@ -3867,6 +3885,14 @@ def validate_args(args: argparse.Namespace) -> None:
         resolve_codex_reasoning_effort(
             getattr(args, "model", None),
             args.effort,
+        )
+    synthesis_settings = effective_synthesis_codex_settings(args)
+    if synthesis_settings.effort and (
+        synthesis_settings.model or not resume_requested
+    ):
+        resolve_codex_reasoning_effort(
+            synthesis_settings.model,
+            synthesis_settings.effort,
         )
 
 
@@ -3880,7 +3906,6 @@ def run_once(
     progress_callback: ProgressCallback = None,
     print_output: bool = True,
 ) -> int:
-    ensure_runtime_sources_unchanged()
     synthesis_agents = max(0, int(getattr(args, "synthesis_agents", 0) or 0))
     subagents = bool(getattr(args, "subagents", False))
     subagents_limit = int(
@@ -3919,6 +3944,31 @@ def run_once(
         effort_model,
         getattr(args, "effort", None),
     )
+    synthesis_settings = effective_synthesis_codex_settings(args)
+    synthesis_effort_model = synthesis_settings.model or (
+        resume_session.model if resume_session else None
+    )
+    synthesis_effective_effort = resolve_codex_reasoning_effort(
+        synthesis_effort_model,
+        synthesis_settings.effort,
+    )
+    synthesis_model_display = model_registry.model_display(
+        synthesis_settings.model
+    )
+    synthesis_effort_display = model_registry.effort_display(
+        synthesis_effort_model,
+        synthesis_settings.effort,
+    )
+    synthesis_fast_display = format_fast_mode(
+        synthesis_settings.fast,
+        model_registry.configured_service_tier,
+    )
+    if getattr(args, "synthesis_model", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
+        synthesis_model_display = f"inherit ({synthesis_model_display})"
+    if getattr(args, "synthesis_effort", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
+        synthesis_effort_display = f"inherit ({synthesis_effort_display})"
+    if getattr(args, "synthesis_fast", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
+        synthesis_fast_display = f"inherit ({synthesis_fast_display})"
 
     run_base = choose_run_base(workspace, args.runs_dir)
     if is_relative_to(run_base, workspace):
@@ -3947,6 +3997,9 @@ def run_once(
                     ["MODEL", model_display],
                     ["EFFORT", effective_effort or "default"],
                     ["FAST", fast_display],
+                    ["SYNTHESIS_MODEL", synthesis_model_display],
+                    ["SYNTHESIS_EFFORT", synthesis_effort_display],
+                    ["SYNTHESIS_FAST", synthesis_fast_display],
                     ["CODEX_BIN", str(args.codex_bin)],
                     ["SYNC_BACK", "NO" if args.no_sync_back else "YES"],
                     ["KEEP_WORKSPACES", "YES" if args.keep_workspaces else "NO"],
@@ -3988,6 +4041,9 @@ def run_once(
         overview.add_row("MODEL", model_display)
         overview.add_row("EFFORT", effective_effort or "default")
         overview.add_row("FAST", fast_display)
+        overview.add_row("SYNTHESIS_MODEL", synthesis_model_display)
+        overview.add_row("SYNTHESIS_EFFORT", synthesis_effort_display)
+        overview.add_row("SYNTHESIS_FAST", synthesis_fast_display)
         overview.add_row("RESUME", resume_session_id or "NO")
         overview.add_row("METADATA", absolute_path_for_display(meta_root))
         overview.add_row("WORKSPACE COPIES", absolute_path_for_display(workspaces_root))
@@ -4011,6 +4067,9 @@ def run_once(
         log("info", "model = {}", model_display)
         log("info", "effort = {}", effective_effort or "default")
         log("info", "fast = {}", fast_display)
+        log("info", "synthesis_model = {}", synthesis_model_display)
+        log("info", "synthesis_effort = {}", synthesis_effort_display)
+        log("info", "synthesis_fast = {}", synthesis_fast_display)
         log("info", "resume = {}", resume_session_id or "NO")
 
     help_text = read_codex_exec_resume_help(args.codex_bin) if resume_session_id else read_codex_exec_help(args.codex_bin)
@@ -4239,6 +4298,9 @@ def run_once(
         "context_path": None,
         "instructions_path": None,
         "resume_session_id": resume_session_id,
+        "model": synthesis_settings.model,
+        "effort": synthesis_effective_effort,
+        "fast": synthesis_settings.fast,
         "status": "disabled" if synthesis_agents == 0 else "pending",
         "reason": None,
         "error": None,
@@ -4289,6 +4351,9 @@ def run_once(
                         "user_prompt": prompt,
                         "developer_instructions": synthesis_instructions,
                         "resume_session_id": resume_session_id,
+                        "model": synthesis_settings.model,
+                        "effort": synthesis_effective_effort,
+                        "fast": synthesis_settings.fast,
                     }
                 )
             synthesis_results = run_additional_agents(

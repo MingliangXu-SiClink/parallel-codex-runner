@@ -51,12 +51,16 @@ from .plugin.lifecycle import (
     DEFAULT_STORAGE_QUOTA_BYTES,
     FileSignal,
     RunOperationLock,
+    WORKER_PROTOCOL_VERSION,
     configured_positive_int,
     deadline_timestamp,
+    enqueue_worker_operation,
+    new_worker_operation_id,
     pid_is_alive,
     read_json,
     spawn_worker,
     utc_deadline,
+    worker_response_path,
 )
 from .plugin.state import (
     STATE_VERSION,
@@ -208,27 +212,9 @@ class PluginRunManager:
             if not RUN_ID_PATTERN.fullmatch(run.run_id):
                 continue
             self._runs[run.run_id] = run
-            if run.status in ACTIVE_RUN_STATES | {"finalizing"}:
+            if run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid:
                 self._refresh_events_locked(run, save=False)
-            if run.status in ACTIVE_RUN_STATES and not pid_is_alive(run.worker_pid):
-                run.status = "interrupted"
-                run.error = (
-                    "The detached PCR worker ended before this run completed. "
-                    "Inspect retained artifacts or discard the run."
-                )
-                for idx, status in list(run.agent_statuses.items()):
-                    if status in {"copying", "queued", "running", "stopping"}:
-                        run.agent_statuses[idx] = "interrupted"
-                if run.run_root:
-                    try:
-                        root = self._validated_run_root(run)
-                        scrub_agent_codex_homes(root / "meta")
-                    except Exception as exc:
-                        run.error += (
-                            " Temporary Codex support files could not be scrubbed "
-                            f"automatically: {exc}"
-                        )
-                run.updated_at = _utc_now()
+            if self._detect_worker_failure_locked(run):
                 changed = True
             previous_status = run.status
             self._recover_finalization_locked(run)
@@ -340,6 +326,8 @@ class PluginRunManager:
         if run is None:
             raise PluginRunError(f"Unknown PCR run: {run_id}")
         self._refresh_events_locked(run, save=False)
+        if self._uses_persistent_worker(run):
+            self._detect_worker_failure_locked(run)
         return run
 
     def _active_context_thread_locked(
@@ -351,11 +339,95 @@ class PluginRunManager:
                 return run_id, thread
         return None
 
+    @staticmethod
+    def _uses_persistent_worker(run: ManagedRun) -> bool:
+        return run.worker_protocol == WORKER_PROTOCOL_VERSION
+
+    def _worker_alive_locked(self, run: ManagedRun) -> bool:
+        context = self._contexts.get(run.run_id)
+        if context is not None and context.thread is not None:
+            return context.thread.is_alive()
+        process = self._worker_processes.get(run.run_id)
+        if process is not None:
+            if process.poll() is not None:
+                self._worker_processes.pop(run.run_id, None)
+                return False
+            return True
+        return pid_is_alive(run.worker_pid)
+
     def _worker_active_locked(self, run: ManagedRun) -> bool:
         context = self._contexts.get(run.run_id)
         if context is not None and context.thread is not None:
             return context.thread.is_alive()
-        return pid_is_alive(run.worker_pid)
+        if self._uses_persistent_worker(run):
+            return self._worker_alive_locked(run) and bool(
+                run.worker_operation
+                or run.worker_state in {"starting", "busy"}
+            )
+        return self._worker_alive_locked(run)
+
+    def _worker_available_locked(self, run: ManagedRun) -> bool:
+        return (
+            self._uses_persistent_worker(run)
+            and run.worker_state not in {"crashed", "stopped"}
+            and self._worker_alive_locked(run)
+        )
+
+    def _detect_worker_failure_locked(self, run: ManagedRun) -> bool:
+        if not self._uses_persistent_worker(run):
+            if run.status not in ACTIVE_RUN_STATES or self._worker_alive_locked(run):
+                return False
+            run.status = "interrupted"
+            run.error = (
+                "The PCR worker ended before this legacy run completed. Inspect "
+                "retained artifacts or discard the run."
+            )
+            for idx, status in list(run.agent_statuses.items()):
+                if status in {"copying", "queued", "running", "stopping"}:
+                    run.agent_statuses[idx] = "interrupted"
+            run.updated_at = _utc_now()
+            return True
+        if run.worker_state in {"crashed", "stopped"}:
+            return False
+        if self._worker_alive_locked(run):
+            return False
+        message = (
+            "This run's persistent PCR worker ended unexpectedly. Its code version "
+            "was pinned when the run started, so PCR will not replace it with a "
+            "worker loaded from different source. The run cannot continue."
+        )
+        run.worker_pid = None
+        run.worker_state = "crashed"
+        run.worker_operation = ""
+        run.worker_operation_id = ""
+        run.worker_error = message
+        if run.status in ACTIVE_RUN_STATES | {"finalizing"}:
+            run.status = "interrupted"
+            run.error = message
+            for idx, status in list(run.agent_statuses.items()):
+                if status in {"copying", "queued", "running", "stopping"}:
+                    run.agent_statuses[idx] = "interrupted"
+            if run.run_root:
+                try:
+                    root = self._validated_run_root(run)
+                    scrub_agent_codex_homes(root / "meta")
+                except Exception as exc:
+                    run.error += (
+                        " Temporary Codex support files could not be scrubbed "
+                        f"automatically: {exc}"
+                    )
+        run.updated_at = _utc_now()
+        return True
+
+    def _require_persistent_worker_locked(self, run: ManagedRun) -> None:
+        if self._worker_available_locked(run):
+            return
+        self._detect_worker_failure_locked(run)
+        detail = run.worker_error or (
+            "This run does not have the persistent worker that loaded its original "
+            "PCR code."
+        )
+        raise PluginRunError(f"{detail} Inspect or discard the retained run instead.")
 
     def _claim_run_operation_locked(self, run_id: str, operation: str) -> None:
         active = self._run_operations.get(run_id)
@@ -408,6 +480,10 @@ class PluginRunManager:
         context = self._contexts.get(run_id)
         if context is not None:
             context.thread = None
+        run = self._runs.get(run_id)
+        if run is not None and not self._uses_persistent_worker(run):
+            run.worker_operation = ""
+            run.worker_operation_id = ""
         self._finish_shutdown_locked()
 
     def _finish_shutdown_locked(self) -> None:
@@ -458,8 +534,21 @@ class PluginRunManager:
             worker_pid = _safe_int(payload.get("pid"))
             if worker_pid > 0:
                 run.worker_pid = worker_pid
+            protocol = _safe_int(payload.get("protocol"))
+            if protocol > 0:
+                run.worker_protocol = protocol
+                run.worker_state = "busy" if run.worker_operation else "idle"
+                run.worker_error = ""
             if run.status == "preparing":
                 run.status = "running"
+        elif kind == "plugin_operation_started":
+            worker_pid = _safe_int(payload.get("pid"))
+            if worker_pid > 0:
+                run.worker_pid = worker_pid
+            run.worker_state = "busy"
+            run.worker_operation = str(payload.get("operation") or "")
+            run.worker_operation_id = str(payload.get("operation_id") or "")
+            run.worker_error = ""
         elif kind == "agent_status" and idx > 0:
             run.agent_statuses[idx] = str(
                 payload.get("status") or run.agent_statuses.get(idx, "queued")
@@ -501,9 +590,65 @@ class PluginRunManager:
             run.error = str(
                 payload.get("message") or "Additional PCR candidates failed"
             )
-        elif kind == "plugin_worker_finished":
-            run.worker_pid = None
-            run.worker_operation = ""
+        elif kind == "agent_selected_for_finalization" and idx > 0:
+            run.finalized_agent = idx
+            run.synced_back = bool(payload.get("synced_back"))
+            promotion = payload.get("session_promotion")
+            run.session_promotion = (
+                dict(promotion) if isinstance(promotion, dict) else None
+            )
+            run.status = "finalizing"
+            run.error = ""
+        elif kind == "agent_finalized" and idx > 0:
+            run.finalized_agent = idx
+            run.synced_back = bool(payload.get("synced_back"))
+            run.workspaces_deleted = bool(payload.get("workspaces_deleted"))
+            run.codex_homes_deleted = bool(payload.get("codex_homes_deleted"))
+            promotion = payload.get("session_promotion")
+            run.session_promotion = (
+                dict(promotion) if isinstance(promotion, dict) else None
+            )
+            run.status = "finalized"
+            run.error = ""
+        elif kind == "workspace_cleanup_failed" and idx > 0:
+            run.finalized_agent = idx
+            run.status = "cleanup_failed"
+            run.error = str(payload.get("message") or "Candidate cleanup failed")
+        elif kind == "finalize_failed" and idx > 0:
+            run.finalized_agent = idx
+            run.status = "sync_ambiguous"
+            run.error = str(payload.get("message") or "Sync-back failed")
+        elif kind == "finalization_metadata_failed":
+            run.error = str(
+                payload.get("message") or "Could not update finalization metadata"
+            )
+        elif kind == "finalization_recovered" and idx > 0:
+            if bool(payload.get("sync_was_applied")):
+                run.finalized_agent = idx
+                run.synced_back = True
+                run.status = "cleanup_failed"
+                run.error = (
+                    "Sync-back was confirmed. Call pcr_accept_agent for the same "
+                    "Agent to finish cleanup without syncing again."
+                )
+            else:
+                run.finalized_agent = None
+                run.synced_back = False
+                run.status = "completed"
+                run.error = ""
+        elif kind == "run_discarded":
+            run.status = "discarded"
+            run.workspaces_deleted = bool(payload.get("workspaces_deleted"))
+            run.codex_homes_deleted = bool(payload.get("codex_homes_deleted"))
+        elif kind in {"plugin_operation_finished", "plugin_worker_finished"}:
+            persistent = kind == "plugin_operation_finished"
+            if persistent:
+                run.worker_state = "idle"
+                run.worker_operation = ""
+                run.worker_operation_id = ""
+            else:
+                run.worker_pid = None
+                run.worker_operation = ""
             if payload.get("expired"):
                 run.status = "expired"
                 run.error = "PCR worker exceeded its configured runtime limit"
@@ -514,6 +659,28 @@ class PluginRunManager:
                 cleanup_error = str(payload.get("cleanup_error") or "").strip()
                 if cleanup_error:
                     run.error += f"; artifact cleanup failed: {cleanup_error}"
+        elif kind == "plugin_operation_failed":
+            run.worker_error = str(
+                payload.get("message") or "Persistent PCR worker operation failed"
+            )
+            operation = str(payload.get("operation") or run.worker_operation)
+            if (
+                operation == "finalize"
+                and run.status == "finalizing"
+                and run.finalized_agent is None
+            ):
+                run.status = "completed"
+                run.error = run.worker_error
+            elif operation == "discard":
+                run.error = run.worker_error
+            elif operation in {"initial", "more", "retry"}:
+                run.status = "failed"
+                run.error = run.worker_error
+        elif kind == "plugin_worker_stopped":
+            run.worker_pid = None
+            run.worker_state = "stopped"
+            run.worker_operation = ""
+            run.worker_operation_id = ""
         run.updated_at = str(payload.get("timestamp") or _utc_now())
 
     def _refresh_events_locked(
@@ -661,6 +828,11 @@ class PluginRunManager:
                 if requests_dir.exists():
                     for request in requests_dir.glob(f"{run.run_id}-*.json"):
                         self._remove_owned_state_path(request, requests_dir)
+                responses_dir = workers_dir / "responses"
+                self._validated_state_parent(responses_dir)
+                if responses_dir.exists():
+                    for response in responses_dir.glob(f"{run.run_id}-*.json"):
+                        self._remove_owned_state_path(response, responses_dir)
                 self._events.delete(run.run_id)
         except RuntimeError as exc:
             raise PluginRunError(str(exc)) from exc
@@ -681,7 +853,10 @@ class PluginRunManager:
         for run in list(self._runs.values()):
             if run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid:
                 self._refresh_events_locked(run, save=False)
+            if self._detect_worker_failure_locked(run):
+                changed = True
             active = self._worker_active_locked(run)
+            worker_alive = self._worker_alive_locked(run)
             deadline = deadline_timestamp(run.worker_deadline)
             if active and deadline is not None and now >= deadline:
                 FileSignal(self.control_dir / run.run_id / "stop").set()
@@ -693,9 +868,19 @@ class PluginRunManager:
                 changed = True
             expires = deadline_timestamp(run.expires_at)
             if (
+                self._uses_persistent_worker(run)
+                and expires is not None
+                and now >= expires
+                and worker_alive
+                and not active
+            ):
+                FileSignal(self.control_dir / run.run_id / "shutdown").set()
+                continue
+            if (
                 expires is not None
                 and now >= expires
                 and not active
+                and not worker_alive
                 and not (run.workspaces_deleted and run.codex_homes_deleted)
             ):
                 try:
@@ -712,6 +897,7 @@ class PluginRunManager:
                 expires is not None
                 and now >= expires + self.artifact_retention_seconds
                 and not active
+                and not worker_alive
                 and run.workspaces_deleted
                 and run.codex_homes_deleted
                 and run.status in FINAL_RUN_STATES | {"expired", "interrupted", "failed"}
@@ -1014,7 +1200,14 @@ class PluginRunManager:
             agent_statuses={idx: "queued" for idx in range(1, num_agents + 1)},
             agent_tokens={idx: None for idx in range(1, num_agents + 1)},
             artifact_token=uuid.uuid4().hex,
+            worker_protocol=(
+                WORKER_PROTOCOL_VERSION if self._detached_workers else 0
+            ),
+            worker_state="starting" if self._detached_workers else "",
             worker_operation="initial",
+            worker_operation_id=(
+                new_worker_operation_id(run_id) if self._detached_workers else ""
+            ),
             worker_started_at=_utc_now(),
             worker_deadline=utc_deadline(self.run_ttl_seconds),
             estimated_bytes=int(storage["total_bytes"]),
@@ -1049,13 +1242,27 @@ class PluginRunManager:
                 self._events.delete(run_id)
                 raise
             if self._detached_workers:
-                process, _operation_id = spawn_worker(
-                    self.state_dir,
-                    run_id,
-                    "initial",
-                    {"run": run.to_dict(), "indices": []},
-                )
+                try:
+                    process, operation_id = spawn_worker(
+                        self.state_dir,
+                        run_id,
+                        "initial",
+                        {"run": run.to_dict(), "indices": []},
+                        operation_id=run.worker_operation_id,
+                    )
+                except Exception as exc:
+                    run.status = "failed"
+                    run.worker_state = "crashed"
+                    run.worker_operation = ""
+                    run.worker_operation_id = ""
+                    run.worker_error = f"Could not start persistent PCR worker: {exc}"
+                    run.error = run.worker_error
+                    run.updated_at = _utc_now()
+                    self._save_state_locked()
+                    raise PluginRunError(run.worker_error) from exc
                 run.worker_pid = process.pid
+                run.worker_state = "busy"
+                run.worker_operation_id = operation_id
                 self._worker_processes[run_id] = process
                 self._save_state_locked()
             else:
@@ -1140,8 +1347,12 @@ class PluginRunManager:
             "workspaces_deleted": run.workspaces_deleted,
             "codex_homes_deleted": run.codex_homes_deleted,
             "worker_active": self._worker_active_locked(run),
+            "worker_available": self._worker_available_locked(run),
             "worker_pid": run.worker_pid,
+            "worker_state": run.worker_state or None,
+            "worker_operation": run.worker_operation or None,
             "worker_deadline": run.worker_deadline or None,
+            "worker_error": run.worker_error or None,
             "session_promotion": run.session_promotion,
             "error": run.error or None,
             "event_count": run.event_count,
@@ -1501,6 +1712,102 @@ class PluginRunManager:
         result["still_running"] = bool(result.get("worker_active"))
         return result
 
+    def _queue_persistent_operation_locked(
+        self,
+        run: ManagedRun,
+        operation: str,
+        request: Dict[str, Any],
+    ) -> str:
+        self._require_persistent_worker_locked(run)
+        if self._worker_active_locked(run):
+            raise PluginRunError(
+                f"PCR run {run.run_id} is still performing "
+                f"{run.worker_operation or 'another operation'}"
+            )
+        previous = (
+            run.worker_state,
+            run.worker_operation,
+            run.worker_operation_id,
+            run.worker_started_at,
+            run.worker_deadline,
+            run.worker_error,
+        )
+        run.worker_state = "busy"
+        run.worker_operation = operation
+        run.worker_operation_id = new_worker_operation_id(run.run_id)
+        run.worker_started_at = _utc_now()
+        run.worker_deadline = utc_deadline(self.run_ttl_seconds)
+        run.worker_error = ""
+        run.updated_at = _utc_now()
+        self._save_state_locked()
+        try:
+            operation_id, _request_path = enqueue_worker_operation(
+                self.state_dir,
+                run.run_id,
+                operation,
+                {
+                    "run": run.to_dict(),
+                    "expect_response": True,
+                    **request,
+                },
+                operation_id=run.worker_operation_id,
+            )
+        except Exception as exc:
+            (
+                run.worker_state,
+                run.worker_operation,
+                run.worker_operation_id,
+                run.worker_started_at,
+                run.worker_deadline,
+                run.worker_error,
+            ) = previous
+            run.updated_at = _utc_now()
+            self._save_state_locked()
+            raise PluginRunError(
+                f"Could not queue {operation} for persistent PCR worker: {exc}"
+            ) from exc
+        return operation_id
+
+    def _wait_for_persistent_operation(
+        self,
+        run_id: str,
+        operation_id: str,
+        timeout_seconds: float,
+    ) -> Dict[str, Any] | None:
+        response_path = worker_response_path(self.state_dir, operation_id)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            response = read_json(response_path)
+            if response:
+                try:
+                    response_path.unlink()
+                except OSError:
+                    pass
+                if bool(response.get("ok")) and str(
+                    response.get("operation") or ""
+                ) in {"finalize", "discard"}:
+                    while time.monotonic() < deadline:
+                        with self._lock:
+                            terminal_run = self._require_run_locked(run_id)
+                            if terminal_run.worker_state in {"stopped", "crashed"}:
+                                break
+                        time.sleep(0.05)
+                with self._lock:
+                    run = self._require_run_locked(run_id)
+                    self._save_state_locked()
+                if not bool(response.get("ok")):
+                    raise PluginRunError(
+                        str(response.get("error") or "Persistent PCR worker operation failed")
+                    )
+                return response
+            with self._lock:
+                run = self._require_run_locked(run_id)
+                if run.worker_state == "crashed":
+                    self._require_persistent_worker_locked(run)
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
+
     def _start_additional_batch(
         self,
         run: ManagedRun,
@@ -1512,6 +1819,8 @@ class PluginRunManager:
             raise PluginRunError(
                 f"PCR run {run.run_id} is still active; wait or stop it first"
             )
+        if self._detached_workers:
+            self._require_persistent_worker_locked(run)
         context = _RunContext(
             cancel_event=threading.Event(),
             agent_cancel_events={idx: threading.Event() for idx in indices},
@@ -1521,6 +1830,25 @@ class PluginRunManager:
             validate_args(args)
         except SystemExit as exc:
             raise PluginRunError(str(exc)) from exc
+        previous_status = run.status
+        previous_error = run.error
+        previous_rejected = list(run.rejected_agents)
+        previous_worker = (
+            run.worker_state,
+            run.worker_operation,
+            run.worker_operation_id,
+            run.worker_started_at,
+            run.worker_deadline,
+            run.worker_error,
+        )
+        previous_agents = {
+            idx: (
+                run.agent_statuses.get(idx),
+                run.agent_tokens.get(idx),
+                dict(run.results[idx]) if idx in run.results else None,
+            )
+            for idx in indices
+        }
         run.status = "running"
         run.error = ""
         for idx in indices:
@@ -1539,6 +1867,9 @@ class PluginRunManager:
             ).clear()
         FileSignal(self.control_dir / run.run_id / "stop").clear()
         run.worker_operation = "retry" if retry_indices else "more"
+        if self._detached_workers:
+            run.worker_state = "busy"
+            run.worker_operation_id = new_worker_operation_id(run.run_id)
         run.worker_started_at = _utc_now()
         run.worker_deadline = utc_deadline(self.run_ttl_seconds)
         self._recompute_recommendation_locked(run)
@@ -1554,19 +1885,55 @@ class PluginRunManager:
         self._save_state_locked()
 
         if self._detached_workers:
-            process, _operation_id = spawn_worker(
-                self.state_dir,
-                run.run_id,
-                run.worker_operation,
-                {
-                    "run": run.to_dict(),
-                    "indices": list(indices),
-                    "retry_indices": sorted(retry_indices),
-                },
-            )
-            run.worker_pid = process.pid
-            self._worker_processes[run.run_id] = process
-            self._save_state_locked()
+            try:
+                _operation_id, _request_path = enqueue_worker_operation(
+                    self.state_dir,
+                    run.run_id,
+                    run.worker_operation,
+                    {
+                        "run": run.to_dict(),
+                        "indices": list(indices),
+                        "retry_indices": sorted(retry_indices),
+                    },
+                    operation_id=run.worker_operation_id,
+                )
+            except Exception as exc:
+                run.status = previous_status
+                run.error = previous_error
+                run.rejected_agents = previous_rejected
+                (
+                    run.worker_state,
+                    run.worker_operation,
+                    run.worker_operation_id,
+                    run.worker_started_at,
+                    run.worker_deadline,
+                    run.worker_error,
+                ) = previous_worker
+                for idx, (status, tokens, result) in previous_agents.items():
+                    if status is None:
+                        run.agent_statuses.pop(idx, None)
+                        run.agent_tokens.pop(idx, None)
+                    else:
+                        run.agent_statuses[idx] = status
+                        run.agent_tokens[idx] = tokens
+                    if result is None:
+                        run.results.pop(idx, None)
+                    else:
+                        run.results[idx] = result
+                self._recompute_recommendation_locked(run)
+                run.updated_at = _utc_now()
+                self._append_event_locked(
+                    run,
+                    {
+                        "type": "batch_queue_failed",
+                        "indices": list(indices),
+                        "message": str(exc),
+                    },
+                )
+                self._save_state_locked()
+                raise PluginRunError(
+                    f"Could not queue persistent worker operation: {exc}"
+                ) from exc
             return self._run_summary_locked(run)
 
         self._contexts[run.run_id] = context
@@ -1682,6 +2049,8 @@ class PluginRunManager:
             except BaseException:
                 run.config["num_agents"] = previous_count
                 run.estimated_bytes = previous_estimate
+                run.updated_at = _utc_now()
+                self._save_state_locked()
                 raise
 
     def retry_agent(self, run_id: str, agent: int) -> Dict[str, Any]:
@@ -1769,15 +2138,96 @@ class PluginRunManager:
         try:
             with RunOperationLock(self.locks_dir, run_id, operation):
                 with self._lock:
-                    self._require_run_locked(run_id)
+                    run = self._require_run_locked(run_id)
                     self._claim_run_operation_locked(run_id, operation)
+                    cleanup_only = (
+                        self._uses_persistent_worker(run)
+                        and not self._worker_available_locked(run)
+                        and run.status == "cleanup_failed"
+                        and run.finalized_agent == int(agent)
+                    )
                 try:
-                    return self._accept_agent(run_id, agent, wait_seconds)
+                    if self._uses_persistent_worker(run) and not cleanup_only:
+                        return self._accept_agent_via_worker(
+                            run_id,
+                            agent,
+                            wait_seconds,
+                        )
+                    return self._accept_agent(
+                        run_id,
+                        agent,
+                        wait_seconds,
+                        stop_active=not cleanup_only,
+                    )
                 finally:
                     with self._lock:
                         self._release_run_operation_locked(run_id, operation)
         except RuntimeError as exc:
             raise PluginRunError(str(exc)) from exc
+
+    def _accept_agent_via_worker(
+        self,
+        run_id: str,
+        agent: int,
+        wait_seconds: float,
+    ) -> Dict[str, Any]:
+        agent = int(agent)
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            if run.status == "sync_ambiguous":
+                raise PluginRunError(
+                    "Sync-back completion is ambiguous. Inspect the workspace and call "
+                    "pcr_recover_finalization before accepting again."
+                )
+            if run.finalized_agent is not None:
+                if run.finalized_agent != agent:
+                    raise PluginRunError(
+                        f"PCR run {run_id} already finalized "
+                        f"AGENT-{run.finalized_agent:03d}"
+                    )
+                if run.status not in {"cleanup_failed", "finalizing"}:
+                    return self._run_summary_locked(run)
+            value = run.results.get(agent)
+            if not isinstance(value, dict) or value.get("status") != "success":
+                raise PluginRunError(
+                    f"AGENT-{agent:03d} has not finished successfully"
+                )
+            operation_active = self._worker_active_locked(run)
+        if operation_active:
+            self.stop_run(run_id, wait_seconds=wait_seconds)
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            if run.finalized_agent is not None:
+                if run.finalized_agent != agent:
+                    raise PluginRunError(
+                        f"PCR run {run_id} already finalized "
+                        f"AGENT-{run.finalized_agent:03d}"
+                    )
+                if run.status not in {"cleanup_failed", "finalizing"}:
+                    return self._run_summary_locked(run)
+            if self._worker_active_locked(run):
+                raise PluginRunError(
+                    "Timed out while stopping remaining Agents; try again after the run stops"
+                )
+            self._require_persistent_worker_locked(run)
+            run.status = "finalizing"
+            run.error = ""
+            operation_id = self._queue_persistent_operation_locked(
+                run,
+                "finalize",
+                {"agent": agent},
+            )
+        response = self._wait_for_persistent_operation(
+            run_id,
+            operation_id,
+            max(0.0, float(wait_seconds)),
+        )
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            summary = self._run_summary_locked(run)
+        if response is None:
+            summary["operation_pending"] = True
+        return summary
 
     def recover_finalization(
         self,
@@ -1793,38 +2243,86 @@ class PluginRunManager:
                         raise PluginRunError(
                             f"PCR run {run_id} does not have an ambiguous sync-back"
                         )
-                    agent = run.finalized_agent
-                    if sync_was_applied:
-                        self._write_finalization_journal(
-                            run,
-                            phase="sync_complete",
-                            agent=agent,
-                            synced_back=True,
-                            recovered=True,
+                    use_worker = (
+                        self._uses_persistent_worker(run)
+                        and self._worker_available_locked(run)
+                    )
+                    self._claim_run_operation_locked(run_id, operation)
+                try:
+                    if use_worker:
+                        with self._lock:
+                            operation_id = self._queue_persistent_operation_locked(
+                                run,
+                                "recover_finalization",
+                                {"sync_was_applied": bool(sync_was_applied)},
+                            )
+                        response = self._wait_for_persistent_operation(
+                            run_id,
+                            operation_id,
+                            45.0,
                         )
-                        run.synced_back = True
-                        run.status = "cleanup_failed"
-                        run.error = (
-                            "Sync-back was confirmed. Call pcr_accept_agent for the "
-                            "same Agent to finish cleanup without syncing again."
-                        )
-                    else:
-                        self._write_finalization_journal(
-                            run,
-                            phase="sync_not_applied",
-                            agent=agent,
-                            synced_back=False,
-                            recovered=True,
-                        )
-                        run.finalized_agent = None
-                        run.synced_back = False
-                        run.status = "completed"
-                        run.error = ""
-                    run.updated_at = _utc_now()
-                    self._save_state_locked()
-                    return self._run_summary_locked(run)
+                        with self._lock:
+                            run = self._require_run_locked(run_id)
+                            summary = self._run_summary_locked(run)
+                        if response is None:
+                            summary["operation_pending"] = True
+                        return summary
+                    return self._recover_finalization(run_id, sync_was_applied)
+                finally:
+                    with self._lock:
+                        self._release_run_operation_locked(run_id, operation)
         except RuntimeError as exc:
             raise PluginRunError(str(exc)) from exc
+
+    def _recover_finalization(
+        self,
+        run_id: str,
+        sync_was_applied: bool,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            if run.status != "sync_ambiguous" or run.finalized_agent is None:
+                raise PluginRunError(
+                    f"PCR run {run_id} does not have an ambiguous sync-back"
+                )
+            agent = run.finalized_agent
+            if sync_was_applied:
+                self._write_finalization_journal(
+                    run,
+                    phase="sync_complete",
+                    agent=agent,
+                    synced_back=True,
+                    recovered=True,
+                )
+                run.synced_back = True
+                run.status = "cleanup_failed"
+                run.error = (
+                    "Sync-back was confirmed. Call pcr_accept_agent for the "
+                    "same Agent to finish cleanup without syncing again."
+                )
+            else:
+                self._write_finalization_journal(
+                    run,
+                    phase="sync_not_applied",
+                    agent=agent,
+                    synced_back=False,
+                    recovered=True,
+                )
+                run.finalized_agent = None
+                run.synced_back = False
+                run.status = "completed"
+                run.error = ""
+            run.updated_at = _utc_now()
+            self._append_event_locked(
+                run,
+                {
+                    "type": "finalization_recovered",
+                    "idx": agent,
+                    "sync_was_applied": bool(sync_was_applied),
+                },
+            )
+            self._save_state_locked()
+            return self._run_summary_locked(run)
 
     def _persist_completed_diffs_locked(self, run: ManagedRun) -> None:
         try:
@@ -1872,6 +2370,8 @@ class PluginRunManager:
         run_id: str,
         agent: int,
         wait_seconds: float,
+        *,
+        stop_active: bool = True,
     ) -> Dict[str, Any]:
         agent = int(agent)
         with self._lock:
@@ -1895,7 +2395,7 @@ class PluginRunManager:
                     f"AGENT-{agent:03d} has not finished successfully"
                 )
             worker_active = self._worker_active_locked(run)
-        if worker_active:
+        if worker_active and stop_active:
             self.stop_run(run_id, wait_seconds=wait_seconds)
             with self._lock:
                 run = self._require_run_locked(run_id)
@@ -2104,9 +2604,15 @@ class PluginRunManager:
         try:
             with RunOperationLock(self.locks_dir, run_id, operation):
                 with self._lock:
-                    self._require_run_locked(run_id)
+                    run = self._require_run_locked(run_id)
                     self._claim_run_operation_locked(run_id, operation)
                 try:
+                    if self._uses_persistent_worker(run) and self._worker_available_locked(run):
+                        return self._discard_run_via_worker(
+                            run_id,
+                            keep_workspaces,
+                            wait_seconds,
+                        )
                     return self._discard_run(run_id, keep_workspaces, wait_seconds)
                 finally:
                     with self._lock:
@@ -2114,11 +2620,65 @@ class PluginRunManager:
         except RuntimeError as exc:
             raise PluginRunError(str(exc)) from exc
 
+    def _discard_run_via_worker(
+        self,
+        run_id: str,
+        keep_workspaces: bool,
+        wait_seconds: float,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            if run.status == "finalized" or run.finalized_agent is not None:
+                raise PluginRunError(
+                    f"PCR run {run_id} already selected an Agent; use accept again "
+                    "to retry cleanup"
+                )
+            if run.status == "discarded" and (
+                keep_workspaces or run.workspaces_deleted
+            ):
+                return self._run_summary_locked(run)
+            operation_active = self._worker_active_locked(run)
+        if operation_active:
+            self.stop_run(run_id, wait_seconds=wait_seconds)
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            if run.status == "discarded" and (
+                keep_workspaces or run.workspaces_deleted
+            ):
+                return self._run_summary_locked(run)
+            if run.status == "finalized" or run.finalized_agent is not None:
+                raise PluginRunError(
+                    f"PCR run {run_id} already selected an Agent; use accept again "
+                    "to retry cleanup"
+                )
+            if self._worker_active_locked(run):
+                raise PluginRunError(
+                    "Run is still stopping; discard it again after all Agents stop"
+                )
+            operation_id = self._queue_persistent_operation_locked(
+                run,
+                "discard",
+                {"keep_workspaces": bool(keep_workspaces)},
+            )
+        response = self._wait_for_persistent_operation(
+            run_id,
+            operation_id,
+            max(0.0, float(wait_seconds)),
+        )
+        with self._lock:
+            run = self._require_run_locked(run_id)
+            summary = self._run_summary_locked(run)
+        if response is None:
+            summary["operation_pending"] = True
+        return summary
+
     def _discard_run(
         self,
         run_id: str,
         keep_workspaces: bool,
         wait_seconds: float,
+        *,
+        stop_active: bool = True,
     ) -> Dict[str, Any]:
         with self._lock:
             existing = self._require_run_locked(run_id)
@@ -2131,10 +2691,11 @@ class PluginRunManager:
                 keep_workspaces or existing.workspaces_deleted
             ):
                 return self._run_summary_locked(existing)
-        self.stop_run(run_id, wait_seconds=wait_seconds)
+        if stop_active:
+            self.stop_run(run_id, wait_seconds=wait_seconds)
         with self._lock:
             run = self._require_run_locked(run_id)
-            if self._worker_active_locked(run):
+            if stop_active and self._worker_active_locked(run):
                 raise PluginRunError(
                     "Run is still stopping; discard it again after all Agents stop"
                 )
@@ -2225,6 +2786,11 @@ class PluginRunManager:
                 "storage": storage,
             }
         finalized = self.accept_agent(run_id, int(agent))
+        if finalized.get("status") != "finalized":
+            raise PluginRunError(
+                "Agent finalization is still running in its persistent worker. "
+                "Wait for the run to finish before continuing."
+            )
         promotion = finalized.get("session_promotion") or {}
         promoted_session = str(promotion.get("session_id") or "") or session_id
         started = self.start_run(
@@ -2399,6 +2965,11 @@ class PluginRunManager:
                 for run in self._runs.values()
                 if self._worker_active_locked(run)
             ]
+            persistent_workers = [
+                run.run_id
+                for run in self._runs.values()
+                if self._worker_available_locked(run)
+            ]
             operation = next(iter(self._run_operations.items()), None)
             return {
                 "ok": not self._closed,
@@ -2406,6 +2977,7 @@ class PluginRunManager:
                 "recorded_runs": len(self._runs),
                 "active_run": active_runs[0] if active_runs else None,
                 "active_runs": active_runs,
+                "persistent_workers": persistent_workers,
                 "active_operation": (
                     {"run_id": operation[0], "operation": operation[1]}
                     if operation is not None
@@ -2427,8 +2999,8 @@ class PluginRunManager:
             contexts = list(self._contexts.items())
             detached_processes = list(self._worker_processes.values())
             self._worker_processes.clear()
-            # Detached workers intentionally survive MCP server recycling. Explicit
-            # stop, discard, TTL, and retention controls own their lifecycle.
+            # Persistent run workers intentionally survive MCP server recycling.
+            # Explicit discard, finalization, TTL, and retention own their lifecycle.
             for _run_id, context in contexts:
                 if context.thread is not None and context.thread.is_alive():
                     context.cancel_event.set()

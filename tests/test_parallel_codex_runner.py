@@ -1262,91 +1262,6 @@ class RunRootTests(unittest.TestCase):
 
 
 class CommandBuildTests(unittest.TestCase):
-    def test_runtime_source_guard_rejects_stale_loaded_code(self) -> None:
-        with mock.patch.object(
-            app_core,
-            "_RUNTIME_SOURCE_DIGEST",
-            "loaded-source",
-        ), mock.patch.object(
-            app_core,
-            "_runtime_source_digest",
-            return_value="updated-source",
-        ), self.assertRaisesRegex(RuntimeError, "重新运行 `pcr`"):
-            app_core.ensure_runtime_sources_unchanged()
-
-    def test_runtime_source_guard_accepts_managed_self_sync(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
-            package = workspace / "parallel_codex_runner_core"
-            package.mkdir()
-
-            with mock.patch.object(
-                app_core,
-                "_RUNTIME_SOURCE_ROOT",
-                package,
-            ), mock.patch.object(
-                app_core,
-                "_RUNTIME_SOURCE_DIGEST",
-                "loaded-source",
-            ), mock.patch.object(
-                app_core,
-                "_runtime_source_digest",
-                return_value="synced-source",
-            ):
-                self.assertTrue(
-                    app_core.acknowledge_runtime_source_sync(workspace)
-                )
-                app_core.ensure_runtime_sources_unchanged()
-                self.assertEqual(
-                    app_core._RUNTIME_SOURCE_DIGEST,
-                    "synced-source",
-                )
-
-    def test_runtime_source_guard_does_not_accept_unrelated_sync(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runtime_root = root / "runtime" / "parallel_codex_runner_core"
-            runtime_root.mkdir(parents=True)
-            workspace = root / "other-workspace"
-            workspace.mkdir()
-
-            with mock.patch.object(
-                app_core,
-                "_RUNTIME_SOURCE_ROOT",
-                runtime_root,
-            ), mock.patch.object(
-                app_core,
-                "_RUNTIME_SOURCE_DIGEST",
-                "loaded-source",
-            ), mock.patch.object(
-                app_core,
-                "_runtime_source_digest",
-            ) as digest:
-                self.assertFalse(
-                    app_core.acknowledge_runtime_source_sync(workspace)
-                )
-                self.assertEqual(
-                    app_core._RUNTIME_SOURCE_DIGEST,
-                    "loaded-source",
-                )
-                digest.assert_not_called()
-
-    def test_runtime_source_digest_tracks_python_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            package = root / "parallel_codex_runner_core"
-            package.mkdir()
-            source = package / "app.py"
-            source.write_text("VALUE = 1\n", encoding="utf-8")
-            first = app_core._runtime_source_digest(package)
-
-            source.write_text("VALUE = 2\n", encoding="utf-8")
-            second = app_core._runtime_source_digest(package)
-
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        self.assertNotEqual(first, second)
-
     def test_model_uses_short_flag_when_only_short_flag_is_supported(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
@@ -1917,6 +1832,52 @@ class ArgParseTests(unittest.TestCase):
 
         self.assertEqual(args.synthesis_agents, 3)
 
+    def test_synthesis_codex_settings_are_independent_cli_overrides(self) -> None:
+        inherited = parse_args(["fix tests"])
+        configured = parse_args(
+            [
+                "fix tests",
+                "--synthesis-model",
+                "review-model",
+                "--synthesis-effort",
+                "high",
+                "--synthesis-fast",
+                "off",
+            ]
+        )
+        automatic = parse_args(
+            [
+                "fix tests",
+                "--synthesis-model",
+                "default",
+                "--synthesis-effort",
+                "auto",
+                "--synthesis-fast",
+                "auto",
+            ]
+        )
+        fast = parse_args(["fix tests", "--synthesis-fast", "on"])
+        standard = parse_args(["fix tests", "--no-synthesis-fast"])
+
+        self.assertEqual(inherited.synthesis_model, "inherit")
+        self.assertEqual(inherited.synthesis_effort, "inherit")
+        self.assertEqual(inherited.synthesis_fast, "inherit")
+        self.assertEqual(configured.synthesis_model, "review-model")
+        self.assertEqual(configured.synthesis_effort, "high")
+        self.assertFalse(configured.synthesis_fast)
+        self.assertIsNone(automatic.synthesis_model)
+        self.assertIsNone(automatic.synthesis_effort)
+        self.assertIsNone(automatic.synthesis_fast)
+        self.assertTrue(fast.synthesis_fast)
+        self.assertFalse(standard.synthesis_fast)
+        self.assertTrue(
+            {
+                "synthesis_model",
+                "synthesis_effort",
+                "synthesis_fast",
+            }.issubset(configured._pcr_explicit_tui_settings)
+        )
+
     def test_negative_synthesis_agent_count_is_rejected(self) -> None:
         args = parse_args(["fix tests", "--synthesis-agents", "-1"])
 
@@ -1933,6 +1894,54 @@ class ArgParseTests(unittest.TestCase):
 
 
 class SynthesisTests(unittest.TestCase):
+    def test_synthesis_execution_args_override_only_synthesis_agents(self) -> None:
+        args = parse_args(
+            [
+                "prompt",
+                "--model",
+                "candidate-model",
+                "--effort",
+                "high",
+                "--fast",
+                "--synthesis-model",
+                "review-model",
+                "--synthesis-effort",
+                "low",
+                "--synthesis-fast",
+                "off",
+            ]
+        )
+
+        candidate = app_core.agent_role_execution_args(args, "candidate")
+        synthesis = app_core.agent_role_execution_args(args, "synthesis")
+
+        self.assertIs(candidate, args)
+        self.assertEqual(candidate.model, "candidate-model")
+        self.assertEqual(candidate.effort, "high")
+        self.assertTrue(candidate.fast)
+        self.assertIsNot(synthesis, args)
+        self.assertEqual(synthesis.model, "review-model")
+        self.assertEqual(synthesis.effort, "low")
+        self.assertFalse(synthesis.fast)
+
+    def test_synthesis_execution_args_inherit_candidate_defaults(self) -> None:
+        args = parse_args(
+            [
+                "prompt",
+                "--model",
+                "candidate-model",
+                "--effort",
+                "high",
+                "--no-fast",
+            ]
+        )
+
+        synthesis = app_core.agent_role_execution_args(args, "synthesis")
+
+        self.assertEqual(synthesis.model, "candidate-model")
+        self.assertEqual(synthesis.effort, "high")
+        self.assertFalse(synthesis.fast)
+
     def test_recommendation_prefers_synthesis_then_falls_back_to_candidates(self) -> None:
         candidate = AgentResult(
             **make_agent_result_data(
@@ -2268,6 +2277,17 @@ class RunOnceCleanupTests(unittest.TestCase):
                     "2",
                     "--synthesis-agents",
                     "2",
+                    "--model",
+                    "candidate-model",
+                    "--effort",
+                    "high",
+                    "--fast",
+                    "--synthesis-model",
+                    "synthesis-model",
+                    "--synthesis-effort",
+                    "low",
+                    "--synthesis-fast",
+                    "off",
                     "--resume-session-id",
                     "session-base",
                     "--no-sync-back",
@@ -2367,9 +2387,31 @@ class RunOnceCleanupTests(unittest.TestCase):
                 summary["synthesis"]["resume_session_id"],
                 "session-base",
             )
+            self.assertEqual(
+                summary["synthesis"]["model"],
+                "synthesis-model",
+            )
+            self.assertEqual(summary["synthesis"]["effort"], "low")
+            self.assertFalse(summary["synthesis"]["fast"])
             self.assertEqual(prepared_session_ids, ["session-base"] * 4)
             self.assertTrue(
                 all(call.get("resume_session_id") == "session-base" for call in build_calls)
+            )
+            self.assertTrue(
+                all(
+                    call.get("model") == "candidate-model"
+                    and call.get("effort") == "high"
+                    and call.get("fast") is True
+                    for call in build_calls[:2]
+                )
+            )
+            self.assertTrue(
+                all(
+                    call.get("model") == "synthesis-model"
+                    and call.get("effort") == "low"
+                    and call.get("fast") is False
+                    for call in build_calls[2:]
+                )
             )
             for idx in range(1, 5):
                 self.assertIn(
@@ -3153,6 +3195,7 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/reject", "\n".join(command_suggestions("/rej")))
         self.assertIn("/retry [agent]", "\n".join(command_suggestions("/ret")))
         self.assertIn("/more <n>", "\n".join(command_suggestions("/mo")))
+        self.assertIn("/queue [n]", "\n".join(command_suggestions("/q")))
         self.assertIn("/diff", "\n".join(command_suggestions("/d")))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
@@ -3211,6 +3254,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(any("/kill" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/accept" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("/diff" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertTrue(any("/queue" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("SUBAGENTS" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("FAST" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("60 秒" in tip for tip in tui_textual.TUI_TIPS))
@@ -3255,6 +3299,9 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/model gpt-5")
         app._handle_command("/effort high")
         app._handle_command("/fast on")
+        app._handle_command("/synthesismodel review-model")
+        app._handle_command("/synthesiseffort low")
+        app._handle_command("/synthesisfast off")
         app._handle_command("/syncback off")
         app._handle_command("/keepworkspaces on")
         app._handle_command("/resumeinclude off")
@@ -3271,6 +3318,9 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.args.model, "gpt-5")
         self.assertEqual(app.args.effort, "high")
         self.assertTrue(app.args.fast)
+        self.assertEqual(app.args.synthesis_model, "review-model")
+        self.assertEqual(app.args.synthesis_effort, "low")
+        self.assertFalse(app.args.synthesis_fast)
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
         self.assertFalse(app.args.resume_include_non_interactive)
@@ -3281,12 +3331,18 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/model clear")
         app._handle_command("/effort auto")
         app._handle_command("/fast auto")
+        app._handle_command("/synthesismodel inherit")
+        app._handle_command("/synthesiseffort inherit")
+        app._handle_command("/synthesisfast inherit")
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertFalse(app.args.subagents)
         self.assertIsNone(app.args.model)
         self.assertIsNone(app.args.effort)
         self.assertIsNone(app.args.fast)
+        self.assertEqual(app.args.synthesis_model, "inherit")
+        self.assertEqual(app.args.synthesis_effort, "inherit")
+        self.assertEqual(app.args.synthesis_fast, "inherit")
         self.assertTrue(
             dict(app._base_info_rows())["FAST"].startswith("AUTO (")
         )
@@ -3363,6 +3419,44 @@ class TuiCommandTests(unittest.TestCase):
         self.assertNotIn(
             ("max", "max"),
             app.model_registry.effort_options("gpt-narrow", app.args.effort),
+        )
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_synthesis_model_has_independent_effort_validation(self) -> None:
+        args = parse_args(
+            [
+                "--model",
+                "gpt-wide",
+                "--effort",
+                "max",
+            ]
+        )
+        app = tui_textual.PcrTextualApp(args)
+        app.model_registry = CodexModelRegistry(
+            models={
+                "gpt-wide": CodexModelInfo(
+                    "gpt-wide",
+                    "medium",
+                    ("medium", "max"),
+                ),
+                "gpt-narrow": CodexModelInfo(
+                    "gpt-narrow",
+                    "medium",
+                    ("low", "medium"),
+                ),
+            }
+        )
+        app._sync = lambda: None
+
+        app._handle_command("/synthesismodel gpt-narrow")
+
+        self.assertEqual(app.args.model, "gpt-wide")
+        self.assertEqual(app.args.effort, "max")
+        self.assertEqual(app.args.synthesis_model, "gpt-narrow")
+        self.assertIsNone(app.args.synthesis_effort)
+        self.assertEqual(
+            dict(app._base_info_rows())["SYNTHESIS_EFFORT"],
+            "auto (medium)",
         )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -4409,11 +4503,44 @@ class TuiCommandTests(unittest.TestCase):
                     effort.value = "high"
                     await pilot.pause()
 
+                    synthesis_model = app.query_one(
+                        "#config-synthesis-model"
+                    )
+                    app._set_select_control(
+                        synthesis_model,
+                        "inherit",
+                        [
+                            ("inherit", "inherit"),
+                            ("default", ""),
+                            ("review-model", "review-model"),
+                        ],
+                    )
+                    synthesis_model.value = "review-model"
+                    await pilot.pause()
+
+                    synthesis_effort = app.query_one(
+                        "#config-synthesis-effort"
+                    )
+                    synthesis_effort.value = "low"
+                    await pilot.pause()
+
+                    synthesis_fast = app.query_one(
+                        "#config-synthesis-fast"
+                    )
+                    synthesis_fast.value = "off"
+                    await pilot.pause()
+
                     self.assertTrue(app.args.serial)
                     self.assertEqual(app.args.recommend_by, "duration")
                     self.assertEqual(app.args.model, "gpt-test")
                     self.assertEqual(app.args.effort, "high")
                     self.assertTrue(app.args.fast)
+                    self.assertEqual(
+                        app.args.synthesis_model,
+                        "review-model",
+                    )
+                    self.assertEqual(app.args.synthesis_effort, "low")
+                    self.assertFalse(app.args.synthesis_fast)
                     self.assertTrue(app.args.subagents)
                     self.assertEqual(app.args.subagents_limit, 12)
                     self.assertTrue(app.args.no_sync_back)
@@ -4472,6 +4599,29 @@ class TuiCommandTests(unittest.TestCase):
                     model.value = "gpt-test"
                     await pilot.pause()
 
+                    synthesis_model = app.query_one(
+                        "#config-synthesis-model"
+                    )
+                    app._set_select_control(
+                        synthesis_model,
+                        "inherit",
+                        [
+                            ("inherit", "inherit"),
+                            ("default", ""),
+                            ("review-model", "review-model"),
+                        ],
+                    )
+                    synthesis_model.value = "review-model"
+                    synthesis_effort = app.query_one(
+                        "#config-synthesis-effort"
+                    )
+                    synthesis_effort.value = "low"
+                    synthesis_fast = app.query_one(
+                        "#config-synthesis-fast"
+                    )
+                    synthesis_fast.value = "off"
+                    await pilot.pause()
+
                     agents.focus()
                     agents.value = "4"
                     captured_args: list[argparse.Namespace] = []
@@ -4496,6 +4646,15 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(captured_args[0].recommend_by, "duration")
                     self.assertEqual(captured_args[0].model, "gpt-test")
                     self.assertTrue(captured_args[0].fast)
+                    self.assertEqual(
+                        captured_args[0].synthesis_model,
+                        "review-model",
+                    )
+                    self.assertEqual(
+                        captured_args[0].synthesis_effort,
+                        "low",
+                    )
+                    self.assertFalse(captured_args[0].synthesis_fast)
                     self.assertEqual(
                         set(captured_args[0].agent_cancel_events),
                         {1, 2, 3, 4, 5, 6},
@@ -5702,22 +5861,16 @@ class TuiCommandTests(unittest.TestCase):
             with mock.patch.object(tui_textual, "promote_best_codex_session_to_workspace") as promote:
                 with mock.patch.object(tui_textual, "sync_best_workspace_back") as sync_back:
                     with mock.patch.object(tui_textual, "cleanup_workspace_copies") as cleanup:
-                        with mock.patch.object(
-                            tui_textual,
-                            "acknowledge_runtime_source_sync",
-                            return_value=True,
-                        ) as acknowledge_runtime:
-                            sync_back.side_effect = sync_side_effect
-                            promote.side_effect = promote_side_effect
+                        sync_back.side_effect = sync_side_effect
+                        promote.side_effect = promote_side_effect
 
-                            self.assertTrue(app._finalize_agent(2))
+                        self.assertTrue(app._finalize_agent(2))
 
             self.assertEqual(app.resume_session_id, "session-2")
             self.assertEqual(calls, ["sync", "promote"])
             sync_back.assert_called_once_with(candidate, workspace.resolve())
-            acknowledge_runtime.assert_called_once_with(workspace.resolve())
             cleanup.assert_called_once_with(workspace.resolve(), workspaces_root)
-            self.assertIn("source updates load after restart", app.status)
+            self.assertEqual(app.status, "Continuing from AGENT-002")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_start_run_continues_from_selected_not_recommended_agent(self) -> None:
@@ -5899,6 +6052,157 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(lines[1], "  1 │ first")
         self.assertEqual(lines[2], "  2 │ second")
         self.assertEqual(lines[3], "    │ continued")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_queue_editor_edits_removes_and_reorders_follow_ups(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            context = app._follow_up_context()
+            first = tui_textual.QueuedFollowUp(
+                "first",
+                record_history=True,
+                context=context,
+            )
+            second = tui_textual.QueuedFollowUp(
+                "second",
+                record_history=False,
+                context=context,
+            )
+            third = tui_textual.QueuedFollowUp(
+                "third",
+                record_history=True,
+                context=context,
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    app.running = True
+                    app.follow_up_queue.extend([first, second, third])
+                    app._handle_command("/queue 2")
+                    await pilot.pause()
+
+                    editor_screen = app.screen
+                    self.assertIsInstance(
+                        editor_screen,
+                        tui_textual.QueueEditorScreen,
+                    )
+                    editor = editor_screen.query_one("#queue-editor-prompt")
+                    self.assertEqual(editor.text, "second")
+                    editor.text = "second edited"
+                    selector = editor_screen.query_one("#queue-editor-select")
+                    selector.value = 1
+                    await pilot.pause()
+                    self.assertEqual(editor.text, "first")
+                    selector.value = 2
+                    await pilot.pause()
+                    self.assertEqual(editor.text, "second edited")
+
+                    editor_screen.action_move_up()
+                    editor_screen.selected_source_position = 3
+                    editor_screen._load_selected_prompt()
+                    editor_screen._remove_selected()
+                    self.assertEqual(
+                        [item.prompt for item in app.follow_up_queue],
+                        ["first", "second", "third"],
+                    )
+                    editor_screen.action_apply_editor()
+                    await pilot.pause()
+
+                    self.assertFalse(app.follow_up_queue_editor_open)
+                    self.assertEqual(
+                        [item.prompt for item in app.follow_up_queue],
+                        ["second edited", "first"],
+                    )
+                    self.assertEqual(
+                        [item.record_history for item in app.follow_up_queue],
+                        [False, True],
+                    )
+                    self.assertEqual(
+                        [item.context for item in app.follow_up_queue],
+                        [context, context],
+                    )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_queue_editor_can_cancel_every_queued_follow_up(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        queued = tui_textual.QueuedFollowUp(
+            "follow-up question",
+            record_history=True,
+            context=app._follow_up_context(),
+        )
+        app.follow_up_queue.append(queued)
+        app.follow_up_continue_at = 160.0
+        app.follow_up_ready = True
+        app.follow_up_source_finalized = True
+        app._follow_up_countdown_second = 20
+        app.follow_up_queue_editor_open = True
+
+        app._finish_follow_up_queue_editor(
+            (queued,),
+            tui_textual.QueueEditorResult(()),
+        )
+
+        self.assertEqual(app.follow_up_queue, [])
+        self.assertIsNone(app.follow_up_continue_at)
+        self.assertFalse(app.follow_up_ready)
+        self.assertFalse(app.follow_up_source_finalized)
+        self.assertIsNone(app._follow_up_countdown_second)
+        self.assertIn("cancelled", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_queue_editor_pauses_and_restarts_full_follow_up_countdown(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question")
+        )
+        app.follow_up_continue_at = 130.0
+        app._follow_up_countdown_second = 30
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+        )
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            with mock.patch.object(app, "push_screen") as push_screen:
+                app._handle_queue([])
+
+        callback = push_screen.call_args.args[1]
+        self.assertTrue(app.follow_up_queue_editor_open)
+        self.assertTrue(app.follow_up_queue_editor_resume_after)
+        self.assertIsNone(app.follow_up_continue_at)
+        self.assertIsNone(app._follow_up_countdown_second)
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=200.0):
+            with mock.patch.object(app, "_dispatch_follow_up") as dispatch:
+                app._tick()
+            callback(None)
+
+        dispatch.assert_not_called()
+        self.assertFalse(app.follow_up_queue_editor_open)
+        self.assertFalse(app.follow_up_queue_editor_resume_after)
+        self.assertEqual(app.follow_up_continue_at, 260.0)
+        self.assertEqual(app._follow_up_countdown_second, 60)
+        self.assertIn("in 60s", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_queue_editor_rejects_stale_snapshot(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        original = tui_textual.QueuedFollowUp("original")
+        replacement = tui_textual.QueuedFollowUp("replacement")
+        app.follow_up_queue.append(replacement)
+        app.follow_up_queue_editor_open = True
+
+        app._finish_follow_up_queue_editor(
+            (original,),
+            tui_textual.QueueEditorResult(
+                (tui_textual.QueueEditorRow(1, "edited"),)
+            ),
+        )
+
+        self.assertEqual(app.follow_up_queue, [replacement])
+        self.assertIn("changed while editing", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_follow_up_countdown_changes_header_without_moving_prompt(self) -> None:
@@ -6518,6 +6822,18 @@ class TuiCommandTests(unittest.TestCase):
                     app.query_one("#config-recommend-by").value,
                     "reasoning_tokens",
                 )
+                self.assertEqual(
+                    app.query_one("#config-synthesis-model").value,
+                    "inherit",
+                )
+                self.assertEqual(
+                    app.query_one("#config-synthesis-effort").value,
+                    "inherit",
+                )
+                self.assertEqual(
+                    app.query_one("#config-synthesis-fast").value,
+                    "inherit",
+                )
                 labels = [label for label, _value in app._tree_rows()]
                 self.assertEqual(
                     labels[:3],
@@ -6535,6 +6851,9 @@ class TuiCommandTests(unittest.TestCase):
                 )
                 self.assertIn("RECOMMEND_BY", labels)
                 self.assertIn("SYNTHESIS_AGENTS", labels)
+                self.assertIn("SYNTHESIS_MODEL", labels)
+                self.assertIn("SYNTHESIS_EFFORT", labels)
+                self.assertIn("SYNTHESIS_FAST", labels)
                 self.assertIn("SUBAGENTS", labels)
                 self.assertIn("SUBAGENTS_LIMIT", labels)
                 self.assertLess(

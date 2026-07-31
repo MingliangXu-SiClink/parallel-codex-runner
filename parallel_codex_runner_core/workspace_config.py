@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import threading
@@ -9,6 +10,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from platformdirs import user_state_path
+
+from .synthesis import (
+    SYNTHESIS_INHERIT,
+    normalize_synthesis_effort,
+    normalize_synthesis_fast,
+    normalize_synthesis_model,
+)
 
 try:
     import fcntl
@@ -41,6 +49,9 @@ class WorkspaceSettings:
     model: str | None = None
     effort: str | None = None
     fast: bool | None = None
+    synthesis_model: str | None = SYNTHESIS_INHERIT
+    synthesis_effort: str | None = SYNTHESIS_INHERIT
+    synthesis_fast: str | bool | None = SYNTHESIS_INHERIT
     sync_back: bool | None = None
     keep_workspaces: bool | None = None
     resume_session_id: str | None = None
@@ -113,6 +124,13 @@ class WorkspaceSettings:
         if resume is not None and resume.upper() == "NO":
             resume = None
 
+        try:
+            synthesis_fast = normalize_synthesis_fast(
+                value.get("SYNTHESIS_FAST", SYNTHESIS_INHERIT)
+            )
+        except argparse.ArgumentTypeError:
+            synthesis_fast = SYNTHESIS_INHERIT
+
         present_fields = frozenset(
             field_name
             for json_name, field_name in {
@@ -126,6 +144,9 @@ class WorkspaceSettings:
                 "MODEL": "model",
                 "EFFORT": "effort",
                 "FAST": "fast",
+                "SYNTHESIS_MODEL": "synthesis_model",
+                "SYNTHESIS_EFFORT": "synthesis_effort",
+                "SYNTHESIS_FAST": "synthesis_fast",
                 "SYNC_BACK": "sync_back",
                 "KEEP_WORKSPACES": "keep_workspaces",
                 "RESUME": "resume_session_id",
@@ -147,6 +168,13 @@ class WorkspaceSettings:
             ),
             effort=effort.lower() if effort else None,
             fast=optional_bool(value.get("FAST")),
+            synthesis_model=normalize_synthesis_model(
+                value.get("SYNTHESIS_MODEL", SYNTHESIS_INHERIT)
+            ),
+            synthesis_effort=normalize_synthesis_effort(
+                value.get("SYNTHESIS_EFFORT", SYNTHESIS_INHERIT)
+            ),
+            synthesis_fast=synthesis_fast,
             sync_back=optional_bool(value.get("SYNC_BACK")),
             keep_workspaces=optional_bool(value.get("KEEP_WORKSPACES")),
             resume_session_id=resume,
@@ -180,6 +208,18 @@ class WorkspaceSettings:
         fast = getattr(args, "fast", None)
         if not isinstance(fast, bool):
             fast = None
+        synthesis_model = normalize_synthesis_model(
+            getattr(args, "synthesis_model", SYNTHESIS_INHERIT)
+        )
+        synthesis_effort = normalize_synthesis_effort(
+            getattr(args, "synthesis_effort", SYNTHESIS_INHERIT)
+        )
+        try:
+            synthesis_fast = normalize_synthesis_fast(
+                getattr(args, "synthesis_fast", SYNTHESIS_INHERIT)
+            )
+        except argparse.ArgumentTypeError:
+            synthesis_fast = SYNTHESIS_INHERIT
         return cls(
             agents=int(agents),
             synthesis_agents=int(synthesis_agents),
@@ -191,6 +231,9 @@ class WorkspaceSettings:
             model=model,
             effort=effort,
             fast=fast,
+            synthesis_model=synthesis_model,
+            synthesis_effort=synthesis_effort,
+            synthesis_fast=synthesis_fast,
             sync_back=not bool(getattr(args, "no_sync_back", False)),
             keep_workspaces=bool(getattr(args, "keep_workspaces", False)),
             resume_session_id=str(resume_session_id or "").strip() or None,
@@ -206,6 +249,9 @@ class WorkspaceSettings:
                     "model",
                     "effort",
                     "fast",
+                    "synthesis_model",
+                    "synthesis_effort",
+                    "synthesis_fast",
                     "sync_back",
                     "keep_workspaces",
                     "resume_session_id",
@@ -225,6 +271,25 @@ class WorkspaceSettings:
             "MODEL": self.model or "",
             "EFFORT": self.effort or "auto",
             "FAST": self.fast if self.fast is not None else "AUTO",
+            "SYNTHESIS_MODEL": (
+                "INHERIT"
+                if self.synthesis_model == SYNTHESIS_INHERIT
+                else (self.synthesis_model or "default")
+            ),
+            "SYNTHESIS_EFFORT": (
+                "INHERIT"
+                if self.synthesis_effort == SYNTHESIS_INHERIT
+                else (self.synthesis_effort or "auto")
+            ),
+            "SYNTHESIS_FAST": (
+                "INHERIT"
+                if self.synthesis_fast == SYNTHESIS_INHERIT
+                else (
+                    "AUTO"
+                    if self.synthesis_fast is None
+                    else self.synthesis_fast
+                )
+            ),
             "SYNC_BACK": self.sync_back,
             "KEEP_WORKSPACES": self.keep_workspaces,
             "RESUME": self.resume_session_id or "NO",
@@ -266,6 +331,12 @@ class WorkspaceSettings:
             args.effort = self.effort or None
         if present("fast") and "fast" not in explicit_settings:
             args.fast = self.fast
+        if present("synthesis_model") and "synthesis_model" not in explicit_settings:
+            args.synthesis_model = self.synthesis_model
+        if present("synthesis_effort") and "synthesis_effort" not in explicit_settings:
+            args.synthesis_effort = self.synthesis_effort
+        if present("synthesis_fast") and "synthesis_fast" not in explicit_settings:
+            args.synthesis_fast = self.synthesis_fast
         if present("sync_back") and self.sync_back is not None and "sync_back" not in explicit_settings:
             args.no_sync_back = not self.sync_back
         if present("keep_workspaces") and self.keep_workspaces is not None and "keep_workspaces" not in explicit_settings:

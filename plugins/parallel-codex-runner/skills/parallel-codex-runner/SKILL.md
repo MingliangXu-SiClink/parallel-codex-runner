@@ -14,7 +14,7 @@ Use the PCR MCP tools rather than built-in sub-agents when the user asks for thi
 3. To resume a conversation, call `pcr_list_resume_sessions`, let the user choose a session, and use `pcr_get_resume_history` when they need to review its earlier conversation before starting.
 4. Call `pcr_start_run` with the user's complete task and requested settings. It performs the storage estimate itself.
 5. If it returns `confirmation_required`, show the estimated usage and free space. Call it again with `confirm_large_run=true` only after explicit user approval.
-6. Keep the returned `run_id` and event cursor. Detached workers survive MCP server recycling; do not assume a disconnected tool call stopped them.
+6. Keep the returned `run_id` and event cursor. Each run's persistent worker survives MCP server recycling and owns all later retry, add, and finalization operations; do not assume a disconnected tool call stopped it.
 
 Use `pcr_estimate_run` separately when the user asks about storage before submitting a task.
 
@@ -31,6 +31,7 @@ result; it is not needed for the review step.
 - Treat `recommended_agent` as a review hint, not a quality verdict. Compare successful candidates by correctness, scope, tests, and actual patch content.
 - When the candidates settle, summarize the useful results, name the strongest candidate and why, then ask the user to confirm which Agent should be accepted.
 - Report failures, killed candidates, and meaningful progress without dumping repetitive raw events.
+- If `worker_state` is `crashed` or `worker_available` is false before finalization, explain that the pinned run cannot continue. Do not start a replacement worker; offer retained-result inspection or discard instead.
 
 The runtime preserves chronological events without truncating them. Diff pages are lossless; pagination is only a transport limit.
 

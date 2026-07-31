@@ -21,6 +21,10 @@ except ImportError:  # pragma: no cover - Windows fallback is process-local
 DEFAULT_RUN_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_ARTIFACT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_STORAGE_QUOTA_BYTES = 20 * 1024**3
+WORKER_PROTOCOL_VERSION = 1
+WORKER_PACKAGE_ROOT_ENV = "_PCR_WORKER_PACKAGE_ROOT"
+WORKER_PARENT_PYTHONPATH_ENV = "_PCR_WORKER_PARENT_PYTHONPATH"
+WORKER_PARENT_PYTHONPATH_PRESENT_ENV = "_PCR_WORKER_PARENT_PYTHONPATH_PRESENT"
 
 
 def configured_positive_int(name: str, default: int) -> int:
@@ -195,40 +199,88 @@ def worker_status_path(state_dir: Path, run_id: str) -> Path:
     return state_dir / "workers" / f"{run_id}.json"
 
 
-def spawn_worker(
+def worker_response_path(state_dir: Path, operation_id: str) -> Path:
+    return state_dir / "workers" / "responses" / f"{operation_id}.json"
+
+
+def new_worker_operation_id(run_id: str) -> str:
+    return f"{run_id}-{time.time_ns():020d}-{uuid.uuid4().hex[:10]}"
+
+
+def enqueue_worker_operation(
     state_dir: Path,
     run_id: str,
     operation: str,
     request: Dict[str, Any],
-) -> tuple[subprocess.Popen[bytes], str]:
-    operation_id = f"{run_id}-{uuid.uuid4().hex[:10]}"
+    *,
+    operation_id: str | None = None,
+) -> tuple[str, Path]:
+    operation_id = operation_id or new_worker_operation_id(run_id)
     request_path = worker_request_path(state_dir, operation_id)
     payload = dict(request)
     payload.update(
         {
+            "protocol": WORKER_PROTOCOL_VERSION,
             "run_id": run_id,
             "operation": operation,
             "operation_id": operation_id,
         }
     )
     write_json_atomic(request_path, payload)
+    return operation_id, request_path
+
+
+def spawn_worker(
+    state_dir: Path,
+    run_id: str,
+    operation: str,
+    request: Dict[str, Any],
+    *,
+    operation_id: str | None = None,
+) -> tuple[subprocess.Popen[bytes], str]:
+    operation_id, request_path = enqueue_worker_operation(
+        state_dir,
+        run_id,
+        operation,
+        request,
+        operation_id=operation_id,
+    )
     command = [
-        str(Path(sys.executable).resolve()),
+        str(Path(sys.executable).absolute()),
         "-m",
         "parallel_codex_runner_core.plugin.worker",
         "--state-dir",
         str(state_dir),
-        "--request",
-        str(request_path),
+        "--run-id",
+        run_id,
     ]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    environment = dict(os.environ)
+    package_root = str(Path(__file__).resolve().parents[2])
+    environment[WORKER_PACKAGE_ROOT_ENV] = package_root
+    if "PYTHONPATH" in environment:
+        environment[WORKER_PARENT_PYTHONPATH_PRESENT_ENV] = "1"
+        environment[WORKER_PARENT_PYTHONPATH_ENV] = environment["PYTHONPATH"]
+    else:
+        environment.pop(WORKER_PARENT_PYTHONPATH_PRESENT_ENV, None)
+        environment.pop(WORKER_PARENT_PYTHONPATH_ENV, None)
+    environment["PYTHONPATH"] = package_root
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            cwd=str(state_dir),
+            env=environment,
+        )
+    except (OSError, ValueError):
+        try:
+            request_path.unlink()
+        except OSError:
+            pass
+        raise
     return process, operation_id
 
 
@@ -248,11 +300,16 @@ def terminate_process_group(pid: int, timeout: float = 5.0) -> bool:
 
 
 @contextmanager
-def installed_signal_handlers(cancel: FileSignal) -> Iterator[None]:
+def installed_signal_handlers(
+    cancel: FileSignal,
+    shutdown: FileSignal | None = None,
+) -> Iterator[None]:
     previous: Dict[int, Any] = {}
 
     def request_cancel(_signum: int, _frame: Any) -> None:
         cancel.set()
+        if shutdown is not None:
+            shutdown.set()
 
     for name in ("SIGINT", "SIGTERM"):
         signum = getattr(signal, name, None)

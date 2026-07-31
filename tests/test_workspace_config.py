@@ -22,6 +22,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             model=None,
             effort=None,
             fast=None,
+            synthesis_model="inherit",
+            synthesis_effort="inherit",
+            synthesis_fast="inherit",
             no_sync_back=False,
             keep_workspaces=False,
             resume_session_id=None,
@@ -46,6 +49,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             args.model = "gpt-test"
             args.effort = "high"
             args.fast = True
+            args.synthesis_model = "review-model"
+            args.synthesis_effort = "low"
+            args.synthesis_fast = False
             args.no_sync_back = True
             args.keep_workspaces = True
             settings = WorkspaceSettings.from_runtime(7, 3, args, "session-a")
@@ -68,6 +74,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertEqual(restored.model, "gpt-test")
             self.assertEqual(restored.effort, "high")
             self.assertTrue(restored.fast)
+            self.assertEqual(restored.synthesis_model, "review-model")
+            self.assertEqual(restored.synthesis_effort, "low")
+            self.assertFalse(restored.synthesis_fast)
             self.assertTrue(restored.no_sync_back)
             self.assertTrue(restored.keep_workspaces)
             self.assertEqual(restored.resume_session_id, "session-a")
@@ -85,6 +94,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             restored.model = "old-model"
             restored.effort = "high"
             restored.fast = True
+            restored.synthesis_model = "old-model"
+            restored.synthesis_effort = "max"
+            restored.synthesis_fast = True
             restored.resume_session_id = "old-session"
             loaded = store.load(workspace)
             self.assertIsNotNone(loaded)
@@ -92,7 +104,30 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertIsNone(restored.model)
             self.assertIsNone(restored.effort)
             self.assertIsNone(restored.fast)
+            self.assertEqual(restored.synthesis_model, "inherit")
+            self.assertEqual(restored.synthesis_effort, "inherit")
+            self.assertEqual(restored.synthesis_fast, "inherit")
             self.assertIsNone(restored.resume_session_id)
+
+    def test_synthesis_default_and_auto_values_are_distinct_from_inherit(self) -> None:
+        settings = WorkspaceSettings.from_mapping(
+            {
+                "SYNTHESIS_MODEL": "default",
+                "SYNTHESIS_EFFORT": "auto",
+                "SYNTHESIS_FAST": "AUTO",
+            }
+        )
+        self.assertIsNotNone(settings)
+        args = self._args()
+
+        settings.apply_to_args(args)
+
+        self.assertIsNone(args.synthesis_model)
+        self.assertIsNone(args.synthesis_effort)
+        self.assertIsNone(args.synthesis_fast)
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_MODEL"], "default")
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_EFFORT"], "auto")
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_FAST"], "AUTO")
 
     def test_explicit_cli_settings_win_over_saved_values(self) -> None:
         saved = WorkspaceSettings.from_mapping(
@@ -102,6 +137,9 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "MAX_PARALLEL": 1,
                 "MODEL": "saved-model",
                 "FAST": True,
+                "SYNTHESIS_MODEL": "saved-review-model",
+                "SYNTHESIS_EFFORT": "high",
+                "SYNTHESIS_FAST": False,
                 "RESUME": "saved-session",
             }
         )
@@ -110,11 +148,28 @@ class WorkspaceConfigTests(unittest.TestCase):
         args.num_agents = 5
         args.model = "cli-model"
         args.fast = False
+        args.synthesis_model = "cli-review-model"
+        args.synthesis_effort = "low"
+        args.synthesis_fast = True
         args.resume_session_id = "cli-session"
-        saved.apply_to_args(args, {"agents", "model", "fast", "resume"})
+        saved.apply_to_args(
+            args,
+            {
+                "agents",
+                "model",
+                "fast",
+                "synthesis_model",
+                "synthesis_effort",
+                "synthesis_fast",
+                "resume",
+            },
+        )
         self.assertEqual(args.num_agents, 5)
         self.assertEqual(args.model, "cli-model")
         self.assertFalse(args.fast)
+        self.assertEqual(args.synthesis_model, "cli-review-model")
+        self.assertEqual(args.synthesis_effort, "low")
+        self.assertTrue(args.synthesis_fast)
         self.assertEqual(args.resume_session_id, "cli-session")
         self.assertTrue(args.serial)
 
@@ -128,6 +183,9 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "MODEL": "default",
                 "EFFORT": "auto",
                 "FAST": "AUTO",
+                "SYNTHESIS_MODEL": "INHERIT",
+                "SYNTHESIS_EFFORT": "INHERIT",
+                "SYNTHESIS_FAST": "INHERIT",
                 "SYNC_BACK": "YES",
                 "KEEP_WORKSPACES": "NO",
                 "RESUME": "NO",
@@ -138,6 +196,9 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertIsNone(settings.model)
         self.assertIsNone(settings.effort)
         self.assertIsNone(settings.fast)
+        self.assertEqual(settings.synthesis_model, "inherit")
+        self.assertEqual(settings.synthesis_effort, "inherit")
+        self.assertEqual(settings.synthesis_fast, "inherit")
         self.assertTrue(settings.sync_back)
         self.assertFalse(settings.keep_workspaces)
         self.assertIsNone(settings.resume_session_id)

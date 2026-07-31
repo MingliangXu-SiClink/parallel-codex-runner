@@ -30,6 +30,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/reject", "exclude the currently displayed agent from recommendations"),
     ("/retry [agent]", "rerun a failed or killed agent on a fresh workspace"),
     ("/more <n>", "add more candidates for the current question"),
+    ("/queue [n]", "edit, remove, or reorder queued follow-up questions"),
     ("/diff", "toggle the full workspace diff for the current agent"),
     ("/kill [agent]", "stop a running agent while queued agents continue normally"),
     ("/numofagents <n>", "set the number of agents for the next run"),
@@ -43,6 +44,18 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     (
         "/synthesis <n|off>",
         "set isolated review-and-synthesis agents for the next run",
+    ),
+    (
+        "/synthesismodel <name|inherit|default>",
+        "set the model used only by synthesis agents",
+    ),
+    (
+        "/synthesiseffort <inherit|auto|level>",
+        "set reasoning effort used only by synthesis agents",
+    ),
+    (
+        "/synthesisfast <inherit|auto|on|off>",
+        "set Fast mode used only by synthesis agents",
     ),
     ("/subagents <on|off>", "allow or block nested Codex agents for the next run"),
     ("/subagentslimit <n>", "limit nested Codex agents within each PCR agent"),
@@ -127,7 +140,9 @@ TUI_TIPS: tuple[str, ...] = (
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
     "输入 /retry 可重跑失败或被终止的 Agent；候选阶段有空闲并发位时会立即重跑。",
     "输入 /more 3 可为当前问题追加 3 个候选 Agent。",
+    "输入 /queue 可编辑、取消或调整排队问题的执行顺序。",
     "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
+    "SYNTHESIS_MODEL、SYNTHESIS_EFFORT 和 SYNTHESIS_FAST 可独立设置综合阶段。",
     "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
     "TUI 不在前台时，所有 Agent 结束后会触发完成通知，失败也算结束。",
@@ -539,7 +554,6 @@ else:
         LARGE_RUN_STORAGE_WARNING_BYTES,
         LiveCandidateCoordinator,
         RunStorageEstimate,
-        acknowledge_runtime_source_sync,
         available_storage_bytes,
         cancel_agent_including_queued,
         estimate_staged_run_storage,
@@ -567,7 +581,15 @@ else:
         normalize_agent_role,
     )
     from .paths import absolute_path_for_display, choose_run_base, is_relative_to
-    from .synthesis import create_synthesis_context
+    from .runtime_pinning import preload_tui_runtime
+    from .synthesis import (
+        SYNTHESIS_INHERIT,
+        create_synthesis_context,
+        effective_synthesis_codex_settings,
+        normalize_synthesis_effort,
+        normalize_synthesis_fast,
+        normalize_synthesis_model,
+    )
     from .workspace import (
         cleanup_workspace_copies,
         estimate_path_storage_bytes,
@@ -577,6 +599,8 @@ else:
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
+    preload_tui_runtime()
 
     def fold_text_by_cells(text: str, width: int) -> str:
         if width <= 1:
@@ -732,6 +756,17 @@ else:
         context: tuple[str, str] | None = None
 
 
+    @dataclass(frozen=True)
+    class QueueEditorRow:
+        source_position: int
+        prompt: str
+
+
+    @dataclass(frozen=True)
+    class QueueEditorResult:
+        rows: tuple[QueueEditorRow, ...]
+
+
     class RunnerEvent(Message):
         def __init__(self, payload: dict[str, Any]) -> None:
             super().__init__()
@@ -875,6 +910,262 @@ else:
 
         def action_continue_run(self) -> None:
             self.dismiss(True)
+
+
+    class QueueEditorScreen(ModalScreen[QueueEditorResult | None]):
+        CSS = """
+        QueueEditorScreen {
+            align: center middle;
+        }
+        #queue-editor-dialog {
+            width: 92%;
+            max-width: 110;
+            height: 80%;
+            min-height: 20;
+            max-height: 38;
+            padding: 1 2;
+            background: #171d25;
+            border: round #5aa9bd;
+        }
+        #queue-editor-title {
+            height: 1;
+            margin-bottom: 1;
+            color: #c8edf5;
+            text-style: bold;
+        }
+        #queue-editor-select {
+            height: 3;
+            margin-bottom: 1;
+        }
+        #queue-editor-prompt {
+            height: 1fr;
+            min-height: 8;
+            margin-bottom: 1;
+            border: round #4c5f74;
+            background: #0d1117;
+        }
+        #queue-editor-status {
+            height: 1;
+            margin-bottom: 1;
+            color: #f0c674;
+        }
+        #queue-editor-actions {
+            height: 3;
+            grid-size: 5 1;
+            grid-columns: 1fr 1fr 1fr 1fr 1fr;
+            grid-gutter: 0 1;
+        }
+        #queue-editor-actions Button {
+            width: 100%;
+        }
+        """
+
+        BINDINGS = [
+            ("escape", "cancel_editor", "Cancel"),
+            ("ctrl+s", "apply_editor", "Apply"),
+            ("alt+up", "move_up", "Move up"),
+            ("alt+down", "move_down", "Move down"),
+        ]
+
+        def __init__(
+            self,
+            rows: list[QueueEditorRow],
+            selected_position: int = 1,
+        ) -> None:
+            super().__init__()
+            self.rows = list(rows)
+            source_positions = {row.source_position for row in self.rows}
+            self.selected_source_position = (
+                selected_position
+                if selected_position in source_positions
+                else self.rows[0].source_position
+                if self.rows
+                else None
+            )
+
+        def _selected_index(self) -> int | None:
+            for index, row in enumerate(self.rows):
+                if row.source_position == self.selected_source_position:
+                    return index
+            return None
+
+        def _select_options(self) -> list[tuple[str, int]]:
+            return [
+                (
+                    f"{index}. {' '.join(row.prompt.split())}",
+                    row.source_position,
+                )
+                for index, row in enumerate(self.rows, 1)
+            ]
+
+        def compose(self) -> ComposeResult:
+            options = self._select_options()
+            select_options = options or [("Queue is empty", -1)]
+            select_value = (
+                self.selected_source_position
+                if self.selected_source_position is not None
+                else -1
+            )
+            with Vertical(id="queue-editor-dialog"):
+                yield Static("QUEUED FOLLOW-UPS", id="queue-editor-title")
+                yield Select(
+                    select_options,
+                    value=select_value,
+                    allow_blank=False,
+                    compact=True,
+                    id="queue-editor-select",
+                )
+                yield TextArea(
+                    "",
+                    id="queue-editor-prompt",
+                    soft_wrap=True,
+                    show_line_numbers=False,
+                )
+                yield Static("", id="queue-editor-status", markup=False)
+                with Grid(id="queue-editor-actions"):
+                    yield Button("↑", id="queue-editor-up")
+                    yield Button("↓", id="queue-editor-down")
+                    yield Button("REMOVE", variant="error", id="queue-editor-remove")
+                    yield Button("CANCEL", id="queue-editor-cancel")
+                    yield Button("APPLY", variant="primary", id="queue-editor-apply")
+
+        def on_mount(self) -> None:
+            self._load_selected_prompt()
+            self._update_controls()
+
+        def _set_status(self, text: str) -> None:
+            self.query_one("#queue-editor-status", Static).update(text)
+
+        def _store_selected_prompt(self) -> bool:
+            index = self._selected_index()
+            if index is None:
+                return True
+            prompt = self.query_one("#queue-editor-prompt", TextArea).text.strip()
+            if not prompt:
+                self._set_status("A queued question cannot be empty.")
+                return False
+            current = self.rows[index]
+            self.rows[index] = QueueEditorRow(
+                current.source_position,
+                prompt,
+            )
+            self._set_status("")
+            return True
+
+        def _load_selected_prompt(self) -> None:
+            editor = self.query_one("#queue-editor-prompt", TextArea)
+            index = self._selected_index()
+            if index is None:
+                editor.text = ""
+                editor.disabled = True
+                return
+            editor.disabled = False
+            editor.text = self.rows[index].prompt
+            lines = editor.text.split("\n")
+            editor.move_cursor((len(lines) - 1, len(lines[-1])))
+            editor.focus()
+
+        def _refresh_selector(self) -> None:
+            selector = self.query_one("#queue-editor-select", Select)
+            options = self._select_options()
+            with selector.prevent(Select.Changed):
+                selector.set_options(options or [("Queue is empty", -1)])
+                selector.disabled = not options
+                selector.value = (
+                    self.selected_source_position
+                    if self.selected_source_position is not None
+                    else -1
+                )
+
+        def _update_controls(self) -> None:
+            index = self._selected_index()
+            has_selection = index is not None
+            self.query_one("#queue-editor-up", Button).disabled = (
+                not has_selection or index == 0
+            )
+            self.query_one("#queue-editor-down", Button).disabled = (
+                not has_selection or index == len(self.rows) - 1
+            )
+            self.query_one("#queue-editor-remove", Button).disabled = (
+                not has_selection
+            )
+
+        def _move_selected(self, offset: int) -> None:
+            index = self._selected_index()
+            if index is None:
+                return
+            destination = index + offset
+            if destination < 0 or destination >= len(self.rows):
+                return
+            if not self._store_selected_prompt():
+                return
+            self.rows[index], self.rows[destination] = (
+                self.rows[destination],
+                self.rows[index],
+            )
+            self._refresh_selector()
+            self._load_selected_prompt()
+            self._update_controls()
+
+        def _remove_selected(self) -> None:
+            index = self._selected_index()
+            if index is None:
+                return
+            self.rows.pop(index)
+            if self.rows:
+                next_index = min(index, len(self.rows) - 1)
+                self.selected_source_position = self.rows[next_index].source_position
+            else:
+                self.selected_source_position = None
+                self._set_status("Apply to cancel all queued questions.")
+            self._refresh_selector()
+            self._load_selected_prompt()
+            self._update_controls()
+
+        @on(Select.Changed, "#queue-editor-select")
+        def _on_queue_item_changed(self, event: Select.Changed) -> None:
+            value = event.value
+            if not isinstance(value, int) or value < 1:
+                return
+            if value == self.selected_source_position:
+                return
+            previous = self.selected_source_position
+            if not self._store_selected_prompt():
+                self.selected_source_position = previous
+                self._refresh_selector()
+                return
+            self.selected_source_position = value
+            self._refresh_selector()
+            self._load_selected_prompt()
+            self._update_controls()
+
+        @on(Button.Pressed)
+        def _on_button_pressed(self, event: Button.Pressed) -> None:
+            button_id = event.button.id
+            if button_id == "queue-editor-up":
+                self.action_move_up()
+            elif button_id == "queue-editor-down":
+                self.action_move_down()
+            elif button_id == "queue-editor-remove":
+                self._remove_selected()
+            elif button_id == "queue-editor-cancel":
+                self.action_cancel_editor()
+            elif button_id == "queue-editor-apply":
+                self.action_apply_editor()
+
+        def action_move_up(self) -> None:
+            self._move_selected(-1)
+
+        def action_move_down(self) -> None:
+            self._move_selected(1)
+
+        def action_cancel_editor(self) -> None:
+            self.dismiss(None)
+
+        def action_apply_editor(self) -> None:
+            if self.rows and not self._store_selected_prompt():
+                return
+            self.dismiss(QueueEditorResult(tuple(self.rows)))
 
 
     class AgentDiffLoaded(Message):
@@ -1138,11 +1429,14 @@ else:
         }
         #runner-frame {
             height: auto;
+            max-height: 65%;
             margin: 0 1;
             padding: 0 1;
             border: round cyan;
             border-title-style: bold;
-            overflow: hidden;
+            overflow-x: hidden;
+            overflow-y: auto;
+            scrollbar-size: 1 1;
         }
         #runner-grid {
             height: auto;
@@ -1188,13 +1482,14 @@ else:
         #config-subagents-limit {
             width: 12;
         }
-        #config-execution, #config-recommend-by, #config-effort {
+        #config-execution, #config-recommend-by, #config-effort,
+        #config-synthesis-effort {
             width: 24;
         }
-        #config-model {
+        #config-model, #config-synthesis-model {
             width: 36;
         }
-        #config-subagents, #config-fast, #config-sync-back,
+        #config-subagents, #config-fast, #config-synthesis-fast, #config-sync-back,
         #config-keep-workspaces {
             width: 10;
         }
@@ -1287,6 +1582,18 @@ else:
                 getattr(args, "_pcr_explicit_tui_settings", set())
             )
             self._apply_saved_workspace_settings()
+            self.args.synthesis_model = normalize_synthesis_model(
+                getattr(self.args, "synthesis_model", SYNTHESIS_INHERIT)
+            )
+            self.args.synthesis_effort = normalize_synthesis_effort(
+                getattr(self.args, "synthesis_effort", SYNTHESIS_INHERIT)
+            )
+            try:
+                self.args.synthesis_fast = normalize_synthesis_fast(
+                    getattr(self.args, "synthesis_fast", SYNTHESIS_INHERIT)
+                )
+            except argparse.ArgumentTypeError:
+                self.args.synthesis_fast = SYNTHESIS_INHERIT
             self.num_agents = args.num_agents
             self.synthesis_agents = max(
                 0,
@@ -1304,6 +1611,8 @@ else:
                 getattr(args, "model", None), getattr(args, "effort", None)
             ):
                 self.args.effort = None
+            if not resume_model_pending:
+                self._coerce_synthesis_effort_for_model()
             self.model_choices = self.model_registry.model_options(
                 getattr(args, "model", None)
             )
@@ -1313,6 +1622,9 @@ else:
                 else getattr(args, "model", None),
                 getattr(args, "effort", None),
             )
+            self.synthesis_model_choices = self._synthesis_model_options()
+            self.synthesis_effort_choices = self._synthesis_effort_options()
+            self.synthesis_fast_choices = self._synthesis_fast_options()
             self.resume_choices = resume_select_options([], self.resume_session_id)
             self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
             self.selected_agent = 1
@@ -1386,14 +1698,21 @@ else:
             self._follow_up_queue_cache = ""
             self._follow_up_queue_items_cache: tuple[str, ...] = ()
             self._follow_up_queue_refresh_deferred = False
+            self.follow_up_queue_editor_open = False
+            self.follow_up_queue_editor_resume_after = False
             self._updating_controls = False
             self._latest_select_event_time: dict[str, float] = {}
             self._committed_model_effort_values: dict[str, str] = {
                 "config-model": str(getattr(self.args, "model", None) or ""),
                 "config-effort": str(getattr(self.args, "effort", None) or ""),
+                "config-synthesis-model": self._synthesis_model_control_value(),
+                "config-synthesis-effort": self._synthesis_effort_control_value(),
             }
             self._committed_fast_value = fast_control_value(
                 getattr(self.args, "fast", None)
+            )
+            self._committed_synthesis_fast_value = (
+                self._synthesis_fast_control_value()
             )
             self._committed_input_values = {
                 "config-agents": str(self.num_agents),
@@ -1544,7 +1863,9 @@ else:
             if (
                 is_text_input
                 and not event.is_forwarded
+                and not self.follow_up_queue_editor_open
                 and not self._is_runner_control(self.focused)
+                and not isinstance(self.focused, TextArea)
             ):
                 self._last_screen_selection = ""
                 try:
@@ -1702,6 +2023,33 @@ else:
                             allow_blank=False,
                             compact=True,
                             id="config-fast",
+                            classes="runner-control",
+                        )
+                        yield Static("SYNTHESIS_MODEL", classes="runner-key")
+                        yield Select(
+                            self.synthesis_model_choices,
+                            value=self._synthesis_model_control_value(),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-synthesis-model",
+                            classes="runner-control",
+                        )
+                        yield Static("SYNTHESIS_EFFORT", classes="runner-key")
+                        yield Select(
+                            self.synthesis_effort_choices,
+                            value=self._synthesis_effort_control_value(),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-synthesis-effort",
+                            classes="runner-control",
+                        )
+                        yield Static("SYNTHESIS_FAST", classes="runner-key")
+                        yield Select(
+                            self.synthesis_fast_choices,
+                            value=self._synthesis_fast_control_value(),
+                            allow_blank=False,
+                            compact=True,
+                            id="config-synthesis-fast",
                             classes="runner-control",
                         )
                         yield Static("SYNC_BACK", classes="runner-key")
@@ -2329,11 +2677,20 @@ else:
                 )
 
         def _fast_control_has_pending_value(self, control: Select) -> bool:
-            return str(control.value or "") != self._committed_fast_value
+            committed = (
+                self._committed_synthesis_fast_value
+                if control.id == "config-synthesis-fast"
+                else self._committed_fast_value
+            )
+            return str(control.value or "") != committed
 
         def _mark_fast_control_committed(self, control: Select) -> None:
             if control.id == "config-fast":
                 self._committed_fast_value = str(control.value or "auto")
+            elif control.id == "config-synthesis-fast":
+                self._committed_synthesis_fast_value = str(
+                    control.value or "auto"
+                )
 
         def _commit_model_control(self) -> bool:
             try:
@@ -2405,6 +2762,78 @@ else:
             self.run_info_rows = self._base_info_rows()
             return True
 
+        def _commit_synthesis_model_control(self) -> bool:
+            try:
+                control = self.query_one("#config-synthesis-model", Select)
+            except Exception:
+                return True
+            requested = str(control.value or "").strip()
+            current = self._synthesis_model_control_value()
+            if requested != current:
+                self._handle_synthesis_model([requested or "default"])
+                current = self._synthesis_model_control_value()
+            if current != requested:
+                control.focus()
+                return False
+            self._mark_model_effort_control_committed(control)
+            return True
+
+        def _commit_synthesis_effort_control(self) -> bool:
+            if not self._commit_synthesis_model_control():
+                return False
+            try:
+                control = self.query_one("#config-synthesis-effort", Select)
+            except Exception:
+                return True
+            requested = str(control.value or "").strip().lower()
+            current = self._synthesis_effort_control_value()
+            if requested != current:
+                self._handle_synthesis_effort([requested or "auto"])
+                current = self._synthesis_effort_control_value()
+            if current != requested:
+                control.focus()
+                return False
+            self._mark_model_effort_control_committed(control)
+            return True
+
+        def _commit_synthesis_model_effort_controls(self) -> bool:
+            try:
+                model_control = self.query_one(
+                    "#config-synthesis-model",
+                    Select,
+                )
+                effort_control = self.query_one(
+                    "#config-synthesis-effort",
+                    Select,
+                )
+            except Exception:
+                return True
+            model_value = str(model_control.value or "").strip()
+            effort_value = str(effort_control.value or "").strip().lower()
+            self.args.synthesis_model = normalize_synthesis_model(
+                model_value or "default"
+            )
+            self._mark_model_effort_control_committed(model_control)
+            self.args.synthesis_effort = normalize_synthesis_effort(
+                effort_value or "auto"
+            )
+            if self._synthesis_effort_model_is_known():
+                settings = effective_synthesis_codex_settings(self.args)
+                try:
+                    self.model_registry.validate_effort(
+                        self._synthesis_model_for_effort(),
+                        settings.effort,
+                    )
+                except ValueError as exc:
+                    self.status = str(exc)
+                    self.run_info_rows = self._base_info_rows()
+                    effort_control.focus()
+                    return False
+
+            self._mark_model_effort_control_committed(effort_control)
+            self.run_info_rows = self._base_info_rows()
+            return True
+
         def _commit_fast_control(self) -> bool:
             try:
                 control = self.query_one("#config-fast", Select)
@@ -2425,12 +2854,35 @@ else:
             self.run_info_rows = self._base_info_rows()
             return True
 
+        def _commit_synthesis_fast_control(self) -> bool:
+            try:
+                control = self.query_one("#config-synthesis-fast", Select)
+            except Exception:
+                return True
+            requested_text = str(control.value or "").strip().lower()
+            try:
+                value = normalize_synthesis_fast(requested_text)
+            except argparse.ArgumentTypeError:
+                self.status = (
+                    "Usage: /synthesisfast <inherit|auto|on|off>"
+                )
+                control.focus()
+                return False
+            self.args.synthesis_fast = value
+            self._mark_fast_control_committed(control)
+            self.run_info_rows = self._base_info_rows()
+            return True
+
         def _commit_runner_inputs(self) -> bool:
             # Select.Changed is queued. Commit the visible MODEL/EFFORT pair
             # before numeric handlers can trigger a repaint from stale args.
             if not self._commit_model_effort_controls():
                 return False
+            if not self._commit_synthesis_model_effort_controls():
+                return False
             if not self._commit_fast_control():
+                return False
+            if not self._commit_synthesis_fast_control():
                 return False
             if not self._commit_agents_control():
                 self.query_one("#config-agents", Input).focus()
@@ -2573,6 +3025,47 @@ else:
                         self.args.fast,
                         self.model_registry.configured_service_tier,
                     )
+                )
+
+        @on(Select.Changed, "#config-synthesis-model")
+        def _on_synthesis_model_selected(self, event: Select.Changed) -> None:
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
+                return
+            self._commit_synthesis_model_control()
+
+        @on(Select.Changed, "#config-synthesis-effort")
+        def _on_synthesis_effort_selected(self, event: Select.Changed) -> None:
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
+                return
+            self._commit_synthesis_effort_control()
+
+        @on(Select.Changed, "#config-synthesis-fast")
+        def _on_synthesis_fast_selected(self, event: Select.Changed) -> None:
+            if (
+                event.value != event.select.value
+                or not self._accept_select_event(event)
+            ):
+                return
+            requested = normalize_synthesis_fast(event.value)
+            current = getattr(
+                self.args,
+                "synthesis_fast",
+                SYNTHESIS_INHERIT,
+            )
+            if requested == current:
+                self._mark_fast_control_committed(event.select)
+                return
+            if not self._prepare_config_change("Synthesis Fast mode"):
+                return
+            if self._commit_synthesis_fast_control():
+                self._show_setting(
+                    f"synthesisfast={self._synthesis_fast_display()}"
                 )
 
         @on(Select.Changed, "#config-sync-back")
@@ -2960,6 +3453,7 @@ else:
             self._load_prompt_history_context()
             self._reset_conversation_detail()
             self._refresh_effort_for_context()
+            self._coerce_synthesis_effort_for_model()
             self.run_info_rows = self._base_info_rows()
             if event.error:
                 loaded_status = f"Resume history unavailable: {event.error}"
@@ -3080,13 +3574,22 @@ else:
                 if isinstance(value, bool):
                     text = "YES" if value else "NO"
                 elif value == "":
-                    if self.focused.id == "config-model":
+                    if self.focused.id in {
+                        "config-model",
+                        "config-synthesis-model",
+                    }:
                         text = "default"
-                    elif self.focused.id == "config-effort":
-                        text = self.model_registry.effort_display(
-                            self._model_for_effort(),
-                            None,
-                        )
+                    elif self.focused.id in {
+                        "config-effort",
+                        "config-synthesis-effort",
+                    }:
+                        if self.focused.id == "config-synthesis-effort":
+                            text = self._synthesis_effort_display()
+                        else:
+                            text = self.model_registry.effort_display(
+                                self._model_for_effort(),
+                                None,
+                            )
                     else:
                         text = "NO"
                 else:
@@ -3174,6 +3677,9 @@ else:
             if name == "/more":
                 self._handle_more(args)
                 return
+            if name == "/queue":
+                self._handle_queue(args)
+                return
             if name in {"/synthesis", "/synthesisagents", "/synthesis-agents"}:
                 self._handle_synthesis(args)
                 return
@@ -3216,6 +3722,15 @@ else:
                 return
             if name == "/fast":
                 self._handle_fast(args)
+                return
+            if name in {"/synthesismodel", "/synthesis-model"}:
+                self._handle_synthesis_model(args)
+                return
+            if name in {"/synthesiseffort", "/synthesis-effort"}:
+                self._handle_synthesis_effort(args)
+                return
+            if name in {"/synthesisfast", "/synthesis-fast"}:
+                self._handle_synthesis_fast(args)
                 return
             if name == "/workspace":
                 self._handle_workspace(args)
@@ -3588,6 +4103,7 @@ else:
 
         def _clear_follow_up_queue(self) -> None:
             self.follow_up_queue.clear()
+            self.follow_up_queue_editor_resume_after = False
             self.follow_up_continue_at = None
             self.follow_up_ready = False
             self.follow_up_source_finalized = False
@@ -3607,6 +4123,141 @@ else:
                 )
                 for item in self.follow_up_queue
             ]
+
+        def _handle_queue(self, args: list[str]) -> None:
+            if len(args) > 1:
+                self.status = "Usage: /queue [n]"
+                self._sync()
+                return
+            if self.storage_preflight_inflight:
+                self.status = "Cannot edit the queue while checking storage"
+                self._sync()
+                return
+            if not self.follow_up_queue:
+                self.status = "No queued follow-up questions"
+                self._sync()
+                return
+            selected_position = 1
+            if args:
+                try:
+                    selected_position = int(args[0])
+                except ValueError:
+                    selected_position = 0
+                if not 1 <= selected_position <= len(self.follow_up_queue):
+                    self.status = (
+                        f"Queue item must be between 1 and "
+                        f"{len(self.follow_up_queue)}"
+                    )
+                    self._sync()
+                    return
+            if self.follow_up_queue_editor_open:
+                self.status = "The follow-up queue editor is already open"
+                self._sync()
+                return
+
+            snapshot = tuple(self.follow_up_queue)
+            self.follow_up_queue_editor_open = True
+            self.follow_up_queue_editor_resume_after = bool(
+                not self.running
+                and (
+                    self.follow_up_continue_at is not None
+                    or self.follow_up_ready
+                    or self.follow_up_source_finalized
+                    or self._successful_agent_result(self.selected_agent) is not None
+                )
+            )
+            if self.follow_up_queue_editor_resume_after:
+                self.follow_up_continue_at = None
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = None
+            self.status = "Editing queued follow-ups"
+            self._refresh_follow_up_queue()
+            self.push_screen(
+                QueueEditorScreen(
+                    [
+                        QueueEditorRow(index, item.prompt)
+                        for index, item in enumerate(snapshot, 1)
+                    ],
+                    selected_position,
+                ),
+                lambda result: self._finish_follow_up_queue_editor(
+                    snapshot,
+                    result,
+                ),
+            )
+
+        def _finish_follow_up_queue_editor(
+            self,
+            snapshot: tuple[QueuedFollowUp, ...],
+            result: QueueEditorResult | None,
+        ) -> None:
+            self.follow_up_queue_editor_open = False
+            resume_after = self.follow_up_queue_editor_resume_after
+            self.follow_up_queue_editor_resume_after = False
+            message = "Queue unchanged"
+            if result is not None:
+                if tuple(self.follow_up_queue) != snapshot:
+                    message = "Queue changed while editing; reopen /queue"
+                else:
+                    rebuilt: list[QueuedFollowUp] = []
+                    used_positions: set[int] = set()
+                    invalid = False
+                    for row in result.rows:
+                        position = row.source_position
+                        prompt = row.prompt.strip()
+                        if (
+                            position in used_positions
+                            or not 1 <= position <= len(snapshot)
+                            or not prompt
+                        ):
+                            invalid = True
+                            break
+                        used_positions.add(position)
+                        source = snapshot[position - 1]
+                        rebuilt.append(
+                            QueuedFollowUp(
+                                prompt,
+                                record_history=source.record_history,
+                                context=source.context,
+                            )
+                        )
+                    if invalid:
+                        message = "Queue edits were invalid; reopen /queue"
+                    else:
+                        self.follow_up_queue = rebuilt
+                        message = (
+                            f"Queue updated: {len(rebuilt)} "
+                            f"{'item' if len(rebuilt) == 1 else 'items'}"
+                            if rebuilt
+                            else "Queued follow-ups cancelled"
+                        )
+
+            if not self.follow_up_queue:
+                self._clear_follow_up_queue()
+                self.status = message
+                self._sync()
+                return
+
+            if (
+                resume_after
+                and not self.running
+                and not self.storage_preflight_inflight
+            ):
+                if (
+                    self.follow_up_source_finalized
+                    or self._successful_agent_result(self.selected_agent) is not None
+                ):
+                    remaining = int(FOLLOW_UP_DELAY_SECONDS)
+                    self.follow_up_continue_at = time.monotonic() + remaining
+                    self.follow_up_ready = False
+                    self._follow_up_countdown_second = remaining
+                    self._set_follow_up_countdown_status(remaining)
+                elif not self._schedule_follow_up_after_completion():
+                    self.status = message
+            else:
+                self.status = message
+            self._refresh_follow_up_queue()
+            self._sync()
 
         def _finalize_displayed_pending(
             self,
@@ -3852,6 +4503,177 @@ else:
         def _refresh_effort_for_context(self) -> bool:
             return self._coerce_effort_for_model()
 
+        def _synthesis_model_setting(self) -> str | None:
+            return normalize_synthesis_model(
+                getattr(
+                    self.args,
+                    "synthesis_model",
+                    SYNTHESIS_INHERIT,
+                )
+            )
+
+        def _synthesis_effort_setting(self) -> str | None:
+            return normalize_synthesis_effort(
+                getattr(
+                    self.args,
+                    "synthesis_effort",
+                    SYNTHESIS_INHERIT,
+                )
+            )
+
+        def _synthesis_fast_setting(self) -> str | bool | None:
+            try:
+                return normalize_synthesis_fast(
+                    getattr(
+                        self.args,
+                        "synthesis_fast",
+                        SYNTHESIS_INHERIT,
+                    )
+                )
+            except argparse.ArgumentTypeError:
+                return SYNTHESIS_INHERIT
+
+        def _synthesis_model_control_value(self) -> str:
+            setting = self._synthesis_model_setting()
+            return SYNTHESIS_INHERIT if setting == SYNTHESIS_INHERIT else str(
+                setting or ""
+            )
+
+        def _synthesis_effort_control_value(self) -> str:
+            setting = self._synthesis_effort_setting()
+            return SYNTHESIS_INHERIT if setting == SYNTHESIS_INHERIT else str(
+                setting or ""
+            )
+
+        def _synthesis_fast_control_value(self) -> str:
+            setting = self._synthesis_fast_setting()
+            if setting == SYNTHESIS_INHERIT:
+                return SYNTHESIS_INHERIT
+            return fast_control_value(setting)
+
+        def _synthesis_model_for_effort(self) -> str | None:
+            configured = effective_synthesis_codex_settings(self.args).model
+            return str(configured or "").strip() or self._resume_model_for_effort()
+
+        def _synthesis_effort_model_is_known(self) -> bool:
+            settings = effective_synthesis_codex_settings(self.args)
+            return bool(
+                settings.model
+                or not self.resume_session_id
+                or self._resume_model_for_effort()
+            )
+
+        def _synthesis_model_options(self) -> list[tuple[str, str]]:
+            if self._effort_model_is_known():
+                inherited_model = self.model_registry.model_display(
+                    self._model_for_effort()
+                )
+            else:
+                inherited_model = "conversation model"
+            current = self._synthesis_model_setting()
+            explicit_current = (
+                None if current == SYNTHESIS_INHERIT else current
+            )
+            return [
+                (f"inherit ({inherited_model})", SYNTHESIS_INHERIT),
+                *self.model_registry.model_options(explicit_current),
+            ]
+
+        def _synthesis_effort_options(self) -> list[tuple[str, str]]:
+            model = (
+                self._synthesis_model_for_effort()
+                if self._synthesis_effort_model_is_known()
+                else UNKNOWN_RESUME_MODEL
+            )
+            inherited_effort = getattr(self.args, "effort", None)
+            try:
+                inherited_display = self.model_registry.effort_display(
+                    model,
+                    inherited_effort,
+                )
+            except ValueError:
+                inherited_display = (
+                    f"{inherited_effort} (unsupported)"
+                    if inherited_effort
+                    else "auto"
+                )
+            setting = self._synthesis_effort_setting()
+            explicit_current = (
+                None if setting == SYNTHESIS_INHERIT else setting
+            )
+            return [
+                (
+                    f"inherit ({inherited_display})",
+                    SYNTHESIS_INHERIT,
+                ),
+                *self.model_registry.effort_options(model, explicit_current),
+            ]
+
+        def _synthesis_fast_options(self) -> list[tuple[str, str]]:
+            inherited = format_fast_mode(
+                getattr(self.args, "fast", None),
+                self.model_registry.configured_service_tier,
+            )
+            return [
+                (f"INHERIT ({inherited})", SYNTHESIS_INHERIT),
+                (
+                    format_fast_mode(
+                        None,
+                        self.model_registry.configured_service_tier,
+                    ),
+                    "auto",
+                ),
+                ("YES", "on"),
+                ("NO", "off"),
+            ]
+
+        def _synthesis_model_display(self) -> str:
+            settings = effective_synthesis_codex_settings(self.args)
+            display = self.model_registry.model_display(settings.model)
+            if self._synthesis_model_setting() == SYNTHESIS_INHERIT:
+                return f"inherit ({display})"
+            return display
+
+        def _synthesis_effort_display(self) -> str:
+            settings = effective_synthesis_codex_settings(self.args)
+            model = (
+                self._synthesis_model_for_effort()
+                if self._synthesis_effort_model_is_known()
+                else UNKNOWN_RESUME_MODEL
+            )
+            try:
+                display = self.model_registry.effort_display(
+                    model,
+                    settings.effort,
+                )
+            except ValueError:
+                display = str(settings.effort or "auto")
+            if self._synthesis_effort_setting() == SYNTHESIS_INHERIT:
+                return f"inherit ({display})"
+            return display
+
+        def _synthesis_fast_display(self) -> str:
+            settings = effective_synthesis_codex_settings(self.args)
+            display = format_fast_mode(
+                settings.fast,
+                self.model_registry.configured_service_tier,
+            )
+            if self._synthesis_fast_setting() == SYNTHESIS_INHERIT:
+                return f"inherit ({display})"
+            return display
+
+        def _coerce_synthesis_effort_for_model(self) -> bool:
+            if not self._synthesis_effort_model_is_known():
+                return False
+            settings = effective_synthesis_codex_settings(self.args)
+            if self.model_registry.effort_is_supported(
+                self._synthesis_model_for_effort(),
+                settings.effort,
+            ):
+                return False
+            self.args.synthesis_effort = None
+            return True
+
         def _handle_model(self, args: list[str]) -> None:
             if not args:
                 self._show_setting(f"model={getattr(self.args, 'model', None) or 'default'}")
@@ -3863,11 +4685,16 @@ else:
                 return
             self.args.model = value
             effort_reset = self._refresh_effort_for_context()
+            synthesis_effort_reset = self._coerce_synthesis_effort_for_model()
             self.run_info_rows = self._base_info_rows()
             setting = f"model={value or 'default'}"
             if effort_reset:
                 setting += (
                     f"; effort={self.model_registry.effort_display(self._model_for_effort(), None)}"
+                )
+            if synthesis_effort_reset:
+                setting += (
+                    f"; synthesis_effort={self._synthesis_effort_display()}"
                 )
             self._show_setting(setting)
 
@@ -3895,10 +4722,16 @@ else:
                     self._sync()
                     return
             self.args.effort = value
+            synthesis_effort_reset = self._coerce_synthesis_effort_for_model()
             self.run_info_rows = self._base_info_rows()
-            self._show_setting(
+            setting = (
                 f"effort={self.model_registry.effort_display(self._model_for_effort(), value)}"
             )
+            if synthesis_effort_reset:
+                setting += (
+                    f"; synthesis_effort={self._synthesis_effort_display()}"
+                )
+            self._show_setting(setting)
 
         def _handle_fast(self, args: list[str]) -> None:
             current = getattr(self.args, "fast", None)
@@ -3947,6 +4780,96 @@ else:
                 )
             )
 
+        def _handle_synthesis_model(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"synthesismodel={self._synthesis_model_display()}"
+                )
+                return
+            if len(args) != 1:
+                self.status = (
+                    "Usage: /synthesismodel <name|inherit|default>"
+                )
+                self._sync()
+                return
+            if not self._prepare_config_change("synthesis model"):
+                return
+            self.args.synthesis_model = normalize_synthesis_model(args[0])
+            effort_reset = self._coerce_synthesis_effort_for_model()
+            self.run_info_rows = self._base_info_rows()
+            setting = f"synthesismodel={self._synthesis_model_display()}"
+            if effort_reset:
+                setting += (
+                    f"; synthesis_effort={self._synthesis_effort_display()}"
+                )
+            self._show_setting(setting)
+
+        def _handle_synthesis_effort(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"synthesiseffort={self._synthesis_effort_display()}"
+                )
+                return
+            if len(args) != 1:
+                self.status = (
+                    "Usage: /synthesiseffort <inherit|auto|level>"
+                )
+                self._sync()
+                return
+            if not self._prepare_config_change("synthesis effort"):
+                return
+            value = normalize_synthesis_effort(args[0])
+            previous = getattr(
+                self.args,
+                "synthesis_effort",
+                SYNTHESIS_INHERIT,
+            )
+            self.args.synthesis_effort = value
+            if self._synthesis_effort_model_is_known():
+                settings = effective_synthesis_codex_settings(self.args)
+                try:
+                    self.model_registry.validate_effort(
+                        self._synthesis_model_for_effort(),
+                        settings.effort,
+                    )
+                except ValueError as exc:
+                    self.args.synthesis_effort = previous
+                    self.status = str(exc)
+                    self._sync()
+                    return
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(
+                f"synthesiseffort={self._synthesis_effort_display()}"
+            )
+
+        def _handle_synthesis_fast(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"synthesisfast={self._synthesis_fast_display()}"
+                )
+                return
+            if len(args) != 1:
+                self.status = (
+                    "Usage: /synthesisfast <inherit|auto|on|off>"
+                )
+                self._sync()
+                return
+            try:
+                value = normalize_synthesis_fast(args[0])
+            except argparse.ArgumentTypeError:
+                self.status = (
+                    "Usage: /synthesisfast <inherit|auto|on|off>"
+                )
+                self._sync()
+                return
+            if not self._prepare_config_change("Synthesis Fast mode"):
+                return
+            self.args.synthesis_fast = value
+            self.run_info_rows = self._base_info_rows()
+            self._show_setting(
+                f"synthesisfast={self._synthesis_fast_display()}"
+            )
+
         def _handle_workspace(self, args: list[str]) -> None:
             if not args:
                 self._show_setting(f"workspace={absolute_path_for_display(self.workspace)}")
@@ -3975,6 +4898,25 @@ else:
             self._committed_fast_value = fast_control_value(
                 getattr(self.args, "fast", None)
             )
+            self._committed_synthesis_fast_value = (
+                self._synthesis_fast_control_value()
+            )
+            self._committed_model_effort_values.update(
+                {
+                    "config-model": str(
+                        getattr(self.args, "model", None) or ""
+                    ),
+                    "config-effort": str(
+                        getattr(self.args, "effort", None) or ""
+                    ),
+                    "config-synthesis-model": (
+                        self._synthesis_model_control_value()
+                    ),
+                    "config-synthesis-effort": (
+                        self._synthesis_effort_control_value()
+                    ),
+                }
+            )
             try:
                 fast_control = self.query_one("#config-fast", Select)
             except Exception:
@@ -3988,6 +4930,10 @@ else:
                 getattr(self.args, "model", None)
             )
             self.effort_choices = self._effort_options_for_context()
+            self._coerce_synthesis_effort_for_model()
+            self.synthesis_model_choices = self._synthesis_model_options()
+            self.synthesis_effort_choices = self._synthesis_effort_options()
+            self.synthesis_fast_choices = self._synthesis_fast_options()
             self._load_prompt_history_context()
             self.resume_history_request += 1
             self._reset_conversation_detail()
@@ -4160,6 +5106,7 @@ else:
                 self.pending_resume_selector = None
                 self._reset_conversation_detail()
                 self._refresh_effort_for_context()
+                self._coerce_synthesis_effort_for_model()
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = "Resume cleared"
@@ -4880,6 +5827,13 @@ else:
                 )
                 return False
             self.selected_agent = idx
+            if self.follow_up_queue_editor_open:
+                self.follow_up_queue_editor_resume_after = True
+                self.follow_up_continue_at = None
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = None
+                self.status = "Completed Agents are waiting for queue edits"
+                return True
             self.follow_up_continue_at = (
                 time.monotonic() + FOLLOW_UP_DELAY_SECONDS
             )
@@ -4930,6 +5884,14 @@ else:
             self._refresh_follow_up_queue()
 
         def _dispatch_follow_up(self) -> bool:
+            if self.follow_up_queue_editor_open:
+                self.follow_up_queue_editor_resume_after = True
+                self.follow_up_continue_at = None
+                self.follow_up_ready = False
+                self._follow_up_countdown_second = None
+                self.status = "Queued follow-up is waiting for queue edits"
+                self._sync()
+                return False
             if (
                 not self.follow_up_queue
                 or self.running
@@ -5143,7 +6105,6 @@ else:
                         return False
 
                 sync_best_workspace_back(Path(result.workspace_dir), workspace)
-                runtime_source_updated = acknowledge_runtime_source_sync(workspace)
 
                 promotion = None
                 try:
@@ -5185,8 +6146,6 @@ else:
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
                 self.status = f"Continuing from AGENT-{idx:03d}"
-                if runtime_source_updated:
-                    self.status += "; PCR source updates load after restart"
                 return True
             except Exception as exc:  # noqa: BLE001
                 self.status = f"Cannot continue AGENT-{idx:03d}: {exc}"
@@ -5225,6 +6184,8 @@ else:
                 else:
                     self.status = f"Working {int(time.monotonic() - self.started_at)}s {self._pulse()}"
                 self._sync()
+                return
+            if self.follow_up_queue_editor_open:
                 return
             if self.follow_up_continue_at is not None:
                 remaining = max(
@@ -5288,6 +6249,8 @@ else:
             self._refresh_tip()
 
         def _follow_up_queue_state(self) -> tuple[str, str]:
+            if self.follow_up_queue_editor_open:
+                return "Editing queue", "#e9c46a"
             if self.running:
                 return "Agents running", "#f0c674"
             if self.storage_preflight_inflight:
@@ -5597,6 +6560,7 @@ else:
         def _apply_resume_choices(self, entries: list[Any]) -> None:
             self.resume_entries = entries
             self._refresh_effort_for_context()
+            self._coerce_synthesis_effort_for_model()
             choices = resume_select_options(entries, self.resume_session_id)
             options_changed = choices != self.resume_choices
             self.resume_choices = choices
@@ -5636,6 +6600,18 @@ else:
             model_select = self.query_one("#config-model", Select)
             effort_select = self.query_one("#config-effort", Select)
             fast_select = self.query_one("#config-fast", Select)
+            synthesis_model_select = self.query_one(
+                "#config-synthesis-model",
+                Select,
+            )
+            synthesis_effort_select = self.query_one(
+                "#config-synthesis-effort",
+                Select,
+            )
+            synthesis_fast_select = self.query_one(
+                "#config-synthesis-fast",
+                Select,
+            )
             current_model = str(getattr(self.args, "model", None) or "")
             display_model = (
                 str(model_select.value or "")
@@ -5671,6 +6647,23 @@ else:
             if desired_effort_choices != self.effort_choices:
                 self.effort_choices = desired_effort_choices
                 effort_options = self.effort_choices
+            current_synthesis_model = self._synthesis_model_control_value()
+            desired_synthesis_model_choices = self._synthesis_model_options()
+            synthesis_model_options = None
+            if desired_synthesis_model_choices != self.synthesis_model_choices:
+                self.synthesis_model_choices = desired_synthesis_model_choices
+                synthesis_model_options = self.synthesis_model_choices
+            current_synthesis_effort = self._synthesis_effort_control_value()
+            desired_synthesis_effort_choices = self._synthesis_effort_options()
+            synthesis_effort_options = None
+            if desired_synthesis_effort_choices != self.synthesis_effort_choices:
+                self.synthesis_effort_choices = desired_synthesis_effort_choices
+                synthesis_effort_options = self.synthesis_effort_choices
+            desired_synthesis_fast_choices = self._synthesis_fast_options()
+            synthesis_fast_options = None
+            if desired_synthesis_fast_choices != self.synthesis_fast_choices:
+                self.synthesis_fast_choices = desired_synthesis_fast_choices
+                synthesis_fast_options = self.synthesis_fast_choices
             resume_options = None
             if self.resume_session_id not in {value for _label, value in self.resume_choices}:
                 self.resume_choices = resume_select_options(
@@ -5696,6 +6689,9 @@ else:
                 model_select,
                 effort_select,
                 fast_select,
+                synthesis_model_select,
+                synthesis_effort_select,
+                synthesis_fast_select,
                 sync_back_select,
                 keep_workspaces_select,
                 resume_select,
@@ -5776,6 +6772,31 @@ else:
                     self._set_select_control(
                         fast_select,
                         fast_control_value(getattr(self.args, "fast", None)),
+                    )
+                self._sync_model_effort_control(
+                    synthesis_model_select,
+                    current_synthesis_model,
+                    synthesis_model_options,
+                )
+                self._sync_model_effort_control(
+                    synthesis_effort_select,
+                    current_synthesis_effort,
+                    synthesis_effort_options,
+                )
+                if self._fast_control_has_pending_value(
+                    synthesis_fast_select
+                ):
+                    self._set_select_control(
+                        synthesis_fast_select,
+                        synthesis_fast_select.value,
+                        synthesis_fast_options,
+                        mark_committed=False,
+                    )
+                else:
+                    self._set_select_control(
+                        synthesis_fast_select,
+                        self._synthesis_fast_control_value(),
+                        synthesis_fast_options,
                     )
                 self._set_select_control(
                     sync_back_select,
@@ -5886,6 +6907,9 @@ else:
                         self.model_registry.configured_service_tier,
                     ),
                 ),
+                ("SYNTHESIS_MODEL", self._synthesis_model_display()),
+                ("SYNTHESIS_EFFORT", self._synthesis_effort_display()),
+                ("SYNTHESIS_FAST", self._synthesis_fast_display()),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),

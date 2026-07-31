@@ -195,9 +195,14 @@ PCR starts two synthesis Agents by default. Set `SYNTHESIS_AGENTS` in the top pa
 ```text
 /synthesis 3
 /synthesis off
+/synthesismodel gpt-5.6-sol
+/synthesiseffort ultra
+/synthesisfast off
 ```
 
 After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
+
+`SYNTHESIS_MODEL`, `SYNTHESIS_EFFORT`, and `SYNTHESIS_FAST` configure only the second stage. Each defaults to `inherit`, preserving the candidate setting. You can instead select a different model or effort, use `auto` for the synthesis model's own default effort/service tier, or force synthesis Fast mode on or off.
 
 Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results. Candidates added with `/more`, and candidate retries requested while the first stage is still open, join that stage before synthesis. If one arrives after synthesis has already started, PCR stops the now-stale synthesis Agents, runs the added candidate work first, then refreshes synthesis from the complete successful candidate set.
 
@@ -226,7 +231,16 @@ Advanced users can enable them from the top panel or with:
 | `/kill [agent]` | Stop a running Agent. Queued Agents still start normally. |
 | `/retry [agent]` | Rerun a failed or killed Agent in a fresh workspace. |
 | `/more <n>` | Add more candidates for the current question. |
+| `/queue [n]` | Open the follow-up queue editor, optionally at item `n`. |
 | `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
+
+### Manage queued follow-ups
+
+When a follow-up is waiting, run `/queue` to open its editor. Choose an item
+from the list, edit its full prompt, use the arrow buttons to change execution
+order, or mark it for removal. `APPLY` commits all changes; `CANCEL` or `Esc`
+discards them. Opening the editor pauses automatic continuation, and closing it
+starts a fresh 60-second review period when the queue is ready to run.
 
 ### Continue an earlier Codex conversation
 
@@ -391,6 +405,9 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `--model` | Codex model name. |
 | `--effort` | Reasoning effort supported by the selected model. |
 | `--fast`, `--no-fast` | Force Fast or Standard mode; omitted inherits Codex configuration and is shown as `AUTO (FAST)`, `AUTO (STANDARD)`, or the configured tier. Fast mode is model-dependent and consumes credits faster. |
+| `--synthesis-model` | Model used only by synthesis Agents; default `inherit`; use `default` to omit the model override. |
+| `--synthesis-effort` | Effort used only by synthesis Agents; default `inherit`; use `auto` for that model's default. |
+| `--synthesis-fast`, `--no-synthesis-fast` | Synthesis-only speed setting. `--synthesis-fast` accepts `inherit`, `auto`, `on`, or `off`; `--no-synthesis-fast` selects Standard mode. |
 | `--resume` | Choose a resumable Codex session interactively. |
 | `--resume-session-id` | Resume a specific session ID. |
 | `--resume-include-non-interactive` | Include `codex exec` sessions in the picker. |
@@ -410,6 +427,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/reject` | Exclude the displayed Agent from recommendations. |
 | `/retry [agent]` | Rerun a failed or killed Agent. |
 | `/more <n>` | Add candidates for the current question. |
+| `/queue [n]` | Edit, remove, or reorder queued follow-ups; optionally select item `n`. |
 | `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
 | `/diff` | Toggle the displayed Agent's complete patch. |
 | `/kill [agent]` | Stop a running Agent. |
@@ -423,6 +441,9 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/model <name\|clear>` | Set or clear the model. |
 | `/effort <auto\|level>` | Select a supported reasoning effort. |
 | `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed; `auto` shows the inherited tier in parentheses. |
+| `/synthesismodel <name\|inherit\|default>` | Set the model used only by synthesis Agents. |
+| `/synthesiseffort <inherit\|auto\|level>` | Set reasoning effort used only by synthesis Agents. |
+| `/synthesisfast <inherit\|auto\|on\|off>` | Set Fast mode used only by synthesis Agents. |
 | `/workspace <path>` | Change the target workspace. |
 | `/runsdir <path\|clear>` | Set or reset the run-data directory. |
 | `/codexbin <path>` | Set the Codex executable. |
@@ -476,10 +497,19 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 
 ## Development
 
-PCR can target its own editable checkout. A sync-back performed by PCR is
-recognized as an intentional source update, so it does not block a queued
-follow-up. The running TUI keeps its already-loaded implementation; restart
-`pcr` before testing the newly synced PCR behavior.
+Use a regular wheel installation for normal use (`python3 -m pip install .`).
+PCR does not copy its own source into temporary runtime snapshots. Python keeps
+already imported modules in memory, so an active CLI process continues with the
+code it loaded at startup. The TUI eagerly imports its PCR and vendored Textual
+dependencies and rejects explicit reloads of those modules.
+
+An editable installation (`python3 -m pip install -e .`) follows the same
+process-lifetime rule: restart PCR to pick up source changes. Each plugin run
+owns one persistent worker. Initial candidates, additional candidates, retries,
+and finalization are sent to that worker over filesystem IPC, so later source
+edits cannot replace the implementation halfway through a run. If that worker
+crashes, PCR reports that the run can no longer continue instead of starting a
+replacement from a different source version.
 
 Run the project checks:
 
@@ -504,6 +534,7 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | --- | --- |
 | `parallel_codex_runner.py` | Package entry point and compatibility imports. |
 | `parallel_codex_runner_core/app.py` | CLI orchestration, Agent execution, summaries, and session promotion. |
+| `parallel_codex_runner_core/runtime_pinning.py` | TUI and plugin-worker module preloading and reload protection. |
 | `parallel_codex_runner_core/synthesis.py` | Second-stage context generation and recommendation priority. |
 | `parallel_codex_runner_core/tui_textual.py` | Interactive TUI and review workflow. |
 | `parallel_codex_runner_core/workspace.py` | Workspace estimation, isolated Git clones, copying, cleanup, and sync-back. |
@@ -515,7 +546,7 @@ See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pin
 | `parallel_codex_runner_core/models.py` | Shared run and session data models. |
 | `parallel_codex_runner_core/plugin_runtime.py` | Persistent review-mode controller for plugin runs. |
 | `parallel_codex_runner_core/plugin_mcp.py` | Local MCP tools used by the Codex App plugin. |
-| `parallel_codex_runner_core/plugin/` | Durable state, indexed events, detached workers, and artifact validation. |
+| `parallel_codex_runner_core/plugin/` | Durable state, indexed events, persistent worker IPC, and artifact validation. |
 | `plugins/parallel-codex-runner/` | Plugin manifest, Skill, runtime check, and plugin documentation. |
 | `.agents/plugins/marketplace.json` | Repository-local Codex plugin marketplace. |
 | `vendor/textual/` | Vendored Textual and PCR's terminal-input patches. |

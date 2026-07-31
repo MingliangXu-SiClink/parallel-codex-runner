@@ -385,7 +385,10 @@ def pcr_list_models(
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        close_manager()
 
 
 if __name__ == "__main__":

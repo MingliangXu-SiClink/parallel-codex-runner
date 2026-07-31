@@ -32,6 +32,8 @@ from parallel_codex_runner_core.plugin_runtime import (
 )
 from parallel_codex_runner_core.plugin.artifacts import ArtifactError, RUN_MARKER_NAME
 from parallel_codex_runner_core.plugin.events import EventLog
+from parallel_codex_runner_core.plugin.lifecycle import WORKER_PROTOCOL_VERSION
+from parallel_codex_runner_core.plugin import lifecycle as plugin_lifecycle
 
 
 def make_storage_estimate(total_bytes: int) -> SimpleNamespace:
@@ -220,7 +222,14 @@ class PluginRunManagerTests(unittest.TestCase):
         request_path = state_dir / "workers" / "requests" / "request.json"
         request_path.parent.mkdir(parents=True)
         request_path.write_text(
-            json.dumps({"run": run.to_dict(), "operation": "initial"}),
+            json.dumps(
+                {
+                    "protocol": WORKER_PROTOCOL_VERSION,
+                    "run": run.to_dict(),
+                    "operation": "initial",
+                    "operation_id": "expired-operation",
+                }
+            ),
             encoding="utf-8",
         )
         run_root = runs_dir / "20260713_120003"
@@ -264,7 +273,9 @@ class PluginRunManagerTests(unittest.TestCase):
             limit=100,
         )["events"]
         finished = next(
-            event for event in reversed(events) if event["type"] == "plugin_worker_finished"
+            event
+            for event in reversed(events)
+            if event["type"] == "plugin_operation_finished"
         )
         return run_root, finished
 
@@ -686,6 +697,50 @@ class PluginRunManagerTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertFalse(request.exists())
 
+    def test_worker_starts_outside_caller_workspace_with_own_package_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            process = mock.Mock(pid=321)
+            with mock.patch.object(
+                plugin_lifecycle.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen:
+                spawned, operation_id = plugin_lifecycle.spawn_worker(
+                    state_dir,
+                    "pcr-20260713T120000Z-1234abcd",
+                    "initial",
+                    {"run": {}},
+                )
+
+            self.assertIs(spawned, process)
+            self.assertTrue(operation_id.startswith("pcr-20260713T120000Z-1234abcd-"))
+            command = popen.call_args.args[0]
+            self.assertEqual(command[0], plugin_lifecycle.sys.executable)
+            self.assertIn("--run-id", command)
+            self.assertNotIn("--request", command)
+            self.assertEqual(popen.call_args.kwargs["cwd"], str(state_dir))
+            self.assertEqual(
+                popen.call_args.kwargs["env"]["PYTHONPATH"],
+                str(Path(plugin_lifecycle.__file__).resolve().parents[2]),
+            )
+
+    def test_worker_restores_parent_pythonpath_before_running_agents(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONPATH": "/pcr/package",
+                plugin_lifecycle.WORKER_PACKAGE_ROOT_ENV: "/pcr/package",
+                plugin_lifecycle.WORKER_PARENT_PYTHONPATH_PRESENT_ENV: "1",
+                plugin_lifecycle.WORKER_PARENT_PYTHONPATH_ENV: "/user/modules",
+            },
+            clear=True,
+        ):
+            plugin_worker._restore_parent_pythonpath()
+
+            self.assertEqual(os.environ.get("PYTHONPATH"), "/user/modules")
+            self.assertNotIn(plugin_lifecycle.WORKER_PACKAGE_ROOT_ENV, os.environ)
+
     def test_kill_agent_stops_only_requested_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -965,6 +1020,47 @@ class PluginRunManagerTests(unittest.TestCase):
             finally:
                 manager.close()
 
+    def test_restart_refreshes_idle_persistent_worker_events_for_completed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True)
+            run = ManagedRun(
+                run_id="pcr-20260713T120000Z-1234abcd",
+                prompt="completed",
+                workspace=str(Path(tmp).resolve()),
+                config={},
+                status="completed",
+                worker_pid=os.getpid(),
+                worker_protocol=WORKER_PROTOCOL_VERSION,
+                worker_state="busy",
+                worker_operation="initial",
+                worker_operation_id="operation-1",
+            )
+            (state_dir / "runs.json").write_text(
+                json.dumps({"version": 3, "runs": [run.to_dict()]}),
+                encoding="utf-8",
+            )
+            EventLog(state_dir / "events").append(
+                run.run_id,
+                {
+                    "type": "plugin_operation_finished",
+                    "operation": "initial",
+                    "operation_id": "operation-1",
+                    "exit_code": 0,
+                    "expired": False,
+                },
+            )
+
+            manager = PluginRunManager(state_dir, detached_workers=True)
+            try:
+                recovered = manager.get_run(run.run_id)
+                self.assertFalse(recovered["worker_active"])
+                self.assertTrue(recovered["worker_available"])
+                self.assertEqual(recovered["worker_state"], "idle")
+                self.assertIsNone(recovered["worker_operation"])
+            finally:
+                manager.close()
+
     def test_resume_session_listing_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -1128,7 +1224,7 @@ class PluginRunManagerTests(unittest.TestCase):
             finally:
                 first.close()
 
-    def test_detached_worker_survives_manager_shutdown(self) -> None:
+    def test_persistent_worker_survives_manager_shutdown_and_handles_later_operations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -1188,9 +1284,130 @@ printf '%s\\n' '{"type":"turn.completed","usage":{"reasoning_output_tokens":42}}
                     completed = recovered.wait_for_run(run_id, timeout_seconds=10)
                     self.assertEqual(completed["status"], "completed")
                     self.assertFalse(completed["worker_active"])
+                    self.assertTrue(completed["worker_available"])
+                    self.assertEqual(completed["worker_pid"], pid)
                     self.assertEqual(completed["agents"][0]["status"], "success")
+                    expanded = recovered.add_agents(run_id, 1)
+                    self.assertEqual(expanded["worker_pid"], pid)
+                    expanded = recovered.wait_for_run(run_id, timeout_seconds=10)
+                    self.assertEqual(expanded["status"], "completed")
+                    self.assertEqual(len(expanded["agents"]), 2)
+                    self.assertEqual(expanded["worker_pid"], pid)
+                    finalized = recovered.accept_agent(
+                        run_id,
+                        2,
+                        wait_seconds=10,
+                    )
+                    self.assertEqual(finalized["status"], "finalized")
+                    self.assertFalse(finalized["worker_available"])
+                    events = recovered.get_events(run_id, limit=250)["events"]
+                    operation_pids = {
+                        event.get("pid")
+                        for event in events
+                        if event.get("type") == "plugin_operation_started"
+                    }
+                    self.assertEqual(operation_pids, {pid})
                 finally:
                     recovered.close()
+
+    def test_crashed_persistent_worker_is_not_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = PluginRunManager(root / "state")
+            try:
+                completed = self.start_completed_run(root, manager, num_agents=1)
+                run_id = completed["run_id"]
+                with manager._lock:
+                    run = manager._runs[run_id]
+                    run.worker_protocol = WORKER_PROTOCOL_VERSION
+                    run.worker_state = "idle"
+                    run.worker_pid = 999_999_999
+                    manager._detached_workers = True
+                    manager._save_state_locked()
+
+                summary = manager.get_run(run_id)
+                self.assertEqual(summary["worker_state"], "crashed")
+                self.assertIn("cannot continue", summary["worker_error"])
+                with (
+                    self.patched_storage(),
+                    mock.patch.object(
+                        plugin_runtime,
+                        "enqueue_worker_operation",
+                    ) as enqueue,
+                    self.assertRaisesRegex(PluginRunError, "cannot continue"),
+                ):
+                    manager.add_agents(run_id, 1)
+                enqueue.assert_not_called()
+            finally:
+                manager.close()
+
+    def test_retry_is_queued_to_the_existing_persistent_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = PluginRunManager(root / "state")
+            try:
+                completed = self.start_completed_run(root, manager, num_agents=1)
+                run_id = completed["run_id"]
+                with manager._lock:
+                    run = manager._runs[run_id]
+                    run.results[1]["status"] = "failed"
+                    run.agent_statuses[1] = "failed"
+                    run.worker_protocol = WORKER_PROTOCOL_VERSION
+                    run.worker_state = "idle"
+                    run.worker_operation = ""
+                    run.worker_operation_id = ""
+                    run.worker_pid = os.getpid()
+                    manager._detached_workers = True
+                    manager._save_state_locked()
+
+                with mock.patch.object(
+                    plugin_runtime,
+                    "enqueue_worker_operation",
+                    return_value=("retry-operation", root / "request.json"),
+                ) as enqueue:
+                    retried = manager.retry_agent(run_id, 1)
+
+                self.assertEqual(retried["worker_pid"], os.getpid())
+                self.assertEqual(retried["worker_operation"], "retry")
+                self.assertEqual(enqueue.call_args.args[1:3], (run_id, "retry"))
+            finally:
+                manager.close()
+
+    def test_failed_persistent_queue_restores_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = PluginRunManager(root / "state")
+            try:
+                completed = self.start_completed_run(root, manager, num_agents=1)
+                run_id = completed["run_id"]
+                with manager._lock:
+                    run = manager._runs[run_id]
+                    run.worker_protocol = WORKER_PROTOCOL_VERSION
+                    run.worker_state = "idle"
+                    run.worker_operation = ""
+                    run.worker_pid = os.getpid()
+                    manager._detached_workers = True
+                    manager._save_state_locked()
+
+                with (
+                    self.patched_storage(),
+                    mock.patch.object(
+                        plugin_runtime,
+                        "enqueue_worker_operation",
+                        side_effect=OSError("disk full"),
+                    ),
+                    self.assertRaisesRegex(PluginRunError, "disk full"),
+                ):
+                    manager.add_agents(run_id, 1)
+
+                restored = manager.get_run(run_id)
+                self.assertEqual(restored["status"], "completed")
+                self.assertEqual(restored["config"]["num_agents"], 1)
+                self.assertEqual(len(restored["agents"]), 1)
+                self.assertEqual(restored["worker_state"], "idle")
+                self.assertIsNone(restored["worker_operation"])
+            finally:
+                manager.close()
 
 
 class EventLogTests(unittest.TestCase):

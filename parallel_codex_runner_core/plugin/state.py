@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - Windows fallback is process-local
     fcntl = None
 
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def utc_now() -> str:
@@ -80,9 +80,13 @@ class ManagedRun:
     session_promotion: Dict[str, Any] | None = None
     artifact_token: str = ""
     worker_pid: int | None = None
+    worker_protocol: int = 0
+    worker_state: str = ""
     worker_operation: str = ""
+    worker_operation_id: str = ""
     worker_started_at: str = ""
     worker_deadline: str = ""
+    worker_error: str = ""
     estimated_bytes: int = 0
     expires_at: str = ""
 
@@ -142,9 +146,13 @@ class ManagedRun:
                 if safe_int(value.get("worker_pid")) > 0
                 else None
             ),
+            worker_protocol=max(0, safe_int(value.get("worker_protocol"))),
+            worker_state=str(value.get("worker_state") or ""),
             worker_operation=str(value.get("worker_operation") or ""),
+            worker_operation_id=str(value.get("worker_operation_id") or ""),
             worker_started_at=str(value.get("worker_started_at") or ""),
             worker_deadline=str(value.get("worker_deadline") or ""),
+            worker_error=str(value.get("worker_error") or ""),
             estimated_bytes=max(0, safe_int(value.get("estimated_bytes"))),
             expires_at=str(value.get("expires_at") or ""),
         )

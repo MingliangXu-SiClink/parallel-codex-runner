@@ -190,9 +190,14 @@ PCR 默认启动 2 个综合 Agent。可以直接修改顶部的 `SYNTHESIS_AGEN
 ```text
 /synthesis 3
 /synthesis off
+/synthesismodel gpt-5.6-sol
+/synthesiseffort ultra
+/synthesisfast off
 ```
 
 第一阶段的候选全部结束后，PCR 会在干净的原始工作区副本中启动 3 个相互独立的综合 Agent。它们会获得所有成功候选工作区和最终回复的路径，并被明确要求只参考、不修改这些来源。如果本轮从已有 Codex 会话继续，综合 Agent 会与第一阶段候选及 `/more` 一样继承本轮开始前的会话。用户原始需求仍作为 Codex 记录中的用户消息；PCR 会先解析该工作区当前生效的 developer instructions，再在其后追加审核与整合流程，保留用户已有配置。对于代码修改任务，综合 Agent 会比较实际实现，在自己的工作区中整合兼容的优点并运行验证；对于回答型任务，它会消除候选回答中的冲突，给出一份完整答案。
+
+`SYNTHESIS_MODEL`、`SYNTHESIS_EFFORT` 和 `SYNTHESIS_FAST` 只控制第二阶段。它们默认使用 `inherit`，即继承候选阶段的对应配置；也可以为综合 Agent 单独选择模型和推理强度，用 `auto` 采用综合模型自身的默认强度或服务档位，或者单独开启、关闭 Fast。
 
 只要有综合 Agent 成功，`RECOMMEND_BY` 就会优先在这些结果中推荐；如果全部失败，则回退到第一阶段的成功候选。这只影响推荐，不限制你的选择：两个阶段中的任意成功 Agent 都可以继续对话或最终采用。`/more <n>` 共享同一本轮开始前的对话基线，但功能仍然不同：它只增加普通候选，不负责审核已有结果。在第一阶段仍开放时追加的 `/more` 候选和候选重试，会直接加入本阶段并在综合前完成；如果请求发出时综合已经开始，PCR 会停止已经过期的综合 Agent，先完成新增候选，再基于完整的成功候选集合重新综合。
 
@@ -221,7 +226,12 @@ PCR 的候选 Agent 与 Codex 自己创建的 Subagent 是两层不同的并行�
 | `/kill [agent]` | 停止正在运行的 Agent；排队中的 Agent 仍会正常启动。 |
 | `/retry [agent]` | 在全新工作区重跑失败或被停止的 Agent。 |
 | `/more <n>` | 为当前问题增加更多候选。 |
+| `/queue [n]` | 打开后续提问队列编辑器，并可直接定位到第 `n` 条。 |
 | `/synthesis <n\|off>` | 设置下一轮的综合 Agent 数量。 |
+
+### 管理排队中的后续提问
+
+存在排队提问时，输入 `/queue` 即可打开编辑器。你可以从列表中选择一条提问，修改完整内容，使用箭头按钮调整执行顺序，或者将其移除。`APPLY` 会一次性应用修改；`CANCEL` 或 `Esc` 会放弃本次修改。编辑器打开时自动续接会暂停；关闭后，如果队列已经可以执行，会重新给出完整的 60 秒确认时间。
 
 ### 继续以前的 Codex 对话
 
@@ -385,6 +395,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `--model` | 指定 Codex 模型。 |
 | `--effort` | 选择当前模型支持的推理强度。 |
 | `--fast`、`--no-fast` | 强制使用 Fast 或 Standard；不传时继承 Codex 配置，并显示为 `AUTO (FAST)`、`AUTO (STANDARD)` 或其他已配置档位。Fast 仅对支持的模型生效，并会更快消耗 credits。 |
+| `--synthesis-model` | 仅供综合 Agent 使用的模型，默认 `inherit`；使用 `default` 可不传模型覆盖。 |
+| `--synthesis-effort` | 仅供综合 Agent 使用的推理强度，默认 `inherit`；使用 `auto` 可采用该模型默认值。 |
+| `--synthesis-fast`、`--no-synthesis-fast` | 综合阶段独立速度设置；`--synthesis-fast` 支持 `inherit`、`auto`、`on` 和 `off`，`--no-synthesis-fast` 表示 Standard。 |
 | `--resume` | 交互选择可恢复的 Codex 会话。 |
 | `--resume-session-id` | 恢复指定会话 ID。 |
 | `--resume-include-non-interactive` | 在选择器中包含 `codex exec` 会话。 |
@@ -404,6 +417,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/reject` | 将当前 Agent 排除在推荐范围外。 |
 | `/retry [agent]` | 重跑失败或被停止的 Agent。 |
 | `/more <n>` | 为当前问题增加候选。 |
+| `/queue [n]` | 编辑、移除或调整排队提问的顺序，并可定位到第 `n` 条。 |
 | `/synthesis <n\|off>` | 设置下一轮的综合 Agent 数量。 |
 | `/diff` | 显示或隐藏当前 Agent 的完整 Patch。 |
 | `/kill [agent]` | 停止正在运行的 Agent。 |
@@ -417,6 +431,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/model <name\|clear>` | 设置或清除模型。 |
 | `/effort <auto\|level>` | 选择模型支持的推理强度。 |
 | `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置；`auto` 会在括号中显示继承的档位。 |
+| `/synthesismodel <name\|inherit\|default>` | 单独设置综合 Agent 使用的模型。 |
+| `/synthesiseffort <inherit\|auto\|level>` | 单独设置综合 Agent 使用的推理强度。 |
+| `/synthesisfast <inherit\|auto\|on\|off>` | 单独设置综合 Agent 的 Fast 模式。 |
 | `/workspace <path>` | 切换目标工作区。 |
 | `/runsdir <path\|clear>` | 设置或重置运行数据目录。 |
 | `/codexbin <path>` | 设置 Codex 可执行文件。 |
@@ -470,9 +487,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 
 ## 开发
 
-PCR 可以把自己的可编辑安装目录作为目标 workspace。由 PCR 完成的回写会被识别为
-受控源码更新，不会阻断已排队的后续对话；当前 TUI 仍使用进程启动时已经加载的实现，
-需要验证刚刚回写的新版本时，请先重启 `pcr`。
+正式使用时建议采用普通 wheel 安装（`python3 -m pip install .`）。PCR 不再把自身源码复制到临时运行快照。Python 会把已经导入的模块保留在内存中，因此正在运行的 CLI 会始终使用启动时加载的代码；TUI 还会在启动时一次性导入所需的 PCR 与内置 Textual 模块，并拒绝对这些模块执行显式 reload。
+
+可编辑安装（`python3 -m pip install -e .`）同样遵循“进程生命周期固定版本”：源码发生变化后，需要重启 PCR 才会加载新实现。每个插件 Run 只创建一个长期存活的 Worker；初始候选、追加候选、重试和最终采用都通过文件 IPC 交给同一个 Worker，所以运行期间的源码修改不会替换这次 Run 使用的实现。如果 Worker 意外崩溃，PCR 会明确报告该 Run 已无法继续，而不会用另一版本的源码悄悄启动替代 Worker。
 
 运行项目检查：
 
@@ -497,6 +514,7 @@ python3 -m unittest tests.test_vendored_textual
 | --- | --- |
 | `parallel_codex_runner.py` | 包入口与兼容导入。 |
 | `parallel_codex_runner_core/app.py` | CLI 编排、Agent 执行、结果汇总与会话提升。 |
+| `parallel_codex_runner_core/runtime_pinning.py` | TUI 与插件 Worker 的模块预加载和 reload 保护。 |
 | `parallel_codex_runner_core/synthesis.py` | 第二阶段上下文生成与推荐优先级。 |
 | `parallel_codex_runner_core/tui_textual.py` | 交互式 TUI 与候选审查流程。 |
 | `parallel_codex_runner_core/workspace.py` | 空间估算、隔离 Git 克隆、复制、清理与回写。 |
@@ -508,7 +526,7 @@ python3 -m unittest tests.test_vendored_textual
 | `parallel_codex_runner_core/models.py` | 共享的运行和会话数据模型。 |
 | `parallel_codex_runner_core/plugin_runtime.py` | 插件运行使用的持久化审查控制器。 |
 | `parallel_codex_runner_core/plugin_mcp.py` | Codex App 插件调用的本地 MCP 工具。 |
-| `parallel_codex_runner_core/plugin/` | 持久化状态、事件索引、独立 worker 和产物路径校验。 |
+| `parallel_codex_runner_core/plugin/` | 持久化状态、事件索引、长期 Worker IPC 和产物路径校验。 |
 | `plugins/parallel-codex-runner/` | 插件清单、Skill、运行检查和插件文档。 |
 | `.agents/plugins/marketplace.json` | 仓库内的 Codex 插件 Marketplace。 |
 | `vendor/textual/` | 内置 Textual 与 PCR 的终端输入补丁。 |

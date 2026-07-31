@@ -89,10 +89,13 @@ Runs and additional candidate batches estimated above 5 GiB require a separate c
 | `pcr_list_models` | List cached models and compatible reasoning efforts. |
 | `pcr_list_runs` | Recover retained or interrupted plugin runs after restart. |
 
-Runs execute in detached worker processes. Codex may recycle the MCP server
-without interrupting active Agents, and multiple Codex windows can share the
-plugin state directory. Short state locks and per-run operation locks prevent
-conflicting writes and finalization races.
+Each run owns one persistent worker process. Initial candidates, retries,
+additional candidates, and finalization all execute in that same process and
+therefore keep the PCR code loaded when the run began. Codex may recycle the MCP
+server without interrupting active Agents, and multiple Codex windows can share
+the plugin state directory. Short state locks and per-run operation locks
+prevent conflicting writes and finalization races. PCR never replaces a crashed
+run worker with a process loaded from another source version.
 
 ## Data And Safety
 
