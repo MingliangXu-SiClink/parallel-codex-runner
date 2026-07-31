@@ -211,7 +211,7 @@ PCR starts two synthesis Agents by default. Set `SYNTHESIS_AGENTS` in the top pa
 
 After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
 
-`SYNTHESIS_MODEL`, `SYNTHESIS_EFFORT`, and `SYNTHESIS_FAST` configure only the second stage, using the same choices as `MODEL`, `EFFORT`, and `FAST`. The synthesis model defaults to the Codex configuration, while effort and Fast default to `auto`; these settings do not implicitly copy the candidate-stage overrides.
+While first-stage candidates are still running, `SYNTHESIS_AGENTS`, `SYNTHESIS_MODEL`, `SYNTHESIS_EFFORT`, and `SYNTHESIS_FAST` remain editable and their latest values apply to the current run. PCR locks them atomically when synthesis starts, so a late edit cannot appear successful while the background runner uses an older value. The model, effort, and Fast controls use the same choices as `MODEL`, `EFFORT`, and `FAST`. The synthesis model defaults to the Codex configuration, while effort and Fast default to `auto`; these settings do not implicitly copy the candidate-stage overrides.
 
 Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results. Candidates added with `/more`, and candidate retries requested while the first stage is still open, join that stage before synthesis. If one arrives after synthesis has already started, PCR stops the now-stale synthesis Agents, runs the added candidate work first, then refreshes synthesis from the complete successful candidate set.
 
@@ -241,7 +241,7 @@ Advanced users can enable them from the top panel or with:
 | `/retry [agent]` | Rerun a failed or killed Agent in a fresh workspace. |
 | `/more <n>` | Add more candidates for the current question. |
 | `/queue [n]` | Open the follow-up queue editor, optionally at item `n`. |
-| `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
+| `/synthesis <n\|off>` | Set the pending synthesis stage's Agent count. |
 
 ### Manage queued follow-ups
 
@@ -437,7 +437,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/retry [agent]` | Rerun a failed or killed Agent. |
 | `/more <n>` | Add candidates for the current question. |
 | `/queue [n]` | Edit, remove, or reorder queued follow-ups; optionally select item `n`. |
-| `/synthesis <n\|off>` | Set synthesis Agents for the next run. |
+| `/synthesis <n\|off>` | Set the pending synthesis stage's Agent count. |
 | `/diff` | Toggle the displayed Agent's complete patch. |
 | `/kill [agent]` | Stop a running Agent. |
 | `/numofagents <n>` | Set the Agent count for the next run. |
@@ -450,9 +450,9 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/model <name\|clear>` | Set or clear the model. |
 | `/effort <auto\|level>` | Select a supported reasoning effort. |
 | `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed; `auto` shows the inherited tier in parentheses. |
-| `/synthesismodel <name\|default>` | Set the model used only by synthesis Agents. |
-| `/synthesiseffort <auto\|level>` | Set reasoning effort used only by synthesis Agents. |
-| `/synthesisfast <auto\|on\|off>` | Set Fast mode used only by synthesis Agents. |
+| `/synthesismodel <name\|default>` | Set the model before the pending synthesis stage starts. |
+| `/synthesiseffort <auto\|level>` | Set reasoning effort before the pending synthesis stage starts. |
+| `/synthesisfast <auto\|on\|off>` | Set Fast mode before the pending synthesis stage starts. |
 | `/workspace <path>` | Change the target workspace. |
 | `/runsdir <path\|clear>` | Set or reset the run-data directory. |
 | `/codexbin <path>` | Set the Codex executable. |

@@ -205,7 +205,7 @@ PCR 默认启动 2 个综合 Agent。可以直接修改顶部的 `SYNTHESIS_AGEN
 
 第一阶段的候选全部结束后，PCR 会在干净的原始工作区副本中启动 3 个相互独立的综合 Agent。它们会获得所有成功候选工作区和最终回复的路径，并被明确要求只参考、不修改这些来源。如果本轮从已有 Codex 会话继续，综合 Agent 会与第一阶段候选及 `/more` 一样继承本轮开始前的会话。用户原始需求仍作为 Codex 记录中的用户消息；PCR 会先解析该工作区当前生效的 developer instructions，再在其后追加审核与整合流程，保留用户已有配置。对于代码修改任务，综合 Agent 会比较实际实现，在自己的工作区中整合兼容的优点并运行验证；对于回答型任务，它会消除候选回答中的冲突，给出一份完整答案。
 
-`SYNTHESIS_MODEL`、`SYNTHESIS_EFFORT` 和 `SYNTHESIS_FAST` 只控制第二阶段，可选项分别与 `MODEL`、`EFFORT` 和 `FAST` 一致。综合模型默认采用 Codex 配置，推理强度和 Fast 默认使用 `auto`；它们不会再隐式复制候选阶段的设置。
+第一阶段候选仍在运行时，`SYNTHESIS_AGENTS`、`SYNTHESIS_MODEL`、`SYNTHESIS_EFFORT` 和 `SYNTHESIS_FAST` 都可以继续修改，最新值会作用于当前这一轮。综合阶段开始时，PCR 会原子锁定这组配置，避免界面看似修改成功、后台却仍使用旧值。模型、推理强度和 Fast 的可选项分别与 `MODEL`、`EFFORT` 和 `FAST` 一致。综合模型默认采用 Codex 配置，推理强度和 Fast 默认使用 `auto`；它们不会再隐式复制候选阶段的设置。
 
 只要有综合 Agent 成功，`RECOMMEND_BY` 就会优先在这些结果中推荐；如果全部失败，则回退到第一阶段的成功候选。这只影响推荐，不限制你的选择：两个阶段中的任意成功 Agent 都可以继续对话或最终采用。`/more <n>` 共享同一本轮开始前的对话基线，但功能仍然不同：它只增加普通候选，不负责审核已有结果。在第一阶段仍开放时追加的 `/more` 候选和候选重试，会直接加入本阶段并在综合前完成；如果请求发出时综合已经开始，PCR 会停止已经过期的综合 Agent，先完成新增候选，再基于完整的成功候选集合重新综合。
 
@@ -235,7 +235,7 @@ PCR 的候选 Agent 与 Codex 自己创建的 Subagent 是两层不同的并行�
 | `/retry [agent]` | 在全新工作区重跑失败或被停止的 Agent。 |
 | `/more <n>` | 为当前问题增加更多候选。 |
 | `/queue [n]` | 打开后续提问队列编辑器，并可直接定位到第 `n` 条。 |
-| `/synthesis <n\|off>` | 设置下一轮的综合 Agent 数量。 |
+| `/synthesis <n\|off>` | 设置尚未开始的综合阶段 Agent 数量。 |
 
 ### 管理排队中的后续提问
 
@@ -426,7 +426,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/retry [agent]` | 重跑失败或被停止的 Agent。 |
 | `/more <n>` | 为当前问题增加候选。 |
 | `/queue [n]` | 编辑、移除或调整排队提问的顺序，并可定位到第 `n` 条。 |
-| `/synthesis <n\|off>` | 设置下一轮的综合 Agent 数量。 |
+| `/synthesis <n\|off>` | 设置尚未开始的综合阶段 Agent 数量。 |
 | `/diff` | 显示或隐藏当前 Agent 的完整 Patch。 |
 | `/kill [agent]` | 停止正在运行的 Agent。 |
 | `/numofagents <n>` | 设置下一轮 Agent 数量。 |
@@ -439,9 +439,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/model <name\|clear>` | 设置或清除模型。 |
 | `/effort <auto\|level>` | 选择模型支持的推理强度。 |
 | `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置；`auto` 会在括号中显示继承的档位。 |
-| `/synthesismodel <name\|default>` | 单独设置综合 Agent 使用的模型。 |
-| `/synthesiseffort <auto\|level>` | 单独设置综合 Agent 使用的推理强度。 |
-| `/synthesisfast <auto\|on\|off>` | 单独设置综合 Agent 的 Fast 模式。 |
+| `/synthesismodel <name\|default>` | 在综合阶段开始前设置其模型。 |
+| `/synthesiseffort <auto\|level>` | 在综合阶段开始前设置其推理强度。 |
+| `/synthesisfast <auto\|on\|off>` | 在综合阶段开始前设置其 Fast 模式。 |
 | `/workspace <path>` | 切换目标工作区。 |
 | `/runsdir <path\|clear>` | 设置或重置运行数据目录。 |
 | `/codexbin <path>` | 设置 Codex 可执行文件。 |

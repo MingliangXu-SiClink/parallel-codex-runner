@@ -43,19 +43,19 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ),
     (
         "/synthesis <n|off>",
-        "set isolated review-and-synthesis agents for the next run",
+        "set synthesis agents before the synthesis stage starts",
     ),
     (
         "/synthesismodel <name|default>",
-        "set the model used only by synthesis agents",
+        "set the stage-two model before synthesis starts",
     ),
     (
         "/synthesiseffort <auto|level>",
-        "set reasoning effort used only by synthesis agents",
+        "set stage-two reasoning effort before synthesis starts",
     ),
     (
         "/synthesisfast <auto|on|off>",
-        "set Fast mode used only by synthesis agents",
+        "set stage-two Fast mode before synthesis starts",
     ),
     ("/subagents <on|off>", "allow or block nested Codex agents for the next run"),
     ("/subagentslimit <n>", "limit nested Codex agents within each PCR agent"),
@@ -81,6 +81,22 @@ UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
 FOLLOW_UP_DELAY_SECONDS = 60.0
+SYNTHESIS_CONFIG_CONTROL_IDS = frozenset(
+    {
+        "config-synthesis-agents",
+        "config-synthesis-model",
+        "config-synthesis-effort",
+        "config-synthesis-fast",
+    }
+)
+SYNTHESIS_INFO_LABELS = frozenset(
+    {
+        "SYNTHESIS_AGENTS",
+        "SYNTHESIS_MODEL",
+        "SYNTHESIS_EFFORT",
+        "SYNTHESIS_FAST",
+    }
+)
 TIP_ICON = "✦"
 TIP_ICON_COLORS: tuple[str, ...] = (
     "#32404b",
@@ -142,7 +158,7 @@ TUI_TIPS: tuple[str, ...] = (
     "输入 /more 3 可为当前问题追加 3 个候选 Agent。",
     "点击 QUEUE 中的问题，或输入 /queue，可编辑、取消或调整执行顺序。",
     "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
-    "SYNTHESIS_MODEL、SYNTHESIS_EFFORT 和 SYNTHESIS_FAST 可独立设置综合阶段。",
+    "候选运行期间仍可调整 SYNTHESIS_AGENTS、SYNTHESIS_MODEL、SYNTHESIS_EFFORT 和 SYNTHESIS_FAST。",
     "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
     "TUI 不在前台时，所有 Agent 结束后会触发完成通知，失败也算结束。",
@@ -553,6 +569,7 @@ else:
     from .app import (
         LARGE_RUN_STORAGE_WARNING_BYTES,
         LiveCandidateCoordinator,
+        LiveSynthesisConfigCoordinator,
         RunStorageEstimate,
         available_storage_bytes,
         cancel_agent_including_queued,
@@ -1701,6 +1718,9 @@ else:
             self.active_batch_indices: set[int] = set()
             self.live_candidate_indices: set[int] = set()
             self.live_candidate_coordinator: LiveCandidateCoordinator | None = None
+            self.live_synthesis_config_coordinator: (
+                LiveSynthesisConfigCoordinator | None
+            ) = None
             self.candidate_revision = 0
             self.synthesis_refresh_needed = False
             self.core_synthesis_revision: int | None = None
@@ -2905,13 +2925,24 @@ else:
                 return True
             model_value = str(model_control.value or "").strip()
             effort_value = str(effort_control.value or "").strip().lower()
-            self.args.synthesis_model = normalize_synthesis_model(
+            requested_model = normalize_synthesis_model(
                 model_value or "default"
             )
-            self._mark_model_effort_control_committed(model_control)
-            self.args.synthesis_effort = normalize_synthesis_effort(
+            requested_effort = normalize_synthesis_effort(
                 effort_value or "auto"
             )
+            if (
+                requested_model == self._synthesis_model_setting()
+                and requested_effort == self._synthesis_effort_setting()
+            ):
+                self._mark_model_effort_control_committed(model_control)
+                self._mark_model_effort_control_committed(effort_control)
+                return True
+            if not self._prepare_synthesis_config_change("synthesis settings"):
+                return False
+            previous = self._synthesis_config_snapshot()
+            self.args.synthesis_model = requested_model
+            self.args.synthesis_effort = requested_effort
             if self._synthesis_effort_model_is_known():
                 settings = effective_synthesis_codex_settings(self.args)
                 try:
@@ -2920,13 +2951,17 @@ else:
                         settings.effort,
                     )
                 except ValueError as exc:
+                    self._restore_synthesis_config(previous)
                     self.status = str(exc)
-                    self.run_info_rows = self._base_info_rows()
+                    self._refresh_synthesis_config_rows()
                     effort_control.focus()
                     return False
 
+            if not self._publish_synthesis_config(previous, "synthesis settings"):
+                return False
+            self._mark_model_effort_control_committed(model_control)
             self._mark_model_effort_control_committed(effort_control)
-            self.run_info_rows = self._base_info_rows()
+            self._refresh_synthesis_config_rows()
             return True
 
         def _commit_fast_control(self) -> bool:
@@ -2961,9 +2996,20 @@ else:
                 self.status = "Usage: /synthesisfast <auto|on|off>"
                 control.focus()
                 return False
+            if value == self._synthesis_fast_setting():
+                self._mark_fast_control_committed(control)
+                return True
+            if not self._prepare_synthesis_config_change("Synthesis Fast mode"):
+                return False
+            previous = self._synthesis_config_snapshot()
             self.args.synthesis_fast = value
+            if not self._publish_synthesis_config(
+                previous,
+                "Synthesis Fast mode",
+            ):
+                return False
             self._mark_fast_control_committed(control)
-            self.run_info_rows = self._base_info_rows()
+            self._refresh_synthesis_config_rows()
             return True
 
         def _commit_runner_inputs(self) -> bool:
@@ -3315,6 +3361,15 @@ else:
                     run_rows = [(str(k), str(v)) for k, v in rows if isinstance(k, str)]
                     self._remember_run_paths(run_rows)
                     prepared = dict(run_rows)
+                    if self.running and self._synthesis_config_is_editable():
+                        current = dict(self._base_info_rows())
+                        for label in (
+                            "SYNTHESIS_AGENTS",
+                            "SYNTHESIS_MODEL",
+                            "SYNTHESIS_EFFORT",
+                            "SYNTHESIS_FAST",
+                        ):
+                            prepared[label] = current[label]
                     merged_rows = [
                         (label, prepared.pop(label, value))
                         for label, value in self._base_info_rows()
@@ -4171,6 +4226,91 @@ else:
                 return False
             return True
 
+        def _synthesis_config_is_editable(self) -> bool:
+            if not self.running:
+                return True
+            coordinator = self.live_synthesis_config_coordinator
+            return bool(coordinator is not None and coordinator.active)
+
+        def _prepare_synthesis_config_change(self, label: str) -> bool:
+            if self.storage_preflight_inflight:
+                self.status = f"Cannot change {label} while checking storage"
+                self._sync()
+                return False
+            if self.running and not self._synthesis_config_is_editable():
+                self.status = f"Cannot change {label} after synthesis has started"
+                self._sync()
+                return False
+            return True
+
+        def _synthesis_config_snapshot(
+            self,
+        ) -> tuple[int, str | None, str | None, bool | None]:
+            return (
+                self.synthesis_agents,
+                self._synthesis_model_setting(),
+                self._synthesis_effort_setting(),
+                self._synthesis_fast_setting(),
+            )
+
+        def _restore_synthesis_config(
+            self,
+            snapshot: tuple[int, str | None, str | None, bool | None],
+        ) -> None:
+            agents, model, effort, fast = snapshot
+            self.synthesis_agents = agents
+            self.args.synthesis_agents = agents
+            self.args.synthesis_model = model
+            self.args.synthesis_effort = effort
+            self.args.synthesis_fast = fast
+
+        def _refresh_synthesis_config_rows(self) -> None:
+            current = dict(self._base_info_rows())
+            if not self.running or not self.run_info_rows:
+                self.run_info_rows = self._base_info_rows()
+                return
+            self.run_info_rows = [
+                (
+                    label,
+                    current.get(label, value)
+                    if label in SYNTHESIS_INFO_LABELS
+                    else value,
+                )
+                for label, value in self.run_info_rows
+            ]
+
+        def _publish_synthesis_config(
+            self,
+            previous: tuple[int, str | None, str | None, bool | None],
+            label: str,
+        ) -> bool:
+            if not self.running:
+                return True
+            coordinator = self.live_synthesis_config_coordinator
+            if coordinator is None or not coordinator.update(
+                self.synthesis_agents,
+                self._synthesis_model_setting(),
+                self._synthesis_effort_setting(),
+                self._synthesis_fast_setting(),
+            ):
+                self._restore_synthesis_config(previous)
+                self._refresh_synthesis_config_rows()
+                self.status = f"Cannot change {label} after synthesis has started"
+                self._sync()
+                return False
+            if self.pending_execution_args is not None:
+                self.pending_execution_args.synthesis_agents = self.synthesis_agents
+                self.pending_execution_args.synthesis_model = (
+                    self._synthesis_model_setting()
+                )
+                self.pending_execution_args.synthesis_effort = (
+                    self._synthesis_effort_setting()
+                )
+                self.pending_execution_args.synthesis_fast = (
+                    self._synthesis_fast_setting()
+                )
+            return True
+
         def _prepare_context_change(self, label: str) -> bool:
             if self.storage_preflight_inflight:
                 self.status = f"Cannot change {label} while checking storage"
@@ -4440,17 +4580,24 @@ else:
                 self.status = "Usage: /synthesis <non-negative integer|off>"
                 self._sync()
                 return
-            if not self._prepare_config_change("synthesis agent count"):
+            if not self._prepare_synthesis_config_change("synthesis agent count"):
                 return
+            previous = self._synthesis_config_snapshot()
             self.synthesis_agents = value
             self.args.synthesis_agents = value
-            self.run_info_rows = self._base_info_rows()
+            if not self._publish_synthesis_config(
+                previous,
+                "synthesis agent count",
+            ):
+                return
+            self._refresh_synthesis_config_rows()
+            scope = "Current run synthesis" if self.running else "Next run"
             if value:
                 self._show_setting(
-                    f"Next run will use {value} synthesis agents"
+                    f"{scope} will use {value} synthesis agents"
                 )
             else:
-                self._show_setting("Synthesis is disabled for the next run")
+                self._show_setting(f"{scope} will skip synthesis")
 
         def _handle_maxparallel(self, args: list[str]) -> None:
             current = getattr(self.args, "max_parallel", None)
@@ -4822,11 +4969,14 @@ else:
                 self.status = "Usage: /synthesismodel <name|default>"
                 self._sync()
                 return
-            if not self._prepare_config_change("synthesis model"):
+            if not self._prepare_synthesis_config_change("synthesis model"):
                 return
+            previous = self._synthesis_config_snapshot()
             self.args.synthesis_model = normalize_synthesis_model(args[0])
             effort_reset = self._coerce_synthesis_effort_for_model()
-            self.run_info_rows = self._base_info_rows()
+            if not self._publish_synthesis_config(previous, "synthesis model"):
+                return
+            self._refresh_synthesis_config_rows()
             setting = f"synthesismodel={self._synthesis_model_display()}"
             if effort_reset:
                 setting += (
@@ -4844,8 +4994,9 @@ else:
                 self.status = "Usage: /synthesiseffort <auto|level>"
                 self._sync()
                 return
-            if not self._prepare_config_change("synthesis effort"):
+            if not self._prepare_synthesis_config_change("synthesis effort"):
                 return
+            previous_config = self._synthesis_config_snapshot()
             value = normalize_synthesis_effort(args[0])
             previous = getattr(
                 self.args,
@@ -4865,7 +5016,12 @@ else:
                     self.status = str(exc)
                     self._sync()
                     return
-            self.run_info_rows = self._base_info_rows()
+            if not self._publish_synthesis_config(
+                previous_config,
+                "synthesis effort",
+            ):
+                return
+            self._refresh_synthesis_config_rows()
             self._show_setting(
                 f"synthesiseffort={self._synthesis_effort_display()}"
             )
@@ -4886,10 +5042,16 @@ else:
                 self.status = "Usage: /synthesisfast <auto|on|off>"
                 self._sync()
                 return
-            if not self._prepare_config_change("Synthesis Fast mode"):
+            if not self._prepare_synthesis_config_change("Synthesis Fast mode"):
                 return
+            previous = self._synthesis_config_snapshot()
             self.args.synthesis_fast = value
-            self.run_info_rows = self._base_info_rows()
+            if not self._publish_synthesis_config(
+                previous,
+                "Synthesis Fast mode",
+            ):
+                return
+            self._refresh_synthesis_config_rows()
             self._show_setting(
                 f"synthesisfast={self._synthesis_fast_display()}"
             )
@@ -5323,12 +5485,27 @@ else:
 
         def _configured_synthesis_indices(self) -> list[int]:
             args = self.pending_execution_args or self.args
-            first = max(
+            candidate = max(
                 0,
                 int(getattr(args, "num_agents", self.num_agents) or 0),
             ) + 1
             count = self._configured_synthesis_agents()
-            return list(range(first, first + count))
+            existing = sorted(
+                idx
+                for idx, pane in self.agents.items()
+                if pane.role == AGENT_ROLE_SYNTHESIS
+            )
+            indices = existing[:count]
+            occupied = {
+                idx
+                for idx, pane in self.agents.items()
+                if pane.role == AGENT_ROLE_CANDIDATE
+            }
+            while len(indices) < count:
+                if candidate not in occupied and candidate not in indices:
+                    indices.append(candidate)
+                candidate += 1
+            return indices
 
         def _discard_queued_synthesis_batches(self) -> None:
             retained: list[CandidateBatch] = []
@@ -5699,6 +5876,9 @@ else:
             self.live_candidate_indices.clear()
             self.live_candidate_coordinator = LiveCandidateCoordinator()
             self.live_candidate_coordinator.activate()
+            self.live_synthesis_config_coordinator = (
+                LiveSynthesisConfigCoordinator.from_args(self.args)
+            )
             self.candidate_revision = 0
             self.synthesis_refresh_needed = False
             self.core_synthesis_revision = None
@@ -5743,6 +5923,9 @@ else:
             run_args.cancel_event = self.cancel_event
             run_args.agent_cancel_events = self.agent_cancel_events
             run_args.live_candidate_coordinator = self.live_candidate_coordinator
+            run_args.live_synthesis_config_coordinator = (
+                self.live_synthesis_config_coordinator
+            )
             self.pending_execution_args = argparse.Namespace(**vars(run_args))
             # Keep the configured limit, not the first batch's effective limit.
             # This preserves max-parallel=auto and larger explicit limits for /more.
@@ -6046,6 +6229,7 @@ else:
             self.active_batch_indices.clear()
             self.live_candidate_indices.clear()
             self.live_candidate_coordinator = None
+            self.live_synthesis_config_coordinator = None
             self.candidate_revision = 0
             self.synthesis_refresh_needed = False
             self.core_synthesis_revision = None
@@ -6856,8 +7040,15 @@ else:
                     self.resume_session_id,
                     resume_options,
                 )
+                synthesis_editable = self._synthesis_config_is_editable()
                 for control in controls:
-                    control.disabled = self.running or self.storage_preflight_inflight
+                    control.disabled = self.storage_preflight_inflight or (
+                        self.running
+                        and (
+                            control.id not in SYNTHESIS_CONFIG_CONTROL_IDS
+                            or not synthesis_editable
+                        )
+                    )
             finally:
                 self._updating_controls = False
 

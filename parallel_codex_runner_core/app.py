@@ -250,6 +250,80 @@ class LiveCandidateRequest:
     retry: bool
 
 
+@dataclass(frozen=True)
+class SynthesisStageConfiguration:
+    agents: int
+    model: Optional[str]
+    effort: Optional[str]
+    fast: Optional[bool]
+
+
+class LiveSynthesisConfigCoordinator:
+    """Thread-safe synthesis settings that remain editable before stage two."""
+
+    def __init__(
+        self,
+        agents: int,
+        model: object = None,
+        effort: object = None,
+        fast: object = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._active = True
+        self._configuration = self._normalize(agents, model, effort, fast)
+
+    @staticmethod
+    def _normalize(
+        agents: int,
+        model: object,
+        effort: object,
+        fast: object,
+    ) -> SynthesisStageConfiguration:
+        return SynthesisStageConfiguration(
+            agents=max(0, int(agents or 0)),
+            model=normalize_synthesis_model(model),
+            effort=normalize_synthesis_effort(effort),
+            fast=normalize_synthesis_fast(fast),
+        )
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "LiveSynthesisConfigCoordinator":
+        return cls(
+            getattr(args, "synthesis_agents", 0),
+            getattr(args, "synthesis_model", None),
+            getattr(args, "synthesis_effort", None),
+            getattr(args, "synthesis_fast", None),
+        )
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def update(
+        self,
+        agents: int,
+        model: object,
+        effort: object,
+        fast: object,
+    ) -> bool:
+        configuration = self._normalize(agents, model, effort, fast)
+        with self._lock:
+            if not self._active:
+                return False
+            self._configuration = configuration
+            return True
+
+    def close_and_snapshot(self) -> SynthesisStageConfiguration:
+        with self._lock:
+            self._active = False
+            return self._configuration
+
+    def deactivate(self) -> None:
+        with self._lock:
+            self._active = False
+
+
 class LiveCandidateCoordinator:
     """Thread-safe handoff for candidate changes that precede synthesis."""
 
@@ -3881,6 +3955,22 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
 
+def _allocate_synthesis_agent_indices(
+    results: Sequence[AgentResult],
+    first_stage_agents: int,
+    synthesis_agents: int,
+) -> List[int]:
+    """Use reserved stage-two slots without colliding with live /more Agents."""
+    occupied = {result.idx for result in results}
+    indices: List[int] = []
+    candidate = max(0, int(first_stage_agents)) + 1
+    while len(indices) < max(0, int(synthesis_agents)):
+        if candidate not in occupied:
+            indices.append(candidate)
+        candidate += 1
+    return indices
+
+
 def should_start_tui(args: argparse.Namespace) -> bool:
     return args.prompt is None and args.prompt_file is None and sys.stdin.isatty()
 
@@ -3906,6 +3996,13 @@ def run_once(
         if isinstance(configured_agent_cancel_events, dict)
         else {}
     )
+    live_synthesis_config = getattr(
+        args,
+        "live_synthesis_config_coordinator",
+        None,
+    )
+    if not isinstance(live_synthesis_config, LiveSynthesisConfigCoordinator):
+        live_synthesis_config = None
     restore_cancel_signals: Callable[[], None] = lambda: None
 
     def log(level: str, message: str, *values: Any) -> None:
@@ -4176,6 +4273,8 @@ def run_once(
                 caps_by_agent[idx] = caps
                 codex_home_by_agent[idx] = agent_codex_home
     except BaseException:
+        if live_synthesis_config is not None:
+            live_synthesis_config.deactivate()
         cleanup_unfinished_run()
         restore_cancel_signals()
         if progress_callback is not None:
@@ -4183,6 +4282,8 @@ def run_once(
         raise
 
     if cancel_requested(cancel_event):
+        if live_synthesis_config is not None:
+            live_synthesis_config.deactivate()
         cleanup_unfinished_run()
         if progress_callback is not None:
             progress_callback(
@@ -4261,6 +4362,8 @@ def run_once(
             )
         )
     except BaseException:
+        if live_synthesis_config is not None:
+            live_synthesis_config.deactivate()
         cleanup_unfinished_run()
         restore_cancel_signals()
         if progress_callback is not None:
@@ -4268,6 +4371,21 @@ def run_once(
         raise
 
     initial_results = list(results)
+    if live_synthesis_config is not None:
+        latest_synthesis = live_synthesis_config.close_and_snapshot()
+        synthesis_agents = latest_synthesis.agents
+        args.synthesis_agents = latest_synthesis.agents
+        args.synthesis_model = latest_synthesis.model
+        args.synthesis_effort = latest_synthesis.effort
+        args.synthesis_fast = latest_synthesis.fast
+        synthesis_settings = effective_synthesis_codex_settings(args)
+        synthesis_effort_model = synthesis_settings.model or (
+            resume_session.model if resume_session else None
+        )
+        synthesis_effective_effort = resolve_codex_reasoning_effort(
+            synthesis_effort_model,
+            synthesis_settings.effort,
+        )
     synthesis_info: Dict[str, Any] = {
         "requested_agents": synthesis_agents,
         "source_agents": [],
@@ -4293,11 +4411,10 @@ def run_once(
         synthesis_info["status"] = "skipped"
         synthesis_info["reason"] = "no successful first-stage candidates"
     elif synthesis_agents:
-        synthesis_indices = list(
-            range(
-                args.num_agents + 1,
-                args.num_agents + synthesis_agents + 1,
-            )
+        synthesis_indices = _allocate_synthesis_agent_indices(
+            initial_results,
+            args.num_agents,
+            synthesis_agents,
         )
         synthesis_info["source_agents"] = [
             result.idx

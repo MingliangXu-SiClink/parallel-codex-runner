@@ -1938,6 +1938,40 @@ class SynthesisTests(unittest.TestCase):
         self.assertIsNone(synthesis.effort)
         self.assertIsNone(synthesis.fast)
 
+    def test_live_synthesis_configuration_locks_the_latest_settings(self) -> None:
+        coordinator = app_core.LiveSynthesisConfigCoordinator(
+            1,
+            "initial-model",
+            "medium",
+            True,
+        )
+
+        self.assertTrue(
+            coordinator.update(3, "review-model", "low", False)
+        )
+        configuration = coordinator.close_and_snapshot()
+
+        self.assertEqual(configuration.agents, 3)
+        self.assertEqual(configuration.model, "review-model")
+        self.assertEqual(configuration.effort, "low")
+        self.assertFalse(configuration.fast)
+        self.assertFalse(coordinator.active)
+        self.assertFalse(coordinator.update(4, "late-model", "high", True))
+        self.assertEqual(coordinator.close_and_snapshot(), configuration)
+
+    def test_synthesis_indices_skip_live_candidate_slots(self) -> None:
+        results = [
+            AgentResult(
+                **make_agent_result_data(idx, Path(f"/tmp/candidate-{idx}"))
+            )
+            for idx in (1, 2, 5, 6)
+        ]
+
+        self.assertEqual(
+            app_core._allocate_synthesis_agent_indices(results, 2, 4),
+            [3, 4, 7, 8],
+        )
+
     def test_recommendation_prefers_synthesis_then_falls_back_to_candidates(self) -> None:
         candidate = AgentResult(
             **make_agent_result_data(
@@ -2272,17 +2306,17 @@ class RunOnceCleanupTests(unittest.TestCase):
                     "-n",
                     "2",
                     "--synthesis-agents",
-                    "2",
+                    "1",
                     "--model",
                     "candidate-model",
                     "--effort",
                     "high",
                     "--fast",
                     "--synthesis-model",
-                    "synthesis-model",
+                    "initial-synthesis-model",
                     "--synthesis-effort",
-                    "low",
-                    "--no-synthesis-fast",
+                    "medium",
+                    "--synthesis-fast",
                     "--resume-session-id",
                     "session-base",
                     "--no-sync-back",
@@ -2290,6 +2324,10 @@ class RunOnceCleanupTests(unittest.TestCase):
                 ]
             )
             args.cancel_event = threading.Event()
+            synthesis_config = app_core.LiveSynthesisConfigCoordinator.from_args(
+                args
+            )
+            args.live_synthesis_config_coordinator = synthesis_config
             command = [
                 sys.executable,
                 "-c",
@@ -2328,6 +2366,20 @@ class RunOnceCleanupTests(unittest.TestCase):
                 updated_at=1,
             )
 
+            def record_event(payload: dict[str, object]) -> None:
+                events.append(payload)
+                if (
+                    payload.get("type") == "agent_finished"
+                    and payload.get("role") == "candidate"
+                    and synthesis_config.active
+                ):
+                    synthesis_config.update(
+                        2,
+                        "synthesis-model",
+                        "low",
+                        False,
+                    )
+
             with mock.patch.object(
                 app_core,
                 "get_codex_home",
@@ -2360,7 +2412,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                 returncode = app_core.run_once(
                     args,
                     "Fix the project.",
-                    progress_callback=events.append,
+                    progress_callback=record_event,
                     print_output=False,
                 )
 
@@ -2468,6 +2520,9 @@ class RunOnceCleanupTests(unittest.TestCase):
             )
             self.assertEqual(synthesis_event["prompt"], "Fix the project.")
             self.assertEqual(synthesis_event["user_prompt"], "Fix the project.")
+            self.assertEqual(synthesis_event["model"], "synthesis-model")
+            self.assertEqual(synthesis_event["effort"], "low")
+            self.assertFalse(synthesis_event["fast"])
             self.assertEqual(
                 synthesis_event["developer_instructions"],
                 synthesis_instructions,
@@ -3343,6 +3398,120 @@ class TuiCommandTests(unittest.TestCase):
         )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_updates_live_synthesis_settings_before_stage_two(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(
+                [
+                    "--synthesis-agents",
+                    "1",
+                    "--synthesis-model",
+                    "initial-model",
+                    "--synthesis-effort",
+                    "medium",
+                    "--synthesis-fast",
+                ]
+            )
+        )
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        coordinator = app_core.LiveSynthesisConfigCoordinator.from_args(
+            app.args
+        )
+        app.live_synthesis_config_coordinator = coordinator
+        app.running = True
+
+        app._handle_command("/synthesis 3")
+        app._handle_command("/synthesismodel review-model")
+        app._handle_command("/synthesiseffort low")
+        app._handle_command("/synthesisfast off")
+
+        configuration = coordinator.close_and_snapshot()
+        self.assertEqual(configuration.agents, 3)
+        self.assertEqual(configuration.model, "review-model")
+        self.assertEqual(configuration.effort, "low")
+        self.assertFalse(configuration.fast)
+        self.assertEqual(app.pending_execution_args.synthesis_agents, 3)
+        self.assertEqual(
+            app.pending_execution_args.synthesis_model,
+            "review-model",
+        )
+        self.assertEqual(app.pending_execution_args.synthesis_effort, "low")
+        self.assertFalse(app.pending_execution_args.synthesis_fast)
+
+        app._handle_command("/synthesis 4")
+
+        self.assertEqual(app.synthesis_agents, 3)
+        self.assertIn("after synthesis has started", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_only_keeps_synthesis_controls_enabled_during_candidates(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    app.running = True
+                    coordinator = (
+                        app_core.LiveSynthesisConfigCoordinator.from_args(app.args)
+                    )
+                    app.live_synthesis_config_coordinator = coordinator
+                    app._sync()
+                    await pilot.pause()
+
+                    self.assertTrue(app.query_one("#config-agents").disabled)
+                    for selector in (
+                        "#config-synthesis-agents",
+                        "#config-synthesis-model",
+                        "#config-synthesis-effort",
+                        "#config-synthesis-fast",
+                    ):
+                        self.assertFalse(app.query_one(selector).disabled)
+
+                    synthesis_agents = app.query_one(
+                        "#config-synthesis-agents"
+                    )
+                    synthesis_agents.value = "3"
+                    synthesis_agents.focus()
+                    await pilot.press("enter")
+
+                    synthesis_model = app.query_one("#config-synthesis-model")
+                    app._set_select_control(
+                        synthesis_model,
+                        "",
+                        [
+                            ("default", ""),
+                            ("review-model", "review-model"),
+                        ],
+                    )
+                    synthesis_model.value = "review-model"
+                    await pilot.pause()
+
+                    synthesis_effort = app.query_one("#config-synthesis-effort")
+                    synthesis_effort.value = "low"
+                    synthesis_fast = app.query_one("#config-synthesis-fast")
+                    synthesis_fast.value = "off"
+                    await pilot.pause()
+
+                    configuration = coordinator.close_and_snapshot()
+                    self.assertEqual(configuration.agents, 3)
+                    self.assertEqual(configuration.model, "review-model")
+                    self.assertEqual(configuration.effort, "low")
+                    self.assertFalse(configuration.fast)
+                    app._sync()
+                    await pilot.pause()
+
+                    for selector in (
+                        "#config-synthesis-agents",
+                        "#config-synthesis-model",
+                        "#config-synthesis-effort",
+                        "#config-synthesis-fast",
+                    ):
+                        self.assertTrue(app.query_one(selector).disabled)
+                    app.running = False
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_prepared_rows_keep_codex_bin_visible(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["--codex-bin", "/opt/codex/bin/codex"]))
         app._sync = lambda: None
@@ -3818,6 +3987,22 @@ class TuiCommandTests(unittest.TestCase):
             ],
         )
         self.assertTrue({3, 4}.issubset(app.agent_cancel_events))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_synthesis_refresh_skips_live_more_candidate_indices(self) -> None:
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "2", "--synthesis-agents", "4"])
+        )
+        app.pending_execution_args = argparse.Namespace(**vars(app.args))
+        app.agents = {
+            idx: tui_textual.AgentPane(
+                idx=idx,
+                role="synthesis" if idx in {3, 4} else "candidate",
+            )
+            for idx in (1, 2, 3, 4, 5, 6)
+        }
+
+        self.assertEqual(app._configured_synthesis_indices(), [3, 4, 7, 8])
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_retry_and_more_queue_candidates_for_current_question(self) -> None:
