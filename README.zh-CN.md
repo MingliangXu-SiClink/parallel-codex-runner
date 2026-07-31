@@ -197,7 +197,7 @@ PCR 默认启动 2 个综合 Agent。可以直接修改顶部的 `SYNTHESIS_AGEN
 
 第一阶段的候选全部结束后，PCR 会在干净的原始工作区副本中启动 3 个相互独立的综合 Agent。它们会获得所有成功候选工作区和最终回复的路径，并被明确要求只参考、不修改这些来源。如果本轮从已有 Codex 会话继续，综合 Agent 会与第一阶段候选及 `/more` 一样继承本轮开始前的会话。用户原始需求仍作为 Codex 记录中的用户消息；PCR 会先解析该工作区当前生效的 developer instructions，再在其后追加审核与整合流程，保留用户已有配置。对于代码修改任务，综合 Agent 会比较实际实现，在自己的工作区中整合兼容的优点并运行验证；对于回答型任务，它会消除候选回答中的冲突，给出一份完整答案。
 
-`SYNTHESIS_MODEL`、`SYNTHESIS_EFFORT` 和 `SYNTHESIS_FAST` 只控制第二阶段。它们默认使用 `inherit`，即继承候选阶段的对应配置；也可以为综合 Agent 单独选择模型和推理强度，用 `auto` 采用综合模型自身的默认强度或服务档位，或者单独开启、关闭 Fast。
+`SYNTHESIS_MODEL`、`SYNTHESIS_EFFORT` 和 `SYNTHESIS_FAST` 只控制第二阶段，可选项分别与 `MODEL`、`EFFORT` 和 `FAST` 一致。综合模型默认采用 Codex 配置，推理强度和 Fast 默认使用 `auto`；它们不会再隐式复制候选阶段的设置。
 
 只要有综合 Agent 成功，`RECOMMEND_BY` 就会优先在这些结果中推荐；如果全部失败，则回退到第一阶段的成功候选。这只影响推荐，不限制你的选择：两个阶段中的任意成功 Agent 都可以继续对话或最终采用。`/more <n>` 共享同一本轮开始前的对话基线，但功能仍然不同：它只增加普通候选，不负责审核已有结果。在第一阶段仍开放时追加的 `/more` 候选和候选重试，会直接加入本阶段并在综合前完成；如果请求发出时综合已经开始，PCR 会停止已经过期的综合 Agent，先完成新增候选，再基于完整的成功候选集合重新综合。
 
@@ -395,9 +395,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `--model` | 指定 Codex 模型。 |
 | `--effort` | 选择当前模型支持的推理强度。 |
 | `--fast`、`--no-fast` | 强制使用 Fast 或 Standard；不传时继承 Codex 配置，并显示为 `AUTO (FAST)`、`AUTO (STANDARD)` 或其他已配置档位。Fast 仅对支持的模型生效，并会更快消耗 credits。 |
-| `--synthesis-model` | 仅供综合 Agent 使用的模型，默认 `inherit`；使用 `default` 可不传模型覆盖。 |
-| `--synthesis-effort` | 仅供综合 Agent 使用的推理强度，默认 `inherit`；使用 `auto` 可采用该模型默认值。 |
-| `--synthesis-fast`、`--no-synthesis-fast` | 综合阶段独立速度设置；`--synthesis-fast` 支持 `inherit`、`auto`、`on` 和 `off`，`--no-synthesis-fast` 表示 Standard。 |
+| `--synthesis-model` | 仅供综合 Agent 使用的模型；省略或使用 `default` 时采用 Codex 配置。 |
+| `--synthesis-effort` | 仅供综合 Agent 使用的推理强度；省略或使用 `auto` 时采用该模型默认值。 |
+| `--synthesis-fast`、`--no-synthesis-fast` | 强制综合 Agent 使用 Fast 或 Standard；省略时采用 Codex 配置的服务档位。 |
 | `--resume` | 交互选择可恢复的 Codex 会话。 |
 | `--resume-session-id` | 恢复指定会话 ID。 |
 | `--resume-include-non-interactive` | 在选择器中包含 `codex exec` 会话。 |
@@ -431,9 +431,9 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 | `/model <name\|clear>` | 设置或清除模型。 |
 | `/effort <auto\|level>` | 选择模型支持的推理强度。 |
 | `/fast <on\|off\|auto>` | 选择 Fast、Standard 或继承 Codex 配置；`auto` 会在括号中显示继承的档位。 |
-| `/synthesismodel <name\|inherit\|default>` | 单独设置综合 Agent 使用的模型。 |
-| `/synthesiseffort <inherit\|auto\|level>` | 单独设置综合 Agent 使用的推理强度。 |
-| `/synthesisfast <inherit\|auto\|on\|off>` | 单独设置综合 Agent 的 Fast 模式。 |
+| `/synthesismodel <name\|default>` | 单独设置综合 Agent 使用的模型。 |
+| `/synthesiseffort <auto\|level>` | 单独设置综合 Agent 使用的推理强度。 |
+| `/synthesisfast <auto\|on\|off>` | 单独设置综合 Agent 的 Fast 模式。 |
 | `/workspace <path>` | 切换目标工作区。 |
 | `/runsdir <path\|clear>` | 设置或重置运行数据目录。 |
 | `/codexbin <path>` | 设置 Codex 可执行文件。 |

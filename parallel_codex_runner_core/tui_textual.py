@@ -46,15 +46,15 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
         "set isolated review-and-synthesis agents for the next run",
     ),
     (
-        "/synthesismodel <name|inherit|default>",
+        "/synthesismodel <name|default>",
         "set the model used only by synthesis agents",
     ),
     (
-        "/synthesiseffort <inherit|auto|level>",
+        "/synthesiseffort <auto|level>",
         "set reasoning effort used only by synthesis agents",
     ),
     (
-        "/synthesisfast <inherit|auto|on|off>",
+        "/synthesisfast <auto|on|off>",
         "set Fast mode used only by synthesis agents",
     ),
     ("/subagents <on|off>", "allow or block nested Codex agents for the next run"),
@@ -140,7 +140,7 @@ TUI_TIPS: tuple[str, ...] = (
     "输入 /reject 可将当前 Agent 排除在推荐范围外。",
     "输入 /retry 可重跑失败或被终止的 Agent；候选阶段有空闲并发位时会立即重跑。",
     "输入 /more 3 可为当前问题追加 3 个候选 Agent。",
-    "输入 /queue 可编辑、取消或调整排队问题的执行顺序。",
+    "点击 QUEUE 中的问题，或输入 /queue，可编辑、取消或调整执行顺序。",
     "使用 /synthesis 3 可在候选完成后运行 3 个独立综合 Agent。",
     "SYNTHESIS_MODEL、SYNTHESIS_EFFORT 和 SYNTHESIS_FAST 可独立设置综合阶段。",
     "综合 Agent 会审核全部成功候选；你仍可采用任意成功 Agent。",
@@ -583,7 +583,6 @@ else:
     from .paths import absolute_path_for_display, choose_run_base, is_relative_to
     from .runtime_pinning import preload_tui_runtime
     from .synthesis import (
-        SYNTHESIS_INHERIT,
         create_synthesis_context,
         effective_synthesis_codex_settings,
         normalize_synthesis_effort,
@@ -597,6 +596,7 @@ else:
     )
     from rich.cells import cell_len
     from rich.panel import Panel
+    from rich.style import Style
     from rich.table import Table
     from rich.text import Text
 
@@ -1208,6 +1208,18 @@ else:
                 with contextlib.suppress(Exception):
                     setattr(self, "placeholder", placeholder)
 
+        def action_select_all(self) -> None:
+            clear_selection = getattr(
+                self.app,
+                "_clear_screen_selection_for_interaction",
+                None,
+            )
+            if callable(clear_selection):
+                clear_selection()
+            else:
+                self.app.clear_selection()
+            super().action_select_all()
+
         def action_copy(self) -> None:
             action = getattr(self.app, "action_interrupt_or_exit", None)
             if callable(action):
@@ -1216,6 +1228,11 @@ else:
                 super().action_copy()
 
         async def _on_key(self, event: events.Key) -> None:
+            if event.key in {"ctrl+a", "super+a"}:
+                event.stop()
+                event.prevent_default()
+                self.action_select_all()
+                return
             if event.key == "enter":
                 event.stop()
                 event.prevent_default()
@@ -1334,6 +1351,21 @@ else:
             self._render_width = event.size.width
             if previous_width and previous_width != self._render_width:
                 self.app.call_after_refresh(self.app._sync)
+
+
+    class FollowUpQueueView(Static):
+        """Reflow hanging-indented queue rows when the viewport width changes."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._render_width = 0
+
+        def on_resize(self, event: events.Resize) -> None:
+            previous_width = self._render_width
+            self._render_width = event.size.width
+            if previous_width and previous_width != self._render_width:
+                self.app.call_after_refresh(self.app._refresh_follow_up_queue)
+
 
     class RainbowDetailFrame(Vertical):
         """Update border colors without invalidating the Detail viewport."""
@@ -1472,7 +1504,16 @@ else:
             min-height: 1;
             max-height: 1;
             text-wrap: nowrap;
-            text-overflow: clip;
+            text-overflow: ellipsis;
+        }
+        .runner-control > SelectOverlay {
+            width: auto;
+            min-width: 100%;
+            max-width: 90vw;
+        }
+        .runner-control > SelectOverlay > .option-list--option {
+            text-wrap: nowrap;
+            text-overflow: ellipsis;
         }
         .runner-control:focus {
             background: #243448;
@@ -1489,9 +1530,11 @@ else:
         #config-model, #config-synthesis-model {
             width: 36;
         }
-        #config-subagents, #config-fast, #config-synthesis-fast, #config-sync-back,
-        #config-keep-workspaces {
+        #config-subagents, #config-sync-back, #config-keep-workspaces {
             width: 10;
+        }
+        #config-fast, #config-synthesis-fast {
+            width: 20;
         }
         #detail-frame {
             height: 1fr;
@@ -1543,6 +1586,7 @@ else:
             width: 100%;
             height: auto;
             padding: 0 1;
+            pointer: pointer;
             text-wrap: wrap;
             text-overflow: clip;
         }
@@ -1583,17 +1627,17 @@ else:
             )
             self._apply_saved_workspace_settings()
             self.args.synthesis_model = normalize_synthesis_model(
-                getattr(self.args, "synthesis_model", SYNTHESIS_INHERIT)
+                getattr(self.args, "synthesis_model", None)
             )
             self.args.synthesis_effort = normalize_synthesis_effort(
-                getattr(self.args, "synthesis_effort", SYNTHESIS_INHERIT)
+                getattr(self.args, "synthesis_effort", None)
             )
             try:
                 self.args.synthesis_fast = normalize_synthesis_fast(
-                    getattr(self.args, "synthesis_fast", SYNTHESIS_INHERIT)
+                    getattr(self.args, "synthesis_fast", None)
                 )
             except argparse.ArgumentTypeError:
-                self.args.synthesis_fast = SYNTHESIS_INHERIT
+                self.args.synthesis_fast = None
             self.num_agents = args.num_agents
             self.synthesis_agents = max(
                 0,
@@ -1698,6 +1742,8 @@ else:
             self._follow_up_queue_cache = ""
             self._follow_up_queue_items_cache: tuple[str, ...] = ()
             self._follow_up_queue_refresh_deferred = False
+            self._follow_up_queue_click_timer: Any | None = None
+            self._follow_up_queue_click_item: QueuedFollowUp | None = None
             self.follow_up_queue_editor_open = False
             self.follow_up_queue_editor_resume_after = False
             self._updating_controls = False
@@ -1899,6 +1945,55 @@ else:
                 # after Screen has already emitted TextSelected for mouse-up.
                 self.call_after_refresh(self._complete_pointer_selection)
 
+        def _cancel_follow_up_queue_click(self) -> None:
+            timer = self._follow_up_queue_click_timer
+            if timer is not None:
+                timer.stop()
+            self._follow_up_queue_click_timer = None
+            self._follow_up_queue_click_item = None
+
+        def _open_clicked_follow_up(self, item: QueuedFollowUp) -> None:
+            self._follow_up_queue_click_timer = None
+            if self._follow_up_queue_click_item is not item:
+                return
+            self._follow_up_queue_click_item = None
+            if self.follow_up_queue_editor_open or self._screen_selection_active():
+                return
+            for position, queued in enumerate(self.follow_up_queue, 1):
+                if queued is item:
+                    self._handle_queue([str(position)])
+                    return
+
+        @on(events.Click, "#follow-up-queue")
+        def _on_follow_up_queue_clicked(self, event: events.Click) -> None:
+            if event.button != 1:
+                return
+            if event.chain >= 2:
+                self._cancel_follow_up_queue_click()
+                return
+            if (
+                event.chain != 1
+                or self.follow_up_queue_editor_open
+                or not self.follow_up_queue
+                or self._selection_drag_active()
+                or self._screen_selection_active()
+            ):
+                return
+            position = event.style.meta.get("pcr_queue_position")
+            if isinstance(position, bool) or not isinstance(position, int):
+                position = 1
+            if not 1 <= position <= len(self.follow_up_queue):
+                return
+            item = self.follow_up_queue[position - 1]
+            self._cancel_follow_up_queue_click()
+            self._follow_up_queue_click_item = item
+            # Waiting for the click chain keeps double-click text selection intact.
+            self._follow_up_queue_click_timer = self.set_timer(
+                self.CLICK_CHAIN_TIME_THRESHOLD,
+                lambda: self._open_clicked_follow_up(item),
+            )
+            event.stop()
+
         def _complete_pointer_selection(self) -> None:
             selected = self.screen.get_selected_text() or ""
             if selected:
@@ -2087,7 +2182,7 @@ else:
                 yield Static("", id="suggestions")
                 yield Static(self._tip_renderable(), id="tips")
                 with VerticalScroll(id="follow-up-queue-frame"):
-                    yield Static("", id="follow-up-queue", markup=False)
+                    yield FollowUpQueueView("", id="follow-up-queue", markup=False)
                 yield PromptEditor(
                     "",
                     id="prompt",
@@ -2863,9 +2958,7 @@ else:
             try:
                 value = normalize_synthesis_fast(requested_text)
             except argparse.ArgumentTypeError:
-                self.status = (
-                    "Usage: /synthesisfast <inherit|auto|on|off>"
-                )
+                self.status = "Usage: /synthesisfast <auto|on|off>"
                 control.focus()
                 return False
             self.args.synthesis_fast = value
@@ -3056,7 +3149,7 @@ else:
             current = getattr(
                 self.args,
                 "synthesis_fast",
-                SYNTHESIS_INHERIT,
+                None,
             )
             if requested == current:
                 self._mark_fast_control_committed(event.select)
@@ -3100,7 +3193,7 @@ else:
                 prompt = self.query_one("#prompt", PromptEditor)
                 if (
                     self.focused is not prompt
-                    and not isinstance(self.focused, (Input, Select))
+                    and not isinstance(self.focused, (Input, Select, TextArea))
                     and not prompt.text.strip()
                 ):
                     event.stop()
@@ -3108,7 +3201,8 @@ else:
                     self._switch_agent(-1 if event.key == "left" else 1)
                     prompt.focus()
                     return
-            await super()._on_key(event)
+            # MessagePump dispatches App._on_key separately through the MRO.
+            # Calling it here would execute focused-widget bindings twice.
 
         def _switch_agent(self, delta: int) -> None:
             if self.storage_preflight_inflight:
@@ -4102,6 +4196,7 @@ else:
             )
 
         def _clear_follow_up_queue(self) -> None:
+            self._cancel_follow_up_queue_click()
             self.follow_up_queue.clear()
             self.follow_up_queue_editor_resume_after = False
             self.follow_up_continue_at = None
@@ -4125,6 +4220,7 @@ else:
             ]
 
         def _handle_queue(self, args: list[str]) -> None:
+            self._cancel_follow_up_queue_click()
             if len(args) > 1:
                 self.status = "Usage: /queue [n]"
                 self._sync()
@@ -4505,51 +4601,30 @@ else:
 
         def _synthesis_model_setting(self) -> str | None:
             return normalize_synthesis_model(
-                getattr(
-                    self.args,
-                    "synthesis_model",
-                    SYNTHESIS_INHERIT,
-                )
+                getattr(self.args, "synthesis_model", None)
             )
 
         def _synthesis_effort_setting(self) -> str | None:
             return normalize_synthesis_effort(
-                getattr(
-                    self.args,
-                    "synthesis_effort",
-                    SYNTHESIS_INHERIT,
-                )
+                getattr(self.args, "synthesis_effort", None)
             )
 
-        def _synthesis_fast_setting(self) -> str | bool | None:
+        def _synthesis_fast_setting(self) -> bool | None:
             try:
                 return normalize_synthesis_fast(
-                    getattr(
-                        self.args,
-                        "synthesis_fast",
-                        SYNTHESIS_INHERIT,
-                    )
+                    getattr(self.args, "synthesis_fast", None)
                 )
             except argparse.ArgumentTypeError:
-                return SYNTHESIS_INHERIT
+                return None
 
         def _synthesis_model_control_value(self) -> str:
-            setting = self._synthesis_model_setting()
-            return SYNTHESIS_INHERIT if setting == SYNTHESIS_INHERIT else str(
-                setting or ""
-            )
+            return str(self._synthesis_model_setting() or "")
 
         def _synthesis_effort_control_value(self) -> str:
-            setting = self._synthesis_effort_setting()
-            return SYNTHESIS_INHERIT if setting == SYNTHESIS_INHERIT else str(
-                setting or ""
-            )
+            return str(self._synthesis_effort_setting() or "")
 
         def _synthesis_fast_control_value(self) -> str:
-            setting = self._synthesis_fast_setting()
-            if setting == SYNTHESIS_INHERIT:
-                return SYNTHESIS_INHERIT
-            return fast_control_value(setting)
+            return fast_control_value(self._synthesis_fast_setting())
 
         def _synthesis_model_for_effort(self) -> str | None:
             configured = effective_synthesis_codex_settings(self.args).model
@@ -4564,20 +4639,9 @@ else:
             )
 
         def _synthesis_model_options(self) -> list[tuple[str, str]]:
-            if self._effort_model_is_known():
-                inherited_model = self.model_registry.model_display(
-                    self._model_for_effort()
-                )
-            else:
-                inherited_model = "conversation model"
-            current = self._synthesis_model_setting()
-            explicit_current = (
-                None if current == SYNTHESIS_INHERIT else current
+            return self.model_registry.model_options(
+                self._synthesis_model_setting()
             )
-            return [
-                (f"inherit ({inherited_model})", SYNTHESIS_INHERIT),
-                *self.model_registry.model_options(explicit_current),
-            ]
 
         def _synthesis_effort_options(self) -> list[tuple[str, str]]:
             model = (
@@ -4585,37 +4649,13 @@ else:
                 if self._synthesis_effort_model_is_known()
                 else UNKNOWN_RESUME_MODEL
             )
-            inherited_effort = getattr(self.args, "effort", None)
-            try:
-                inherited_display = self.model_registry.effort_display(
-                    model,
-                    inherited_effort,
-                )
-            except ValueError:
-                inherited_display = (
-                    f"{inherited_effort} (unsupported)"
-                    if inherited_effort
-                    else "auto"
-                )
-            setting = self._synthesis_effort_setting()
-            explicit_current = (
-                None if setting == SYNTHESIS_INHERIT else setting
+            return self.model_registry.effort_options(
+                model,
+                self._synthesis_effort_setting(),
             )
-            return [
-                (
-                    f"inherit ({inherited_display})",
-                    SYNTHESIS_INHERIT,
-                ),
-                *self.model_registry.effort_options(model, explicit_current),
-            ]
 
         def _synthesis_fast_options(self) -> list[tuple[str, str]]:
-            inherited = format_fast_mode(
-                getattr(self.args, "fast", None),
-                self.model_registry.configured_service_tier,
-            )
             return [
-                (f"INHERIT ({inherited})", SYNTHESIS_INHERIT),
                 (
                     format_fast_mode(
                         None,
@@ -4629,10 +4669,7 @@ else:
 
         def _synthesis_model_display(self) -> str:
             settings = effective_synthesis_codex_settings(self.args)
-            display = self.model_registry.model_display(settings.model)
-            if self._synthesis_model_setting() == SYNTHESIS_INHERIT:
-                return f"inherit ({display})"
-            return display
+            return self.model_registry.model_display(settings.model)
 
         def _synthesis_effort_display(self) -> str:
             settings = effective_synthesis_codex_settings(self.args)
@@ -4648,19 +4685,14 @@ else:
                 )
             except ValueError:
                 display = str(settings.effort or "auto")
-            if self._synthesis_effort_setting() == SYNTHESIS_INHERIT:
-                return f"inherit ({display})"
             return display
 
         def _synthesis_fast_display(self) -> str:
             settings = effective_synthesis_codex_settings(self.args)
-            display = format_fast_mode(
+            return format_fast_mode(
                 settings.fast,
                 self.model_registry.configured_service_tier,
             )
-            if self._synthesis_fast_setting() == SYNTHESIS_INHERIT:
-                return f"inherit ({display})"
-            return display
 
         def _coerce_synthesis_effort_for_model(self) -> bool:
             if not self._synthesis_effort_model_is_known():
@@ -4787,9 +4819,7 @@ else:
                 )
                 return
             if len(args) != 1:
-                self.status = (
-                    "Usage: /synthesismodel <name|inherit|default>"
-                )
+                self.status = "Usage: /synthesismodel <name|default>"
                 self._sync()
                 return
             if not self._prepare_config_change("synthesis model"):
@@ -4811,9 +4841,7 @@ else:
                 )
                 return
             if len(args) != 1:
-                self.status = (
-                    "Usage: /synthesiseffort <inherit|auto|level>"
-                )
+                self.status = "Usage: /synthesiseffort <auto|level>"
                 self._sync()
                 return
             if not self._prepare_config_change("synthesis effort"):
@@ -4822,7 +4850,7 @@ else:
             previous = getattr(
                 self.args,
                 "synthesis_effort",
-                SYNTHESIS_INHERIT,
+                None,
             )
             self.args.synthesis_effort = value
             if self._synthesis_effort_model_is_known():
@@ -4849,17 +4877,13 @@ else:
                 )
                 return
             if len(args) != 1:
-                self.status = (
-                    "Usage: /synthesisfast <inherit|auto|on|off>"
-                )
+                self.status = "Usage: /synthesisfast <auto|on|off>"
                 self._sync()
                 return
             try:
                 value = normalize_synthesis_fast(args[0])
             except argparse.ArgumentTypeError:
-                self.status = (
-                    "Usage: /synthesisfast <inherit|auto|on|off>"
-                )
+                self.status = "Usage: /synthesisfast <auto|on|off>"
                 self._sync()
                 return
             if not self._prepare_config_change("Synthesis Fast mode"):
@@ -6270,7 +6294,10 @@ else:
                 return "Ready from finalized Agent", "#8bd49c"
             return "Waiting for recommendation", "#aebed3"
 
-        def _follow_up_queue_renderable(self) -> Text:
+        def _follow_up_queue_renderable(
+            self,
+            content_width: int | None = None,
+        ) -> Text:
             if not self.follow_up_queue:
                 return Text()
 
@@ -6289,21 +6316,36 @@ else:
 
             number_width = len(str(count))
             for index, item in enumerate(self.follow_up_queue, 1):
-                prompt_lines = item.prompt.splitlines() or [""]
+                queue_meta = {"pcr_queue_position": index}
+                prefix_style = Style(
+                    color="#6faec0",
+                    bold=True,
+                    meta=queue_meta,
+                )
+                prompt_style = Style(color="#edf5f7", meta=queue_meta)
+                continuation_style = Style(color="#536b7a", meta=queue_meta)
                 if count == 1:
                     prefix = "  › "
                     continuation = "    "
                 else:
                     prefix = f"  {index:>{number_width}} │ "
                     continuation = f"  {'':>{number_width}} │ "
+                if content_width is None:
+                    prompt_lines = item.prompt.splitlines() or [""]
+                else:
+                    body_width = max(2, content_width - cell_len(prefix))
+                    prompt_lines = (
+                        fold_text_by_cells(item.prompt, body_width).splitlines()
+                        or [""]
+                    )
 
-                content.append("\n")
-                content.append(prefix, style="bold #6faec0")
-                content.append(prompt_lines[0], style="#edf5f7")
+                content.append("\n", style=prompt_style)
+                content.append(prefix, style=prefix_style)
+                content.append(prompt_lines[0], style=prompt_style)
                 for line in prompt_lines[1:]:
-                    content.append("\n")
-                    content.append(continuation, style="#536b7a")
-                    content.append(line, style="#edf5f7")
+                    content.append("\n", style=prompt_style)
+                    content.append(continuation, style=continuation_style)
+                    content.append(line, style=prompt_style)
             return content
 
         def _follow_up_queue_text(self) -> str:
@@ -6321,22 +6363,25 @@ else:
                 widget = self.query_one("#follow-up-queue", Static)
             except Exception:
                 return
-            renderable = self._follow_up_queue_renderable()
+            content_width = int(getattr(widget.size, "width", 0) or 0)
+            if content_width <= 0:
+                content_width = max(
+                    0,
+                    int(getattr(frame.size, "width", 0) or 0) - 2,
+                )
+            if content_width <= 0:
+                content_width = max(
+                    0,
+                    int(getattr(self.size, "width", 0) or 0) - 4,
+                )
+            content_width = max(8, content_width or 80)
+            renderable = self._follow_up_queue_renderable(content_width)
             text = renderable.plain
             frame.display = bool(text)
             if not text:
                 self._follow_up_queue_cache = ""
                 self._follow_up_queue_items_cache = ()
                 return
-            content_width = max(
-                20,
-                int(
-                    getattr(frame.content_size, "width", 0)
-                    or getattr(frame.size, "width", 0)
-                    or 80
-                )
-                - 3,
-            )
             visible_lines = sum(
                 max(1, (cell_len(line) + content_width - 1) // content_width)
                 for line in text.splitlines()

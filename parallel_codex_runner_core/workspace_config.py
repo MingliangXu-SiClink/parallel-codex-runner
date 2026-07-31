@@ -12,7 +12,6 @@ from typing import Any, Iterator
 from platformdirs import user_state_path
 
 from .synthesis import (
-    SYNTHESIS_INHERIT,
     normalize_synthesis_effort,
     normalize_synthesis_fast,
     normalize_synthesis_model,
@@ -49,9 +48,9 @@ class WorkspaceSettings:
     model: str | None = None
     effort: str | None = None
     fast: bool | None = None
-    synthesis_model: str | None = SYNTHESIS_INHERIT
-    synthesis_effort: str | None = SYNTHESIS_INHERIT
-    synthesis_fast: str | bool | None = SYNTHESIS_INHERIT
+    synthesis_model: str | None = None
+    synthesis_effort: str | None = None
+    synthesis_fast: bool | None = None
     sync_back: bool | None = None
     keep_workspaces: bool | None = None
     resume_session_id: str | None = None
@@ -126,10 +125,10 @@ class WorkspaceSettings:
 
         try:
             synthesis_fast = normalize_synthesis_fast(
-                value.get("SYNTHESIS_FAST", SYNTHESIS_INHERIT)
+                value.get("SYNTHESIS_FAST")
             )
         except argparse.ArgumentTypeError:
-            synthesis_fast = SYNTHESIS_INHERIT
+            synthesis_fast = None
 
         present_fields = frozenset(
             field_name
@@ -169,10 +168,10 @@ class WorkspaceSettings:
             effort=effort.lower() if effort else None,
             fast=optional_bool(value.get("FAST")),
             synthesis_model=normalize_synthesis_model(
-                value.get("SYNTHESIS_MODEL", SYNTHESIS_INHERIT)
+                value.get("SYNTHESIS_MODEL")
             ),
             synthesis_effort=normalize_synthesis_effort(
-                value.get("SYNTHESIS_EFFORT", SYNTHESIS_INHERIT)
+                value.get("SYNTHESIS_EFFORT")
             ),
             synthesis_fast=synthesis_fast,
             sync_back=optional_bool(value.get("SYNC_BACK")),
@@ -209,17 +208,17 @@ class WorkspaceSettings:
         if not isinstance(fast, bool):
             fast = None
         synthesis_model = normalize_synthesis_model(
-            getattr(args, "synthesis_model", SYNTHESIS_INHERIT)
+            getattr(args, "synthesis_model", None)
         )
         synthesis_effort = normalize_synthesis_effort(
-            getattr(args, "synthesis_effort", SYNTHESIS_INHERIT)
+            getattr(args, "synthesis_effort", None)
         )
         try:
             synthesis_fast = normalize_synthesis_fast(
-                getattr(args, "synthesis_fast", SYNTHESIS_INHERIT)
+                getattr(args, "synthesis_fast", None)
             )
         except argparse.ArgumentTypeError:
-            synthesis_fast = SYNTHESIS_INHERIT
+            synthesis_fast = None
         return cls(
             agents=int(agents),
             synthesis_agents=int(synthesis_agents),
@@ -271,24 +270,10 @@ class WorkspaceSettings:
             "MODEL": self.model or "",
             "EFFORT": self.effort or "auto",
             "FAST": self.fast if self.fast is not None else "AUTO",
-            "SYNTHESIS_MODEL": (
-                "INHERIT"
-                if self.synthesis_model == SYNTHESIS_INHERIT
-                else (self.synthesis_model or "default")
-            ),
-            "SYNTHESIS_EFFORT": (
-                "INHERIT"
-                if self.synthesis_effort == SYNTHESIS_INHERIT
-                else (self.synthesis_effort or "auto")
-            ),
+            "SYNTHESIS_MODEL": self.synthesis_model or "default",
+            "SYNTHESIS_EFFORT": self.synthesis_effort or "auto",
             "SYNTHESIS_FAST": (
-                "INHERIT"
-                if self.synthesis_fast == SYNTHESIS_INHERIT
-                else (
-                    "AUTO"
-                    if self.synthesis_fast is None
-                    else self.synthesis_fast
-                )
+                "AUTO" if self.synthesis_fast is None else self.synthesis_fast
             ),
             "SYNC_BACK": self.sync_back,
             "KEEP_WORKSPACES": self.keep_workspaces,

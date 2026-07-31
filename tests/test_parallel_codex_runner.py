@@ -1833,7 +1833,7 @@ class ArgParseTests(unittest.TestCase):
         self.assertEqual(args.synthesis_agents, 3)
 
     def test_synthesis_codex_settings_are_independent_cli_overrides(self) -> None:
-        inherited = parse_args(["fix tests"])
+        defaults = parse_args(["fix tests"])
         configured = parse_args(
             [
                 "fix tests",
@@ -1841,8 +1841,7 @@ class ArgParseTests(unittest.TestCase):
                 "review-model",
                 "--synthesis-effort",
                 "high",
-                "--synthesis-fast",
-                "off",
+                "--no-synthesis-fast",
             ]
         )
         automatic = parse_args(
@@ -1852,16 +1851,14 @@ class ArgParseTests(unittest.TestCase):
                 "default",
                 "--synthesis-effort",
                 "auto",
-                "--synthesis-fast",
-                "auto",
             ]
         )
-        fast = parse_args(["fix tests", "--synthesis-fast", "on"])
+        fast = parse_args(["fix tests", "--synthesis-fast"])
         standard = parse_args(["fix tests", "--no-synthesis-fast"])
 
-        self.assertEqual(inherited.synthesis_model, "inherit")
-        self.assertEqual(inherited.synthesis_effort, "inherit")
-        self.assertEqual(inherited.synthesis_fast, "inherit")
+        self.assertIsNone(defaults.synthesis_model)
+        self.assertIsNone(defaults.synthesis_effort)
+        self.assertIsNone(defaults.synthesis_fast)
         self.assertEqual(configured.synthesis_model, "review-model")
         self.assertEqual(configured.synthesis_effort, "high")
         self.assertFalse(configured.synthesis_fast)
@@ -1907,8 +1904,7 @@ class SynthesisTests(unittest.TestCase):
                 "review-model",
                 "--synthesis-effort",
                 "low",
-                "--synthesis-fast",
-                "off",
+                "--no-synthesis-fast",
             ]
         )
 
@@ -1924,7 +1920,7 @@ class SynthesisTests(unittest.TestCase):
         self.assertEqual(synthesis.effort, "low")
         self.assertFalse(synthesis.fast)
 
-    def test_synthesis_execution_args_inherit_candidate_defaults(self) -> None:
+    def test_synthesis_execution_args_use_independent_defaults(self) -> None:
         args = parse_args(
             [
                 "prompt",
@@ -1938,9 +1934,9 @@ class SynthesisTests(unittest.TestCase):
 
         synthesis = app_core.agent_role_execution_args(args, "synthesis")
 
-        self.assertEqual(synthesis.model, "candidate-model")
-        self.assertEqual(synthesis.effort, "high")
-        self.assertFalse(synthesis.fast)
+        self.assertIsNone(synthesis.model)
+        self.assertIsNone(synthesis.effort)
+        self.assertIsNone(synthesis.fast)
 
     def test_recommendation_prefers_synthesis_then_falls_back_to_candidates(self) -> None:
         candidate = AgentResult(
@@ -2286,8 +2282,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                     "synthesis-model",
                     "--synthesis-effort",
                     "low",
-                    "--synthesis-fast",
-                    "off",
+                    "--no-synthesis-fast",
                     "--resume-session-id",
                     "session-base",
                     "--no-sync-back",
@@ -3331,18 +3326,18 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/model clear")
         app._handle_command("/effort auto")
         app._handle_command("/fast auto")
-        app._handle_command("/synthesismodel inherit")
-        app._handle_command("/synthesiseffort inherit")
-        app._handle_command("/synthesisfast inherit")
+        app._handle_command("/synthesismodel default")
+        app._handle_command("/synthesiseffort auto")
+        app._handle_command("/synthesisfast auto")
         self.assertFalse(app.args.serial)
         self.assertIsNone(app.args.max_parallel)
         self.assertFalse(app.args.subagents)
         self.assertIsNone(app.args.model)
         self.assertIsNone(app.args.effort)
         self.assertIsNone(app.args.fast)
-        self.assertEqual(app.args.synthesis_model, "inherit")
-        self.assertEqual(app.args.synthesis_effort, "inherit")
-        self.assertEqual(app.args.synthesis_fast, "inherit")
+        self.assertIsNone(app.args.synthesis_model)
+        self.assertIsNone(app.args.synthesis_effort)
+        self.assertIsNone(app.args.synthesis_fast)
         self.assertTrue(
             dict(app._base_info_rows())["FAST"].startswith("AUTO (")
         )
@@ -4508,9 +4503,8 @@ class TuiCommandTests(unittest.TestCase):
                     )
                     app._set_select_control(
                         synthesis_model,
-                        "inherit",
+                        "",
                         [
-                            ("inherit", "inherit"),
                             ("default", ""),
                             ("review-model", "review-model"),
                         ],
@@ -4604,9 +4598,8 @@ class TuiCommandTests(unittest.TestCase):
                     )
                     app._set_select_control(
                         synthesis_model,
-                        "inherit",
+                        "",
                         [
-                            ("inherit", "inherit"),
                             ("default", ""),
                             ("review-model", "review-model"),
                         ],
@@ -4969,6 +4962,47 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(copied, ["copy", "parallel"])
                     self.assertTrue(app.query_one("#detail").allow_select)
                     self.assertTrue(app.query_one("#runner-workspace").allow_select)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_select_all_copies_every_line(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(80, 30)) as pilot:
+                    pane = app.agents[1]
+                    pane.input_text = "old detail question"
+                    pane.final_text = "old detail answer"
+                    app._mark_detail_dirty(pane)
+                    app._sync()
+                    await pilot.pause()
+
+                    prompt = app.query_one("#prompt")
+                    text = "first line\n第二行内容\nthird line"
+                    prompt.text = text
+                    prompt.focus()
+                    copied: list[str] = []
+                    app.copy_to_clipboard = copied.append
+
+                    self.assertTrue(
+                        await pilot.double_click("#detail", offset=(3, 0))
+                    )
+                    await pilot.pause()
+                    self.assertTrue(app._last_screen_selection)
+                    copied.clear()
+
+                    prompt.focus()
+                    await pilot.press("ctrl+a", "ctrl+c")
+                    self.assertEqual(copied, [text])
+                    self.assertEqual(prompt.text, text)
+                    self.assertEqual(prompt.selected_text, text)
+
+                    prompt.move_cursor((2, len("third line")))
+                    copied.clear()
+                    await pilot.press("super+a", "super+c")
+                    self.assertEqual(copied, [text])
+                    self.assertEqual(prompt.text, text)
 
         asyncio.run(run())
 
@@ -6054,6 +6088,59 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(lines[3], "    │ continued")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_queue_wraps_with_hanging_bar_indent(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app.follow_up_queue.extend(
+            [
+                tui_textual.QueuedFollowUp("short"),
+                tui_textual.QueuedFollowUp("abcdefghijklmnopqrstuvwxyz"),
+            ]
+        )
+
+        lines = app._follow_up_queue_renderable(16).plain.splitlines()
+
+        self.assertEqual(lines[1], "  1 │ short")
+        self.assertEqual(lines[2], "  2 │ abcdefghij")
+        self.assertEqual(lines[3], "    │ klmnopqrst")
+        self.assertEqual(lines[4], "    │ uvwxyz")
+        self.assertTrue(all(tui_textual.cell_len(line) <= 16 for line in lines[1:]))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_follow_up_queue_reflows_hanging_indent_after_resize(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            prompt = "abcdefghijklmnopqrstuvwxyz" * 5
+            app.follow_up_queue.extend(
+                [
+                    tui_textual.QueuedFollowUp("short"),
+                    tui_textual.QueuedFollowUp(prompt),
+                ]
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(100, 30)) as pilot:
+                    app._refresh_follow_up_queue()
+                    await pilot.pause()
+                    queue = app.query_one("#follow-up-queue")
+                    wide_lines = queue.content.plain.splitlines()
+
+                    await pilot.resize_terminal(45, 30)
+                    await pilot.pause()
+                    narrow_lines = queue.content.plain.splitlines()
+
+                    self.assertGreater(len(narrow_lines), len(wide_lines))
+                    item_lines = narrow_lines[2:]
+                    self.assertTrue(item_lines[0].startswith("  2 │ "))
+                    self.assertTrue(
+                        all(line.startswith("    │ ") for line in item_lines[1:])
+                    )
+                    self.assertEqual(
+                        "".join(line.split("│ ", 1)[1] for line in item_lines),
+                        prompt,
+                    )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_queue_editor_edits_removes_and_reorders_follow_ups(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
@@ -6120,6 +6207,95 @@ class TuiCommandTests(unittest.TestCase):
                         [item.context for item in app.follow_up_queue],
                         [context, context],
                     )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_clicking_queue_item_opens_that_item(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            app.follow_up_queue.extend(
+                [
+                    tui_textual.QueuedFollowUp("first", True),
+                    tui_textual.QueuedFollowUp("second", True),
+                ]
+            )
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(100, 32)) as pilot:
+                    app.running = True
+                    app._refresh_follow_up_queue()
+                    await pilot.pause()
+
+                    self.assertTrue(
+                        await pilot.click("#follow-up-queue", offset=(8, 2))
+                    )
+                    await pilot.pause(app.CLICK_CHAIN_TIME_THRESHOLD + 0.1)
+
+                    self.assertIsInstance(
+                        app.screen,
+                        tui_textual.QueueEditorScreen,
+                    )
+                    self.assertEqual(app.screen.selected_source_position, 2)
+                    self.assertEqual(
+                        app.screen.query_one("#queue-editor-prompt").text,
+                        "second",
+                    )
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_double_clicking_queue_keeps_text_selection(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            app.follow_up_queue.append(tui_textual.QueuedFollowUp("select me"))
+            app.copy_to_clipboard = mock.Mock()
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(100, 32)) as pilot:
+                    app._refresh_follow_up_queue()
+                    await pilot.pause()
+
+                    await pilot.click(
+                        "#follow-up-queue",
+                        offset=(8, 1),
+                        times=2,
+                    )
+                    await pilot.pause(app.CLICK_CHAIN_TIME_THRESHOLD + 0.1)
+
+                    self.assertNotIsInstance(
+                        app.screen,
+                        tui_textual.QueueEditorScreen,
+                    )
+                    self.assertTrue(app.screen.get_selected_text())
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_queue_editor_editing_keys_run_once(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+            app.follow_up_queue.append(tui_textual.QueuedFollowUp("abcd"))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test() as pilot:
+                    app.running = True
+                    app._handle_queue([])
+                    await pilot.pause()
+
+                    editor = app.screen.query_one("#queue-editor-prompt")
+                    editor.move_cursor((0, 4))
+                    await pilot.press("backspace")
+                    self.assertEqual(editor.text, "abc")
+                    self.assertEqual(editor.cursor_location, (0, 3))
+
+                    editor.text = "abcd"
+                    editor.move_cursor((0, 1))
+                    await pilot.press("delete")
+                    self.assertEqual(editor.text, "acd")
+                    self.assertEqual(editor.cursor_location, (0, 1))
+
+                    editor.text = "abcd"
+                    editor.move_cursor((0, 4))
+                    await pilot.press("left")
+                    self.assertEqual(editor.cursor_location, (0, 3))
 
         asyncio.run(run())
 
@@ -6824,15 +7000,39 @@ class TuiCommandTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     app.query_one("#config-synthesis-model").value,
-                    "inherit",
+                    "",
                 )
                 self.assertEqual(
                     app.query_one("#config-synthesis-effort").value,
-                    "inherit",
+                    "",
                 )
                 self.assertEqual(
                     app.query_one("#config-synthesis-fast").value,
+                    "auto",
+                )
+                self.assertEqual(
+                    app.synthesis_model_choices,
+                    app.model_choices,
+                )
+                self.assertEqual(
+                    app.synthesis_effort_choices,
+                    app.effort_choices,
+                )
+                self.assertEqual(
+                    [value for _label, value in app.synthesis_fast_choices],
+                    ["auto", "on", "off"],
+                )
+                self.assertNotIn(
                     "inherit",
+                    {
+                        value
+                        for choices in (
+                            app.synthesis_model_choices,
+                            app.synthesis_effort_choices,
+                            app.synthesis_fast_choices,
+                        )
+                        for _label, value in choices
+                    },
                 )
                 labels = [label for label, _value in app._tree_rows()]
                 self.assertEqual(
@@ -6867,6 +7067,47 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertNotIn("RUN_ANCHOR", [label for label, _value in app._tree_rows()])
                 self.assertEqual(len(app.query("#runner-module-dir")), 0)
                 self.assertEqual(len(app.query("#runner-run-anchor")), 0)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_runner_select_options_stay_on_one_line(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+
+                fast = app.query_one("#config-fast")
+                fast_label = fast.query_one("#label")
+                self.assertGreaterEqual(
+                    fast_label.region.width,
+                    len(str(fast_label.render())),
+                )
+                fast.expanded = True
+                await pilot.pause()
+                fast_overlay = fast.query_one("SelectOverlay")
+                self.assertTrue(fast_overlay._heights)
+                self.assertTrue(
+                    all(height == 1 for height in fast_overlay._heights.values())
+                )
+                fast.expanded = False
+                await pilot.pause()
+
+                model = app.query_one("#config-model")
+                long_label = "模型-" + "很长的名称" * 8
+                app._set_select_control(
+                    model,
+                    "",
+                    [("default", ""), (long_label, "long-model")],
+                )
+                model.expanded = True
+                await pilot.pause()
+                model_overlay = model.query_one("SelectOverlay")
+                self.assertGreater(model_overlay.region.width, model.region.width)
+                self.assertLessEqual(model_overlay.region.width, 90)
+                self.assertTrue(
+                    all(height == 1 for height in model_overlay._heights.values())
+                )
 
         asyncio.run(run())
 

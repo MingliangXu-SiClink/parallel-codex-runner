@@ -8,9 +8,6 @@ from typing import Any, Sequence
 from .models import AGENT_ROLE_SYNTHESIS, AgentResult
 
 
-SYNTHESIS_INHERIT = "inherit"
-
-
 @dataclass(frozen=True)
 class SynthesisCodexSettings:
     model: str | None
@@ -21,8 +18,10 @@ class SynthesisCodexSettings:
 def normalize_synthesis_model(value: object) -> str | None:
     text = str(value or "").strip()
     normalized = text.lower()
+    # Older workspace settings used "inherit" for the candidate-stage value.
+    # Treat it as the new independent default when those settings are loaded.
     if normalized in {"inherit", "same", "candidate"}:
-        return SYNTHESIS_INHERIT
+        return None
     if normalized in {"", "auto", "clear", "default", "none"}:
         return None
     return text
@@ -31,55 +30,41 @@ def normalize_synthesis_model(value: object) -> str | None:
 def normalize_synthesis_effort(value: object) -> str | None:
     normalized = str(value or "").strip().lower()
     if normalized in {"inherit", "same", "candidate"}:
-        return SYNTHESIS_INHERIT
+        return None
     if normalized in {"", "auto", "clear", "default", "none"}:
         return None
     return normalized
 
 
-def normalize_synthesis_fast(value: object) -> str | bool | None:
+def normalize_synthesis_fast(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
     normalized = str(value or "").strip().lower()
     if normalized in {"inherit", "same", "candidate"}:
-        return SYNTHESIS_INHERIT
+        return None
     if normalized in {"", "auto", "clear", "default", "none"}:
         return None
     if normalized in {"on", "yes", "true", "1"}:
         return True
     if normalized in {"off", "no", "false", "0"}:
         return False
-    raise argparse.ArgumentTypeError(
-        "synthesis fast must be inherit, auto, on, or off"
-    )
+    raise argparse.ArgumentTypeError("synthesis fast must be auto, on, or off")
 
 
 def effective_synthesis_codex_settings(args: Any) -> SynthesisCodexSettings:
     model_setting = normalize_synthesis_model(
-        getattr(args, "synthesis_model", SYNTHESIS_INHERIT)
+        getattr(args, "synthesis_model", None)
     )
     effort_setting = normalize_synthesis_effort(
-        getattr(args, "synthesis_effort", SYNTHESIS_INHERIT)
+        getattr(args, "synthesis_effort", None)
     )
     fast_setting = normalize_synthesis_fast(
-        getattr(args, "synthesis_fast", SYNTHESIS_INHERIT)
+        getattr(args, "synthesis_fast", None)
     )
     return SynthesisCodexSettings(
-        model=(
-            getattr(args, "model", None)
-            if model_setting == SYNTHESIS_INHERIT
-            else model_setting
-        ),
-        effort=(
-            getattr(args, "effort", None)
-            if effort_setting == SYNTHESIS_INHERIT
-            else effort_setting
-        ),
-        fast=(
-            getattr(args, "fast", None)
-            if fast_setting == SYNTHESIS_INHERIT
-            else fast_setting
-        ),
+        model=model_setting,
+        effort=effort_setting,
+        fast=fast_setting,
     )
 
 

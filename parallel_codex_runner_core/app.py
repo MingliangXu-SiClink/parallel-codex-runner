@@ -109,7 +109,6 @@ from .paths import (
     safe_tail,
 )
 from .synthesis import (
-    SYNTHESIS_INHERIT,
     create_synthesis_context,
     effective_synthesis_codex_settings,
     normalize_synthesis_effort,
@@ -3778,39 +3777,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--synthesis-model",
         type=normalize_synthesis_model,
-        default=SYNTHESIS_INHERIT,
+        default=None,
         metavar="MODEL",
-        help=(
-            "Codex model for synthesis agents. Defaults to inherit, which uses "
-            "--model. Use default to omit the model override."
-        ),
+        help="Codex model for synthesis agents. Defaults to the Codex configuration.",
     )
     parser.add_argument(
         "--synthesis-effort",
         type=normalize_synthesis_effort,
-        default=SYNTHESIS_INHERIT,
+        default=None,
         metavar="LEVEL",
-        help=(
-            "Reasoning effort for synthesis agents. Defaults to inherit, which "
-            "uses --effort. Use auto to select the synthesis model's default."
-        ),
+        help="Reasoning effort for synthesis agents. Defaults to auto.",
     )
     parser.add_argument(
         "--synthesis-fast",
-        type=normalize_synthesis_fast,
-        default=SYNTHESIS_INHERIT,
-        metavar="{inherit,auto,on,off}",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Fast mode for synthesis agents. inherit uses --fast and auto "
-            "uses the Codex service-tier default."
+            "Force Codex Fast mode on or off for synthesis agents. When "
+            "omitted, use the Codex service-tier configuration."
         ),
-    )
-    parser.add_argument(
-        "--no-synthesis-fast",
-        dest="synthesis_fast",
-        action="store_const",
-        const=False,
-        help="Force Standard mode for synthesis agents.",
     )
     parser.add_argument(
         "--resume",
@@ -3866,14 +3851,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--fast / --no-fast 配置无效。")
     args.fast = fast
     args.synthesis_model = normalize_synthesis_model(
-        getattr(args, "synthesis_model", SYNTHESIS_INHERIT)
+        getattr(args, "synthesis_model", None)
     )
     args.synthesis_effort = normalize_synthesis_effort(
-        getattr(args, "synthesis_effort", SYNTHESIS_INHERIT)
+        getattr(args, "synthesis_effort", None)
     )
     try:
         args.synthesis_fast = normalize_synthesis_fast(
-            getattr(args, "synthesis_fast", SYNTHESIS_INHERIT)
+            getattr(args, "synthesis_fast", None)
         )
     except argparse.ArgumentTypeError as exc:
         raise SystemExit(str(exc)) from exc
@@ -3963,13 +3948,6 @@ def run_once(
         synthesis_settings.fast,
         model_registry.configured_service_tier,
     )
-    if getattr(args, "synthesis_model", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
-        synthesis_model_display = f"inherit ({synthesis_model_display})"
-    if getattr(args, "synthesis_effort", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
-        synthesis_effort_display = f"inherit ({synthesis_effort_display})"
-    if getattr(args, "synthesis_fast", SYNTHESIS_INHERIT) == SYNTHESIS_INHERIT:
-        synthesis_fast_display = f"inherit ({synthesis_fast_display})"
-
     run_base = choose_run_base(workspace, args.runs_dir)
     if is_relative_to(run_base, workspace):
         raise SystemExit(f"内部错误：run_base 位于 workspace 内部：{run_base}")

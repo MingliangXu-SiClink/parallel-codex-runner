@@ -22,9 +22,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             model=None,
             effort=None,
             fast=None,
-            synthesis_model="inherit",
-            synthesis_effort="inherit",
-            synthesis_fast="inherit",
+            synthesis_model=None,
+            synthesis_effort=None,
+            synthesis_fast=None,
             no_sync_back=False,
             keep_workspaces=False,
             resume_session_id=None,
@@ -104,12 +104,12 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertIsNone(restored.model)
             self.assertIsNone(restored.effort)
             self.assertIsNone(restored.fast)
-            self.assertEqual(restored.synthesis_model, "inherit")
-            self.assertEqual(restored.synthesis_effort, "inherit")
-            self.assertEqual(restored.synthesis_fast, "inherit")
+            self.assertIsNone(restored.synthesis_model)
+            self.assertIsNone(restored.synthesis_effort)
+            self.assertIsNone(restored.synthesis_fast)
             self.assertIsNone(restored.resume_session_id)
 
-    def test_synthesis_default_and_auto_values_are_distinct_from_inherit(self) -> None:
+    def test_synthesis_default_and_auto_values_round_trip(self) -> None:
         settings = WorkspaceSettings.from_mapping(
             {
                 "SYNTHESIS_MODEL": "default",
@@ -196,9 +196,12 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertIsNone(settings.model)
         self.assertIsNone(settings.effort)
         self.assertIsNone(settings.fast)
-        self.assertEqual(settings.synthesis_model, "inherit")
-        self.assertEqual(settings.synthesis_effort, "inherit")
-        self.assertEqual(settings.synthesis_fast, "inherit")
+        self.assertIsNone(settings.synthesis_model)
+        self.assertIsNone(settings.synthesis_effort)
+        self.assertIsNone(settings.synthesis_fast)
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_MODEL"], "default")
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_EFFORT"], "auto")
+        self.assertEqual(settings.to_mapping()["SYNTHESIS_FAST"], "AUTO")
         self.assertTrue(settings.sync_back)
         self.assertFalse(settings.keep_workspaces)
         self.assertIsNone(settings.resume_session_id)

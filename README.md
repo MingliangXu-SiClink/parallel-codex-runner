@@ -202,7 +202,7 @@ PCR starts two synthesis Agents by default. Set `SYNTHESIS_AGENTS` in the top pa
 
 After all first-stage candidates finish, PCR starts three independent synthesis Agents in clean copies of the original workspace. Each one receives references to every successful candidate workspace and final response, with explicit instructions to leave those sources unchanged. When the run resumes an existing Codex conversation, synthesis Agents inherit the same pre-turn session used by first-stage candidates and `/more`. PCR keeps the original request as the Codex user message and appends the review workflow to the effective developer instructions, preserving the guidance already configured for that workspace. For code tasks, each synthesis Agent compares the implementations, integrates compatible strengths in its own workspace, and validates the result. For answer-only tasks, it reconciles the candidate responses into one complete answer.
 
-`SYNTHESIS_MODEL`, `SYNTHESIS_EFFORT`, and `SYNTHESIS_FAST` configure only the second stage. Each defaults to `inherit`, preserving the candidate setting. You can instead select a different model or effort, use `auto` for the synthesis model's own default effort/service tier, or force synthesis Fast mode on or off.
+`SYNTHESIS_MODEL`, `SYNTHESIS_EFFORT`, and `SYNTHESIS_FAST` configure only the second stage, using the same choices as `MODEL`, `EFFORT`, and `FAST`. The synthesis model defaults to the Codex configuration, while effort and Fast default to `auto`; these settings do not implicitly copy the candidate-stage overrides.
 
 Successful synthesis Agents are preferred by `RECOMMEND_BY`. If none succeeds, PCR falls back to the successful first-stage candidates. This affects only the recommendation: you can still switch to, continue from, or finalize any successful Agent from either stage. `/more <n>` shares the same pre-turn conversation baseline but remains functionally different: it adds ordinary candidates instead of reviewing existing results. Candidates added with `/more`, and candidate retries requested while the first stage is still open, join that stage before synthesis. If one arrives after synthesis has already started, PCR stops the now-stale synthesis Agents, runs the added candidate work first, then refreshes synthesis from the complete successful candidate set.
 
@@ -405,9 +405,9 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `--model` | Codex model name. |
 | `--effort` | Reasoning effort supported by the selected model. |
 | `--fast`, `--no-fast` | Force Fast or Standard mode; omitted inherits Codex configuration and is shown as `AUTO (FAST)`, `AUTO (STANDARD)`, or the configured tier. Fast mode is model-dependent and consumes credits faster. |
-| `--synthesis-model` | Model used only by synthesis Agents; default `inherit`; use `default` to omit the model override. |
-| `--synthesis-effort` | Effort used only by synthesis Agents; default `inherit`; use `auto` for that model's default. |
-| `--synthesis-fast`, `--no-synthesis-fast` | Synthesis-only speed setting. `--synthesis-fast` accepts `inherit`, `auto`, `on`, or `off`; `--no-synthesis-fast` selects Standard mode. |
+| `--synthesis-model` | Model used only by synthesis Agents; omitted or `default` uses the Codex configuration. |
+| `--synthesis-effort` | Effort used only by synthesis Agents; omitted or `auto` uses that model's default. |
+| `--synthesis-fast`, `--no-synthesis-fast` | Force Fast or Standard mode for synthesis Agents; omitted uses the configured service tier. |
 | `--resume` | Choose a resumable Codex session interactively. |
 | `--resume-session-id` | Resume a specific session ID. |
 | `--resume-include-non-interactive` | Include `codex exec` sessions in the picker. |
@@ -441,9 +441,9 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/model <name\|clear>` | Set or clear the model. |
 | `/effort <auto\|level>` | Select a supported reasoning effort. |
 | `/fast <on\|off\|auto>` | Select Fast, Standard, or inherited Codex speed; `auto` shows the inherited tier in parentheses. |
-| `/synthesismodel <name\|inherit\|default>` | Set the model used only by synthesis Agents. |
-| `/synthesiseffort <inherit\|auto\|level>` | Set reasoning effort used only by synthesis Agents. |
-| `/synthesisfast <inherit\|auto\|on\|off>` | Set Fast mode used only by synthesis Agents. |
+| `/synthesismodel <name\|default>` | Set the model used only by synthesis Agents. |
+| `/synthesiseffort <auto\|level>` | Set reasoning effort used only by synthesis Agents. |
+| `/synthesisfast <auto\|on\|off>` | Set Fast mode used only by synthesis Agents. |
 | `/workspace <path>` | Change the target workspace. |
 | `/runsdir <path\|clear>` | Set or reset the run-data directory. |
 | `/codexbin <path>` | Set the Codex executable. |
