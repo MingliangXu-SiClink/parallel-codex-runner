@@ -65,11 +65,16 @@ Textual 已包含在本仓库中，并带有 PCR 针对中文输入和终端宽�
 
 ### 安装
 
-在项目检出目录中运行：
+在项目检出目录中，将 PCR 安装为普通 wheel 包：
 
 ```bash
-python3 -m pip install .
+python3 -m pip install --force-reinstall .
 ```
+
+`pip` 会先构建 wheel，再把它安装到当前 Python 环境中。这个命令会替换
+已有的可编辑安装，因此安装后的 `pcr` 不会随着检出目录中的源码变化而变化，
+除非你再次执行安装。在 Conda 环境中，启动器通常位于
+`$CONDA_PREFIX/bin/pcr`。
 
 开发时可以使用可编辑安装：
 
@@ -81,8 +86,11 @@ python3 -m pip install -e .
 
 ```bash
 codex --version
+command -v pcr
 pcr --help
 ```
+
+拉取新的 PCR 提交后，再次执行上面的普通安装命令即可更新已安装的 wheel。
 
 ### 启动 TUI
 
@@ -133,8 +141,8 @@ Codex，PCR 在后台保留并运行隔离候选；全部结束后，Codex 比�
 在仓库根目录依次安装运行程序、检查环境、注册本地 Marketplace，然后安装插件：
 
 ```bash
-# 安装 PCR 与 MCP Server
-python3 -m pip install -e .
+# 将 PCR 与 MCP Server 安装为普通 wheel
+python3 -m pip install --force-reinstall .
 
 # 检查运行环境
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
@@ -487,7 +495,7 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 
 ## 开发
 
-正式使用时建议采用普通 wheel 安装（`python3 -m pip install .`）。PCR 不再把自身源码复制到临时运行快照。Python 会把已经导入的模块保留在内存中，因此正在运行的 CLI 会始终使用启动时加载的代码；TUI 还会在启动时一次性导入所需的 PCR 与内置 Textual 模块，并拒绝对这些模块执行显式 reload。
+正式使用时建议采用普通 wheel 安装（`python3 -m pip install --force-reinstall .`）。PCR 不再把自身源码复制到临时运行快照。Python 会把已经导入的模块保留在内存中，因此正在运行的 CLI 会始终使用启动时加载的代码；TUI 还会在启动时一次性导入所需的 PCR 与内置 Textual 模块，并拒绝对这些模块执行显式 reload。
 
 可编辑安装（`python3 -m pip install -e .`）同样遵循“进程生命周期固定版本”：源码发生变化后，需要重启 PCR 才会加载新实现。每个插件 Run 只创建一个长期存活的 Worker；初始候选、追加候选、重试和最终采用都通过文件 IPC 交给同一个 Worker，所以运行期间的源码修改不会替换这次 Run 使用的实现。如果 Worker 意外崩溃，PCR 会明确报告该 Run 已无法继续，而不会用另一版本的源码悄悄启动替代 Worker。
 

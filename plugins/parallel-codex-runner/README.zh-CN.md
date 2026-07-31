@@ -17,9 +17,12 @@
 在仓库根目录安装 PCR 与 MCP Server：
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install --force-reinstall .
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 ```
+
+第一条命令会在当前 Python 环境中构建并安装普通 wheel。它会替换已有的可编辑
+安装，因此插件启动器会一直使用已安装的 PCR 版本，直到你再次执行安装。
 
 把当前仓库注册为本地插件市场：
 
@@ -123,7 +126,7 @@ git diff --check
 
 ## 常见问题
 
-- **MCP Server 无法启动：**重新运行 `python3 -m pip install -e .`。插件自带的启动器会寻找能够导入 PCR 与 FastMCP 的绝对 Python 路径；需要固定环境时设置 `PCR_PYTHON`。
+- **MCP Server 无法启动：**重新运行 `python3 -m pip install --force-reinstall .`。插件自带的启动器会寻找能够导入 PCR 与 FastMCP 的绝对 Python 路径；需要固定环境时设置 `PCR_PYTHON`。
 - **MCP Server 重启后任务仍在运行：**这是预期行为。使用 `pcr_stop_run` 或 `pcr_discard_run` 主动停止，遗留任务还会受到 TTL 限制。
 - **找不到 Codex CLI：**确认同一运行环境能够执行 `codex --version`。
 - **重启后显示运行中断：**使用 `pcr_list_runs` 找到记录，然后重试符合条件的 Agent，或放弃并清理该运行。

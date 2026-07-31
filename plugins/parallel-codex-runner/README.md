@@ -17,9 +17,13 @@ Requirements:
 From the repository root, install PCR and its MCP server:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install --force-reinstall .
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 ```
+
+The first command builds and installs a regular wheel in the active Python
+environment. It replaces an existing editable installation, so the plugin's
+launcher keeps using the installed PCR version until you install again.
 
 Register this repository as a local marketplace:
 
@@ -131,7 +135,7 @@ The repository marketplace is defined in [`.agents/plugins/marketplace.json`](..
 
 ## Troubleshooting
 
-- **MCP server cannot start:** run `python3 -m pip install -e .` again. The plugin-local launcher discovers a compatible absolute Python interpreter; set `PCR_PYTHON` when the App must use a specific environment.
+- **MCP server cannot start:** run `python3 -m pip install --force-reinstall .` again. The plugin-local launcher discovers a compatible absolute Python interpreter; set `PCR_PYTHON` when the App must use a specific environment.
 - **Run continues after the MCP server restarts:** this is intentional. Use `pcr_stop_run` or `pcr_discard_run`; TTL cleanup handles abandoned workers.
 - **Codex CLI not found:** ensure the same environment can run `codex --version`.
 - **Run interrupted after restart:** inspect it with `pcr_list_runs`, then retry eligible Agents or discard the retained run.

@@ -65,11 +65,16 @@ Textual is included in this repository, including PCR's Chinese input and termin
 
 ### Install
 
-From a checkout:
+From a checkout, install PCR as a regular wheel package:
 
 ```bash
-python3 -m pip install .
+python3 -m pip install --force-reinstall .
 ```
+
+`pip` builds the wheel and installs it into the active Python environment.
+This replaces an existing editable installation, so the installed `pcr`
+launcher is independent of the checkout until you install again. In a Conda
+environment, the launcher is normally under `$CONDA_PREFIX/bin/pcr`.
 
 For development:
 
@@ -81,8 +86,12 @@ Check that both commands are available:
 
 ```bash
 codex --version
+command -v pcr
 pcr --help
 ```
+
+After pulling a new PCR commit, run the regular installation command again to
+replace the installed wheel.
 
 ### Start the TUI
 
@@ -137,8 +146,8 @@ From the repository root, install the runtime, verify it, register this
 repository as a local marketplace, and install the plugin:
 
 ```bash
-# Install PCR and its MCP server
-python3 -m pip install -e .
+# Install PCR and its MCP server as a regular wheel
+python3 -m pip install --force-reinstall .
 
 # Verify the runtime
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
@@ -497,8 +506,9 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 
 ## Development
 
-Use a regular wheel installation for normal use (`python3 -m pip install .`).
-PCR does not copy its own source into temporary runtime snapshots. Python keeps
+Use a regular wheel installation for normal use
+(`python3 -m pip install --force-reinstall .`). PCR does not copy its own source
+into temporary runtime snapshots. Python keeps
 already imported modules in memory, so an active CLI process continues with the
 code it loaded at startup. The TUI eagerly imports its PCR and vendored Textual
 dependencies and rejects explicit reloads of those modules.
