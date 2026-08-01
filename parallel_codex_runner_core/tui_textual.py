@@ -3785,6 +3785,10 @@ else:
             if not self._finalize_displayed_pending(require_resume=False):
                 self._sync()
                 return
+            # Finalization may promote the selected Agent's first session into
+            # the real workspace. Persist that session instead of retaining the
+            # pre-run RESUME=NO value written above.
+            self._persist_workspace_settings()
             self.exit()
 
         def _handle_command(self, raw: str) -> None:
@@ -6320,11 +6324,15 @@ else:
                 except Exception:
                     if require_resume:
                         raise
+                promotion_error = (
+                    getattr(promotion, "error", None)
+                    if promotion is not None
+                    else None
+                )
                 if require_resume:
                     if promotion is None or not result.codex_thread_id:
                         self.status = f"AGENT-{idx:03d} has no resumable session"
                         return False
-                    promotion_error = getattr(promotion, "error", None)
                     if promotion_error:
                         self.status = f"AGENT-{idx:03d} session promotion failed: {promotion_error}"
                         return False
@@ -6339,8 +6347,11 @@ else:
                         and next_context != self.prompt_history_context
                     ):
                         self._associate_pending_prompt_with_context(next_context)
-                    if require_resume:
+                    if require_resume or (
+                        promotion is not None and not promotion_error
+                    ):
                         self.resume_session_id = result.codex_thread_id
+                        self.args.resume_session_id = result.codex_thread_id
                         self._load_prompt_history_context()
                 if not self._cleanup_after_pending_run():
                     return False

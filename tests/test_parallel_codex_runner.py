@@ -3767,6 +3767,48 @@ class TuiCommandTests(unittest.TestCase):
         exit_app.assert_called_once_with()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_exit_persists_promoted_session_for_next_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            candidate = root / "run" / "workspaces" / "agent_001"
+            workspace.mkdir()
+            candidate.mkdir(parents=True)
+            args = parse_args(["--workspace", str(workspace), "-n", "1"])
+            app = tui_textual.PcrTextualApp(args)
+            app.workspace_config_store = tui_textual.WorkspaceConfigStore(
+                root / "workspace-config.json"
+            )
+            app.pending_workspaces_root = candidate.parent
+            app.pending_workspace = workspace.resolve()
+            app.selected_agent = 1
+            app.agents[1].result = make_agent_result_data(1, candidate)
+            promotion = app_core.CodexSessionPromotion(
+                session_id="session-1",
+                workspace=str(workspace.resolve()),
+                state_found=True,
+            )
+
+            with (
+                mock.patch.object(tui_textual, "sync_best_workspace_back"),
+                mock.patch.object(
+                    tui_textual,
+                    "promote_best_codex_session_to_workspace",
+                    return_value=promotion,
+                ),
+                mock.patch.object(app, "_cleanup_after_pending_run", return_value=True),
+                mock.patch.object(app, "exit") as exit_app,
+            ):
+                app._request_exit()
+
+            restored = app.workspace_config_store.load(workspace)
+            self.assertIsNotNone(restored)
+            self.assertEqual(app.resume_session_id, "session-1")
+            self.assertEqual(app.args.resume_session_id, "session-1")
+            self.assertEqual(restored.resume_session_id, "session-1")
+            exit_app.assert_called_once_with()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_accept_finalizes_displayed_agent(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "3"]))
         app._sync = lambda: None
