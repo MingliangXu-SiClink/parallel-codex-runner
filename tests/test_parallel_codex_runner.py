@@ -1789,6 +1789,33 @@ class ArgParseTests(unittest.TestCase):
         self.assertEqual(args.num_agents, 4)
         self.assertEqual(args.synthesis_agents, 2)
 
+    def test_follow_up_delay_is_a_non_negative_tui_setting(self) -> None:
+        defaults = parse_args(["fix tests"])
+        configured = parse_args(
+            ["fix tests", "--follow-up-delay", "15"]
+        )
+        immediate = parse_args(
+            ["fix tests", "--follow-up-delay", "0"]
+        )
+
+        app_core.validate_args(defaults)
+        app_core.validate_args(configured)
+        app_core.validate_args(immediate)
+
+        self.assertEqual(defaults.follow_up_delay, 60)
+        self.assertEqual(configured.follow_up_delay, 15)
+        self.assertEqual(immediate.follow_up_delay, 0)
+        self.assertIn(
+            "follow_up_delay",
+            configured._pcr_explicit_tui_settings,
+        )
+
+    def test_negative_follow_up_delay_is_rejected(self) -> None:
+        args = parse_args(["fix tests", "--follow-up-delay", "-1"])
+
+        with self.assertRaisesRegex(SystemExit, "follow-up-delay"):
+            app_core.validate_args(args)
+
     def test_subagents_are_opt_in_with_a_configurable_limit(self) -> None:
         defaults = parse_args(["fix tests"])
         enabled = parse_args(
@@ -3246,6 +3273,10 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("/retry [agent]", "\n".join(command_suggestions("/ret")))
         self.assertIn("/more <n>", "\n".join(command_suggestions("/mo")))
         self.assertIn("/queue [n]", "\n".join(command_suggestions("/q")))
+        self.assertIn(
+            "/followupdelay <seconds>",
+            "\n".join(command_suggestions("/followup")),
+        )
         self.assertIn("/diff", "\n".join(command_suggestions("/d")))
         self.assertIn("/resume <n|session>", "\n".join(command_suggestions("/resume")))
         self.assertIn("/model <name|clear>", "\n".join(command_suggestions("/model")))
@@ -3307,8 +3338,11 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertTrue(any("/queue" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("SUBAGENTS" in tip for tip in tui_textual.TUI_TIPS))
                     self.assertTrue(any("FAST" in tip for tip in tui_textual.TUI_TIPS))
-                    self.assertTrue(any("60 秒" in tip for tip in tui_textual.TUI_TIPS))
-                    self.assertEqual(tui_textual.FOLLOW_UP_DELAY_SECONDS, 60.0)
+                    self.assertTrue(any("FOLLOW_UP_DELAY" in tip for tip in tui_textual.TUI_TIPS))
+                    self.assertEqual(
+                        tui_textual.DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+                        60,
+                    )
                     self.assertEqual(tips.region.height, 1)
                     self.assertLess(tips.region.y, prompt.region.y)
                     self.assertIn(first_tip, tips.content.plain)
@@ -3352,6 +3386,7 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/synthesismodel review-model")
         app._handle_command("/synthesiseffort low")
         app._handle_command("/synthesisfast off")
+        app._handle_command("/followupdelay 15")
         app._handle_command("/syncback off")
         app._handle_command("/keepworkspaces on")
         app._handle_command("/resumeinclude off")
@@ -3371,6 +3406,8 @@ class TuiCommandTests(unittest.TestCase):
         self.assertEqual(app.args.synthesis_model, "review-model")
         self.assertEqual(app.args.synthesis_effort, "low")
         self.assertFalse(app.args.synthesis_fast)
+        self.assertEqual(app.args.follow_up_delay, 15)
+        self.assertEqual(dict(app._base_info_rows())["FOLLOW_UP_DELAY"], "15")
         self.assertTrue(app.args.no_sync_back)
         self.assertTrue(app.args.keep_workspaces)
         self.assertFalse(app.args.resume_include_non_interactive)
@@ -3459,6 +3496,9 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.pause()
 
                     self.assertTrue(app.query_one("#config-agents").disabled)
+                    self.assertFalse(
+                        app.query_one("#config-follow-up-delay").disabled
+                    )
                     for selector in (
                         "#config-synthesis-agents",
                         "#config-synthesis-model",
@@ -3490,6 +3530,10 @@ class TuiCommandTests(unittest.TestCase):
                     synthesis_effort.value = "low"
                     synthesis_fast = app.query_one("#config-synthesis-fast")
                     synthesis_fast.value = "off"
+                    follow_up_delay = app.query_one("#config-follow-up-delay")
+                    follow_up_delay.value = "15"
+                    follow_up_delay.focus()
+                    await pilot.press("enter")
                     await pilot.pause()
 
                     configuration = coordinator.close_and_snapshot()
@@ -3497,6 +3541,7 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(configuration.model, "review-model")
                     self.assertEqual(configuration.effort, "low")
                     self.assertFalse(configuration.fast)
+                    self.assertEqual(app.args.follow_up_delay, 15)
                     app._sync()
                     await pilot.pause()
 
@@ -3507,6 +3552,9 @@ class TuiCommandTests(unittest.TestCase):
                         "#config-synthesis-fast",
                     ):
                         self.assertTrue(app.query_one(selector).disabled)
+                    self.assertFalse(
+                        app.query_one("#config-follow-up-delay").disabled
+                    )
                     app.running = False
 
         asyncio.run(run())
@@ -6235,7 +6283,9 @@ class TuiCommandTests(unittest.TestCase):
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_completed_run_selects_recommended_agent_and_delays_queued_follow_up(self) -> None:
-        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app = tui_textual.PcrTextualApp(
+            parse_args(["-n", "2", "--follow-up-delay", "15"])
+        )
         app._sync = lambda: None
         app.running = True
         app.selected_agent = 1
@@ -6269,16 +6319,16 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(app.recommended_agent, 2)
         self.assertEqual(app.selected_agent, 2)
-        self.assertEqual(app.follow_up_continue_at, 160.0)
-        self.assertIn("in 60s", app.status)
+        self.assertEqual(app.follow_up_continue_at, 115.0)
+        self.assertIn("in 15s", app.status)
 
         with mock.patch.object(tui_textual.time, "monotonic", return_value=101.0):
             app._tick()
             queue_text = app._follow_up_queue_text()
 
-        self.assertEqual(app._follow_up_countdown_second, 59)
-        self.assertIn("in 59s", app.status)
-        self.assertIn("starts in 59s", queue_text)
+        self.assertEqual(app._follow_up_countdown_second, 14)
+        self.assertIn("in 14s", app.status)
+        self.assertIn("starts in 14s", queue_text)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_follow_up_queue_separates_status_from_single_prompt(self) -> None:
@@ -6590,6 +6640,48 @@ class TuiCommandTests(unittest.TestCase):
         self.assertIn("in 60s", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_changing_follow_up_delay_restarts_active_countdown(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question")
+        )
+        app.follow_up_continue_at = 130.0
+        app._follow_up_countdown_second = 30
+
+        with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
+            app._handle_command("/followupdelay 15")
+
+        self.assertEqual(app.args.follow_up_delay, 15)
+        self.assertEqual(app.follow_up_continue_at, 115.0)
+        self.assertEqual(app._follow_up_countdown_second, 15)
+        self.assertIn("in 15s", app.status)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_zero_follow_up_delay_makes_queued_prompt_ready(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args(["-n", "1"]))
+        app._sync = lambda: None
+        app._show_text = lambda _text: None
+        app.follow_up_queue.append(
+            tui_textual.QueuedFollowUp("follow-up question")
+        )
+        app.follow_up_continue_at = 130.0
+        app.agents[1].result = make_agent_result_data(
+            1,
+            Path("/tmp/agent-1"),
+        )
+
+        app._handle_command("/followupdelay 0")
+
+        self.assertIsNone(app.follow_up_continue_at)
+        self.assertTrue(app.follow_up_ready)
+        self.assertIsNone(app._follow_up_countdown_second)
+        with mock.patch.object(app, "_dispatch_follow_up") as dispatch:
+            app._tick()
+        dispatch.assert_called_once_with()
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_queue_editor_rejects_stale_snapshot(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
         original = tui_textual.QueuedFollowUp("original")
@@ -6858,16 +6950,45 @@ class TuiCommandTests(unittest.TestCase):
         )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_run_finished_does_not_auto_switch_to_recommended_agent(self) -> None:
+    def test_tui_run_finished_auto_switches_to_recommended_agent_without_queue(self) -> None:
         args = parse_args(["-n", "5"])
         app = tui_textual.PcrTextualApp(args)
         app._sync = lambda: None
         app.selected_agent = 2
+        app.agents[2].result = {"status": "error"}
+        app.agents[5].result = make_agent_result_data(
+            5,
+            Path("/tmp/agent-5"),
+            reasoning_tokens=200,
+        )
 
         app._on_runner_event(tui_textual.RunnerEvent({"type": "run_finished", "run_root": "/tmp/pcr-test/run", "best_agent": 5}))
 
-        self.assertEqual(app.selected_agent, 2)
+        self.assertEqual(app.selected_agent, 5)
         self.assertEqual(app.recommended_agent, 5)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_run_finished_keeps_selection_when_all_agents_failed(self) -> None:
+        args = parse_args(["-n", "2"])
+        app = tui_textual.PcrTextualApp(args)
+        app._sync = lambda: None
+        app.selected_agent = 2
+        app.agents[1].result = {"status": "error"}
+        app.agents[2].result = {"status": "killed"}
+
+        app._on_runner_event(
+            tui_textual.RunnerEvent(
+                {
+                    "type": "run_finished",
+                    "run_root": "/tmp/pcr-test/run",
+                    "best_agent": None,
+                }
+            )
+        )
+
+        self.assertEqual(app.selected_agent, 2)
+        self.assertIsNone(app.recommended_agent)
+        self.assertEqual(app.status, "No successful agent")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_start_run_discards_no_success_pending_run(self) -> None:
@@ -7281,6 +7402,7 @@ class TuiCommandTests(unittest.TestCase):
                 self.assertIn("SYNTHESIS_MODEL", labels)
                 self.assertIn("SYNTHESIS_EFFORT", labels)
                 self.assertIn("SYNTHESIS_FAST", labels)
+                self.assertIn("FOLLOW_UP_DELAY", labels)
                 self.assertIn("SUBAGENTS", labels)
                 self.assertIn("SUBAGENTS_LIMIT", labels)
                 self.assertLess(
@@ -7356,8 +7478,51 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
 
                 recommendation = app.query_one("#runner-recommended-agent-key")
-                self.assertEqual(recommendation.region.y, resume.region.bottom)
+                self.assertEqual(recommendation.region.y, resume.region.y)
                 self.assertEqual(resume.query_one("SelectCurrent").region.height, 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_runner_panel_uses_responsive_multi_pair_grid(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            async with app.run_test(size=(80, 40)) as pilot:
+                app.agents[1].input_text = "hello"
+                app._mark_detail_dirty(app.agents[1])
+                app._sync()
+                await pilot.pause()
+
+                grid = app.query_one("#runner-grid")
+                frame = app.query_one("#runner-frame")
+                agents = app.query_one("#config-agents")
+                synthesis_agents = app.query_one("#config-synthesis-agents")
+                execution = app.query_one("#config-execution")
+                context = app.query_one("#runner-workspace")
+                narrow_height = frame.region.height
+
+                self.assertEqual(grid.styles.grid_size_columns, 2)
+                self.assertNotEqual(agents.region.y, synthesis_agents.region.y)
+                self.assertGreater(context.region.width, 40)
+
+                await pilot.resize_terminal(100, 40)
+                await pilot.pause()
+
+                two_pair_height = frame.region.height
+                self.assertEqual(grid.styles.grid_size_columns, 4)
+                self.assertEqual(agents.region.y, synthesis_agents.region.y)
+                self.assertNotEqual(agents.region.y, execution.region.y)
+                self.assertLess(two_pair_height, narrow_height)
+                self.assertGreater(context.region.width, 70)
+
+                await pilot.resize_terminal(150, 40)
+                await pilot.pause()
+
+                self.assertEqual(grid.styles.grid_size_columns, 6)
+                self.assertEqual(agents.region.y, synthesis_agents.region.y)
+                self.assertEqual(agents.region.y, execution.region.y)
+                self.assertLess(frame.region.height, two_pair_height)
+                self.assertGreater(context.region.width, 120)
 
         asyncio.run(run())
 

@@ -129,10 +129,10 @@ The settings at the top of the TUI are editable too.
 
 PCR remembers these TUI settings separately for each workspace, including the
 Agent counts, execution mode, nested-Agent limits, recommendation strategy,
-model, effort, Fast mode, sync-back, workspace retention, and selected resume
-session. They are stored in the user's PCR state directory rather than inside
-the project. Explicit command-line options take precedence over the remembered
-workspace values.
+model, effort, Fast mode, queued follow-up delay, sync-back, workspace retention,
+and selected resume session. They are stored in the user's PCR state directory
+rather than inside the project. Explicit command-line options take precedence
+over the remembered workspace values.
 
 ## Codex App Plugin
 
@@ -241,6 +241,7 @@ Advanced users can enable them from the top panel or with:
 | `/retry [agent]` | Rerun a failed or killed Agent in a fresh workspace. |
 | `/more <n>` | Add more candidates for the current question. |
 | `/queue [n]` | Open the follow-up queue editor, optionally at item `n`. |
+| `/followupdelay <seconds>` | Set the review delay before a queued follow-up starts. |
 | `/synthesis <n\|off>` | Set the pending synthesis stage's Agent count. |
 
 ### Manage queued follow-ups
@@ -249,7 +250,14 @@ When a follow-up is waiting, run `/queue` to open its editor. Choose an item
 from the list, edit its full prompt, use the arrow buttons to change execution
 order, or mark it for removal. `APPLY` commits all changes; `CANCEL` or `Esc`
 discards them. Opening the editor pauses automatic continuation, and closing it
-starts a fresh 60-second review period when the queue is ready to run.
+starts a fresh review period when the queue is ready to run.
+
+`FOLLOW_UP_DELAY` controls that review period in seconds and defaults to `60`.
+You can edit it in the top panel at any time, including while Agents are running
+or while a countdown is active. The command `/followupdelay 15` and startup
+option `--follow-up-delay 15` set the same value; `0` starts the queued question
+without a review delay. Switching Agents during the review restarts the full
+configured countdown from the newly displayed Agent.
 
 ### Continue an earlier Codex conversation
 
@@ -402,6 +410,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | --- | --- |
 | `-n, --num-agents` | Number of candidates; default `4`. |
 | `--synthesis-agents` | Isolated review-and-synthesis Agents started after candidates finish; default `2`; use `0` to disable. |
+| `--follow-up-delay` | TUI review delay before a queued question starts from the selected Agent; default `60` seconds; `0` starts immediately. |
 | `--max-parallel` | Maximum number of concurrent Codex processes. |
 | `--subagents`, `--no-subagents` | Enable or disable nested Codex Agents; disabled by default. |
 | `--subagents-limit` | Maximum nested subagents per PCR Agent when enabled; default `8`. |
@@ -437,6 +446,7 @@ Run PCR only on prompts and repositories you trust. Before pushing or releasing 
 | `/retry [agent]` | Rerun a failed or killed Agent. |
 | `/more <n>` | Add candidates for the current question. |
 | `/queue [n]` | Edit, remove, or reorder queued follow-ups; optionally select item `n`. |
+| `/followupdelay <seconds>` | Set the queued follow-up review delay; `0` starts immediately. |
 | `/synthesis <n\|off>` | Set the pending synthesis stage's Agent count. |
 | `/diff` | Toggle the displayed Agent's complete patch. |
 | `/kill [agent]` | Stop a running Agent. |

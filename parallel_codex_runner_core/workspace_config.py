@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 from platformdirs import user_state_path
 
+from .models import DEFAULT_FOLLOW_UP_DELAY_SECONDS
 from .synthesis import (
     normalize_synthesis_effort,
     normalize_synthesis_fast,
@@ -51,6 +52,7 @@ class WorkspaceSettings:
     synthesis_model: str | None = None
     synthesis_effort: str | None = None
     synthesis_fast: bool | None = None
+    follow_up_delay: int | None = None
     sync_back: bool | None = None
     keep_workspaces: bool | None = None
     resume_session_id: str | None = None
@@ -146,6 +148,7 @@ class WorkspaceSettings:
                 "SYNTHESIS_MODEL": "synthesis_model",
                 "SYNTHESIS_EFFORT": "synthesis_effort",
                 "SYNTHESIS_FAST": "synthesis_fast",
+                "FOLLOW_UP_DELAY": "follow_up_delay",
                 "SYNC_BACK": "sync_back",
                 "KEEP_WORKSPACES": "keep_workspaces",
                 "RESUME": "resume_session_id",
@@ -174,6 +177,10 @@ class WorkspaceSettings:
                 value.get("SYNTHESIS_EFFORT")
             ),
             synthesis_fast=synthesis_fast,
+            follow_up_delay=positive_int(
+                value.get("FOLLOW_UP_DELAY"),
+                allow_zero=True,
+            ),
             sync_back=optional_bool(value.get("SYNC_BACK")),
             keep_workspaces=optional_bool(value.get("KEEP_WORKSPACES")),
             resume_session_id=resume,
@@ -233,6 +240,13 @@ class WorkspaceSettings:
             synthesis_model=synthesis_model,
             synthesis_effort=synthesis_effort,
             synthesis_fast=synthesis_fast,
+            follow_up_delay=int(
+                getattr(
+                    args,
+                    "follow_up_delay",
+                    DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+                )
+            ),
             sync_back=not bool(getattr(args, "no_sync_back", False)),
             keep_workspaces=bool(getattr(args, "keep_workspaces", False)),
             resume_session_id=str(resume_session_id or "").strip() or None,
@@ -251,6 +265,7 @@ class WorkspaceSettings:
                     "synthesis_model",
                     "synthesis_effort",
                     "synthesis_fast",
+                    "follow_up_delay",
                     "sync_back",
                     "keep_workspaces",
                     "resume_session_id",
@@ -275,6 +290,7 @@ class WorkspaceSettings:
             "SYNTHESIS_FAST": (
                 "AUTO" if self.synthesis_fast is None else self.synthesis_fast
             ),
+            "FOLLOW_UP_DELAY": self.follow_up_delay,
             "SYNC_BACK": self.sync_back,
             "KEEP_WORKSPACES": self.keep_workspaces,
             "RESUME": self.resume_session_id or "NO",
@@ -322,6 +338,12 @@ class WorkspaceSettings:
             args.synthesis_effort = self.synthesis_effort
         if present("synthesis_fast") and "synthesis_fast" not in explicit_settings:
             args.synthesis_fast = self.synthesis_fast
+        if (
+            present("follow_up_delay")
+            and self.follow_up_delay is not None
+            and "follow_up_delay" not in explicit_settings
+        ):
+            args.follow_up_delay = self.follow_up_delay
         if present("sync_back") and self.sync_back is not None and "sync_back" not in explicit_settings:
             args.no_sync_back = not self.sync_back
         if present("keep_workspaces") and self.keep_workspaces is not None and "keep_workspaces" not in explicit_settings:

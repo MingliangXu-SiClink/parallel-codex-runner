@@ -42,6 +42,10 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
         "choose how successful agents are recommended",
     ),
     (
+        "/followupdelay <seconds>",
+        "set the review delay before a queued follow-up starts",
+    ),
+    (
         "/synthesis <n|off>",
         "set synthesis agents before the synthesis stage starts",
     ),
@@ -80,7 +84,9 @@ MAX_SUGGESTIONS = 15
 UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
-FOLLOW_UP_DELAY_SECONDS = 60.0
+RUNNER_TWO_PAIR_MIN_WIDTH = 96
+RUNNER_THREE_PAIR_MIN_WIDTH = 150
+FOLLOW_UP_CONFIG_CONTROL_ID = "config-follow-up-delay"
 SYNTHESIS_CONFIG_CONTROL_IDS = frozenset(
     {
         "config-synthesis-agents",
@@ -170,7 +176,7 @@ TUI_TIPS: tuple[str, ...] = (
     "输入框中按 ↑/↓ 可浏览当前 Workspace 与 Session 的输入历史。",
     "大型工作区会在复制前估算空间，并在预计超过 5 GiB 时请求确认。",
     "SUBAGENTS 默认关闭；启用后可用 SUBAGENTS_LIMIT 控制每个 PCR Agent 的嵌套数量。",
-    "当前 Agent 未完成时提交的新问题会排队，本轮结束后留出 60 秒选择续接的 Agent。",
+    "当前 Agent 未完成时提交的新问题会排队；FOLLOW_UP_DELAY 控制自动续接前的选择时间。",
 )
 
 
@@ -592,6 +598,7 @@ else:
     from .models import (
         AGENT_ROLE_CANDIDATE,
         AGENT_ROLE_SYNTHESIS,
+        DEFAULT_FOLLOW_UP_DELAY_SECONDS,
         DEFAULT_SUBAGENTS_LIMIT,
         AgentResult,
         CodexHistoryEntry,
@@ -1478,7 +1485,7 @@ else:
         }
         #runner-frame {
             height: auto;
-            max-height: 65%;
+            max-height: 50%;
             margin: 0 1;
             padding: 0 1;
             border: round cyan;
@@ -1537,7 +1544,7 @@ else:
             color: #ffffff;
         }
         #config-agents, #config-synthesis-agents, #config-max-parallel,
-        #config-subagents-limit {
+        #config-subagents-limit, #config-follow-up-delay {
             width: 12;
         }
         #config-execution, #config-recommend-by, #config-effort,
@@ -1791,12 +1798,16 @@ else:
                         DEFAULT_SUBAGENTS_LIMIT,
                     )
                 ),
+                "config-follow-up-delay": str(
+                    self._follow_up_delay_seconds()
+                ),
             }
             self._mouse_down_in_runner_control = False
             self._last_screen_selection = ""
             self._sync_deferred_for_selection = False
             self._tip_refresh_deferred_for_selection = False
             self._recommend_border_deferred_for_selection = False
+            self._runner_grid_columns = 0
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
             self.app_in_foreground = True
@@ -2032,13 +2043,33 @@ else:
                 with Vertical(id="runner-frame"):
                     with Grid(id="runner-grid"):
                         yield Static("CONVERSATION", classes="runner-key")
-                        yield Static("", id="runner-conversation", classes="runner-value", markup=False)
+                        yield Static(
+                            "",
+                            id="runner-conversation",
+                            classes="runner-value runner-context-value",
+                            markup=False,
+                        )
                         yield Static("CODEX_BIN", classes="runner-key")
-                        yield Static("", id="runner-codex-bin", classes="runner-value", markup=False)
+                        yield Static(
+                            "",
+                            id="runner-codex-bin",
+                            classes="runner-value runner-context-value",
+                            markup=False,
+                        )
                         yield Static("WORKSPACE", classes="runner-key")
-                        yield Static("", id="runner-workspace", classes="runner-value", markup=False)
+                        yield Static(
+                            "",
+                            id="runner-workspace",
+                            classes="runner-value runner-context-value",
+                            markup=False,
+                        )
                         yield Static("RUNS_ROOT", classes="runner-key")
-                        yield Static("", id="runner-runs-root", classes="runner-value", markup=False)
+                        yield Static(
+                            "",
+                            id="runner-runs-root",
+                            classes="runner-value runner-context-value",
+                            markup=False,
+                        )
                         yield Static("AGENTS", classes="runner-key")
                         yield Input(
                             str(self.num_agents),
@@ -2167,6 +2198,13 @@ else:
                             id="config-synthesis-fast",
                             classes="runner-control",
                         )
+                        yield Static("FOLLOW_UP_DELAY", classes="runner-key")
+                        yield Input(
+                            str(self._follow_up_delay_seconds()),
+                            id="config-follow-up-delay",
+                            classes="runner-control",
+                            type="integer",
+                        )
                         yield Static("SYNC_BACK", classes="runner-key")
                         yield Select(
                             [("YES", True), ("NO", False)],
@@ -2214,6 +2252,7 @@ else:
 
         def on_mount(self) -> None:
             self.query_one("#runner-frame", Vertical).border_title = "PARALLEL-CODEX-RUNNER"
+            self._sync_runner_layout(self.size.width)
             self.set_interval(0.25, self._tick)
             self.set_interval(TIP_ROTATION_SECONDS, self._advance_tip)
             self.set_interval(TIP_ICON_REFRESH_SECONDS, self._advance_tip_icon)
@@ -2232,6 +2271,30 @@ else:
             if not self.is_headless:
                 self._refresh_resume_control()
             self.query_one("#prompt", PromptEditor).focus()
+
+        def on_resize(self, event: events.Resize) -> None:
+            self._sync_runner_layout(event.size.width)
+
+        def _sync_runner_layout(self, width: int) -> None:
+            if width >= RUNNER_THREE_PAIR_MIN_WIDTH:
+                columns = 6
+            elif width >= RUNNER_TWO_PAIR_MIN_WIDTH:
+                columns = 4
+            else:
+                columns = 2
+            if columns == self._runner_grid_columns:
+                return
+            try:
+                grid = self.query_one("#runner-grid", Grid)
+            except Exception:
+                return
+
+            context_span = columns - 1
+            for value in self.query(".runner-context-value"):
+                value.styles.column_span = context_span
+            grid.styles.grid_columns = " ".join(["18", "1fr"] * (columns // 2))
+            grid.styles.grid_size_columns = columns
+            self._runner_grid_columns = columns
 
         def _current_prompt_history_context(self) -> tuple[str, str]:
             return self.prompt_history_store.context_key(
@@ -2771,6 +2834,32 @@ else:
             self._set_committed_input_value(control, display_value)
             return applied
 
+        def _commit_follow_up_delay_control(self) -> bool:
+            try:
+                control = self.query_one("#config-follow-up-delay", Input)
+            except Exception:
+                return True
+            value_text = control.value.strip()
+            if value_text == self._committed_input_values.get(
+                "config-follow-up-delay"
+            ):
+                return True
+            try:
+                requested = int(value_text)
+            except ValueError:
+                requested = None
+            self._handle_followupdelay([value_text])
+            applied = (
+                requested is not None
+                and requested >= 0
+                and self._follow_up_delay_seconds() == requested
+            )
+            self._set_committed_input_value(
+                control,
+                str(self._follow_up_delay_seconds()),
+            )
+            return applied
+
         def _model_effort_control_has_pending_value(
             self,
             control: Select,
@@ -3035,6 +3124,9 @@ else:
             if not self._commit_subagents_limit_control():
                 self.query_one("#config-subagents-limit", Input).focus()
                 return False
+            if not self._commit_follow_up_delay_control():
+                self.query_one("#config-follow-up-delay", Input).focus()
+                return False
             return True
 
         @on(Input.Submitted, "#config-agents")
@@ -3086,6 +3178,20 @@ else:
         ) -> None:
             if not self._updating_controls:
                 self._commit_subagents_limit_control()
+
+        @on(Input.Submitted, "#config-follow-up-delay")
+        def _on_follow_up_delay_submitted(self, _event: Input.Submitted) -> None:
+            if self._updating_controls:
+                return
+            self._commit_follow_up_delay_control()
+
+        @on(events.DescendantBlur, "#config-follow-up-delay")
+        def _on_follow_up_delay_blurred(
+            self,
+            _event: events.DescendantBlur,
+        ) -> None:
+            if not self._updating_controls:
+                self._commit_follow_up_delay_control()
 
         def _accept_select_event(self, event: Select.Changed) -> bool:
             """Ignore delayed Select messages that predate the current choice."""
@@ -3268,14 +3374,7 @@ else:
                     or self.follow_up_ready
                 )
             ):
-                self.follow_up_continue_at = (
-                    time.monotonic() + FOLLOW_UP_DELAY_SECONDS
-                )
-                self.follow_up_ready = False
-                self._follow_up_countdown_second = int(FOLLOW_UP_DELAY_SECONDS)
-                self._set_follow_up_countdown_status(
-                    self._follow_up_countdown_second
-                )
+                self._start_follow_up_countdown()
             self._sync()
 
         def _agent_kill_requested(self, idx: int) -> bool:
@@ -3486,6 +3585,7 @@ else:
                     if not self._launch_next_pending_stage():
                         self.status = self._completed_status()
                         self._notify_completion_if_background()
+                        self._select_recommended_agent_after_completion()
                         self._schedule_follow_up_after_completion()
             elif kind == "run_failed":
                 self.running = False
@@ -3543,6 +3643,7 @@ else:
                     if not self._launch_next_pending_stage():
                         self.status = self._completed_status()
                         self._notify_completion_if_background()
+                        self._select_recommended_agent_after_completion()
                         self._schedule_follow_up_after_completion()
             elif kind == "candidate_batch_failed":
                 self.running = False
@@ -3561,6 +3662,7 @@ else:
                     self._recompute_recommendation()
                     self.status = f"Additional candidates failed: {payload.get('message') or ''}"
                     self._notify_completion_if_background()
+                    self._select_recommended_agent_after_completion()
                     self._schedule_follow_up_after_completion()
             if kind not in {"agent_line", "agent_tokens", "agent_status"}:
                 self._sync()
@@ -3832,6 +3934,9 @@ else:
                 return
             if name == "/queue":
                 self._handle_queue(args)
+                return
+            if name in {"/followupdelay", "/follow-up-delay"}:
+                self._handle_followupdelay(args)
                 return
             if name in {"/synthesis", "/synthesisagents", "/synthesis-agents"}:
                 self._handle_synthesis(args)
@@ -4230,6 +4335,73 @@ else:
                 return False
             return True
 
+        def _refresh_follow_up_delay_row(self) -> None:
+            value = str(self._follow_up_delay_seconds())
+            if not self.run_info_rows:
+                self.run_info_rows = self._base_info_rows()
+                return
+            updated = False
+            rows: list[tuple[str, str]] = []
+            for label, current in self.run_info_rows:
+                if label == "FOLLOW_UP_DELAY":
+                    rows.append((label, value))
+                    updated = True
+                else:
+                    rows.append((label, current))
+            if not updated:
+                insert_at = next(
+                    (
+                        index
+                        for index, (label, _current) in enumerate(rows)
+                        if label == "SYNC_BACK"
+                    ),
+                    len(rows),
+                )
+                rows.insert(insert_at, ("FOLLOW_UP_DELAY", value))
+            self.run_info_rows = rows
+
+        def _handle_followupdelay(self, args: list[str]) -> None:
+            if not args:
+                self._show_setting(
+                    f"followupdelay={self._follow_up_delay_seconds()}s"
+                )
+                return
+            if len(args) != 1:
+                self.status = "Usage: /followupdelay <non-negative seconds>"
+                self._sync()
+                return
+            try:
+                value = int(args[0])
+            except ValueError:
+                value = -1
+            if value < 0:
+                self.status = "followupdelay must be >= 0"
+                self._sync()
+                return
+            if self.storage_preflight_inflight:
+                self.status = "Cannot change follow-up delay while checking storage"
+                self._sync()
+                return
+
+            countdown_active = bool(
+                self.follow_up_continue_at is not None
+                or self.follow_up_ready
+                or self.follow_up_source_finalized
+            )
+            self.args.follow_up_delay = value
+            self._refresh_follow_up_delay_row()
+            message = f"followupdelay={value}s"
+            if (
+                countdown_active
+                and self.follow_up_queue
+                and not self.running
+                and not self.follow_up_queue_editor_open
+            ):
+                self._start_follow_up_countdown()
+                self._show_text(message)
+            else:
+                self._show_setting(message)
+
         def _synthesis_config_is_editable(self) -> bool:
             if not self.running:
                 return True
@@ -4487,11 +4659,7 @@ else:
                     self.follow_up_source_finalized
                     or self._successful_agent_result(self.selected_agent) is not None
                 ):
-                    remaining = int(FOLLOW_UP_DELAY_SECONDS)
-                    self.follow_up_continue_at = time.monotonic() + remaining
-                    self.follow_up_ready = False
-                    self._follow_up_countdown_second = remaining
-                    self._set_follow_up_countdown_status(remaining)
+                    self._start_follow_up_countdown()
                 elif not self._schedule_follow_up_after_completion():
                     self.status = message
             else:
@@ -5409,6 +5577,21 @@ else:
                 return "Done: all successful agents are rejected"
             return "No successful agent"
 
+        def _select_recommended_agent_after_completion(self) -> bool:
+            idx = self.recommended_agent
+            if idx is None:
+                return False
+            pane = self.agents.get(idx)
+            if (
+                pane is None
+                or pane.rejected
+                or pane.stale_synthesis
+                or self._successful_agent_result(idx) is None
+            ):
+                return False
+            self.selected_agent = idx
+            return True
+
         def _notify_completion_if_background(self) -> None:
             if self.completion_notification_sent:
                 return
@@ -6045,15 +6228,37 @@ else:
                 self._follow_up_countdown_second = None
                 self.status = "Completed Agents are waiting for queue edits"
                 return True
-            self.follow_up_continue_at = (
-                time.monotonic() + FOLLOW_UP_DELAY_SECONDS
-            )
-            self.follow_up_ready = False
-            self._follow_up_countdown_second = int(FOLLOW_UP_DELAY_SECONDS)
-            self._set_follow_up_countdown_status(
-                self._follow_up_countdown_second
-            )
+            self._start_follow_up_countdown()
             return True
+
+        def _follow_up_delay_seconds(self) -> int:
+            raw = getattr(
+                self.args,
+                "follow_up_delay",
+                DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+            )
+            if isinstance(raw, bool):
+                return DEFAULT_FOLLOW_UP_DELAY_SECONDS
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return DEFAULT_FOLLOW_UP_DELAY_SECONDS
+            return max(0, value)
+
+        def _start_follow_up_countdown(self) -> None:
+            delay = self._follow_up_delay_seconds()
+            if delay == 0:
+                self.follow_up_continue_at = None
+                self.follow_up_ready = True
+                self._follow_up_countdown_second = None
+                self.status = (
+                    f"Queued follow-up is ready from AGENT-{self.selected_agent:03d}"
+                )
+                return
+            self.follow_up_continue_at = time.monotonic() + delay
+            self.follow_up_ready = False
+            self._follow_up_countdown_second = delay
+            self._set_follow_up_countdown_status(delay)
 
         def _set_follow_up_countdown_status(self, remaining: int) -> None:
             self.status = (
@@ -6089,9 +6294,7 @@ else:
             if self.running or not self.follow_up_queue:
                 self.follow_up_source_finalized = False
             elif self.follow_up_source_finalized:
-                self.follow_up_continue_at = (
-                    time.monotonic() + FOLLOW_UP_DELAY_SECONDS
-                )
+                self._start_follow_up_countdown()
             self._refresh_follow_up_queue()
 
         def _dispatch_follow_up(self) -> bool:
@@ -6932,6 +7135,7 @@ else:
                 synthesis_model_select,
                 synthesis_effort_select,
                 synthesis_fast_select,
+                self.query_one("#config-follow-up-delay", Input),
                 sync_back_select,
                 keep_workspaces_select,
                 resume_select,
@@ -6974,6 +7178,16 @@ else:
                     self._committed_input_values[
                         "config-subagents-limit"
                     ] = subagents_limit_value
+                follow_up_delay_input = self.query_one(
+                    "#config-follow-up-delay",
+                    Input,
+                )
+                if self.focused is not follow_up_delay_input:
+                    follow_up_delay_value = str(self._follow_up_delay_seconds())
+                    follow_up_delay_input.value = follow_up_delay_value
+                    self._committed_input_values[
+                        "config-follow-up-delay"
+                    ] = follow_up_delay_value
                 self._set_select_control(
                     execution_select,
                     rows.get("EXECUTION", "parallel"),
@@ -7053,13 +7267,16 @@ else:
                 )
                 synthesis_editable = self._synthesis_config_is_editable()
                 for control in controls:
-                    control.disabled = self.storage_preflight_inflight or (
-                        self.running
-                        and (
-                            control.id not in SYNTHESIS_CONFIG_CONTROL_IDS
-                            or not synthesis_editable
-                        )
-                    )
+                    if self.storage_preflight_inflight:
+                        control.disabled = True
+                    elif not self.running:
+                        control.disabled = False
+                    elif control.id == FOLLOW_UP_CONFIG_CONTROL_ID:
+                        control.disabled = False
+                    elif control.id in SYNTHESIS_CONFIG_CONTROL_IDS:
+                        control.disabled = not synthesis_editable
+                    else:
+                        control.disabled = True
             finally:
                 self._updating_controls = False
 
@@ -7157,6 +7374,7 @@ else:
                 ("SYNTHESIS_MODEL", self._synthesis_model_display()),
                 ("SYNTHESIS_EFFORT", self._synthesis_effort_display()),
                 ("SYNTHESIS_FAST", self._synthesis_fast_display()),
+                ("FOLLOW_UP_DELAY", str(self._follow_up_delay_seconds())),
                 ("SYNC_BACK", "NO" if getattr(self.args, "no_sync_back", False) else "YES"),
                 ("KEEP_WORKSPACES", "YES" if getattr(self.args, "keep_workspaces", False) else "NO"),
                 ("RESUME", self.resume_session_id or "NO"),

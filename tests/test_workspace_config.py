@@ -25,6 +25,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             synthesis_model=None,
             synthesis_effort=None,
             synthesis_fast=None,
+            follow_up_delay=60,
             no_sync_back=False,
             keep_workspaces=False,
             resume_session_id=None,
@@ -52,6 +53,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             args.synthesis_model = "review-model"
             args.synthesis_effort = "low"
             args.synthesis_fast = False
+            args.follow_up_delay = 25
             args.no_sync_back = True
             args.keep_workspaces = True
             settings = WorkspaceSettings.from_runtime(7, 3, args, "session-a")
@@ -77,6 +79,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertEqual(restored.synthesis_model, "review-model")
             self.assertEqual(restored.synthesis_effort, "low")
             self.assertFalse(restored.synthesis_fast)
+            self.assertEqual(restored.follow_up_delay, 25)
             self.assertTrue(restored.no_sync_back)
             self.assertTrue(restored.keep_workspaces)
             self.assertEqual(restored.resume_session_id, "session-a")
@@ -140,6 +143,7 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "SYNTHESIS_MODEL": "saved-review-model",
                 "SYNTHESIS_EFFORT": "high",
                 "SYNTHESIS_FAST": False,
+                "FOLLOW_UP_DELAY": 45,
                 "RESUME": "saved-session",
             }
         )
@@ -151,6 +155,7 @@ class WorkspaceConfigTests(unittest.TestCase):
         args.synthesis_model = "cli-review-model"
         args.synthesis_effort = "low"
         args.synthesis_fast = True
+        args.follow_up_delay = 12
         args.resume_session_id = "cli-session"
         saved.apply_to_args(
             args,
@@ -161,6 +166,7 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "synthesis_model",
                 "synthesis_effort",
                 "synthesis_fast",
+                "follow_up_delay",
                 "resume",
             },
         )
@@ -170,6 +176,7 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertEqual(args.synthesis_model, "cli-review-model")
         self.assertEqual(args.synthesis_effort, "low")
         self.assertTrue(args.synthesis_fast)
+        self.assertEqual(args.follow_up_delay, 12)
         self.assertEqual(args.resume_session_id, "cli-session")
         self.assertTrue(args.serial)
 
@@ -205,6 +212,16 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertTrue(settings.sync_back)
         self.assertFalse(settings.keep_workspaces)
         self.assertIsNone(settings.resume_session_id)
+
+    def test_zero_follow_up_delay_round_trips(self) -> None:
+        settings = WorkspaceSettings.from_mapping({"FOLLOW_UP_DELAY": 0})
+        self.assertIsNotNone(settings)
+        args = self._args()
+
+        settings.apply_to_args(args)
+
+        self.assertEqual(args.follow_up_delay, 0)
+        self.assertEqual(settings.to_mapping()["FOLLOW_UP_DELAY"], 0)
 
 
 if __name__ == "__main__":

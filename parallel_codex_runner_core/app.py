@@ -91,6 +91,7 @@ from .codex_models import CodexModelRegistry
 from .models import (
     AGENT_ROLE_CANDIDATE,
     AGENT_ROLE_SYNTHESIS,
+    DEFAULT_FOLLOW_UP_DELAY_SECONDS,
     DEFAULT_NUM_AGENTS,
     DEFAULT_SUBAGENTS_LIMIT,
     DEFAULT_SYNTHESIS_AGENTS,
@@ -3738,6 +3739,7 @@ def _explicit_tui_settings(argv: Sequence[str]) -> set[str]:
         "-n": "agents",
         "--num-agents": "agents",
         "--synthesis-agents": "synthesis_agents",
+        "--follow-up-delay": "follow_up_delay",
         "--serial": "execution",
         "--max-parallel": "max_parallel",
         "--subagents": "subagents",
@@ -3793,6 +3795,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "After all candidates finish, run this many isolated agents to review "
             "and synthesize their successful results. Zero disables synthesis."
+        ),
+    )
+    parser.add_argument(
+        "--follow-up-delay",
+        type=int,
+        default=DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "TUI review delay before a queued follow-up starts from the selected "
+            "agent. Zero starts it immediately."
         ),
     )
     parser.add_argument(
@@ -3899,6 +3911,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("-n / --num-agents 必须大于 0。")
     if getattr(args, "synthesis_agents", 0) < 0:
         raise SystemExit("--synthesis-agents 不能小于 0。")
+    follow_up_delay = getattr(
+        args,
+        "follow_up_delay",
+        DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+    )
+    if isinstance(follow_up_delay, bool) or not isinstance(follow_up_delay, int):
+        raise SystemExit("--follow-up-delay 必须是非负整数秒数。")
+    if follow_up_delay < 0:
+        raise SystemExit("--follow-up-delay 不能小于 0。")
+    args.follow_up_delay = follow_up_delay
     if args.max_parallel is not None and args.max_parallel <= 0:
         raise SystemExit("--max-parallel 必须大于 0。")
     subagents_limit = getattr(
