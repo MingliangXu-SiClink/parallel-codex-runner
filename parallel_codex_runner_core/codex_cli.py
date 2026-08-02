@@ -205,7 +205,7 @@ def read_effective_codex_developer_instructions(
                     "clientInfo": {
                         "name": "parallel_codex_runner",
                         "title": "Parallel Codex Runner",
-                        "version": "0.1.5",
+                        "version": "0.1.6",
                     }
                 },
             }

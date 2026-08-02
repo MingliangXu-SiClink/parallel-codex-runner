@@ -86,6 +86,21 @@ TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1
 RUNNER_TWO_PAIR_MIN_WIDTH = 96
 RUNNER_THREE_PAIR_MIN_WIDTH = 150
+
+
+def _column_major_indices(item_count: int, column_count: int) -> tuple[int, ...]:
+    """Return row-major placement indices for column-major reading order."""
+    if item_count <= 0 or column_count <= 0:
+        return ()
+    row_count = (item_count + column_count - 1) // column_count
+    return tuple(
+        index
+        for row in range(row_count)
+        for column in range(column_count)
+        if (index := column * row_count + row) < item_count
+    )
+
+
 FOLLOW_UP_CONFIG_CONTROL_ID = "config-follow-up-delay"
 SYNTHESIS_CONFIG_CONTROL_IDS = frozenset(
     {
@@ -560,6 +575,7 @@ try:
     from textual.geometry import Region
     from textual.message import Message
     from textual.screen import ModalScreen
+    from textual.widget import Widget
     from textual.widgets import Button, Input, Select, Static, TextArea
 except (ModuleNotFoundError, RuntimeError) as exc:
     _TEXTUAL_IMPORT_ERROR = exc
@@ -1808,6 +1824,7 @@ else:
             self._tip_refresh_deferred_for_selection = False
             self._recommend_border_deferred_for_selection = False
             self._runner_grid_columns = 0
+            self._runner_config_pairs: tuple[tuple[Widget, Widget], ...] = ()
             self._detail_cache_key: tuple[Any, ...] | None = None
             self._detail_cache_renderable: object = ""
             self.app_in_foreground = True
@@ -2232,7 +2249,11 @@ else:
                             id="config-resume",
                             classes="runner-control",
                         )
-                        yield Static("RECOMMENDED AGENT", id="runner-recommended-agent-key", classes="runner-key")
+                        yield Static(
+                            "RECOMMENDED AGENT",
+                            id="runner-recommended-agent-key",
+                            classes="runner-key",
+                        )
                         yield Static("", id="runner-recommended-agent", classes="runner-value", markup=False)
                 with RainbowDetailFrame(id="detail-frame"):
                     with DetailScroll(id="detail-scroll"):
@@ -2289,12 +2310,49 @@ else:
             except Exception:
                 return
 
-            context_span = columns - 1
-            for value in self.query(".runner-context-value"):
-                value.styles.column_span = context_span
-            grid.styles.grid_columns = " ".join(["18", "1fr"] * (columns // 2))
-            grid.styles.grid_size_columns = columns
+            with self.batch_update():
+                context_span = columns - 1
+                for value in self.query(".runner-context-value"):
+                    value.styles.column_span = context_span
+                grid.styles.grid_columns = " ".join(
+                    ["18", "1fr"] * (columns // 2)
+                )
+                grid.styles.grid_size_columns = columns
+                self._reorder_runner_config_pairs(grid, columns // 2)
             self._runner_grid_columns = columns
+
+        def _reorder_runner_config_pairs(
+            self,
+            grid: Grid,
+            pair_columns: int,
+        ) -> None:
+            if not self._runner_config_pairs or any(
+                key.parent is not grid or value.parent is not grid
+                for key, value in self._runner_config_pairs
+            ):
+                children = list(grid.children)
+                pairs: list[tuple[Widget, Widget]] = []
+                for index, child in enumerate(children[1:], 1):
+                    if child.has_class("runner-control") or (
+                        child.id == "runner-recommended-agent"
+                    ):
+                        pairs.append((children[index - 1], child))
+                self._runner_config_pairs = tuple(pairs)
+
+            anchor = grid.query_one("#runner-runs-root")
+            for pair_index in _column_major_indices(
+                len(self._runner_config_pairs),
+                pair_columns,
+            ):
+                for child in self._runner_config_pairs[pair_index]:
+                    children = list(grid.children)
+                    anchor_index = children.index(anchor)
+                    if (
+                        anchor_index + 1 >= len(children)
+                        or children[anchor_index + 1] is not child
+                    ):
+                        grid.move_child(child, after=anchor)
+                    anchor = child
 
         def _current_prompt_history_context(self) -> tuple[str, str]:
             return self.prompt_history_store.context_key(

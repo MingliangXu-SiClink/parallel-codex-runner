@@ -7478,13 +7478,13 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
 
                 recommendation = app.query_one("#runner-recommended-agent-key")
-                self.assertEqual(recommendation.region.y, resume.region.y)
+                self.assertEqual(recommendation.region.y, resume.region.bottom)
                 self.assertEqual(resume.query_one("SelectCurrent").region.height, 1)
 
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_runner_panel_uses_responsive_multi_pair_grid(self) -> None:
+    def test_tui_runner_panel_uses_responsive_column_major_grid(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args([]))
             async with app.run_test(size=(80, 40)) as pilot:
@@ -7498,11 +7498,19 @@ class TuiCommandTests(unittest.TestCase):
                 agents = app.query_one("#config-agents")
                 synthesis_agents = app.query_one("#config-synthesis-agents")
                 execution = app.query_one("#config-execution")
+                max_parallel = app.query_one("#config-max-parallel")
+                subagents = app.query_one("#config-subagents")
+                subagents_limit = app.query_one("#config-subagents-limit")
+                fast = app.query_one("#config-fast")
+                recommend_by = app.query_one("#config-recommend-by")
+                synthesis_fast = app.query_one("#config-synthesis-fast")
                 context = app.query_one("#runner-workspace")
                 narrow_height = frame.region.height
 
                 self.assertEqual(grid.styles.grid_size_columns, 2)
-                self.assertNotEqual(agents.region.y, synthesis_agents.region.y)
+                self.assertEqual(agents.region.x, synthesis_agents.region.x)
+                self.assertLess(agents.region.y, synthesis_agents.region.y)
+                self.assertLess(synthesis_agents.region.y, execution.region.y)
                 self.assertGreater(context.region.width, 40)
 
                 await pilot.resize_terminal(100, 40)
@@ -7510,8 +7518,12 @@ class TuiCommandTests(unittest.TestCase):
 
                 two_pair_height = frame.region.height
                 self.assertEqual(grid.styles.grid_size_columns, 4)
-                self.assertEqual(agents.region.y, synthesis_agents.region.y)
-                self.assertNotEqual(agents.region.y, execution.region.y)
+                self.assertEqual(agents.region.x, synthesis_agents.region.x)
+                self.assertEqual(agents.region.x, execution.region.x)
+                self.assertLess(agents.region.y, synthesis_agents.region.y)
+                self.assertLess(synthesis_agents.region.y, execution.region.y)
+                self.assertGreater(fast.region.x, agents.region.x)
+                self.assertEqual(fast.region.y, agents.region.y)
                 self.assertLess(two_pair_height, narrow_height)
                 self.assertGreater(context.region.width, 70)
 
@@ -7519,10 +7531,45 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
 
                 self.assertEqual(grid.styles.grid_size_columns, 6)
-                self.assertEqual(agents.region.y, synthesis_agents.region.y)
-                self.assertEqual(agents.region.y, execution.region.y)
+                first_column = [
+                    agents,
+                    synthesis_agents,
+                    execution,
+                    max_parallel,
+                    subagents,
+                    subagents_limit,
+                ]
+                self.assertEqual(
+                    {control.region.x for control in first_column},
+                    {agents.region.x},
+                )
+                first_column_rows = [
+                    control.region.y for control in first_column
+                ]
+                self.assertTrue(
+                    all(
+                        previous < current
+                        for previous, current in zip(
+                            first_column_rows,
+                            first_column_rows[1:],
+                        )
+                    )
+                )
+                self.assertGreater(recommend_by.region.x, agents.region.x)
+                self.assertEqual(recommend_by.region.y, agents.region.y)
+                self.assertGreater(synthesis_fast.region.x, recommend_by.region.x)
+                self.assertEqual(synthesis_fast.region.y, agents.region.y)
                 self.assertLess(frame.region.height, two_pair_height)
                 self.assertGreater(context.region.width, 120)
+
+                await pilot.resize_terminal(80, 40)
+                await pilot.pause()
+
+                self.assertEqual(grid.styles.grid_size_columns, 2)
+                self.assertEqual(agents.region.x, synthesis_agents.region.x)
+                self.assertLess(agents.region.y, synthesis_agents.region.y)
+                self.assertLess(synthesis_agents.region.y, execution.region.y)
+                self.assertEqual(frame.region.height, narrow_height)
 
         asyncio.run(run())
 
