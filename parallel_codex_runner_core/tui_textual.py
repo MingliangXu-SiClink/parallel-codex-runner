@@ -155,12 +155,18 @@ DETAIL_INPUT_MARKER = "›"
 DETAIL_AGENT_MARKER = "•"
 DETAIL_ACTIVITY_MARKER = "◦"
 DETAIL_STYLE_PREFIX = "detail-"
+DETAIL_DIVIDER_STYLE = "dim #405466"
+DETAIL_HEADING_STYLE = "bold #c8edf5"
+DETAIL_BULLET_STYLE = "bold #5aa9bd"
+DETAIL_CODE_STYLE = "#b7c8e6"
+DETAIL_CODE_FENCE_STYLE = "bold #e9c46a"
 DETAIL_TEXT_STYLES: dict[str, tuple[str, str]] = {
-    "input": ("bold dim white", "white"),
-    "thought": ("dim white", "dim white"),
-    "output": ("dim white", "white"),
-    "activity": ("dim white", "dim white"),
-    "live": ("bold white", "dim white"),
+    # Keep roles distinct without turning the detail pane into a rainbow.
+    "input": ("bold #ffd27a", "#f0c674"),
+    "thought": ("bold #8fb3ff", "#8fa4bd"),
+    "output": ("bold #5aa9bd", "#e7ebf2"),
+    "activity": ("#6faec0", "#8091a3"),
+    "live": ("bold #5aa9bd", "#8091a3"),
 }
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
@@ -7452,7 +7458,19 @@ else:
             blocks = self._detail_blocks(pane)
             if not blocks:
                 return ""
-            return "\n\n".join(self._format_prefixed_block(prefix, text) for prefix, text, _style in blocks)
+            rendered: list[str] = []
+            previous_style = ""
+            for prefix, text, style in blocks:
+                if rendered:
+                    separator = (
+                        f"\n{self._detail_separator_text()}\n"
+                        if self._needs_detail_separator(previous_style, style)
+                        else "\n\n"
+                    )
+                    rendered.append(separator)
+                rendered.append(self._format_prefixed_block(prefix, text))
+                previous_style = style
+            return "".join(rendered)
 
         def _detail_renderable(self) -> object:
             pane = self.agents.get(self.selected_agent)
@@ -7476,9 +7494,15 @@ else:
                 self._detail_cache_renderable = ""
                 return ""
             parts: list[str | tuple[str, str]] = []
+            previous_style = ""
             for idx, (prefix, block, style) in enumerate(blocks):
                 if idx:
-                    parts.append("\n\n")
+                    if self._needs_detail_separator(previous_style, style):
+                        parts.append("\n")
+                        parts.append((self._detail_separator_text(), DETAIL_DIVIDER_STYLE))
+                        parts.append("\n")
+                    else:
+                        parts.append("\n\n")
                 formatted = self._format_prefixed_block(prefix, block)
                 if style.startswith("command-"):
                     self._append_command_renderable(parts, formatted, style.removeprefix("command-"))
@@ -7491,6 +7515,7 @@ else:
                     )
                 else:
                     parts.append((formatted, style))
+                previous_style = style
             renderable = Content.assemble(*parts)
             self._detail_cache_key = key
             self._detail_cache_renderable = renderable
@@ -7510,9 +7535,76 @@ else:
             )
             if prefix and formatted.startswith(prefix):
                 parts.append((prefix, marker_style))
-                parts.append((formatted[len(prefix) :], body_style))
+                self._append_detail_body_renderable(
+                    parts,
+                    formatted[len(prefix) :],
+                    category,
+                    body_style,
+                )
             else:
-                parts.append((formatted, body_style))
+                self._append_detail_body_renderable(parts, formatted, category, body_style)
+
+        def _append_detail_body_renderable(
+            self,
+            parts: list[str | tuple[str, str]],
+            body: str,
+            category: str,
+            body_style: str,
+        ) -> None:
+            if category not in {"thought", "output"} or not body:
+                parts.append((body, body_style))
+                return
+
+            in_code_block = False
+            lines = body.splitlines(keepends=True) or [body]
+            for line in lines:
+                content = line.rstrip("\r\n")
+                line_ending = line[len(content) :]
+                stripped = content.lstrip()
+                leading = content[: len(content) - len(stripped)]
+
+                if stripped.startswith("```"):
+                    parts.append((content + line_ending, DETAIL_CODE_FENCE_STYLE))
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block:
+                    parts.append((content + line_ending, DETAIL_CODE_STYLE))
+                    continue
+                if re.match(r"^#{1,6}\s+", stripped):
+                    parts.append((content + line_ending, DETAIL_HEADING_STYLE))
+                    continue
+                if re.match(r"^(?:[-*_])(?:\s*[-*_]){2,}$|^[─━┄╌]{3,}$", stripped):
+                    parts.append((content + line_ending, DETAIL_DIVIDER_STYLE))
+                    continue
+                bullet = re.match(r"((?:[-*+]\s+|\d+[.)]\s+))(.*)$", stripped)
+                if bullet:
+                    bullet_prefix = leading + bullet.group(1)
+                    parts.append((bullet_prefix, DETAIL_BULLET_STYLE))
+                    parts.append((bullet.group(2) + line_ending, body_style))
+                    continue
+                parts.append((content + line_ending, body_style))
+
+        def _detail_block_kind(self, style: str) -> str:
+            if style.startswith("command-"):
+                return "command"
+            if style.startswith(DETAIL_STYLE_PREFIX):
+                return style.removeprefix(DETAIL_STYLE_PREFIX)
+            return style
+
+        def _needs_detail_separator(self, previous_style: str, style: str) -> bool:
+            previous = self._detail_block_kind(previous_style)
+            current = self._detail_block_kind(style)
+            if not previous or not current:
+                return False
+            if current == "input" and previous != "input":
+                return True
+            if current == "command" or previous == "command":
+                return current != "command" or previous != "command"
+            return False
+
+        def _detail_separator_text(self) -> str:
+            width = max(12, min(72, self._detail_content_width() - 2))
+            return " " + "─" * width
 
         def _diff_renderable(self, pane: AgentPane) -> object:
             if pane.diff_loading:

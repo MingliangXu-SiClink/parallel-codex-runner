@@ -6164,8 +6164,18 @@ class TuiCommandTests(unittest.TestCase):
             "◦ waiting for another event\n\n"
             "• The change is ready.",
         )
-        self.assertEqual(str(rendered.spans[0].style), "bold dim white")
-        self.assertEqual(str(rendered.spans[1].style), "white")
+        self.assertEqual(
+            str(rendered.spans[0].style),
+            tui_textual.DETAIL_TEXT_STYLES["input"][0],
+        )
+        self.assertEqual(
+            str(rendered.spans[1].style),
+            tui_textual.DETAIL_TEXT_STYLES["input"][1],
+        )
+        self.assertNotEqual(
+            tui_textual.DETAIL_TEXT_STYLES["input"][1],
+            tui_textual.DETAIL_TEXT_STYLES["output"][1],
+        )
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_idle_detail_uses_only_a_codex_style_live_marker(self) -> None:
@@ -6180,6 +6190,27 @@ class TuiCommandTests(unittest.TestCase):
 
         self.assertEqual(first, ("•", "", "detail-live"))
         self.assertEqual(second, ("◦", "", "detail-live"))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_adds_codex_sections_and_markdown_hierarchy(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        pane.input_text = "review the implementation"
+        pane.append("## Summary\n- first result\n- second result", "output")
+        pane.append("pytest -q\n✓ exit 0", "command")
+        pane.append("```python\nprint('ready')\n```", "output")
+
+        rendered = app._detail_renderable()
+
+        self.assertIn("─", rendered.plain)
+        self.assertIn("## Summary", rendered.plain)
+        self.assertIn("```python", rendered.plain)
+        styles = {str(span.style) for span in rendered.spans}
+        self.assertIn(tui_textual.DETAIL_HEADING_STYLE, styles)
+        self.assertIn(tui_textual.DETAIL_BULLET_STYLE, styles)
+        self.assertIn(tui_textual.DETAIL_CODE_FENCE_STYLE, styles)
+        self.assertIn(tui_textual.DETAIL_CODE_STYLE, styles)
+        self.assertIn(tui_textual.DETAIL_DIVIDER_STYLE, styles)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:
