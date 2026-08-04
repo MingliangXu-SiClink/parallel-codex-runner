@@ -5830,8 +5830,8 @@ class TuiCommandTests(unittest.TestCase):
                                         break
 
                                 detail = app._detail_text()
-                                self.assertIn("> previous question", detail)
-                                self.assertIn("✓ previous answer", detail)
+                                self.assertIn("› previous question", detail)
+                                self.assertIn("• previous answer", detail)
                                 self.assertTrue(app.query_one("#detail-frame").display)
 
         asyncio.run(run())
@@ -6086,7 +6086,11 @@ class TuiCommandTests(unittest.TestCase):
         self.assertNotIn("many", "\n".join(pane.lines))
         self.assertNotIn("output", "\n".join(pane.lines))
         timeline = app._current_attempt_blocks(pane)
-        self.assertEqual([prefix for prefix, _text, _style in timeline], ["◇", "•", "◇"])
+        self.assertEqual([prefix for prefix, _text, _style in timeline], ["•", "•", "•"])
+        self.assertEqual(
+            [style for _prefix, _text, style in timeline],
+            ["detail-output", "command-success", "detail-output"],
+        )
         self.assertEqual(timeline[0][1], "I will inspect the project.")
         self.assertEqual(
             timeline[1][1],
@@ -6123,7 +6127,59 @@ class TuiCommandTests(unittest.TestCase):
         rendered = app._detail_renderable()
         self.assertIn("• Ran pytest -q\n  └ completed (exit 0)", rendered.plain)
         self.assertNotIn("/bin/zsh -lc", rendered.plain)
-        self.assertTrue(any(str(span.style) == "bold green" for span in rendered.spans))
+        self.assertTrue(any(str(span.style) == "bold white" for span in rendered.spans))
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_detail_uses_codex_cli_text_hierarchy(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        pane.input_text = "inspect the project"
+        pane.append("consider the implementation", "thought")
+        pane.append("I found the relevant module.", "output")
+        pane.append("waiting for another event", "activity")
+        pane.final_text = "The change is ready."
+
+        blocks = app._current_attempt_blocks(pane)
+
+        self.assertEqual(
+            [prefix for prefix, _text, _style in blocks],
+            ["›", "•", "•", "◦", "•"],
+        )
+        self.assertEqual(
+            [style for _prefix, _text, style in blocks],
+            [
+                "detail-input",
+                "detail-thought",
+                "detail-output",
+                "detail-activity",
+                "detail-output",
+            ],
+        )
+        rendered = app._detail_renderable()
+        self.assertEqual(
+            rendered.plain,
+            "› inspect the project\n\n"
+            "• consider the implementation\n\n"
+            "• I found the relevant module.\n\n"
+            "◦ waiting for another event\n\n"
+            "• The change is ready.",
+        )
+        self.assertEqual(str(rendered.spans[0].style), "bold dim white")
+        self.assertEqual(str(rendered.spans[1].style), "white")
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_idle_detail_uses_only_a_codex_style_live_marker(self) -> None:
+        app = tui_textual.PcrTextualApp(parse_args([]))
+        pane = app.agents[1]
+        pane.status = "running"
+        app.work_frame = 0
+
+        first = app._current_attempt_blocks(pane)[0]
+        app.work_frame = 1
+        second = app._current_attempt_blocks(pane)[0]
+
+        self.assertEqual(first, ("•", "", "detail-live"))
+        self.assertEqual(second, ("◦", "", "detail-live"))
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_finalize_selected_agent_sets_resume_and_syncs(self) -> None:

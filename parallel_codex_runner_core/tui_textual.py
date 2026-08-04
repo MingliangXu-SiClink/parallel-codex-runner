@@ -148,17 +148,20 @@ RECOMMEND_BORDER_COLORS: tuple[str, ...] = (
 )
 RECOMMEND_TITLE_BACKGROUND = "#123326"
 COMMAND_SPINNER_FRAMES: tuple[str, ...] = (
-    "⠋",
-    "⠙",
-    "⠹",
-    "⠸",
-    "⠼",
-    "⠴",
-    "⠦",
-    "⠧",
-    "⠇",
-    "⠏",
+    "•",
+    "◦",
 )
+DETAIL_INPUT_MARKER = "›"
+DETAIL_AGENT_MARKER = "•"
+DETAIL_ACTIVITY_MARKER = "◦"
+DETAIL_STYLE_PREFIX = "detail-"
+DETAIL_TEXT_STYLES: dict[str, tuple[str, str]] = {
+    "input": ("bold dim white", "white"),
+    "thought": ("dim white", "dim white"),
+    "output": ("dim white", "white"),
+    "activity": ("dim white", "dim white"),
+    "live": ("bold white", "dim white"),
+}
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
     "输入框为空时，←/→ 可切换 Agent。",
@@ -5463,10 +5466,10 @@ else:
 
         def _history_detail_block(self, entry: CodexHistoryEntry) -> tuple[str, str, str]:
             if entry.category == "user":
-                return ">", entry.text, "cyan"
+                return DETAIL_INPUT_MARKER, entry.text, "detail-input"
             if entry.category == "thought":
-                return "·", entry.text, "dim white"
-            return "✓", entry.text, "green"
+                return DETAIL_AGENT_MARKER, entry.text, "detail-thought"
+            return DETAIL_AGENT_MARKER, entry.text, "detail-output"
 
         def _select_resume_session(self, session_id: str, rollout_path: str = "") -> None:
             session_id = session_id.strip()
@@ -7479,12 +7482,37 @@ else:
                 formatted = self._format_prefixed_block(prefix, block)
                 if style.startswith("command-"):
                     self._append_command_renderable(parts, formatted, style.removeprefix("command-"))
+                elif style.startswith(DETAIL_STYLE_PREFIX):
+                    self._append_detail_text_renderable(
+                        parts,
+                        formatted,
+                        prefix,
+                        style.removeprefix(DETAIL_STYLE_PREFIX),
+                    )
                 else:
                     parts.append((formatted, style))
             renderable = Content.assemble(*parts)
             self._detail_cache_key = key
             self._detail_cache_renderable = renderable
             return renderable
+
+        def _append_detail_text_renderable(
+            self,
+            parts: list[str | tuple[str, str]],
+            formatted: str,
+            prefix: str,
+            category: str,
+        ) -> None:
+            """Render the quiet gutter and readable body used by Codex CLI."""
+            marker_style, body_style = DETAIL_TEXT_STYLES.get(
+                category,
+                ("white", "white"),
+            )
+            if prefix and formatted.startswith(prefix):
+                parts.append((prefix, marker_style))
+                parts.append((formatted[len(prefix) :], body_style))
+            else:
+                parts.append((formatted, body_style))
 
         def _diff_renderable(self, pane: AgentPane) -> object:
             if pane.diff_loading:
@@ -7572,12 +7600,12 @@ else:
         def _current_attempt_blocks(self, pane: AgentPane) -> list[tuple[str, str, str]]:
             blocks: list[tuple[str, str, str]] = []
             if pane.input_text:
-                blocks.append((">", pane.input_text, "cyan"))
+                blocks.append((DETAIL_INPUT_MARKER, pane.input_text, "detail-input"))
             event_blocks: list[tuple[str, str, str]] = []
             display_by_category = {
-                "thought": ("·", "dim white"),
-                "output": ("◇", "white"),
-                "activity": ("•", "dim white"),
+                "thought": (DETAIL_AGENT_MARKER, "detail-thought"),
+                "output": (DETAIL_AGENT_MARKER, "detail-output"),
+                "activity": (DETAIL_ACTIVITY_MARKER, "detail-activity"),
             }
             previous_category = ""
             for category, text in pane.ordered_detail_events():
@@ -7608,9 +7636,9 @@ else:
                 previous_category = category
             blocks.extend(event_blocks)
             if pane.status == "running" and not pane.has_agent_text() and not pane.has_active_command():
-                blocks.append(("·", self._pulse(), "dim white"))
+                blocks.append((self._command_marker(), "", "detail-live"))
             if pane.final_text:
-                blocks.append(("✓", pane.final_text, "green"))
+                blocks.append((DETAIL_AGENT_MARKER, pane.final_text, "detail-output"))
             return blocks
 
         def _detail_content_width(self) -> int:
@@ -7640,13 +7668,13 @@ else:
             state: str,
         ) -> None:
             marker_style = {
-                "running": "bold cyan",
-                "success": "bold green",
+                "running": "bold white",
+                "success": "bold white",
                 "failed": "bold red",
                 "cancelled": "bold yellow",
             }.get(state, "bold white")
             status_style = {
-                "success": "green",
+                "success": "dim white",
                 "failed": "red",
                 "cancelled": "yellow",
             }.get(state, "dim white")
