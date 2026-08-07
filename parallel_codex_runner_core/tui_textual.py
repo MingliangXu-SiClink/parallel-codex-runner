@@ -241,6 +241,33 @@ def command_suggestions(value: str) -> list[str]:
     ][:MAX_SUGGESTIONS]
 
 
+_PROMPT_CONTROL_TRANSLATION = {
+    codepoint: None
+    for codepoint in (
+        *range(0, 9),
+        11,
+        12,
+        *range(14, 32),
+        127,
+        *range(128, 160),
+    )
+}
+
+
+def normalize_prompt_text(value: str) -> str:
+    """Keep literal prompt text while removing controls unsafe for TUI rendering."""
+    text = str(value or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u2028", "\n").replace("\u2029", "\n")
+    return text.translate(_PROMPT_CONTROL_TRANSLATION)
+
+
+def _recorded_history_context_kwargs(
+    context: tuple[str, str] | None,
+) -> dict[str, tuple[str, str]]:
+    return {"recorded_history_context": context} if context is not None else {}
+
+
 def build_help_text() -> str:
     command_width = max(len(command) for command, _description in TEXTUAL_COMMANDS)
     lines = ["Commands:"]
@@ -652,6 +679,7 @@ else:
     preload_tui_runtime()
 
     def fold_text_by_cells(text: str, width: int) -> str:
+        text = normalize_prompt_text(text)
         if width <= 1:
             return text
         folded_lines: list[str] = []
@@ -803,6 +831,7 @@ else:
         prompt: str
         record_history: bool = False
         context: tuple[str, str] | None = None
+        recorded_history_context: tuple[str, str] | None = None
 
 
     @dataclass(frozen=True)
@@ -867,6 +896,7 @@ else:
             configuration_key: tuple[Any, ...] = (),
             from_follow_up_queue: bool = False,
             bypass_follow_up_queue: bool = False,
+            recorded_history_context: tuple[str, str] | None = None,
         ) -> None:
             super().__init__()
             self.request_id = request_id
@@ -879,6 +909,19 @@ else:
             self.configuration_key = configuration_key
             self.from_follow_up_queue = from_follow_up_queue
             self.bypass_follow_up_queue = bypass_follow_up_queue
+            self.recorded_history_context = recorded_history_context
+
+
+    class SafePasteTextArea(TextArea):
+        """A plain-text editor that rejects terminal controls at the paste boundary."""
+
+        async def _on_paste(self, event: events.Paste) -> None:
+            if self.read_only:
+                return
+            text = normalize_prompt_text(event.text)
+            if result := self._replace_via_keyboard(text, *self.selection):
+                self.move_cursor(result.end_location)
+                self.focus()
 
 
     class StorageWarningScreen(ModalScreen[bool]):
@@ -1064,7 +1107,7 @@ else:
                     compact=True,
                     id="queue-editor-select",
                 )
-                yield TextArea(
+                yield SafePasteTextArea(
                     "",
                     id="queue-editor-prompt",
                     soft_wrap=True,
@@ -1089,7 +1132,9 @@ else:
             index = self._selected_index()
             if index is None:
                 return True
-            prompt = self.query_one("#queue-editor-prompt", TextArea).text.strip()
+            prompt = normalize_prompt_text(
+                self.query_one("#queue-editor-prompt", SafePasteTextArea).text
+            ).strip()
             if not prompt:
                 self._set_status("A queued question cannot be empty.")
                 return False
@@ -1102,7 +1147,7 @@ else:
             return True
 
         def _load_selected_prompt(self) -> None:
-            editor = self.query_one("#queue-editor-prompt", TextArea)
+            editor = self.query_one("#queue-editor-prompt", SafePasteTextArea)
             index = self._selected_index()
             if index is None:
                 editor.text = ""
@@ -1235,7 +1280,7 @@ else:
     class PromptSubmitted(Message):
         def __init__(self, value: str) -> None:
             super().__init__()
-            self.value = value
+            self.value = normalize_prompt_text(value)
 
 
     class PromptHistoryRequested(Message):
@@ -1250,7 +1295,7 @@ else:
             self.delta = delta
 
 
-    class PromptEditor(TextArea):
+    class PromptEditor(SafePasteTextArea):
         def __init__(self, *args: Any, placeholder: str = "", **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             if placeholder:
@@ -1768,7 +1813,7 @@ else:
                 self.prompt_history_context: ""
             }
             self.prompt_history_navigator = PromptHistoryNavigator(
-                self.prompt_history_store.entries(*self.prompt_history_context)
+                self._prompt_history_entries(self.prompt_history_context)
             )
             self._prompt_history_programmatic_values: list[str] = []
             self.detail_revision = 0
@@ -1784,6 +1829,7 @@ else:
             self.queued_prompt = ""
             self.queued_agent: int | None = None
             self.queued_prompt_records_history = False
+            self.queued_prompt_recorded_history_context: tuple[str, str] | None = None
             # Follow-ups submitted from unfinished panes wait without stopping
             # the current run; queued_prompt above remains the immediate path.
             self.follow_up_queue: list[QueuedFollowUp] = []
@@ -2369,12 +2415,22 @@ else:
                 self.resume_session_id,
             )
 
+        def _prompt_history_entries(
+            self,
+            context: tuple[str, str],
+        ) -> list[str]:
+            return [
+                normalize_prompt_text(entry)
+                for entry in self.prompt_history_store.entries(*context)
+            ]
+
         def _save_prompt_history_draft(self) -> None:
             self.prompt_history_drafts[self.prompt_history_context] = (
                 self.prompt_history_navigator.draft
             )
 
         def _replace_prompt_text(self, text: str) -> None:
+            text = normalize_prompt_text(text)
             try:
                 prompt = self.query_one("#prompt", PromptEditor)
             except Exception:
@@ -2398,10 +2454,11 @@ else:
             context = self._current_prompt_history_context()
             if draft is None:
                 draft = self.prompt_history_drafts.get(context, "")
+            draft = normalize_prompt_text(draft)
             self.prompt_history_context = context
             self.prompt_history_drafts[context] = draft
             self.prompt_history_navigator.reset(
-                self.prompt_history_store.entries(*context),
+                self._prompt_history_entries(context),
                 draft,
             )
             self._replace_prompt_text(draft)
@@ -2477,7 +2534,11 @@ else:
             *,
             from_follow_up_queue: bool = False,
             bypass_follow_up_queue: bool = False,
+            recorded_history_context: tuple[str, str] | None = None,
         ) -> bool:
+            prompt = normalize_prompt_text(prompt).strip()
+            if not prompt:
+                return False
             if (
                 self.follow_up_queue
                 and not from_follow_up_queue
@@ -2487,9 +2548,16 @@ else:
                 return self._enqueue_follow_up(
                     prompt,
                     record_history=record_history,
+                    recorded_history_context=recorded_history_context,
                 )
             if self.running:
-                return self._start_run(prompt, record_history=record_history)
+                return self._start_run(
+                    prompt,
+                    record_history=record_history,
+                    **_recorded_history_context_kwargs(
+                        recorded_history_context
+                    ),
+                )
             if self.storage_preflight_inflight:
                 self.status = "A storage check is already in progress"
                 self._sync()
@@ -2571,6 +2639,7 @@ else:
                             configuration_key,
                             from_follow_up_queue,
                             bypass_follow_up_queue,
+                            recorded_history_context,
                         ),
                     )
                 except RuntimeError:
@@ -2597,6 +2666,9 @@ else:
                     record_history=event.record_history,
                     from_follow_up_queue=event.from_follow_up_queue,
                     bypass_follow_up_queue=event.bypass_follow_up_queue,
+                    **_recorded_history_context_kwargs(
+                        event.recorded_history_context
+                    ),
                 ):
                     if not event.from_follow_up_queue:
                         self._restore_prompt_after_storage_failure(event.prompt)
@@ -2667,6 +2739,9 @@ else:
             started = self._start_run(
                 event.prompt,
                 record_history=event.record_history,
+                **_recorded_history_context_kwargs(
+                    event.recorded_history_context
+                ),
             )
             if started and event.from_follow_up_queue:
                 self._consume_follow_up(event.prompt)
@@ -2717,6 +2792,9 @@ else:
             self._complete_storage_preflight(event, True)
 
         def _submit_task_prompt(self, prompt: str) -> bool:
+            prompt = normalize_prompt_text(prompt).strip()
+            if not prompt:
+                return False
             actual_context = self._current_prompt_history_context()
             if actual_context != self.prompt_history_context:
                 self._load_prompt_history_context()
@@ -2727,15 +2805,25 @@ else:
             self._load_prompt_history_context(draft="")
             return True
 
-        def _record_started_prompt(self, prompt: str) -> None:
-            context = self._current_prompt_history_context()
-            self.prompt_history_store.append(*context, prompt)
+        def _record_prompt_history(
+            self,
+            prompt: str,
+            context: tuple[str, str] | None = None,
+        ) -> tuple[str, str] | None:
+            prompt = normalize_prompt_text(prompt)
+            context = context or self._current_prompt_history_context()
+            if not self.prompt_history_store.append(*context, prompt):
+                return None
             if context == self.prompt_history_context:
                 draft = self.prompt_history_navigator.draft
                 self.prompt_history_navigator.reset(
-                    self.prompt_history_store.entries(*context),
+                    self._prompt_history_entries(context),
                     draft,
                 )
+            return context
+
+        def _record_started_prompt(self, prompt: str) -> None:
+            self._record_prompt_history(prompt)
 
         def _associate_pending_prompt_with_context(
             self,
@@ -3944,6 +4032,7 @@ else:
                 self.queued_prompt = ""
                 self.queued_agent = None
                 self.queued_prompt_records_history = False
+                self.queued_prompt_recorded_history_context = None
                 self.pending_accept_agent = None
                 self._discard_queued_candidate_batches()
                 self.exit_after_run = True
@@ -4116,6 +4205,7 @@ else:
                 self.queued_prompt = ""
                 self.queued_agent = None
                 self.queued_prompt_records_history = False
+                self.queued_prompt_recorded_history_context = None
                 self._discard_queued_candidate_batches()
                 if self.cancel_event is not None:
                     self.cancel_event.set()
@@ -4599,6 +4689,7 @@ else:
                     item.prompt,
                     record_history=item.record_history,
                     context=context,
+                    recorded_history_context=item.recorded_history_context,
                 )
                 for item in self.follow_up_queue
             ]
@@ -4694,11 +4785,17 @@ else:
                             break
                         used_positions.add(position)
                         source = snapshot[position - 1]
+                        recorded_history_context = source.recorded_history_context
+                        if source.record_history and prompt != source.prompt:
+                            recorded_history_context = self._record_prompt_history(
+                                prompt
+                            )
                         rebuilt.append(
                             QueuedFollowUp(
                                 prompt,
                                 record_history=source.record_history,
                                 context=source.context,
+                                recorded_history_context=recorded_history_context,
                             )
                         )
                     if invalid:
@@ -6081,11 +6178,18 @@ else:
             if self._cleanup_after_pending_run():
                 self._clear_pending_run()
 
-        def _start_run(self, prompt: str, record_history: bool = False) -> bool:
+        def _start_run(
+            self,
+            prompt: str,
+            record_history: bool = False,
+            *,
+            recorded_history_context: tuple[str, str] | None = None,
+        ) -> bool:
             if self.running:
                 return self._handle_prompt_while_running(
                     prompt,
                     record_history=record_history,
+                    recorded_history_context=recorded_history_context,
                 )
             if not self._commit_runner_inputs():
                 self._sync()
@@ -6199,7 +6303,11 @@ else:
 
             self.runner_thread = threading.Thread(target=target, name="pcr-tui-runner", daemon=False)
             self.runner_thread.start()
-            if record_history:
+            if (
+                record_history
+                and recorded_history_context
+                != self._current_prompt_history_context()
+            ):
                 self._record_started_prompt(prompt)
             return True
 
@@ -6214,16 +6322,24 @@ else:
             self,
             prompt: str,
             record_history: bool = False,
+            *,
+            recorded_history_context: tuple[str, str] | None = None,
         ) -> bool:
+            prompt = normalize_prompt_text(prompt).strip()
+            if not prompt:
+                return False
             if self._pending_sync_disabled():
                 self.status = "Cannot queue a follow-up while sync back is disabled"
                 self._sync()
                 return False
+            if record_history and recorded_history_context is None:
+                recorded_history_context = self._record_prompt_history(prompt)
             self.follow_up_queue.append(
                 QueuedFollowUp(
                     prompt,
                     record_history=record_history,
                     context=self._follow_up_context(),
+                    recorded_history_context=recorded_history_context,
                 )
             )
             if self.running:
@@ -6241,6 +6357,8 @@ else:
             self,
             prompt: str,
             record_history: bool = False,
+            *,
+            recorded_history_context: tuple[str, str] | None = None,
         ) -> bool:
             if self._pending_sync_disabled():
                 self.status = "Cannot continue a running agent while sync back is disabled"
@@ -6254,15 +6372,20 @@ else:
                 return self._enqueue_follow_up(
                     prompt,
                     record_history=record_history,
+                    recorded_history_context=recorded_history_context,
                 )
             if self._successful_agent_result(self.selected_agent) is None:
                 return self._enqueue_follow_up(
                     prompt,
                     record_history=record_history,
+                    recorded_history_context=recorded_history_context,
                 )
+            if record_history and recorded_history_context is None:
+                recorded_history_context = self._record_prompt_history(prompt)
             self.queued_prompt = prompt
             self.queued_agent = self.selected_agent
             self.queued_prompt_records_history = record_history
+            self.queued_prompt_recorded_history_context = recorded_history_context
             self.pending_accept_agent = None
             self._discard_queued_candidate_batches()
             if self.cancel_event is not None:
@@ -6422,6 +6545,9 @@ else:
                 item.prompt,
                 record_history=item.record_history,
                 from_follow_up_queue=True,
+                **_recorded_history_context_kwargs(
+                    item.recorded_history_context
+                ),
             )
             if not started:
                 self._sync()
@@ -6431,9 +6557,13 @@ else:
             prompt = self.queued_prompt
             agent_idx = self.queued_agent
             record_history = self.queued_prompt_records_history
+            recorded_history_context = (
+                self.queued_prompt_recorded_history_context
+            )
             self.queued_prompt = ""
             self.queued_agent = None
             self.queued_prompt_records_history = False
+            self.queued_prompt_recorded_history_context = None
             if not prompt or agent_idx is None:
                 return
             if not self._finalize_agent(agent_idx, archive_detail=True):
@@ -6447,16 +6577,21 @@ else:
                 return
             self._rebind_follow_up_queue()
             self._archive_command_history()
+            history_kwargs = _recorded_history_context_kwargs(
+                recorded_history_context
+            )
             if self.follow_up_queue:
                 started = self._request_run_with_storage_check(
                     prompt,
                     record_history=record_history,
                     bypass_follow_up_queue=True,
+                    **history_kwargs,
                 )
             elif record_history:
                 started = self._request_run_with_storage_check(
                     prompt,
                     record_history=True,
+                    **history_kwargs,
                 )
             else:
                 started = self._request_run_with_storage_check(prompt)

@@ -161,7 +161,7 @@ class PromptHistoryTuiTests(unittest.TestCase):
                 ["initial request"],
             )
 
-    def test_running_follow_up_defers_history_until_it_actually_starts(self) -> None:
+    def test_running_follow_up_records_history_when_it_is_queued(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             history_path = Path(tmp) / "prompt_history.json"
             workspace = Path(tmp) / "workspace"
@@ -180,9 +180,17 @@ class PromptHistoryTuiTests(unittest.TestCase):
                 self.assertTrue(app._submit_task_prompt("follow up"))
                 self.assertEqual(
                     PromptHistoryStore(history_path).entries(workspace, ""),
-                    [],
+                    ["follow up"],
                 )
                 self.assertTrue(app.queued_prompt_records_history)
+                history_context = app.prompt_history_store.context_key(
+                    workspace,
+                    None,
+                )
+                self.assertEqual(
+                    app.queued_prompt_recorded_history_context,
+                    history_context,
+                )
 
                 app.running = False
                 with mock.patch.object(app, "_finalize_agent", return_value=True):
@@ -193,9 +201,13 @@ class PromptHistoryTuiTests(unittest.TestCase):
                     ) as start:
                         app._continue_queued_prompt()
 
-                start.assert_called_once_with("follow up", record_history=True)
+                start.assert_called_once_with(
+                    "follow up",
+                    record_history=True,
+                    recorded_history_context=history_context,
+                )
 
-    def test_unfinished_agent_follow_up_keeps_history_flag_in_deferred_queue(self) -> None:
+    def test_unfinished_agent_follow_up_records_deferred_queue_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             history_path = Path(tmp) / "prompt_history.json"
             workspace = Path(tmp) / "workspace"
@@ -213,10 +225,18 @@ class PromptHistoryTuiTests(unittest.TestCase):
                 self.assertTrue(app._submit_task_prompt("queued follow up"))
                 self.assertEqual(
                     PromptHistoryStore(history_path).entries(workspace, ""),
-                    [],
+                    ["queued follow up"],
                 )
                 self.assertEqual(len(app.follow_up_queue), 1)
                 self.assertTrue(app.follow_up_queue[0].record_history)
+                history_context = app.prompt_history_store.context_key(
+                    workspace,
+                    None,
+                )
+                self.assertEqual(
+                    app.follow_up_queue[0].recorded_history_context,
+                    history_context,
+                )
 
                 app.running = False
                 app.pending_workspaces_root = Path(tmp) / "run" / "workspaces"
@@ -234,7 +254,78 @@ class PromptHistoryTuiTests(unittest.TestCase):
                     "queued follow up",
                     record_history=True,
                     from_follow_up_queue=True,
+                    recorded_history_context=history_context,
                 )
+
+    def test_clearing_a_pending_queue_does_not_erase_submitted_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "prompt_history.json"
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            args = parse_args(["--workspace", str(workspace)])
+
+            with mock.patch.dict(
+                os.environ,
+                {"PCR_PROMPT_HISTORY_PATH": str(history_path)},
+            ):
+                app = tui_textual.PcrTextualApp(args)
+                app._sync = lambda: None
+                app._refresh_follow_up_queue = lambda: None
+                app.running = True
+
+                self.assertTrue(app._submit_task_prompt("keep after exit"))
+                self.assertEqual(len(app.follow_up_queue), 1)
+                app._clear_follow_up_queue()
+
+            self.assertEqual(
+                PromptHistoryStore(history_path).entries(workspace, ""),
+                ["keep after exit"],
+            )
+
+    def test_latex_paste_remains_literal_and_drops_terminal_controls(self) -> None:
+        async def run() -> None:
+            formula = (
+                r"\[\begin{aligned}"
+                r"\mathcal{L}_{\text{total}} &= \sum_i \frac{x_i^2}{N} \\ "
+                r"y &= \text{value}"
+                r"\end{aligned}\]"
+            )
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(
+                tui_textual,
+                "list_resume_sessions",
+                return_value=[],
+            ):
+                async with app.run_test() as pilot:
+                    prompt = app.query_one("#prompt")
+                    prompt.focus()
+                    await prompt._on_paste(
+                        tui_textual.events.Paste(
+                            formula + "\r\nnext\x07\x08\x0c\x1b"
+                        )
+                    )
+                    await pilot.pause()
+
+                    self.assertEqual(prompt.text, formula + "\nnext")
+                    pane = app.agents[1]
+                    pane.input_text = prompt.text
+                    app._mark_detail_dirty(pane)
+                    rendered = app._detail_renderable().plain
+                    self.assertIn(r"\begin{aligned}", rendered)
+                    self.assertIn(r"\frac{x_i^2}{N}", rendered)
+                    self.assertIn(r"\text{value}", rendered)
+                    self.assertNotIn("\x07", rendered)
+                    self.assertNotIn("\x08", rendered)
+                    self.assertNotIn("\x0c", rendered)
+                    self.assertNotIn("\x1b", rendered)
+                    app.follow_up_queue.append(
+                        tui_textual.QueuedFollowUp(prompt.text)
+                    )
+                    queued = app._follow_up_queue_renderable(60).plain
+                    self.assertIn(r"\begin{aligned}", queued)
+                    self.assertIn(r"\text{value}", queued)
+
+        asyncio.run(run())
 
     def test_prompt_up_down_navigation_and_edited_draft(self) -> None:
         async def run() -> None:
