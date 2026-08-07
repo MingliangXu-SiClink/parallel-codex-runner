@@ -2697,6 +2697,7 @@ else:
             )
             if (
                 event.estimate.total_bytes > LARGE_RUN_STORAGE_WARNING_BYTES
+                and not event.from_follow_up_queue
                 and not warning_approved
             ):
                 self.status = (
