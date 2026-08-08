@@ -170,7 +170,7 @@ DETAIL_TEXT_STYLES: dict[str, tuple[str, str]] = {
 }
 TUI_TIPS: tuple[str, ...] = (
     "输入 / 可查看并补全命令。",
-    "输入框为空时，←/→ 可切换 Agent。",
+    "输入框为空时，←/→ 可切换 Agent；有内容时将鼠标移至 Agent 区域也可切换。",
     "Shift-Enter 可在输入框中换行。",
     "选中Agent栏目文本即可复制。",
     "使用 /resume 可载入之前的 Codex 对话。",
@@ -193,6 +193,8 @@ TUI_TIPS: tuple[str, ...] = (
     "输入 /diff 可切换当前 Agent 的完整文件差异。",
     "TUI 不在前台时，所有 Agent 结束后会触发完成通知，失败也算结束。",
     "Ctrl-C 会依情境执行复制、清空输入或退出。",
+    "Command-Z / Shift-Command-Z 可撤销或重做输入；Command-A/X/C/V 支持常用编辑操作。",
+    "Option-←/→ 按词移动，Command-←/→/↑/↓ 跳到行或全文边界；配合 Shift 可选择文本。",
     "KEEP_WORKSPACES 可保留候选工作目录。",
     "SYNC_BACK 控制是否同步选中的结果至工作区。",
     "注意本项目默认以Codex Full Access 权限运行。",
@@ -280,6 +282,8 @@ def build_help_text() -> str:
             "Run-setting commands apply to the next run without selecting an agent.",
             "Accept, follow-up, exit, workspace, and resume actions use the displayed agent.",
             "Ctrl-C copies selected text; otherwise it clears a non-empty prompt or exits.",
+            "Command-Z / Shift-Command-Z undo or redo prompt edits; Command-A/X/C/V provide standard editing.",
+            "Option-Left/Right moves by word; Command-Arrows move to line or document edges; add Shift to select.",
         ]
     )
     return "\n".join(lines)
@@ -913,7 +917,147 @@ else:
 
 
     class SafePasteTextArea(TextArea):
-        """A plain-text editor that rejects terminal controls at the paste boundary."""
+        """A plain-text editor with safe paste and native editing shortcuts."""
+
+        @staticmethod
+        def _consume_editing_key(event: events.Key) -> None:
+            event.stop()
+            event.prevent_default()
+
+        def _copy_editor_selection(self) -> None:
+            copy_active = getattr(self.app, "_copy_active_text", None)
+            if callable(copy_active) and copy_active():
+                return
+            if self.selected_text:
+                self.app.copy_to_clipboard(self.selected_text)
+
+        def action_select_all(self) -> None:
+            clear_selection = getattr(
+                self.app,
+                "_clear_screen_selection_for_interaction",
+                None,
+            )
+            if callable(clear_selection):
+                clear_selection()
+            else:
+                self.app.clear_selection()
+            super().action_select_all()
+
+        def _move_to_line_edge(self, *, end: bool, select: bool) -> None:
+            row, _column = self.cursor_location
+            column = len(self.document[row]) if end else 0
+            self.move_cursor((row, column), select=select)
+
+        def _move_to_document_edge(self, *, end: bool, select: bool) -> None:
+            self.move_cursor(self.document.end if end else (0, 0), select=select)
+
+        def _delete_to_line_edge(self, *, end: bool) -> None:
+            if not self.selection.is_empty:
+                self._delete_via_keyboard(*self.selection)
+                return
+            row, column = self.cursor_location
+            edge = len(self.document[row]) if end else 0
+            if column != edge:
+                self._delete_via_keyboard((row, column), (row, edge))
+
+        async def _on_key(self, event: events.Key) -> None:
+            tokens = event.key.split("+")
+            key = tokens[-1]
+            modifiers = frozenset(tokens[:-1])
+
+            if modifiers == {"super"} and key == "a":
+                self._consume_editing_key(event)
+                self.action_select_all()
+                return
+            if modifiers == {"super"} and key == "c":
+                self._consume_editing_key(event)
+                self._copy_editor_selection()
+                return
+            if modifiers == {"super"} and key == "x":
+                self._consume_editing_key(event)
+                if self.selected_text:
+                    self.action_cut()
+                return
+            if modifiers == {"super"} and key == "v":
+                self._consume_editing_key(event)
+                self.action_paste()
+                return
+            if modifiers in ({"super"}, {"ctrl"}) and key == "z":
+                self._consume_editing_key(event)
+                self.action_undo()
+                return
+            if (
+                modifiers in ({"shift", "super"}, {"ctrl", "shift"})
+                and key == "z"
+            ) or (modifiers in ({"super"}, {"ctrl"}) and key == "y"):
+                self._consume_editing_key(event)
+                self.action_redo()
+                return
+
+            if key in {"left", "right"} and modifiers in (
+                {"alt"},
+                {"alt", "shift"},
+            ):
+                self._consume_editing_key(event)
+                action = (
+                    self.action_cursor_word_left
+                    if key == "left"
+                    else self.action_cursor_word_right
+                )
+                action(select="shift" in modifiers)
+                return
+            if key in {"left", "right"} and modifiers in (
+                {"super"},
+                {"shift", "super"},
+            ):
+                self._consume_editing_key(event)
+                self._move_to_line_edge(
+                    end=key == "right",
+                    select="shift" in modifiers,
+                )
+                return
+            if key in {"up", "down"} and modifiers in (
+                {"super"},
+                {"shift", "super"},
+            ):
+                self._consume_editing_key(event)
+                self._move_to_document_edge(
+                    end=key == "down",
+                    select="shift" in modifiers,
+                )
+                return
+
+            if modifiers == {"alt"} and key in {"backspace", "delete"}:
+                self._consume_editing_key(event)
+                action = (
+                    self.action_delete_word_left
+                    if key == "backspace"
+                    else self.action_delete_word_right
+                )
+                action()
+                return
+            if modifiers == {"super"} and key in {"backspace", "delete"}:
+                self._consume_editing_key(event)
+                self._delete_to_line_edge(end=key == "delete")
+                return
+
+            await super()._on_key(event)
+
+        async def _on_mouse_down(self, event: events.MouseDown) -> None:
+            # Screen selections (used by Detail and the runner panel) and the
+            # TextArea's editable selection are independent.  Clear the former
+            # before starting an editor selection so Copy cannot pick up stale
+            # rendered text instead of the selected prompt lines.
+            clear_selection = getattr(
+                self.app,
+                "_clear_screen_selection_for_interaction",
+                None,
+            )
+            if callable(clear_selection):
+                clear_selection()
+            else:
+                self.app.clear_selection()
+            await super()._on_mouse_down(event)
 
         async def _on_paste(self, event: events.Paste) -> None:
             if self.read_only:
@@ -1302,18 +1446,6 @@ else:
                 with contextlib.suppress(Exception):
                     setattr(self, "placeholder", placeholder)
 
-        def action_select_all(self) -> None:
-            clear_selection = getattr(
-                self.app,
-                "_clear_screen_selection_for_interaction",
-                None,
-            )
-            if callable(clear_selection):
-                clear_selection()
-            else:
-                self.app.clear_selection()
-            super().action_select_all()
-
         def action_copy(self) -> None:
             action = getattr(self.app, "action_interrupt_or_exit", None)
             if callable(action):
@@ -1340,7 +1472,14 @@ else:
             if event.key in {"left", "right"}:
                 event.stop()
                 event.prevent_default()
-                if not self.text.strip():
+                pointer_switch = getattr(
+                    self.app,
+                    "_pointer_requests_agent_switch",
+                    None,
+                )
+                if not self.text.strip() or (
+                    callable(pointer_switch) and pointer_switch()
+                ):
                     self.post_message(AgentSwitchRequested(-1 if event.key == "left" else 1))
                 elif event.key == "left":
                     self.action_cursor_left()
@@ -1384,7 +1523,7 @@ else:
                 event.prevent_default()
                 self.action_delete_word_right()
                 return
-            if event.key in {"ctrl+u", "super+backspace"}:
+            if event.key == "ctrl+u":
                 event.stop()
                 event.prevent_default()
                 self.action_delete_to_start_of_line()
@@ -1910,10 +2049,23 @@ else:
 
         def _is_detail_widget(self, node: Any) -> bool:
             while node is not None:
-                if getattr(node, "id", None) in {"detail", "detail-scroll"}:
+                if getattr(node, "id", None) in {
+                    "detail",
+                    "detail-scroll",
+                    "detail-frame",
+                }:
                     return True
                 node = node.parent
             return False
+
+        def _pointer_requests_agent_switch(self) -> bool:
+            try:
+                node, _offset = self.screen.get_widget_and_offset_at(
+                    *self.mouse_position
+                )
+            except Exception:
+                return False
+            return self._is_detail_widget(node)
 
         @staticmethod
         def _is_node_within(node: Any, ancestor: Any) -> bool:
@@ -3502,7 +3654,10 @@ else:
                 if (
                     self.focused is not prompt
                     and not isinstance(self.focused, (Input, Select, TextArea))
-                    and not prompt.text.strip()
+                    and (
+                        not prompt.text.strip()
+                        or self._pointer_requests_agent_switch()
+                    )
                 ):
                     event.stop()
                     event.prevent_default()

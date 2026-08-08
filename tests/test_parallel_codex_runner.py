@@ -5282,6 +5282,128 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_mouse_selection_replaces_stale_screen_selection(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(80, 30)) as pilot:
+                    pane = app.agents[1]
+                    pane.input_text = "stale detail line"
+                    pane.final_text = "old answer"
+                    app._mark_detail_dirty(pane)
+                    app._sync()
+                    await pilot.pause()
+
+                    self.assertTrue(
+                        await pilot.double_click("#detail", offset=(3, 0))
+                    )
+                    await pilot.pause()
+                    self.assertTrue(app._last_screen_selection)
+
+                    prompt = app.query_one("#prompt")
+                    text = "first line\n\u7b2c\u4e8c\u884c\u5185\u5bb9\nthird line"
+                    prompt.text = text
+                    copied: list[str] = []
+                    app.copy_to_clipboard = copied.append
+                    await pilot.pause()
+
+                    self.assertTrue(await pilot.mouse_down(prompt, offset=(1, 1)))
+                    await pilot.pause()
+                    self.assertFalse(app._last_screen_selection)
+                    self.assertFalse(app.screen.get_selected_text())
+
+                    self.assertTrue(await pilot.mouse_up(prompt, offset=(12, 3)))
+                    self.assertFalse(
+                        app.screen.get_selected_text(),
+                        repr(app.screen.selections),
+                    )
+                    self.assertEqual(prompt.selected_text, text)
+                    await pilot.press("super+c")
+
+                    self.assertEqual(copied, [text])
+                    self.assertEqual(prompt.selected_text, text)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_supports_common_macos_editing_shortcuts(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(80, 30)) as pilot:
+                    prompt = app.query_one("#prompt")
+                    prompt.focus()
+                    prompt.insert("first")
+                    prompt.history.checkpoint()
+                    prompt.insert(" second")
+
+                    await pilot.press("super+z")
+                    self.assertEqual(prompt.text, "first")
+                    await pilot.press("shift+super+z")
+                    self.assertEqual(prompt.text, "first second")
+
+                    copied: list[str] = []
+                    app.copy_to_clipboard = copied.append
+                    await pilot.press("super+a", "super+c")
+                    self.assertEqual(copied, ["first second"])
+                    await pilot.press("super+x")
+                    self.assertEqual(prompt.text, "")
+                    self.assertEqual(copied, ["first second", "first second"])
+                    await pilot.press("super+z")
+                    self.assertEqual(prompt.text, "first second")
+
+                    app._clipboard = " pasted"
+                    prompt.move_cursor(prompt.document.end)
+                    await pilot.press("super+v")
+                    self.assertEqual(prompt.text, "first second pasted")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_supports_macos_navigation_and_deletion_shortcuts(self) -> None:
+        async def run() -> None:
+            app = tui_textual.PcrTextualApp(parse_args([]))
+            with mock.patch.object(tui_textual, "list_resume_sessions", return_value=[]):
+                async with app.run_test(size=(80, 30)) as pilot:
+                    prompt = app.query_one("#prompt")
+                    prompt.text = "one two\nthree four"
+                    prompt.focus()
+                    prompt.move_cursor(prompt.document.end)
+
+                    await pilot.press("alt+left")
+                    self.assertEqual(prompt.cursor_location, (1, len("three ")))
+                    await pilot.press("shift+super+left")
+                    self.assertEqual(prompt.selected_text, "three ")
+                    await pilot.press("super+right")
+                    self.assertEqual(prompt.cursor_location, (1, len("three four")))
+                    await pilot.press("super+up")
+                    self.assertEqual(prompt.cursor_location, (0, 0))
+                    await pilot.press("shift+super+down")
+                    self.assertEqual(prompt.selected_text, "one two\nthree four")
+
+                    prompt.move_cursor(prompt.document.end)
+                    await pilot.press("alt+backspace")
+                    self.assertEqual(prompt.text, "one two\nthree ")
+                    await pilot.press("super+backspace")
+                    self.assertEqual(prompt.text, "one two\n")
+                    await pilot.press("super+z", "super+z")
+                    self.assertEqual(prompt.text, "one two\nthree four")
+
+                    prompt.move_cursor((0, 0))
+                    await pilot.press("super+delete")
+                    self.assertEqual(prompt.text, "\nthree four")
+
+                    prompt.text = "  indented text"
+                    prompt.move_cursor(prompt.document.end)
+                    await pilot.press("super+left")
+                    self.assertEqual(prompt.cursor_location, (0, 0))
+                    prompt.selection = ((0, 2), (0, 11))
+                    await pilot.press("super+delete")
+                    self.assertEqual(prompt.text, "  text")
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_ctrl_q_uses_pcr_cleanup_path(self) -> None:
         async def run() -> None:
             app = tui_textual.PcrTextualApp(parse_args([]))
@@ -6661,6 +6783,16 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.press("left")
                     self.assertEqual(editor.cursor_location, (0, 3))
 
+                    editor.text = "queue draft"
+                    editor.move_cursor(editor.document.end)
+                    editor.insert(" updated")
+                    await pilot.press("super+z")
+                    self.assertEqual(editor.text, "queue draft")
+                    await pilot.press("shift+super+z")
+                    self.assertEqual(editor.text, "queue draft updated")
+                    await pilot.press("super+a")
+                    self.assertEqual(editor.selected_text, "queue draft updated")
+
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
@@ -7245,6 +7377,46 @@ class TuiCommandTests(unittest.TestCase):
                 await pilot.pause()
                 self.assertEqual(prompt.cursor_location, (0, 3))
                 self.assertEqual(app.selected_agent, 1)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_prompt_left_right_follows_pointer_region_when_text_exists(self) -> None:
+        async def run() -> None:
+            args = parse_args(["-n", "5"])
+            app = tui_textual.PcrTextualApp(args)
+            async with app.run_test(size=(100, 32)) as pilot:
+                for pane in app.agents.values():
+                    pane.input_text = f"question for agent {pane.idx}"
+                    pane.final_text = f"answer from agent {pane.idx}"
+                    app._mark_detail_dirty(pane)
+                app.selected_agent = 2
+                app._sync()
+                await pilot.pause()
+
+                prompt = app.query_one("#prompt")
+                prompt.text = "draft"
+                prompt.move_cursor(prompt.document.end)
+                prompt.focus()
+                await pilot.hover("#detail", offset=(3, 1))
+
+                self.assertTrue(app._pointer_requests_agent_switch())
+                await pilot.press("right")
+                self.assertEqual(app.selected_agent, 3)
+                self.assertEqual(prompt.cursor_location, (0, len("draft")))
+
+                await pilot.hover(prompt, offset=(3, 1))
+                self.assertFalse(app._pointer_requests_agent_switch())
+                await pilot.press("left")
+                self.assertEqual(app.selected_agent, 3)
+                self.assertEqual(prompt.cursor_location, (0, len("draf")))
+
+                await pilot.hover("#detail", offset=(3, 1))
+                app.query_one("#detail-scroll").focus()
+                await pilot.press("left")
+                self.assertEqual(app.selected_agent, 2)
+                self.assertEqual(getattr(app.focused, "id", None), "prompt")
+                self.assertEqual(prompt.cursor_location, (0, len("draf")))
 
         asyncio.run(run())
 
