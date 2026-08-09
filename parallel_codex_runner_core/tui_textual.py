@@ -979,8 +979,10 @@ else:
                     self.action_cut()
                 return
             if modifiers == {"super"} and key == "v":
+                # Terminal emulators send the clipboard as a separate bracketed
+                # Paste event. Consume the key without inserting from the app
+                # clipboard, otherwise the same payload is inserted twice.
                 self._consume_editing_key(event)
-                self.action_paste()
                 return
             if modifiers in ({"super"}, {"ctrl"}) and key == "z":
                 self._consume_editing_key(event)

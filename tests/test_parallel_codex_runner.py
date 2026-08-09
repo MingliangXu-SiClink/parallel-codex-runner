@@ -5352,9 +5352,12 @@ class TuiCommandTests(unittest.TestCase):
                     await pilot.press("super+z")
                     self.assertEqual(prompt.text, "first second")
 
-                    app._clipboard = " pasted"
                     prompt.move_cursor(prompt.document.end)
-                    await pilot.press("super+v")
+                    await prompt._on_key(
+                        tui_textual.events.Key("super+v", "v")
+                    )
+                    self.assertEqual(prompt.text, "first second")
+                    await prompt._on_paste(tui_textual.events.Paste(" pasted"))
                     self.assertEqual(prompt.text, "first second pasted")
 
         asyncio.run(run())
@@ -6792,6 +6795,13 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(editor.text, "queue draft updated")
                     await pilot.press("super+a")
                     self.assertEqual(editor.selected_text, "queue draft updated")
+                    editor.move_cursor(editor.document.end)
+                    await editor._on_key(
+                        tui_textual.events.Key("super+v", "v")
+                    )
+                    self.assertEqual(editor.text, "queue draft updated")
+                    await editor._on_paste(tui_textual.events.Paste(" once"))
+                    self.assertEqual(editor.text, "queue draft updated once")
 
         asyncio.run(run())
 
