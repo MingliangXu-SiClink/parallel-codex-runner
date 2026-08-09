@@ -8031,11 +8031,24 @@ class TuiCommandTests(unittest.TestCase):
 
                         start_run.assert_not_called()
                         self.assertFalse(app.storage_preflight_inflight)
-                        self.assertIn("Prompt ignored", app.status)
+                        self.assertIn("Run canceled", app.status)
                         self.assertEqual(
                             app.prompt_history_store.entries(workspace, None),
                             [],
                         )
+                        self.assertEqual(
+                            app.query_one("#prompt").text,
+                            "large question",
+                        )
+                        self.assertEqual(
+                            app.prompt_history_navigator.draft,
+                            "large question",
+                        )
+                        self.assertEqual(
+                            app.prompt_history_drafts[app.prompt_history_context],
+                            "large question",
+                        )
+                        self.assertEqual(getattr(app.focused, "id", None), "prompt")
 
         asyncio.run(run())
 

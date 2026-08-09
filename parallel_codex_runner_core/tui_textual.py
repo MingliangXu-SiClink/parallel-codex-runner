@@ -2670,7 +2670,7 @@ else:
         def _large_storage_approval_key(self) -> str:
             return str(self.workspace.expanduser().resolve())
 
-        def _restore_prompt_after_storage_failure(self, prompt_text: str) -> None:
+        def _restore_prompt_after_storage_abort(self, prompt_text: str) -> None:
             try:
                 prompt = self.query_one("#prompt", PromptEditor)
             except Exception:
@@ -2825,7 +2825,7 @@ else:
                     ),
                 ):
                     if not event.from_follow_up_queue:
-                        self._restore_prompt_after_storage_failure(event.prompt)
+                        self._restore_prompt_after_storage_abort(event.prompt)
                 return True
             return False
 
@@ -2842,7 +2842,9 @@ else:
                 self.storage_preflight_inflight = False
                 if event.from_follow_up_queue:
                     self._consume_follow_up(event.prompt)
-                self.status = "Prompt ignored: storage confirmation declined"
+                else:
+                    self._restore_prompt_after_storage_abort(event.prompt)
+                self.status = "Run canceled: storage confirmation declined"
                 self._sync()
                 self.query_one("#prompt", PromptEditor).focus()
                 return
@@ -2854,7 +2856,7 @@ else:
                 self.storage_preflight_inflight = False
                 self.status = "Run failed: storage estimate is unavailable"
                 if not event.from_follow_up_queue:
-                    self._restore_prompt_after_storage_failure(event.prompt)
+                    self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
                 return
             if remember_large_storage_approval:
@@ -2867,7 +2869,7 @@ else:
                 self.storage_preflight_inflight = False
                 self.status = f"Run failed: cannot inspect available disk space: {exc}"
                 if not event.from_follow_up_queue:
-                    self._restore_prompt_after_storage_failure(event.prompt)
+                    self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
                 return
             usable = available + event.reclaimable_bytes
@@ -2885,7 +2887,7 @@ else:
                     f"available {available_text})"
                 )
                 if not event.from_follow_up_queue:
-                    self._restore_prompt_after_storage_failure(event.prompt)
+                    self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
                 return
 
@@ -2900,7 +2902,7 @@ else:
             if started and event.from_follow_up_queue:
                 self._consume_follow_up(event.prompt)
             elif not started and not event.from_follow_up_queue:
-                self._restore_prompt_after_storage_failure(event.prompt)
+                self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
 
         @on(StoragePreflightFinished)
@@ -2917,7 +2919,7 @@ else:
                 message = event.error or "storage estimate is unavailable"
                 self.status = f"Run failed: cannot estimate storage: {message}"
                 if not event.from_follow_up_queue:
-                    self._restore_prompt_after_storage_failure(event.prompt)
+                    self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
                 return
             warning_approved = (
