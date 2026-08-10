@@ -299,7 +299,7 @@ class PromptHistoryTuiTests(unittest.TestCase):
                 async with app.run_test() as pilot:
                     prompt = app.query_one("#prompt")
                     prompt.focus()
-                    await prompt._on_paste(
+                    app.post_message(
                         tui_textual.events.Paste(
                             formula + "\r\nnext\x07\x08\x0c\x1b"
                         )

@@ -1062,6 +1062,10 @@ else:
             await super()._on_mouse_down(event)
 
         async def _on_paste(self, event: events.Paste) -> None:
+            # Textual dispatches private event handlers through the widget MRO.
+            # Without preventing the default handler, TextArea._on_paste inserts
+            # the same bracketed-paste payload a second time.
+            event.prevent_default()
             if self.read_only:
                 return
             text = normalize_prompt_text(event.text)
