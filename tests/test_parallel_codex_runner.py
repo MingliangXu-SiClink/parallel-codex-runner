@@ -5312,12 +5312,19 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertFalse(app._last_screen_selection)
                     self.assertFalse(app.screen.get_selected_text())
 
-                    self.assertTrue(await pilot.mouse_up(prompt, offset=(12, 3)))
+                    with mock.patch.object(tui_textual.sys, "platform", "darwin"):
+                        self.assertTrue(await pilot.mouse_up(prompt, offset=(12, 3)))
+                        await pilot.pause()
                     self.assertFalse(
                         app.screen.get_selected_text(),
                         repr(app.screen.selections),
                     )
                     self.assertEqual(prompt.selected_text, text)
+                    # iTerm2 and Terminal.app consume Command-C themselves, so
+                    # the internal editor selection must already be on the
+                    # system clipboard before a super+c event could arrive.
+                    self.assertEqual(copied, [text])
+                    copied.clear()
                     await pilot.press("super+c")
 
                     self.assertEqual(copied, [text])
@@ -5351,6 +5358,14 @@ class TuiCommandTests(unittest.TestCase):
                     self.assertEqual(copied, ["first second", "first second"])
                     await pilot.press("super+z")
                     self.assertEqual(prompt.text, "first second")
+
+                    copied.clear()
+                    prompt.move_cursor(prompt.document.end)
+                    with mock.patch.object(tui_textual.sys, "platform", "darwin"):
+                        await pilot.press("shift+left")
+                        await pilot.pause()
+                    self.assertEqual(prompt.selected_text, "d")
+                    self.assertEqual(copied, ["d"])
 
                     prompt.move_cursor(prompt.document.end)
                     await prompt._on_key(

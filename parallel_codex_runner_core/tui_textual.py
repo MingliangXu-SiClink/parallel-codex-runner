@@ -925,10 +925,18 @@ else:
             event.prevent_default()
 
         def _copy_editor_selection(self) -> None:
+            if self.selected_text:
+                self.app.copy_to_clipboard(self.selected_text)
+                return
             copy_active = getattr(self.app, "_copy_active_text", None)
             if callable(copy_active) and copy_active():
                 return
-            if self.selected_text:
+
+        def _sync_macos_editor_selection(self) -> None:
+            # macOS terminal apps consume Command-C before Textual can receive
+            # super+c. Their native Copy command cannot see TextArea's internal
+            # selection, so keep the pasteboard synchronized as it is selected.
+            if sys.platform == "darwin" and self.selected_text:
                 self.app.copy_to_clipboard(self.selected_text)
 
         def action_select_all(self) -> None:
@@ -959,6 +967,17 @@ else:
             edge = len(self.document[row]) if end else 0
             if column != edge:
                 self._delete_via_keyboard((row, column), (row, edge))
+
+        def move_cursor(
+            self,
+            location: tuple[int, int],
+            select: bool = False,
+            center: bool = False,
+            record_width: bool = True,
+        ) -> None:
+            super().move_cursor(location, select, center, record_width)
+            if select:
+                self._sync_macos_editor_selection()
 
         async def _on_key(self, event: events.Key) -> None:
             tokens = event.key.split("+")
@@ -1059,7 +1078,13 @@ else:
                 clear_selection()
             else:
                 self.app.clear_selection()
+            event.prevent_default()
             await super()._on_mouse_down(event)
+
+        async def _on_mouse_up(self, event: events.MouseUp) -> None:
+            event.prevent_default()
+            await super()._on_mouse_up(event)
+            self._sync_macos_editor_selection()
 
         async def _on_paste(self, event: events.Paste) -> None:
             # Textual dispatches private event handlers through the widget MRO.
