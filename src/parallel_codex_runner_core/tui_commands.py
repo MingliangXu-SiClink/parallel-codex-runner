@@ -42,6 +42,7 @@ from .tui_components import (
     AgentDiffLoaded,
     AgentPane,
     CandidateBatch,
+    ConfirmationScreen,
     QueueEditorResult,
     QueueEditorRow,
     QueueEditorScreen,
@@ -101,6 +102,9 @@ class PcrTextualCommandMixin:
             return
         if name == "/queue":
             self._handle_queue(args)
+            return
+        if name in {"/rebind", "/rebind-queue"}:
+            self._handle_rebind(args)
             return
         if name in {"/followupdelay", "/follow-up-delay"}:
             self._handle_followupdelay(args)
@@ -1794,3 +1798,81 @@ class PcrTextualCommandMixin:
 
     def _show_status(self) -> None:
         self._show_text(self._tree_text())
+
+    def _handle_rebind(self, args: list[str]) -> None:
+        """Rebind paused follow-up queue to current context."""
+        if args:
+            self._command_error("Usage: /rebind")
+            return
+
+        if not self.follow_up_queue:
+            self.status = "No queued follow-up messages"
+            self._sync()
+            return
+
+        # Check if queue is paused (context mismatch)
+        current_context = self._follow_up_context()
+        has_mismatched = any(
+            item.context and item.context != current_context
+            for item in self.follow_up_queue
+        )
+
+        if not has_mismatched:
+            self.status = "Queue is not paused; no rebind needed"
+            self._sync()
+            return
+
+        if self.running or self.storage_preflight_inflight:
+            self.status = "Cannot rebind queue while run is active"
+            self._sync()
+            return
+
+        if not self._has_pending_run():
+            self.status = "No completed run available to rebind queue"
+            self._sync()
+            return
+
+        # Confirm with user
+        ws_display = absolute_path_for_display(self.workspace)
+        resume_display = self.resume_session_id or "none"
+        message = (
+            f"Rebind {len(self.follow_up_queue)} queued message(s) to current context?\n\n"
+            f"Workspace: {ws_display}\n"
+            f"Resume: {resume_display}"
+        )
+        buttons = [
+            ("Cancel", "cancel", "primary"),
+            ("Rebind", "rebind", "warning"),
+        ]
+
+        def on_confirmed(action: str | None) -> None:
+            if action == "rebind":
+                self._execute_rebind()
+
+        self.push_screen(ConfirmationScreen("REBIND QUEUE", message, buttons), on_confirmed)
+
+    def _execute_rebind(self) -> None:
+        """Execute the rebind operation."""
+        new_context = self._follow_up_context()
+
+        # Update local queue context
+        self.follow_up_queue = [
+            QueuedFollowUp(
+                item.prompt,
+                id=item.id,
+                record_history=item.record_history,
+                context=new_context,
+                recorded_history_context=item.recorded_history_context,
+            )
+            for item in self.follow_up_queue
+        ]
+
+        # Reset countdown state
+        self.follow_up_continue_at = None
+        self.follow_up_ready = False
+        self.follow_up_source_finalized = False
+        self._follow_up_countdown_second = None
+
+        self.status = f"Rebound {len(self.follow_up_queue)} queued messages to current context"
+        self._refresh_follow_up_queue()
+        self._sync()
