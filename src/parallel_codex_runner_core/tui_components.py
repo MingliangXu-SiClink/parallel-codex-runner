@@ -123,6 +123,7 @@ class QueuedFollowUp:
     record_history: bool = False
     context: tuple[str, str] | None = None
     recorded_history_context: tuple[str, str] | None = None
+    id: str | None = None  # Unique identifier for stable queue consumption
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,7 @@ class StoragePreflightFinished(Message):
         from_follow_up_queue: bool = False,
         bypass_follow_up_queue: bool = False,
         recorded_history_context: tuple[str, str] | None = None,
+        follow_up_id: str | None = None,
     ) -> None:
         super().__init__()
         self.request_id = request_id
@@ -201,6 +203,7 @@ class StoragePreflightFinished(Message):
         self.from_follow_up_queue = from_follow_up_queue
         self.bypass_follow_up_queue = bypass_follow_up_queue
         self.recorded_history_context = recorded_history_context
+        self.follow_up_id = follow_up_id
 
 
 class SafePasteTextArea(TextArea):
@@ -528,6 +531,79 @@ class ExitConfirmationScreen(ModalScreen[str | None]):
         self.dismiss(action)
 
     def action_cancel_exit(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmationScreen(ModalScreen[str | None]):
+    """Generic confirmation dialog with customizable title, message, and buttons."""
+
+    CSS = """
+    ConfirmationScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        padding: 1 2;
+        background: #171d25;
+        border: round #e5b567;
+    }
+    #confirm-title {
+        height: 1;
+        margin-bottom: 1;
+        color: #ffd27a;
+        text-style: bold;
+    }
+    #confirm-body {
+        height: auto;
+        margin-bottom: 1;
+        color: #e7ebf2;
+    }
+    #confirm-actions {
+        height: auto;
+        grid-size: 1 3;
+        grid-gutter: 0 1;
+    }
+    #confirm-actions Button {
+        width: 100%;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel_confirm", "Cancel"),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        buttons: list[tuple[str, str, str]],
+    ) -> None:
+        super().__init__()
+        self.title = title
+        self.message = message
+        self.buttons = buttons
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(self.title, id="confirm-title")
+            yield Static(self.message, id="confirm-body", markup=False)
+            with Grid(id="confirm-actions"):
+                for label, action, variant in self.buttons:
+                    yield Button(label, variant=variant, id=f"confirm-btn-{action}")
+
+    def on_mount(self) -> None:
+        first_btn = self.query_one("#confirm-actions Button", Button)
+        first_btn.focus()
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        action = btn_id.removeprefix("confirm-btn-")
+        self.dismiss(action)
+
+    def action_cancel_confirm(self) -> None:
         self.dismiss(None)
 
 

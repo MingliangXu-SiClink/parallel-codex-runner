@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,7 @@ else:
         RunnerEvent,
         StoragePreflightFinished,
         StorageWarningScreen,
+        ConfirmationScreen,
         ExitConfirmationScreen,
     )
     from .tui_commands import PcrTextualCommandMixin
@@ -1224,6 +1226,7 @@ else:
             from_follow_up_queue: bool = False,
             bypass_follow_up_queue: bool = False,
             recorded_history_context: tuple[str, str] | None = None,
+            follow_up_id: str | None = None,
         ) -> bool:
             prompt = normalize_prompt_text(prompt).strip()
             if not prompt:
@@ -1329,6 +1332,7 @@ else:
                             from_follow_up_queue,
                             bypass_follow_up_queue,
                             recorded_history_context,
+                            follow_up_id,
                         ),
                     )
                 except RuntimeError:
@@ -1350,16 +1354,26 @@ else:
                 and event.configuration_key != self._storage_preflight_configuration()
             ):
                 self.storage_preflight_inflight = False
+                self.status = "Storage check restarting due to configuration change…"
+                self._sync()
                 if not self._request_run_with_storage_check(
                     event.prompt,
                     record_history=event.record_history,
                     from_follow_up_queue=event.from_follow_up_queue,
                     bypass_follow_up_queue=event.bypass_follow_up_queue,
+                    follow_up_id=event.follow_up_id,
                     **_recorded_history_context_kwargs(
                         event.recorded_history_context
                     ),
                 ):
-                    if not event.from_follow_up_queue:
+                    self.status = (
+                        "Storage check cancelled after configuration change"
+                        + (" (follow-up discarded)" if event.from_follow_up_queue else "")
+                    )
+                    self._sync()
+                    if event.from_follow_up_queue:
+                        self._consume_follow_up(event.follow_up_id)
+                    else:
                         self._restore_prompt_after_storage_abort(event.prompt)
                 return True
             return False
@@ -1376,7 +1390,7 @@ else:
             if not continue_run:
                 self.storage_preflight_inflight = False
                 if event.from_follow_up_queue:
-                    self._consume_follow_up(event.prompt)
+                    self._consume_follow_up(event.follow_up_id)
                 else:
                     self._restore_prompt_after_storage_abort(event.prompt)
                 self.status = "Run canceled: storage confirmation declined"
@@ -1454,7 +1468,7 @@ else:
                 message = event.error or "storage estimate is unavailable"
                 self.status = f"Run failed: cannot estimate storage: {message}"
                 if event.from_follow_up_queue:
-                    self._consume_follow_up(event.prompt)
+                    self._consume_follow_up(event.follow_up_id)
                 else:
                     self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()
@@ -3450,6 +3464,7 @@ else:
             self.follow_up_queue.append(
                 QueuedFollowUp(
                     prompt,
+                    id=str(uuid.uuid4()),
                     record_history=record_history,
                     context=self._follow_up_context(),
                     recorded_history_context=recorded_history_context,
@@ -3583,15 +3598,20 @@ else:
             except Exception:
                 return
 
-        def _consume_follow_up(self, prompt: str) -> None:
+        def _consume_follow_up(self, follow_up_id: str | None) -> None:
             if self.follow_up_queue:
-                if self.follow_up_queue[0].prompt == prompt:
+                if follow_up_id is not None:
+                    # Stable ID-based removal (preferred)
+                    if self.follow_up_queue[0].id == follow_up_id:
+                        self.follow_up_queue.pop(0)
+                    else:
+                        for index, item in enumerate(self.follow_up_queue):
+                            if item.id == follow_up_id:
+                                self.follow_up_queue.pop(index)
+                                break
+                elif self.follow_up_queue[0].id is None:
+                    # Legacy fallback for items without IDs (should not occur in new code)
                     self.follow_up_queue.pop(0)
-                else:
-                    for index, item in enumerate(self.follow_up_queue):
-                        if item.prompt == prompt:
-                            self.follow_up_queue.pop(index)
-                            break
             self.follow_up_continue_at = None
             self.follow_up_ready = False
             self._follow_up_countdown_second = None
@@ -3658,6 +3678,7 @@ else:
                 item.prompt,
                 record_history=item.record_history,
                 from_follow_up_queue=True,
+                follow_up_id=item.id,
                 **_recorded_history_context_kwargs(
                     item.recorded_history_context
                 ),
@@ -3908,7 +3929,10 @@ else:
                 self._clear_pending_run()
                 self.run_info_rows = self._base_info_rows()
                 self._refresh_resume_control()
-                self.status = f"Continuing from AGENT-{idx:03d}"
+                status_msg = f"Continuing from AGENT-{idx:03d}"
+                if outcome.cleanup_error:
+                    status_msg += f" (workspace cleanup failed: {outcome.cleanup_error})"
+                self.status = status_msg
                 return True
             except FinalizationStageError as exc:
                 if exc.stage == "sync_preflight":

@@ -1093,11 +1093,12 @@ class FollowUpQueueCoordinator:
             item["failure_count"] = failures
             item["retry_at"] = retry_at
             item["last_error"] = ""
+            # Clear the old deadline unconditionally — retry starts fresh.
+            queue["deadline"] = None
             # Finalization may still be running, or its response may be lost.
             # Keep the claimed command immutable; retry is not a new countdown.
             claimed = isinstance(item.get("dispatch"), Mapping)
             queue["state"] = "dispatching" if claimed else "waiting"
-            queue["deadline"] = None if claimed else retry_at
             queue["last_error"] = ""
             # When retrying a claimed dispatch, preserve the selection identity
             # so process_workspace recognizes it as an active dispatch rather

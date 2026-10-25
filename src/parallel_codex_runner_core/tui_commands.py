@@ -594,7 +594,13 @@ class PcrTextualCommandMixin:
             self._sync()
             return False
         if self.running and not self._synthesis_config_is_editable():
-            self.status = f"Cannot change {label} after synthesis has started"
+            coordinator = self.live_synthesis_config_coordinator
+            if coordinator is None:
+                self.status = f"Cannot change {label}: synthesis coordinator not available"
+            elif not coordinator.active:
+                self.status = f"Cannot change {label}: synthesis has completed"
+            else:
+                self.status = f"Cannot change {label} after synthesis has started"
             self._sync()
             return False
         return True
@@ -676,12 +682,33 @@ class PcrTextualCommandMixin:
             self.status = f"Cannot change {label} while running"
             self._sync()
             return False
+
+        # If there's a pending agent to finalize, do that first. Finalization will
+        # advance the context (new run), making current-context queue items stale.
         if self._finalize_displayed_pending(
             require_resume=False,
             archive_detail=True,
         ):
             self._clear_follow_up_queue()
             return True
+
+        # No pending agent was finalized. Check if the queue has items from the
+        # current context. If so, block the context change to prevent data loss.
+        if self.follow_up_queue:
+            current_context = self._follow_up_context()
+            has_current_context_items = any(
+                item.context == current_context for item in self.follow_up_queue
+            )
+            if has_current_context_items:
+                queued_count = len(self.follow_up_queue)
+                plural = "messages" if queued_count != 1 else "message"
+                self.status = (
+                    f"Cannot change {label} while {queued_count} follow-up {plural} "
+                    f"queued for the current context. Use /queue to view or clear them first."
+                )
+                self._sync()
+                return False
+
         self._sync()
         return False
 
@@ -1642,6 +1669,8 @@ class PcrTextualCommandMixin:
         self.agents = {idx: AgentPane(idx) for idx in range(1, self.num_agents + 1)}
         self.selected_agent = min(self.selected_agent, self.num_agents)
         self.recommended_agent = None
+        self.pending_accept_agent = None
+        self.queued_agent = None
         self.detail_history.clear()
         self.command_history.clear()
         self._mark_detail_dirty()

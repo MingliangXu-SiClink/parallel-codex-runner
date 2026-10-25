@@ -7244,6 +7244,7 @@ class TuiCommandTests(unittest.TestCase):
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
         app._sync = lambda: None
         app._show_text = lambda _text: None
+        app.args.follow_up_delay = 30  # Set initial delay to 30s
         app.follow_up_queue.append(
             tui_textual.QueuedFollowUp("follow-up question")
         )
@@ -7544,11 +7545,13 @@ class TuiCommandTests(unittest.TestCase):
                     app._tick()
 
         finalize.assert_called_once_with(2, archive_detail=True)
-        start.assert_called_once_with(
-            "follow-up question",
-            record_history=True,
-            from_follow_up_queue=True,
-        )
+        # Allow any follow_up_id since it's a UUID generated at queue-time
+        start.assert_called_once()
+        args, kwargs = start.call_args
+        self.assertEqual(args, ("follow-up question",))
+        self.assertEqual(kwargs["record_history"], True)
+        self.assertEqual(kwargs["from_follow_up_queue"], True)
+        self.assertIn("follow_up_id", kwargs)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_run_finished_auto_switches_to_recommended_agent_without_queue(self) -> None:
