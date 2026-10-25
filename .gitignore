@@ -6,16 +6,31 @@ __pycache__/
 
 *.egg-info/
 build/
+.build/
 dist/
+release/*
+!release/README.md
 
 .codex_parallel_runs/
 .codex_parallel_meta/
+parallel_codex_parallel_runs/
 
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.env
 
 .venv/
 venv/
 env/
+
+apps/android/.gradle/
+apps/android/.idea/
+apps/android/.kotlin/
+apps/android/local.properties
+apps/android/keystore.properties
+apps/android/*.jks
+apps/android/*.keystore
+apps/android/**/build/
+.tools/

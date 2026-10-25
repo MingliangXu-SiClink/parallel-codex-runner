@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parallel-codex-runner.local/protocol/pcr-remote-v1.schema.json",
+  "title": "PCR Remote request envelope v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "command_id",
+    "client_id",
+    "action",
+    "body"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "request"
+    },
+    "request_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "command_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "client_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "client_capabilities": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "action": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "body": {
+      "type": "object"
+    },
+    "expected_revision": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

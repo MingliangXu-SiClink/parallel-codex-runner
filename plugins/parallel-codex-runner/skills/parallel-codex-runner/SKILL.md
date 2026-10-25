@@ -5,7 +5,7 @@ description: Run one coding task through multiple isolated Codex CLI candidates,
 
 # Parallel Codex Runner
 
-Use the PCR MCP tools rather than built-in sub-agents when the user asks for this plugin. PCR gives every candidate an isolated workspace and leaves the original workspace unchanged until finalization.
+Use the PCR MCP tools rather than built-in sub-agents when the user asks for this plugin. PCR gives every candidate an isolated local workspace and leaves the original local workspace unchanged until finalization.
 
 ## Start A Run
 
@@ -43,6 +43,8 @@ The runtime preserves chronological events without truncating them. Diff pages a
 - Use `pcr_retry_agent` only for failed, killed, cancelled, or interrupted candidates.
 - Use `pcr_add_agents` after the active batch stops to add more independent candidates for the same prompt. If it requests storage confirmation, obtain explicit approval before calling it again with `confirm_large_run=true`.
 - Use `pcr_list_runs` after an app or MCP restart to find retained or interrupted runs.
+- Use `pcr_list_conversations` and `pcr_get_conversation` when the user needs the
+  durable conversation history rather than one technical run record.
 - Use `pcr_cleanup_expired_runs` when the user asks to release expired plugin storage immediately.
 
 ## Finalize Safely
@@ -64,3 +66,16 @@ Use `pcr_discard_run` only when the user wants to abandon the run. It stops acti
 ## Safety
 
 PCR isolates working trees, not operating-system access. Candidates still share the host, network, account, quota, and possibly Git object storage. Do not describe PCR as a sandbox, and do not run untrusted prompts or repositories without warning the user.
+
+Every candidate and synthesis Agent can carry out user-authorized remote work
+using existing SSH access and remote tools. Local workspace isolation does not
+ban remote code changes or experiments. Use the user's project layout and named
+scheme directories, not a mandatory PCR timestamp/Agent namespace. Isolate actual
+concurrent write conflicts only, without moving paths used by existing jobs.
+For shared organization, deletion or deployment, only the user-designated
+executor (otherwise candidate Agent 1) acts; other candidates and synthesis
+Agents inspect or propose. Check target scope, active references and completion
+evidence before acting. A lock alone does not prevent repeating a completed action.
+Remote effects are not automatically
+synced back, rolled back, or cleaned up by candidate selection or discard;
+inspect the recorded host, workspace, job identifiers, and result paths.

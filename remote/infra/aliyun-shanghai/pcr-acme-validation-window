@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+action=${1:?open or close required}
+chain=IN_BT_Country
+comment=pcr-relay-acme-validation
+
+# Only bypass the geographic filter for HTTP validation. IP blocklists and
+# UFW remain in force; systemd removes the exception even if renewal fails.
+case "$action" in
+    open)
+        if ! /usr/sbin/iptables -w 10 -S "$chain" >/dev/null 2>&1; then
+            exit 0
+        fi
+        if ! /usr/sbin/iptables -w 10 -C "$chain" -p tcp --dport 80 -m comment --comment "$comment" -j RETURN 2>/dev/null; then
+            /usr/sbin/iptables -w 10 -I "$chain" 1 -p tcp --dport 80 -m comment --comment "$comment" -j RETURN
+        fi
+        ;;
+    close)
+        while /usr/sbin/iptables -w 10 -C "$chain" -p tcp --dport 80 -m comment --comment "$comment" -j RETURN 2>/dev/null; do
+            /usr/sbin/iptables -w 10 -D "$chain" -p tcp --dport 80 -m comment --comment "$comment" -j RETURN
+        done
+        ;;
+    *)
+        exit 64
+        ;;
+esac

@@ -4,16 +4,17 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PLUGIN_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$PLUGIN_DIR/../.." && pwd)
+SOURCE_ROOT="$REPO_ROOT/src"
 
 try_python() {
     candidate=$1
     if [ -z "$candidate" ] || [ ! -x "$candidate" ]; then
         return 1
     fi
-    if PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$candidate" -c \
+    if PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$candidate" -c \
         'import mcp.server.fastmcp; import parallel_codex_runner_core.plugin_mcp' \
         >/dev/null 2>&1; then
-        exec env PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        exec env PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
             "$candidate" -m parallel_codex_runner_core.plugin_mcp
     fi
     return 1
@@ -31,7 +32,14 @@ for name in python3 python; do
     try_python "$candidate" || true
 done
 
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+for candidate in \
+    "${HOME:-}/.local/bin/python3" \
+    "${HOME:-}/miniconda3/bin/python3" \
+    "${HOME:-}/anaconda3/bin/python3" \
+    "${HOME:-}/.pyenv/shims/python3" \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3; do
     try_python "$candidate" || true
 done
 

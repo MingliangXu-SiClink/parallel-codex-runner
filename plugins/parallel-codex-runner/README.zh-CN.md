@@ -17,7 +17,7 @@
 在仓库根目录安装 PCR 与 MCP Server：
 
 ```bash
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 ```
 
@@ -90,6 +90,7 @@ codex plugin add parallel-codex-runner@personal
 | `pcr_get_resume_history` | 分页读取所选会话中可见的历史对话。 |
 | `pcr_list_models` | 列出缓存中的模型及其兼容推理强度。 |
 | `pcr_list_runs` | App 重启后恢复查看保留或中断的运行。 |
+| `pcr_list_conversations` / `pcr_get_conversation` | 按顺序读取持久化的对话、回合和 Agent 候选。 |
 
 任务运行在独立 Worker 进程中。Codex 即使重启 MCP Server，也不会中断仍在执行的
 Agent；多个 Codex 窗口也可以共用插件状态目录。短时状态锁和按运行划分的操作锁会
@@ -101,11 +102,15 @@ Agent；多个 Codex 窗口也可以共用插件状态目录。短时状态锁�
 
 插件会在每个运行目录写入内部标记。执行 Diff、回写或删除前，会重新核对原工作区、运行目录、候选路径和标记。候选清理前还会把已完成 Agent 的 Diff 保存到磁盘，因此重启或删除候选工作区后仍可查看。
 
-默认的任务运行上限为 6 小时，运行产物保留 7 天，插件存储配额为 20 GiB。
-可以分别通过 `PCR_PLUGIN_RUN_TTL_SECONDS`、`PCR_PLUGIN_RETENTION_SECONDS` 和
-`PCR_PLUGIN_STORAGE_QUOTA_BYTES` 调整。主动停止或放弃仍是最快的资源回收方式。
-`keep_workspaces=true` 会同时保留候选工作区和对应的
-`meta/agent_*/codex_home`；关闭后则会一起删除。
+任务默认没有运行时限。仅在需要主动限制时，将 `PCR_PLUGIN_RUN_TTL_SECONDS`
+设置为正数秒数；不设置或设为 `0` 都表示不限时。即使显式设置的时限到期，也不会
+删除未完成的修改或 Agent 的私有会话。仍可随时主动停止或放弃任务。
+
+运行产物保留和执行时限互相独立：插件默认保留产物 7 天、存储配额为 20 GiB，
+分别通过 `PCR_PLUGIN_RETENTION_SECONDS` 和 `PCR_PLUGIN_STORAGE_QUOTA_BYTES`
+调整。保留策略不会清理仍在运行的任务；pcrd 会保留对话历史。
+`keep_workspaces=true` 会在采用结果后保留候选工作区和对应的
+`meta/agent_*/codex_home`；关闭后，仅在采用、放弃或产物保留期结束时清理。
 
 采用过程使用持久化日志记录回写阶段。如果 PCR 无法确认回写是否已经完成，它不会
 自动再次回写，而是要求检查原工作区后通过 `pcr_recover_finalization` 明确处理。
@@ -118,7 +123,7 @@ PCR 隔离的是工作区和 Git 管理数据，不是宿主机权限。Agent �
 
 ```bash
 python3 -m unittest tests.test_plugin_package tests.test_plugin_runtime
-python3 -m compileall -q parallel_codex_runner_core plugins/parallel-codex-runner/scripts
+python3 -m compileall -q src plugins/parallel-codex-runner/scripts
 git diff --check
 ```
 
@@ -126,7 +131,7 @@ git diff --check
 
 ## 常见问题
 
-- **MCP Server 无法启动：**重新运行 `python3 -m pip install --force-reinstall .`。插件自带的启动器会寻找能够导入 PCR 与 FastMCP 的绝对 Python 路径；需要固定环境时设置 `PCR_PYTHON`。
+- **MCP Server 无法启动：**重新运行 `python3 -m pip install --upgrade .`。插件自带的启动器会寻找能够导入 PCR 与 FastMCP 的绝对 Python 路径；需要固定环境时设置 `PCR_PYTHON`。
 - **MCP Server 重启后任务仍在运行：**这是预期行为。使用 `pcr_stop_run` 或 `pcr_discard_run` 主动停止，遗留任务还会受到 TTL 限制。
 - **找不到 Codex CLI：**确认同一运行环境能够执行 `codex --version`。
 - **重启后显示运行中断：**使用 `pcr_list_runs` 找到记录，然后重试符合条件的 Agent，或放弃并清理该运行。

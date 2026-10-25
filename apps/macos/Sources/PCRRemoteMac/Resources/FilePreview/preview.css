@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; }
+html, body { margin: 0; min-height: 100%; background: transparent; }
+body { overflow: auto; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; }
+#content { padding: 16px; box-sizing: border-box; min-height: 100vh; }
+.image-preview { display: block; margin: auto; height: auto; }
+.docx-wrapper { padding: 0 !important; background: transparent !important; align-items: center; }
+section.docx { color-scheme: light; box-shadow: none !important; margin-bottom: 20px !important; }
+section.docx:last-child { margin-bottom: 0 !important; }
+section.docx ins { background: #ddf6e4; text-decoration: underline; }
+section.docx del { background: #ffe4e4; text-decoration: line-through; }
+section.docx .docx-comment-ref { cursor: help; padding: 0 2px; }
+section.docx .docx-comment-popover { z-index: 10; max-width: 320px; overflow-wrap: anywhere; }
+/* Document ink and highlights retain their original colors in either app theme. */
+section.docx, section.docx article { background-color: white; color: black; }
+::selection { background-color: #a5c8fb; }

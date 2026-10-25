@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parallel-codex-runner.local/protocol/pcr-conversation-v1.schema.json",
+  "title": "Parallel Codex conversation domain protocol v1",
+  "description": "Canonical cross-client data model for machines, workspaces, conversations, turns, and Agent candidates.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine", "workspace", "conversation", "turn", "candidates"],
+  "properties": {
+    "schema_version": { "const": 1, "type": "integer" },
+    "machine": { "$ref": "#/$defs/MachineRecord" },
+    "workspace": { "$ref": "#/$defs/WorkspaceRecord" },
+    "conversation": { "$ref": "#/$defs/ConversationRecord" },
+    "turn": { "$ref": "#/$defs/TurnRecord" },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/AgentCandidateRecord" }
+    }
+  },
+  "$defs": {
+    "WorkOperationKind": {
+      "type": "string",
+      "enum": ["file_read", "file_search", "directory_list", "command", "file_change", "web_search", "unknown"]
+    },
+    "WorkOperationStatus": {
+      "type": "string",
+      "enum": ["running", "completed", "failed", "cancelled", "unknown"]
+    },
+    "WorkFileChangeKind": {
+      "type": "string",
+      "enum": ["create", "update", "delete", "rename", "unknown"]
+    },
+    "WorkOperationTarget": {
+      "type": "object",
+      "x-swift-hashable": true,
+      "properties": {
+        "path": { "type": "string" },
+        "change": { "$ref": "#/$defs/WorkFileChangeKind" },
+        "added": { "type": ["integer", "null"] },
+        "deleted": { "type": ["integer", "null"] }
+      }
+    },
+    "WorkOperationRecord": {
+      "type": "object",
+      "x-swift-hashable": true,
+      "properties": {
+        "id": { "type": "string" },
+        "event_id": { "type": "integer" },
+        "kind": { "$ref": "#/$defs/WorkOperationKind" },
+        "status": { "$ref": "#/$defs/WorkOperationStatus" },
+        "command": { "type": ["string", "null"] },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/WorkOperationTarget" } },
+        "query": { "type": ["string", "null"] },
+        "duration_ms": { "type": ["integer", "null"] },
+        "duration_source": { "type": ["string", "null"] },
+        "planned_duration_ms": { "type": ["integer", "null"] },
+        "wait_until": { "type": ["string", "null"] },
+        "output_bytes": { "type": ["integer", "null"] },
+        "exit_code": { "type": ["integer", "null"] },
+        "details_available": { "type": "boolean" }
+      }
+    },
+    "WorkOperationDetailPage": {
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "next_cursor": { "type": "integer" },
+        "has_more": { "type": "boolean" },
+        "total_bytes": { "type": "integer" },
+        "availability": { "type": "string" }
+      }
+    },
+    "AgentActivityRecord": {
+      "type": "object",
+      "x-swift-hashable": true,
+      "x-swift-parsed-timestamps": ["observed_at", "last_output_at", "wait_until"],
+      "properties": {
+        "state": { "type": "string" },
+        "observed_at": { "type": ["string", "null"] },
+        "last_output_at": { "type": ["string", "null"] },
+        "wait_until": { "type": ["string", "null"] },
+        "active_operation_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "TurnPhase": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "primary_running",
+        "synthesis_running",
+        "review",
+        "finalizing",
+        "finalized",
+        "stopped",
+        "failed",
+        "discarded",
+        "expired",
+        "cleanup_failed",
+        "sync_ambiguous",
+        "unknown"
+      ]
+    },
+    "CandidateRole": {
+      "type": "string",
+      "enum": ["candidate", "synthesis"]
+    },
+    "CandidateStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "copying",
+        "starting",
+        "resuming",
+        "submitting",
+        "waiting_for_output",
+        "running",
+        "waiting_for_models",
+        "stopping",
+        "success",
+        "failed",
+        "error",
+        "killed",
+        "stopped",
+        "cancelled",
+        "canceled",
+        "interrupted",
+        "discarded",
+        "unknown"
+      ]
+    },
+    "RunSettingsRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "num_agents",
+        "synthesis_agents",
+        "serial",
+        "recommend_by",
+        "follow_up_delay",
+        "subagents",
+        "subagents_limit",
+        "sync_back",
+        "keep_workspaces",
+        "codex_bin"
+      ],
+      "properties": {
+        "num_agents": { "type": "integer", "minimum": 1 },
+        "synthesis_agents": { "type": "integer", "minimum": 0 },
+        "max_parallel": { "type": ["integer", "null"], "minimum": 1 },
+        "serial": { "type": "boolean" },
+        "recommend_by": { "type": "string" },
+        "model": { "type": ["string", "null"] },
+        "effort": { "type": ["string", "null"] },
+        "fast": { "type": ["boolean", "null"] },
+        "synthesis_model": { "type": ["string", "null"] },
+        "synthesis_effort": { "type": ["string", "null"] },
+        "synthesis_fast": { "type": ["boolean", "null"] },
+        "follow_up_delay": { "type": "integer", "minimum": 0 },
+        "subagents": { "type": "boolean" },
+        "subagents_limit": { "type": "integer", "minimum": 1 },
+        "sync_back": { "type": "boolean" },
+        "keep_workspaces": { "type": "boolean" },
+        "resume_session_id": { "type": ["string", "null"] },
+        "runs_dir": { "type": ["string", "null"] },
+        "codex_bin": { "type": "string" }
+      }
+    },
+    "MachineRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_id", "name", "platform", "online", "updated_at"],
+      "properties": {
+        "machine_id": { "type": "string" },
+        "name": { "type": "string" },
+        "platform": { "type": "string" },
+        "online": { "type": "boolean" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "WorkspaceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_id", "machine_id", "name", "path", "available", "updated_at"],
+      "properties": {
+        "workspace_id": { "type": "string" },
+        "machine_id": { "type": "string" },
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "available": { "type": "boolean" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ConversationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "conversation_id",
+        "workspace_id",
+        "title",
+        "created_at",
+        "updated_at",
+        "turn_ids"
+      ],
+      "properties": {
+        "conversation_id": { "type": "string" },
+        "workspace_id": { "type": "string" },
+        "title": { "type": "string" },
+        "custom_title": { "type": ["string", "null"] },
+        "title_revision": { "type": ["integer", "null"], "minimum": 0 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "active_turn_id": { "type": ["string", "null"] },
+        "resume_session_id": { "type": ["string", "null"] },
+        "turn_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "TurnRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turn_id",
+        "conversation_id",
+        "run_id",
+        "turn_index",
+        "prompt",
+        "phase",
+        "settings",
+        "created_at",
+        "updated_at",
+        "candidate_ids"
+      ],
+      "properties": {
+        "turn_id": { "type": "string" },
+        "conversation_id": { "type": "string" },
+        "run_id": { "type": "string" },
+        "turn_index": { "type": "integer", "minimum": 0 },
+        "prompt": { "type": "string" },
+        "phase": { "$ref": "#/$defs/TurnPhase" },
+        "settings": { "$ref": "#/$defs/RunSettingsRecord" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "continued_from_turn_id": { "type": ["string", "null"] },
+        "continued_from_candidate_id": { "type": ["string", "null"] },
+        "recommended_candidate_id": { "type": ["string", "null"] },
+        "finalized_candidate_id": { "type": ["string", "null"] },
+        "candidate_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "AgentCandidateRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "turn_id",
+        "agent_index",
+        "display_name",
+        "role",
+        "status",
+        "reasoning_token_counts",
+        "rejected",
+        "stale",
+        "recommended",
+        "finalized",
+        "workspace_available",
+        "can_accept",
+        "can_continue",
+        "can_retry"
+      ],
+      "properties": {
+        "candidate_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "agent_index": { "type": "integer", "minimum": 1 },
+        "display_name": { "type": "string" },
+        "role": { "$ref": "#/$defs/CandidateRole" },
+        "status": { "$ref": "#/$defs/CandidateStatus" },
+        "seconds": { "type": ["number", "null"] },
+        "started_at": { "type": ["string", "null"] },
+        "finished_at": { "type": ["string", "null"] },
+        "activity": { "anyOf": [{ "$ref": "#/$defs/AgentActivityRecord" }, { "type": "null" }] },
+        "reasoning_tokens": { "type": ["integer", "null"], "format": "int64" },
+        "reasoning_token_counts": {
+          "type": "object",
+          "additionalProperties": { "type": "integer" }
+        },
+        "codex_thread_id": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] },
+        "rejected": { "type": "boolean" },
+        "stale": { "type": "boolean" },
+        "recommended": { "type": "boolean" },
+        "finalized": { "type": "boolean" },
+        "workspace_dir": { "type": ["string", "null"] },
+        "workspace_available": { "type": "boolean" },
+        "can_accept": { "type": "boolean" },
+        "can_continue": { "type": "boolean" },
+        "can_retry": { "type": "boolean" }
+      }
+    }
+  }
+}

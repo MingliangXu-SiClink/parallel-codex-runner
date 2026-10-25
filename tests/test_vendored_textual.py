@@ -26,7 +26,9 @@ class TextEditorApp(App[None]):
 class VendoredTextualTests(unittest.IsolatedAsyncioTestCase):
     def test_repository_uses_vendored_textual(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        vendored_source = repository / "vendor" / "textual" / "src"
+        vendored_source = (
+            repository / "src" / "parallel_codex_runner_core" / "_vendor"
+        )
         self.assertTrue(Path(textual.__file__).resolve().is_relative_to(vendored_source))
         self.assertEqual(textual.__version__, "8.2.8+pcr.1")
 

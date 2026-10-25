@@ -1,0 +1,19 @@
+{
+  "description": "Public test material only; never use these keys for a real device.",
+  "device_private_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "server_private_key": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+  "challenge": {
+    "authorization_generation": 7,
+    "challenge_id": "device-login-vector",
+    "device_id": "macos-vector",
+    "nonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+    "public_key": "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=",
+    "purpose": "session-bootstrap",
+    "relay_url": "https://relay.example",
+    "server_public_key": "NYBy1jZYgNGu6jKa35EhODhR7SGijjt16WXQ0s0WYlQ=",
+    "user_id": "user-vector",
+    "version": 1,
+    "expires_at": "2026-09-30T01:00:00+00:00"
+  },
+  "proof": "K2/Qrpn447ouwxIOETgm2Omex4pd5rH4cOUyYqobGRc="
+}

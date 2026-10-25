@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pcr-relay"
+version = "0.1.20"
+description = "Authenticated opaque-message relay for PCR Remote."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.16,<2",
+    "aiosqlite>=0.21,<1",
+    "asyncpg>=0.30,<1",
+    "cryptography>=42,<50",
+    "fastapi>=0.136,<1",
+    "httpx>=0.28,<1",
+    "PyJWT>=2.10,<3",
+    "sqlalchemy[asyncio]>=2.0.40,<3",
+    "uvicorn[standard]>=0.49,<1",
+]
+
+[project.scripts]
+pcr-relay = "pcr_relay.app:main"
+pcr-relay-admin = "pcr_relay.admin:main"
+pcr-relay-migrate = "pcr_relay.migrate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pcr_relay"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "pcr_relay/_alembic/alembic.ini"
+"migrations" = "pcr_relay/_alembic/migrations"

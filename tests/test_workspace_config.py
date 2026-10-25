@@ -29,6 +29,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             no_sync_back=False,
             keep_workspaces=False,
             resume_session_id=None,
+            resume_include_non_interactive=False,
+            runs_dir=None,
+            codex_bin="codex",
         )
 
     def test_settings_are_saved_per_workspace_and_round_trip(self) -> None:
@@ -56,6 +59,9 @@ class WorkspaceConfigTests(unittest.TestCase):
             args.follow_up_delay = 25
             args.no_sync_back = True
             args.keep_workspaces = True
+            args.resume_include_non_interactive = True
+            args.runs_dir = "/Volumes/External/.codex_parallel_runs"
+            args.codex_bin = "/opt/homebrew/bin/codex"
             settings = WorkspaceSettings.from_runtime(7, 3, args, "session-a")
 
             self.assertTrue(store.save(workspace_a, settings))
@@ -83,6 +89,12 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertTrue(restored.no_sync_back)
             self.assertTrue(restored.keep_workspaces)
             self.assertEqual(restored.resume_session_id, "session-a")
+            self.assertTrue(restored.resume_include_non_interactive)
+            self.assertEqual(
+                restored.runs_dir,
+                "/Volumes/External/.codex_parallel_runs",
+            )
+            self.assertEqual(restored.codex_bin, "/opt/homebrew/bin/codex")
 
     def test_saved_auto_and_default_values_clear_previous_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,6 +157,9 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "SYNTHESIS_FAST": False,
                 "FOLLOW_UP_DELAY": 45,
                 "RESUME": "saved-session",
+                "RESUME_INCLUDE_NON_INTERACTIVE": True,
+                "RUNS_DIR": "/saved/runs",
+                "CODEX_BIN": "/saved/codex",
             }
         )
         self.assertIsNotNone(saved)
@@ -157,6 +172,9 @@ class WorkspaceConfigTests(unittest.TestCase):
         args.synthesis_fast = True
         args.follow_up_delay = 12
         args.resume_session_id = "cli-session"
+        args.resume_include_non_interactive = False
+        args.runs_dir = "/cli/runs"
+        args.codex_bin = "/cli/codex"
         saved.apply_to_args(
             args,
             {
@@ -168,6 +186,9 @@ class WorkspaceConfigTests(unittest.TestCase):
                 "synthesis_fast",
                 "follow_up_delay",
                 "resume",
+                "resume_include_non_interactive",
+                "runs_dir",
+                "codex_bin",
             },
         )
         self.assertEqual(args.num_agents, 5)
@@ -178,6 +199,9 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertTrue(args.synthesis_fast)
         self.assertEqual(args.follow_up_delay, 12)
         self.assertEqual(args.resume_session_id, "cli-session")
+        self.assertFalse(args.resume_include_non_interactive)
+        self.assertEqual(args.runs_dir, "/cli/runs")
+        self.assertEqual(args.codex_bin, "/cli/codex")
         self.assertTrue(args.serial)
 
     def test_legacy_display_values_are_read(self) -> None:
@@ -222,6 +246,64 @@ class WorkspaceConfigTests(unittest.TestCase):
 
         self.assertEqual(args.follow_up_delay, 0)
         self.assertEqual(settings.to_mapping()["FOLLOW_UP_DELAY"], 0)
+
+    def test_partial_updates_preserve_other_workspace_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "project"
+            workspace.mkdir()
+            store = WorkspaceConfigStore(root / "settings.json")
+            original = WorkspaceSettings.from_mapping(
+                {
+                    "AGENTS": 4,
+                    "SYNTHESIS_AGENTS": 2,
+                    "MODEL": "gpt-test",
+                    "EFFORT": "high",
+                }
+            )
+            self.assertIsNotNone(original)
+            self.assertTrue(store.save(workspace, original))
+
+            updated = store.update(workspace, {"AGENTS": 7})
+
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.agents, 7)
+            self.assertEqual(updated.synthesis_agents, 2)
+            self.assertEqual(updated.model, "gpt-test")
+            self.assertEqual(updated.effort, "high")
+
+    def test_new_workspace_defaults_are_copied_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            store = WorkspaceConfigStore(root / "settings.json")
+
+            defaults = store.update_defaults(
+                {
+                    "AGENTS": 6,
+                    "SYNTHESIS_AGENTS": 3,
+                    "MODEL": "gpt-default",
+                    "KEEP_WORKSPACES": True,
+                    "RESUME": "session-must-not-leak",
+                }
+            )
+            self.assertIsNotNone(defaults)
+
+            initialized = store.initialize_from_defaults(first)
+            self.assertIsNotNone(initialized)
+            self.assertEqual(initialized.agents, 6)
+            self.assertEqual(initialized.synthesis_agents, 3)
+            self.assertEqual(initialized.model, "gpt-default")
+            self.assertTrue(initialized.keep_workspaces)
+            self.assertIsNone(initialized.resume_session_id)
+
+            store.update(first, {"AGENTS": 9})
+            store.update_defaults({"AGENTS": 2})
+            self.assertEqual(store.initialize_from_defaults(first).agents, 9)
+            self.assertEqual(store.initialize_from_defaults(second).agents, 2)
 
 
 if __name__ == "__main__":

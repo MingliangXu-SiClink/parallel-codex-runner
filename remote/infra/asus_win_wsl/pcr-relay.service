@@ -1,0 +1,33 @@
+[Unit]
+Description=Parallel Codex Runner remote relay
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pcr-relay
+Group=pcr-relay
+WorkingDirectory=/var/lib/pcr-relay
+EnvironmentFile=/etc/pcr-relay/pcr-relay.env
+ExecStart=/opt/pcr-relay/venv/bin/pcr-relay --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=true
+ReadWritePaths=/var/lib/pcr-relay /var/log/pcr-relay
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

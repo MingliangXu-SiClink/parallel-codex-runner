@@ -23,6 +23,7 @@ import parallel_codex_runner_core.paths as paths_core
 import parallel_codex_runner_core.workspace as workspace_core
 from parallel_codex_runner_core.codex_models import CodexModelInfo, CodexModelRegistry
 from parallel_codex_runner_core.diffing import build_workspace_diff_text
+from parallel_codex_runner_core.visible_paths import record_session_workspace_mapping
 from parallel_codex_runner import (
     AgentResult,
     AgentState,
@@ -811,10 +812,10 @@ class WorkspaceCopyTests(unittest.TestCase):
             (workspace / "tracked.txt").write_text("dirty", encoding="utf-8")
             run_base = root / "runs"
             dst = run_base / "workspaces" / "agent_001"
-            original_sync = workspace_core.sync_back_with_python
+            original_copy = workspace_core._copy_workspace_snapshot
             observed_lock = []
 
-            def sync_with_lock_check(src: Path, destination: Path) -> None:
+            def copy_with_lock_check(src: Path, destination: Path, **kwargs) -> None:
                 destination_index = workspace_core._git_index_path(destination)
                 self.assertIsNotNone(destination_index)
                 assert destination_index is not None
@@ -823,12 +824,12 @@ class WorkspaceCopyTests(unittest.TestCase):
                 self.assertIsNotNone(
                     workspace_core._owned_index_lock_file(lock_path)
                 )
-                original_sync(src, destination)
+                original_copy(src, destination, **kwargs)
 
             with mock.patch.object(
                 workspace_core,
-                "sync_back_with_python",
-                side_effect=sync_with_lock_check,
+                "_copy_workspace_snapshot",
+                side_effect=copy_with_lock_check,
             ):
                 copy_workspace(workspace, dst, run_base)
             try:
@@ -969,6 +970,155 @@ class WorkspaceCopyTests(unittest.TestCase):
                 cleanup_workspace_copy(workspace, agent)
 
     @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_missing_base_state_after_original_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                self._git(agent, "add", ".")
+                self._git(agent, "commit", "-m", "agent commit")
+
+                (workspace / "original.txt").write_text("original", encoding="utf-8")
+                self._git(workspace, "add", ".")
+                self._git(workspace, "commit", "-m", "original commit")
+                original_head = self._git(workspace, "rev-parse", "HEAD").stdout.strip()
+
+                marker = workspace_core._git_base_state_path(agent)
+                self.assertIsNotNone(marker)
+                assert marker is not None
+                marker.unlink()
+
+                with self.assertRaisesRegex(RuntimeError, "isolated Git metadata"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    self._git(workspace, "rev-parse", "HEAD").stdout.strip(),
+                    original_head,
+                )
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "base",
+                )
+                self.assertEqual(
+                    (workspace / "original.txt").read_text(encoding="utf-8"),
+                    "original",
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_missing_base_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                marker = workspace_core._git_base_state_path(agent)
+                self.assertIsNotNone(marker)
+                assert marker is not None
+                marker.unlink()
+
+                with self.assertRaisesRegex(RuntimeError, "isolated Git metadata"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "base",
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_unrecognized_isolation_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                marker = workspace_core._git_base_state_path(agent)
+                self.assertIsNotNone(marker)
+                assert marker is not None
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                payload["isolation"] = "unknown-isolation-kind"
+                marker.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.assertRaisesRegex(RuntimeError, "Git isolation"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "base",
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_rejects_agent_workspace_without_git_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            self._init_git_workspace(workspace, {"tracked.txt": "base"})
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+                shutil.rmtree(agent / ".git")
+
+                with self.assertRaisesRegex(RuntimeError, "no Git repository"):
+                    workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "base",
+                )
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
+    def test_git_sync_uses_file_path_for_unborn_original_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            self._git(workspace, "-c", "init.defaultBranch=main", "init")
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+
+            run_base = root / "runs"
+            agent = run_base / "workspaces" / "agent_001"
+            copy_workspace(workspace, agent, run_base)
+            try:
+                self.assertFalse((agent / ".git").exists())
+                (agent / "tracked.txt").write_text("agent", encoding="utf-8")
+
+                workspace_core.sync_best_workspace_back(agent, workspace)
+
+                self.assertEqual(
+                    (workspace / "tracked.txt").read_text(encoding="utf-8"),
+                    "agent",
+                )
+                self.assertTrue((workspace / ".git").is_dir())
+            finally:
+                cleanup_workspace_copy(workspace, agent)
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_cleanup_workspace_copies_prunes_worktree_record_when_root_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -1088,25 +1238,55 @@ class RunStorageEstimateTests(unittest.TestCase):
             codex_home.mkdir()
             config = codex_home / "config.toml"
             state = codex_home / "state_5.sqlite"
-            wal = codex_home / "state_5.sqlite-wal"
             rollout = codex_home / "sessions" / "rollout-session-1.jsonl"
             config.write_bytes(b"c" * 1024)
-            state.write_bytes(b"s" * 4096)
-            wal.write_bytes(b"w" * 2048)
             rollout.parent.mkdir()
             rollout.write_bytes(b"r" * 8192)
+            with sqlite3.connect(state) as connection:
+                connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+                connection.execute("INSERT INTO threads VALUES (?,?)", ("session-1", str(rollout)))
 
             estimated = app_core.estimate_agent_metadata_bytes(
                 codex_home,
                 "session-1",
                 runtime_reserve_bytes=123,
             )
-            expected = 123 + sum(
+            expected = 123 + app_core.scoped_database_bytes(state, "state", ("session-1",), (str(rollout),)) + sum(
                 workspace_core.estimate_path_storage_bytes(path)
-                for path in (config, state, wal, rollout)
+                for path in (config, rollout)
             )
 
         self.assertEqual(estimated, expected)
+
+    def test_rollout_lookup_stops_after_another_sessions_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            (sessions / "legacy.jsonl").touch()
+            reader = mock.MagicMock()
+            reader.__enter__.return_value = reader
+            reader.readline.side_effect = [
+                json.dumps({"type": "session_meta", "payload": {"id": "other"}}),
+                AssertionError("Must not read another conversation's message bodies"),
+            ]
+            with mock.patch.object(Path, "open", return_value=reader):
+                self.assertIsNone(app_core.find_rollout_path_for_session(home, "missing"))
+            self.assertEqual(reader.readline.call_count, 1)
+
+    def test_rollout_lookup_keeps_legacy_metadata_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            rollout = sessions / "legacy.jsonl"
+            rollout.write_text(
+                "invalid line\n"
+                + json.dumps({"type": "session_meta", "payload": {"id": "wanted"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(app_core.find_rollout_path_for_session(home, "wanted"), rollout)
 
     def test_run_storage_estimate_multiplies_workspace_and_meta_per_agent(self) -> None:
         with mock.patch.object(
@@ -1135,7 +1315,9 @@ class RunStorageEstimateTests(unittest.TestCase):
             app_core,
             "estimate_agent_metadata_bytes",
             return_value=80,
-        ) as estimate_metadata:
+        ) as estimate_metadata, mock.patch.object(
+            app_core, "estimate_resume_source_bytes", return_value=100,
+        ) as estimate_source:
             estimate = app_core.estimate_staged_run_storage(
                 Path.cwd(),
                 candidate_agents=3,
@@ -1145,10 +1327,14 @@ class RunStorageEstimateTests(unittest.TestCase):
 
         self.assertEqual(estimate.num_agents, 5)
         self.assertEqual(estimate.workspace_copies_bytes, 500)
-        self.assertEqual(estimate.metadata_bytes, 400)
-        self.assertEqual(estimate.total_bytes, 900)
+        self.assertEqual(estimate.metadata_bytes_per_agent, 180)
+        self.assertEqual(estimate.shared_source_bytes, 100)
+        self.assertEqual(estimate.metadata_bytes, 1000)
+        self.assertEqual(estimate.total_bytes, 1500)
         estimate_metadata.assert_called_once()
-        self.assertEqual(estimate_metadata.call_args.args[1], "session-1")
+        self.assertIsNone(estimate_metadata.call_args.args[1])
+        estimate_source.assert_called_once()
+        self.assertEqual(estimate_source.call_args.args[1], "session-1")
 
 
 class RunRootTests(unittest.TestCase):
@@ -1262,6 +1448,49 @@ class RunRootTests(unittest.TestCase):
 
 
 class CommandBuildTests(unittest.TestCase):
+    def test_codex_executable_falls_back_to_common_user_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            executable = home / ".local" / "bin" / "codex"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            resolved = codex_cli_core.resolve_codex_executable(
+                "codex",
+                home=home,
+                search_path="",
+            )
+
+            self.assertEqual(resolved, str(executable))
+
+    def test_codex_executable_finds_version_manager_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            executable = home / ".nvm" / "versions" / "node" / "v22.0.0" / "bin" / "codex"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            resolved = codex_cli_core.resolve_codex_executable(
+                "codex",
+                home=home,
+                search_path="",
+            )
+
+            self.assertEqual(resolved, str(executable))
+
+    def test_codex_environment_adds_executable_runtime_directory(self) -> None:
+        environment = codex_cli_core.codex_process_environment(
+            "/opt/homebrew/bin/codex",
+            {"PATH": "/usr/bin:/bin"},
+        )
+
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0],
+            "/opt/homebrew/bin",
+        )
+
     def test_model_uses_short_flag_when_only_short_flag_is_supported(self) -> None:
         cmd, caps = build_codex_command(
             "codex",
@@ -1539,7 +1768,7 @@ class CommandBuildTests(unittest.TestCase):
         process.stdin.close.assert_called_once()
         process.terminate.assert_called_once()
 
-    def test_workspace_guard_is_appended_and_config_is_resolved_once(self) -> None:
+    def test_workspace_guard_preserves_each_workspaces_effective_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / "codex-home"
@@ -1553,22 +1782,28 @@ class CommandBuildTests(unittest.TestCase):
             with mock.patch.object(
                 app_core,
                 "read_effective_codex_developer_instructions",
-                return_value="Project guidance.",
+                side_effect=["Project guidance.", "Other workspace guidance."],
             ) as read_instructions:
                 first = resolver.for_workspace(
                     codex_bin="codex",
                     codex_home=codex_home,
                     agent_workspace=first_workspace,
+                    run_root=root,
+                    agent_idx=1,
                 )
                 second = resolver.for_workspace(
                     codex_bin="codex",
                     codex_home=codex_home,
                     agent_workspace=second_workspace,
+                    run_root=root,
+                    agent_idx=2,
                     additional_instructions="Review the candidate results.",
                 )
 
-        read_instructions.assert_called_once()
+        self.assertEqual(read_instructions.call_count, 2)
         self.assertTrue(first.startswith("Project guidance.\n\n"))
+        self.assertTrue(second.startswith("Other workspace guidance.\n\n"))
+        self.assertNotIn("Project guidance.", second)
         self.assertIn(str(first_workspace.resolve()), first)
         self.assertNotIn(str(second_workspace.resolve()), first)
         self.assertLess(
@@ -1581,43 +1816,38 @@ class CommandBuildTests(unittest.TestCase):
         )
         self.assertIn("bounded calls that return once", second)
         self.assertIn(str(second_workspace.resolve()), second)
-        self.assertIn("Never modify the original workspace", second)
-        self.assertTrue(second.endswith("but they are read-only."))
+        self.assertIn("Never modify any other local workspace", second)
+        self.assertIn("but they are read-only.", second)
+        self.assertIn("PCR remote environment access:", second)
+        self.assertIn(json.dumps({"run": root.name, "agent": 1}), first)
+        self.assertNotIn(json.dumps({"run": root.name, "agent": 2}), first)
+        self.assertIn(json.dumps({"run": root.name, "agent": 2}), second)
+        self.assertNotIn(".pcr/", first)
 
-    def test_workspace_guard_survives_optional_config_read_failure(self) -> None:
+    def test_legacy_config_failure_never_drops_existing_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / "codex-home"
             first_workspace = root / "workspaces" / "agent_001"
-            second_workspace = root / "workspaces" / "agent_002"
             codex_home.mkdir()
             first_workspace.mkdir(parents=True)
-            second_workspace.mkdir(parents=True)
             resolver = app_core._AgentDeveloperInstructionResolver()
 
             with mock.patch.object(
                 app_core,
                 "read_effective_codex_developer_instructions",
                 side_effect=RuntimeError("config/read unavailable"),
-            ) as read_instructions, mock.patch.object(
-                app_core.logger,
-                "warning",
-            ) as warning:
-                first = resolver.for_workspace(
-                    codex_bin="codex",
-                    codex_home=codex_home,
-                    agent_workspace=first_workspace,
-                )
-                second = resolver.for_workspace(
-                    codex_bin="codex",
-                    codex_home=codex_home,
-                    agent_workspace=second_workspace,
-                )
+            ) as read_instructions:
+                with self.assertRaisesRegex(RuntimeError, "config/read unavailable"):
+                    resolver.for_workspace(
+                        codex_bin="codex",
+                        codex_home=codex_home,
+                        agent_workspace=first_workspace,
+                        run_root=root,
+                        agent_idx=1,
+                    )
 
         read_instructions.assert_called_once()
-        warning.assert_called_once()
-        self.assertIn(str(first_workspace.resolve()), first)
-        self.assertIn(str(second_workspace.resolve()), second)
 
     def test_synthesis_does_not_discard_existing_instructions_on_read_failure(
         self,
@@ -1639,6 +1869,8 @@ class CommandBuildTests(unittest.TestCase):
                     codex_bin="codex",
                     codex_home=codex_home,
                     agent_workspace=workspace,
+                    run_root=root,
+                    agent_idx=1,
                     additional_instructions="Review every candidate.",
                 )
 
@@ -1783,6 +2015,22 @@ class CommandBuildTests(unittest.TestCase):
 
 
 class ArgParseTests(unittest.TestCase):
+    def test_version_flag_reports_the_installed_distribution(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                app_core,
+                "distribution_version",
+                return_value="9.8.7",
+            ),
+            mock.patch("sys.stdout", output),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "pcr 9.8.7")
+
     def test_default_agent_counts_are_four_candidates_and_two_synthesis(self) -> None:
         args = parse_args(["fix tests"])
 
@@ -2171,8 +2419,80 @@ class SynthesisTests(unittest.TestCase):
             {1, 2, 3},
         )
 
+    def test_targeted_synthesis_retry_keeps_other_synthesis_results_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            candidate = AgentResult(
+                **make_agent_result_data(1, root / "candidate-1")
+            )
+            synthesis_two = AgentResult(
+                **make_agent_result_data(
+                    2,
+                    root / "synthesis-2",
+                    role="synthesis",
+                )
+            )
+            synthesis_three = AgentResult(
+                **make_agent_result_data(
+                    3,
+                    root / "synthesis-3",
+                    role="synthesis",
+                )
+            )
+            args = parse_args(["review", "--synthesis-agents", "2"])
+
+            with mock.patch.object(
+                app_core,
+                "run_additional_agents",
+                return_value=[synthesis_two],
+            ) as run_additional:
+                app_core.run_synthesis_refresh(
+                    args=args,
+                    prompt="review",
+                    run_root=root,
+                    workspace=workspace,
+                    recorded_results=[candidate, synthesis_two, synthesis_three],
+                    synthesis_indices=[2],
+                    retry_synthesis_indices={2},
+                    recommendation_excluded_indices={9},
+                )
+
+            kwargs = run_additional.call_args.kwargs
+            self.assertEqual(kwargs["recommendation_excluded_indices"], {9})
+            self.assertEqual(kwargs["synthesis_requested_agents"], 2)
+
 
 class ReasoningEffortTests(unittest.TestCase):
+    def test_known_model_does_not_offer_an_incompatible_saved_effort(self) -> None:
+        registry = CodexModelRegistry(
+            models={
+                "gpt-narrow": CodexModelInfo(
+                    slug="gpt-narrow",
+                    default_effort="medium",
+                    supported_efforts=("low", "medium", "high"),
+                )
+            }
+        )
+
+        values = [
+            value
+            for _label, value in registry.effort_options("gpt-narrow", "ultra")
+        ]
+
+        self.assertNotIn("ultra", values)
+
+    def test_unknown_model_keeps_a_custom_saved_effort_visible(self) -> None:
+        registry = CodexModelRegistry(models={})
+
+        values = [
+            value
+            for _label, value in registry.effort_options("custom-model", "custom")
+        ]
+
+        self.assertIn("custom", values)
+
     def test_auto_effort_falls_back_to_model_default_when_config_is_unsupported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2211,6 +2531,14 @@ class ReasoningEffortTests(unittest.TestCase):
 
 
 class RunOnceCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transport = mock.patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "exec"})
+        transport.start()
+        self.addCleanup(transport.stop)
+        model_cache = mock.patch.object(app_core.CodexModelCacheManager, "populate", return_value=False)
+        model_cache.start()
+        self.addCleanup(model_cache.stop)
+
     def test_run_once_cleans_partial_workspace_when_copy_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2227,10 +2555,13 @@ class RunOnceCleanupTests(unittest.TestCase):
 
             with mock.patch.object(app_core, "read_codex_exec_help", return_value="Usage: codex exec [OPTIONS] [PROMPT]\n  --json\n"):
                 with mock.patch.object(app_core, "copy_workspace", side_effect=fail_copy):
-                    with self.assertRaises(RuntimeError):
-                        app_core.run_once(args, "prompt", progress_callback=lambda _payload: None, print_output=False)
+                    returncode = app_core.run_once(args, "prompt", progress_callback=lambda _payload: None, print_output=False)
 
+            self.assertEqual(returncode, 2)
             self.assertFalse(any(path.exists() for path in runs.glob("*/workspaces")))
+            summary = json.loads(next(runs.glob("*/summary.json")).read_text(encoding="utf-8"))
+            self.assertEqual(summary["results"][0]["status"], "error")
+            self.assertIn("copy failed", summary["results"][0]["error"])
 
     def test_run_once_sync_failure_still_cleans_and_writes_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2375,6 +2706,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                 destination: Path,
                 _workspace: Path,
                 session_id: str | None,
+                **_kwargs: object,
             ) -> None:
                 destination.mkdir(parents=True, exist_ok=True)
                 prepared_session_ids.append(session_id)
@@ -2488,16 +2820,12 @@ class RunOnceCleanupTests(unittest.TestCase):
                 )
             )
             for idx in range(1, 5):
-                self.assertIn(
-                    str(
-                        (
-                            run_root
-                            / "workspaces"
-                            / f"agent_{idx:03d}"
-                        ).resolve()
-                    ),
-                    str(build_calls[idx - 1].get("developer_instructions") or ""),
-                )
+                agent_workspace = str((run_root / "workspaces" / f"agent_{idx:03d}").resolve())
+                matching_commands = [
+                    call for call in build_calls
+                    if agent_workspace in str(call.get("developer_instructions") or "")
+                ]
+                self.assertEqual(len(matching_commands), 1)
                 received_prompt = (
                     run_root
                     / "workspaces"
@@ -2513,7 +2841,9 @@ class RunOnceCleanupTests(unittest.TestCase):
                 Path(summary["synthesis"]["instructions_path"]).resolve(),
                 instructions_path.resolve(),
             )
-            self.assertEqual(read_instructions.call_count, 2)
+            self.assertEqual(read_instructions.call_count, 4)
+            self.assertEqual(len({call.args[1] for call in read_instructions.call_args_list}), 4)
+            self.assertEqual(len({call.args[2] for call in read_instructions.call_args_list}), 4)
             self.assertTrue(
                 all(
                     str(call.get("developer_instructions") or "").startswith(
@@ -2602,6 +2932,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                 destination: Path,
                 _workspace: Path,
                 session_id: str | None,
+                **_kwargs: object,
             ) -> None:
                 destination.mkdir(parents=True, exist_ok=True)
                 prepared_session_ids.append(session_id)
@@ -2719,6 +3050,7 @@ class RunOnceCleanupTests(unittest.TestCase):
                 destination: Path,
                 _workspace: Path,
                 _session_id: str | None,
+                **_kwargs: object,
             ) -> None:
                 destination.mkdir(parents=True, exist_ok=True)
 
@@ -3027,6 +3359,15 @@ class LiveCandidateCoordinatorTests(unittest.TestCase):
 
 
 class AdditionalAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transport = mock.patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "exec"})
+        transport.start()
+        self.addCleanup(transport.stop)
+
+        model_cache = mock.patch.object(app_core.CodexModelCacheManager, "populate", return_value=False)
+        model_cache.start()
+        self.addCleanup(model_cache.stop)
+
     def test_additional_agents_use_global_indices_and_retry_fresh_workspaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3106,8 +3447,10 @@ class AdditionalAgentTests(unittest.TestCase):
             self.assertEqual(summary["recommend_by"], "duration")
             self.assertNotIn("best_by", summary)
             self.assertEqual([result["idx"] for result in summary["results"]], [3, 4])
-            started = [event["idx"] for event in events if event.get("type") == "agent_started"]
-            self.assertEqual(started, [3, 4, 3])
+            started = [event["idx"] for event in events if event.get("type") == "agent_process_started"]
+            self.assertEqual(len(started), 3)
+            self.assertEqual(set(started[:2]), {3, 4})
+            self.assertEqual(started[2], 3)
             self.assertTrue(
                 all(call.kwargs["fast"] is True for call in build_command.call_args_list)
             )
@@ -3789,16 +4132,23 @@ class TuiCommandTests(unittest.TestCase):
         app.agents[3].result = {"status": "failed"}
         app.agents[5].result = {"status": "success"}
 
-        with mock.patch.object(app, "_finalize_agent", return_value=False) as finalize:
+        target_idx, needs_confirm = app._determine_exit_target()
+        self.assertEqual(target_idx, 5)
+        self.assertTrue(needs_confirm)
+
+        with mock.patch.object(app, "_finalize_agent", return_value=True) as finalize:
             with mock.patch.object(app, "exit") as exit_app:
-                app._request_exit()
+                with mock.patch.object(app, "push_screen") as push_screen:
+                    app._request_exit()
+                    push_screen.assert_called_once()
+                    screen, callback = push_screen.call_args[0]
+                    callback("finalize-5")
 
         finalize.assert_called_once_with(
-            3,
+            5,
             require_resume=False,
-            archive_detail=False,
         )
-        exit_app.assert_not_called()
+        exit_app.assert_called_once()
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_exit_discards_run_when_no_agent_succeeded(self) -> None:
@@ -6873,6 +7223,8 @@ class TuiCommandTests(unittest.TestCase):
         self.assertTrue(app.follow_up_queue_editor_resume_after)
         self.assertIsNone(app.follow_up_continue_at)
         self.assertIsNone(app._follow_up_countdown_second)
+        # Opening the editor should save the remaining time (130 - 100 = 30s).
+        self.assertEqual(app.follow_up_queue_editor_saved_remaining, 30.0)
 
         with mock.patch.object(tui_textual.time, "monotonic", return_value=200.0):
             with mock.patch.object(app, "_dispatch_follow_up") as dispatch:
@@ -6882,9 +7234,10 @@ class TuiCommandTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertFalse(app.follow_up_queue_editor_open)
         self.assertFalse(app.follow_up_queue_editor_resume_after)
-        self.assertEqual(app.follow_up_continue_at, 260.0)
-        self.assertEqual(app._follow_up_countdown_second, 60)
-        self.assertIn("in 60s", app.status)
+        # Closing the editor should restore the remaining 30s, not restart from 60s.
+        self.assertEqual(app.follow_up_continue_at, 230.0)
+        self.assertEqual(app._follow_up_countdown_second, 30)
+        self.assertIn("in 30s", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_changing_follow_up_delay_restarts_active_countdown(self) -> None:
@@ -6986,7 +7339,7 @@ class TuiCommandTests(unittest.TestCase):
         asyncio.run(run())
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_switching_agent_restarts_follow_up_countdown(self) -> None:
+    def test_tui_switching_agent_preserves_follow_up_countdown(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
         app._sync = lambda: None
         app.follow_up_queue.append(
@@ -7000,12 +7353,13 @@ class TuiCommandTests(unittest.TestCase):
             app._switch_agent(1)
 
         self.assertEqual(app.selected_agent, 2)
-        self.assertEqual(app.follow_up_continue_at, 160.0)
-        self.assertEqual(app._follow_up_countdown_second, 60)
-        self.assertIn("AGENT-002 in 60s", app.status)
+        # Switching agents preserves the countdown instead of restarting it.
+        # The user would be frustrated if every agent switch extended the delay.
+        self.assertEqual(app.follow_up_continue_at, 105.0)
+        self.assertEqual(app._follow_up_countdown_second, 5)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
-    def test_tui_switching_agent_restarts_expired_follow_up_review(self) -> None:
+    def test_tui_switching_agent_preserves_expired_follow_up_review(self) -> None:
         app = tui_textual.PcrTextualApp(parse_args(["-n", "2"]))
         app._sync = lambda: None
         app.follow_up_queue.append(
@@ -7017,9 +7371,10 @@ class TuiCommandTests(unittest.TestCase):
         with mock.patch.object(tui_textual.time, "monotonic", return_value=100.0):
             app._switch_agent(1)
 
-        self.assertEqual(app.follow_up_continue_at, 160.0)
-        self.assertFalse(app.follow_up_ready)
-        self.assertEqual(app._follow_up_countdown_second, 60)
+        # Switching agents does not restart the countdown. If the follow-up
+        # was ready before the switch, it remains ready.
+        self.assertIsNone(app.follow_up_continue_at)
+        self.assertTrue(app.follow_up_ready)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_context_change_clears_bound_follow_ups_after_finalize(self) -> None:
@@ -7137,21 +7492,20 @@ class TuiCommandTests(unittest.TestCase):
                         return_value=58.5,
                     ):
                         app._tick()
-                    await pilot.pause()
 
-                    self.assertEqual(app._follow_up_countdown_second, 42)
-                    self.assertIn(
-                        "AGENT-002 in 42s",
-                        str(app.query_one("#runner-conversation").content),
-                    )
-                    self.assertIn(
-                        "starts in 42s",
-                        str(app.query_one("#follow-up-queue").content),
-                    )
-                    self.assertIn(
-                        "in 42s",
-                        str(app.query_one("#state").content),
-                    )
+                        self.assertEqual(app._follow_up_countdown_second, 42)
+                        self.assertIn(
+                            "AGENT-002 in 42s",
+                            str(app.query_one("#runner-conversation").content),
+                        )
+                        self.assertIn(
+                            "starts in 42s",
+                            str(app.query_one("#follow-up-queue").content),
+                        )
+                        self.assertIn(
+                            "in 42s",
+                            str(app.query_one("#state").content),
+                        )
                     app.follow_up_continue_at = None
                     app.follow_up_queue.clear()
 
@@ -7354,6 +7708,59 @@ class TuiCommandTests(unittest.TestCase):
             self.assertIn("thought", history_text)
             self.assertIn("draft answer", history_text)
             self.assertIn("final answer", history_text)
+
+    @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
+    def test_tui_finalize_archives_links_to_the_original_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            candidate = root / "run" / "workspaces" / "agent_002"
+            workspace.mkdir()
+            candidate.mkdir(parents=True)
+            (workspace / "README.md").write_text("accepted", encoding="utf-8")
+            args = parse_args([])
+            args.workspace = str(workspace)
+            app = tui_textual.PcrTextualApp(args)
+            app.pending_workspaces_root = candidate.parent
+            pane = app.agents[2]
+            pane.output_lines = [f"See [{candidate.name}]({candidate}/README.md)"]
+            pane.final_text = f"Open `{candidate}/README.md:4`"
+            pane.result = {
+                "idx": 2,
+                "workspace_dir": str(candidate),
+                "meta_dir": "",
+                "codex_home": "",
+                "stdout_log": "",
+                "stderr_log": "",
+                "final_message": "",
+                "command": [],
+                "returncode": 0,
+                "status": "success",
+                "seconds": 1.0,
+                "codex_thread_id": "session-2",
+                "reasoning_tokens": 10,
+                "reasoning_token_values": [10],
+                "error": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+            with mock.patch.object(
+                tui_textual,
+                "promote_best_codex_session_to_workspace",
+                side_effect=lambda result, _workspace: result,
+            ):
+                with mock.patch.object(tui_textual, "sync_best_workspace_back"):
+                    with mock.patch.object(tui_textual, "cleanup_workspace_copies"):
+                        self.assertTrue(app._finalize_agent(2, archive_detail=True))
+
+            history_text = "\n".join(
+                block for _prefix, block, _style in app.detail_history
+            )
+            visible_workspace = workspace.resolve()
+            self.assertIn(f"({visible_workspace}/README.md)", history_text)
+            self.assertIn(f"`{visible_workspace}/README.md:4`", history_text)
+            self.assertNotIn(str(candidate), history_text)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_left_right_switches_when_detail_scroll_has_focus(self) -> None:
@@ -7958,7 +8365,11 @@ class TuiCommandTests(unittest.TestCase):
                 pane.output_lines.extend(f"new line {idx}" for idx in range(30))
                 app._mark_detail_dirty(pane)
                 app._sync()
-                await pilot.pause()
+                # Tail following settles again after the new content geometry refreshes.
+                for _ in range(3):
+                    await pilot.pause()
+                    if scroll.is_vertical_scroll_end:
+                        break
 
                 self.assertTrue(scroll.is_vertical_scroll_end)
 
@@ -8641,8 +9052,108 @@ class StreamLogTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_stream_to_log_reports_model_refresh_without_losing_diagnostic(self) -> None:
+        async def run() -> None:
+            raw_line = (
+                b"2026-08-24T01:02:03Z ERROR codex_models_manager::manager: "
+                b"failed to refresh available models: timeout waiting for child process to exit\n"
+            )
+            reader = asyncio.StreamReader(limit=8)
+            reader.feed_data(raw_line)
+            reader.feed_eof()
+            events = []
+            state = AgentState(idx=7)
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = Path(tmp) / "stderr.log"
+                await stream_to_log(reader, log_path, state, "stderr", events.append)
+
+                self.assertEqual(log_path.read_bytes(), raw_line)
+
+            self.assertEqual(state.models_manager_timeouts, 1)
+            self.assertTrue(
+                any(
+                    event.get("type") == "agent_status"
+                    and event.get("status") == "waiting_for_models"
+                    for event in events
+                )
+            )
+
+        asyncio.run(run())
+
 
 class AgentCancelTests(unittest.TestCase):
+    def test_run_one_agent_waits_through_repeated_model_refresh_errors(self) -> None:
+        async def run() -> None:
+            marker = (
+                "ERROR codex_models_manager::manager: failed to refresh available "
+                "models: timeout waiting for child process to exit"
+            )
+            script = (
+                "import sys,time; "
+                f"sys.stderr.write({(marker + chr(10) + marker + chr(10))!r}); "
+                "sys.stderr.flush(); time.sleep(1.1); print('ready')"
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+                started = time.monotonic()
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=root / "meta",
+                    codex_home=codex_home,
+                    prompt="",
+                    command=[sys.executable, "-c", script],
+                )
+
+            self.assertEqual(result.status, "success")
+            self.assertIsNone(result.error)
+            self.assertGreater(time.monotonic() - started, 1)
+            self.assertLess(time.monotonic() - started, 4)
+
+        asyncio.run(run())
+
+    @unittest.skipIf(os.name != "posix", "process group signalling is POSIX only")
+    def test_run_one_agent_can_cancel_while_model_refresh_is_still_pending(self) -> None:
+        async def run() -> None:
+            marker = (
+                "ERROR codex_models_manager::manager: failed to refresh available "
+                "models: timeout waiting for child process to exit"
+            )
+            script = (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                f"sys.stderr.write({(marker + chr(10) + marker + chr(10))!r}); "
+                "sys.stderr.flush(); time.sleep(30)"
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                codex_home = root / "codex_home"
+                workspace.mkdir()
+                codex_home.mkdir()
+                cancel = threading.Event()
+                loop = asyncio.get_running_loop()
+                loop.call_later(0.3, cancel.set)
+                result = await run_one_agent(
+                    idx=1,
+                    agent_workspace=workspace,
+                    meta_dir=root / "meta",
+                    codex_home=codex_home,
+                    prompt="",
+                    command=[sys.executable, "-c", script],
+                    cancel_event=cancel,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.status, "cancelled")
+            self.assertIsNone(result.error)
+
+        asyncio.run(run())
+
     def test_run_one_agent_scrubs_codex_support_entries_after_process_exit(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:
@@ -8883,7 +9394,7 @@ class AgentCancelTests(unittest.TestCase):
                         and event.get("idx") == 2
                     ):
                         agent_cancel_events[2].set()
-                    if event.get("type") == "agent_started" and event.get("idx") == 1:
+                    if event.get("type") == "agent_process_started" and event.get("idx") == 1:
                         agent_cancel_events[1].set()
 
                 results = await app_core.run_all_agents(
@@ -8906,8 +9417,62 @@ class AgentCancelTests(unittest.TestCase):
                 {1: "killed", 2: "success"},
             )
             self.assertEqual(
-                [event.get("idx") for event in events if event.get("type") == "agent_started"],
+                [event.get("idx") for event in events if event.get("type") == "agent_process_started"],
                 [1, 2],
+            )
+
+        asyncio.run(run())
+
+    def test_run_all_agents_prepares_cache_only_after_concurrency_slot(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspaces = root / "workspaces"
+                meta = root / "meta"
+                codex_homes = {
+                    1: root / "codex_home_1",
+                    2: root / "codex_home_2",
+                }
+                for idx in (1, 2):
+                    (workspaces / f"agent_{idx:03d}").mkdir(parents=True)
+                    codex_homes[idx].mkdir()
+
+                active_preparers = 0
+                maximum_active_preparers = 0
+                lock = threading.Lock()
+
+                def prepare(_codex_home: Path) -> bool:
+                    nonlocal active_preparers, maximum_active_preparers
+                    with lock:
+                        active_preparers += 1
+                        maximum_active_preparers = max(
+                            maximum_active_preparers,
+                            active_preparers,
+                        )
+                    time.sleep(0.05)
+                    with lock:
+                        active_preparers -= 1
+                    return True
+
+                results = await app_core.run_all_agents(
+                    n=2,
+                    workspaces_root=workspaces,
+                    meta_root=meta,
+                    prompt="",
+                    command_by_agent={
+                        1: [sys.executable, "-c", "print('one')"],
+                        2: [sys.executable, "-c", "print('two')"],
+                    },
+                    codex_home_by_agent=codex_homes,
+                    max_parallel=1,
+                    progress_callback=lambda _event: None,
+                    agent_start_preparer=prepare,
+                )
+
+            self.assertEqual(maximum_active_preparers, 1)
+            self.assertEqual(
+                {result.idx: result.status for result in results},
+                {1: "success", 2: "success"},
             )
 
         asyncio.run(run())
@@ -9143,8 +9708,8 @@ class ResumeSessionTests(unittest.TestCase):
             sessions = real_home / "sessions" / "2026" / "07" / "30"
             sessions.mkdir(parents=True)
             agent_workspace.mkdir(parents=True)
-            session_id = "019f-orphan-output"
-            rollout = sessions / f"rollout-{session_id}.jsonl"
+            session_id = "11111111-1111-4111-8111-111111111111"
+            rollout = sessions / f"rollout-2026-07-30T00-00-00-{session_id}.jsonl"
             records = [
                 {
                     "type": "session_meta",
@@ -9307,6 +9872,15 @@ class ResumeSessionTests(unittest.TestCase):
                     ("output", "previous answer"),
                 ],
             )
+            self.assertEqual(
+                [entry.id for entry in history],
+                [
+                    "history:session-1:3",
+                    "history:session-1:5",
+                    "history:session-1:7",
+                ],
+            )
+            self.assertTrue(all(entry.turn_id == "turn-1" for entry in history))
 
     def test_load_codex_session_history_falls_back_to_response_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9341,6 +9915,179 @@ class ResumeSessionTests(unittest.TestCase):
             self.assertEqual(
                 [(entry.category, entry.text) for entry in history],
                 [("user", "fallback question"), ("output", "fallback answer")],
+            )
+
+    def test_load_codex_session_history_renders_file_citation_directives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-session-1.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "session-1"}},
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": (
+                            'Created :codex-file-citation{path="/workspace/result file.md" '
+                            'purpose="output"}.'
+                        ),
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            history = load_codex_session_history(root, "session-1", rollout)
+
+            self.assertEqual(
+                history[0].text,
+                "Created [result file.md](<file:///workspace/result%20file.md>).",
+            )
+
+    def test_load_codex_session_history_deduplicates_citation_enriched_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-session-1.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "session-1"}},
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "turn-1"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "final answer\n\n",
+                        "phase": "final_answer",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": (
+                                    "final answer\n\n"
+                                    "<oai-mem-citation>\n"
+                                    "<citation_entries>\n"
+                                    "MEMORY.md:1-2|note=[context]\n"
+                                    "</citation_entries>\n"
+                                    "<rollout_ids></rollout_ids>\n"
+                                    "</oai-mem-citation>"
+                                ),
+                            }
+                        ],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": "turn-1"
+                        },
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            history = load_codex_session_history(root, "session-1", rollout)
+
+            self.assertEqual(
+                [(entry.category, entry.text) for entry in history],
+                [("output", "final answer")],
+            )
+            self.assertEqual(history[0].id, "history:session-1:2")
+
+    def test_load_codex_session_history_maps_only_accepted_agent_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex"
+            rollout = codex_home / "rollout-session-1.jsonl"
+            candidate = root / "runs" / "workspaces" / "agent_001"
+            workspace = root / "Project Name"
+            workspace.mkdir()
+            (workspace / "README.md").write_text("accepted", encoding="utf-8")
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "session-1"}},
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"Keep this literal: {candidate}/README.md",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": f"Open [{candidate.name}]({candidate}/README.md)",
+                    },
+                },
+            ]
+            codex_home.mkdir()
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            record_session_workspace_mapping(
+                codex_home,
+                "session-1",
+                candidate,
+                workspace,
+            )
+
+            history = load_codex_session_history(
+                codex_home,
+                "session-1",
+                rollout,
+            )
+
+            self.assertIn(str(candidate), history[0].text)
+            self.assertIn(f"({workspace}/README.md)", history[1].text)
+            self.assertNotIn(str(candidate), history[1].text)
+
+    def test_load_codex_session_history_stops_at_the_run_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-session-1.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "session-1"}},
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "earlier question"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "earlier answer"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "current question"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "current answer"},
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            history = load_codex_session_history(
+                root,
+                "session-1",
+                rollout,
+                max_lines=3,
+            )
+
+            self.assertEqual(
+                [(entry.category, entry.text) for entry in history],
+                [("user", "earlier question"), ("output", "earlier answer")],
             )
 
     def test_codex_sqlite_access_is_serialized_across_threads(self) -> None:
@@ -9444,6 +10191,102 @@ class ResumeSessionTests(unittest.TestCase):
 
             self.assertEqual([s.session_id for s in default_sessions], ["interactive"])
             self.assertEqual([s.session_id for s in all_sessions], ["exec", "interactive"])
+
+    def test_empty_compatible_state_does_not_fall_back_to_rollout_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            conn = sqlite3.connect(root / "state_5.sqlite")
+            try:
+                conn.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, source TEXT)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with (
+                mock.patch.object(app_core, "get_codex_home", return_value=root),
+                mock.patch.object(
+                    app_core,
+                    "load_resume_sessions_from_jsonl",
+                    side_effect=AssertionError("rollout scan must not run"),
+                ),
+            ):
+                sessions = app_core.list_resume_sessions(workspace)
+
+            self.assertEqual(sessions, [])
+            self.assertEqual(sessions.source, "state")
+            self.assertTrue(sessions.complete)
+
+    def test_state_loader_matches_resolved_workspace_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            alias = root / "workspace-alias"
+            workspace.mkdir()
+            alias.symlink_to(workspace, target_is_directory=True)
+            conn = sqlite3.connect(root / "state_5.sqlite")
+            try:
+                conn.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, source TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    ("session-alias", str(alias), "cli"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            sessions = app_core.query_resume_sessions_from_state(root, workspace)
+
+            self.assertTrue(sessions.available)
+            self.assertEqual([item.session_id for item in sessions.sessions], ["session-alias"])
+
+    def test_jsonl_loader_samples_sparse_large_rollout_and_reuses_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            sessions = root / "sessions" / "2026" / "08" / "24"
+            workspace.mkdir()
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout-large.jsonl"
+            meta = {
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-large",
+                    "cwd": str(workspace),
+                    "source": "vscode",
+                },
+            }
+            final = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Latest answer"}],
+                },
+            }
+            with rollout.open("wb") as handle:
+                handle.write(json.dumps(meta).encode("utf-8") + b"\n")
+                handle.seek(64 * 1024 * 1024)
+                handle.write(b"\n" + json.dumps(final).encode("utf-8") + b"\n")
+
+            with mock.patch.object(
+                app_core,
+                "_read_resume_index_entry",
+                wraps=app_core._read_resume_index_entry,
+            ) as read_entry:
+                first = app_core.load_resume_sessions_from_jsonl(root, workspace)
+                second = app_core.load_resume_sessions_from_jsonl(root, workspace)
+
+            self.assertEqual([item.session_id for item in first], ["session-large"])
+            self.assertEqual(first[0].preview, "Latest answer")
+            self.assertEqual([item.session_id for item in second], ["session-large"])
+            self.assertEqual(read_entry.call_count, 1)
+            self.assertTrue((root / ".pcr" / app_core.RESUME_INDEX_FILENAME).is_file())
 
     def test_state_loader_excludes_and_rejects_codex_v2_subagents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9687,9 +10530,15 @@ class ResumeSessionTests(unittest.TestCase):
             real_home.mkdir()
             agent_workspace.mkdir(parents=True)
 
-            session_id = "019f-rollout-context"
+            session_id = "22222222-2222-4222-8222-222222222222"
             old_workspace = "/tmp/removed-pcr-worktree"
-            rollout = real_home / "sessions" / "2026" / "07" / f"rollout-{session_id}.jsonl"
+            stale_tool_workspace = (
+                "/tmp/custom-runs/20260707_000000/workspaces/agent_018"
+            )
+            stale_codex_home = (
+                "/tmp/custom-runs/20260707_000000/meta/agent_018/codex_home"
+            )
+            rollout = real_home / "sessions" / "2026" / "07" / f"rollout-2026-07-30T00-00-00-{session_id}.jsonl"
             rollout.parent.mkdir(parents=True)
             records = [
                 {
@@ -9705,6 +10554,7 @@ class ResumeSessionTests(unittest.TestCase):
                     "payload": {
                         "cwd": old_workspace,
                         "workspace_roots": [old_workspace],
+                        "skills_context": f"{stale_codex_home}/skills/example/SKILL.md",
                         "permission_profile": {
                             "file_system": {
                                 "entries": [
@@ -9739,6 +10589,7 @@ class ResumeSessionTests(unittest.TestCase):
                     "payload": {
                         "thread_settings": {
                             "cwd": old_workspace,
+                            "codex_home": stale_codex_home,
                             "permission_profile": {
                                 "file_system": {
                                     "entries": [
@@ -9762,6 +10613,25 @@ class ResumeSessionTests(unittest.TestCase):
                     },
                 },
                 {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "patch_apply_end",
+                        "stdout": f"M {stale_tool_workspace}/project/result.py",
+                        "changes": {
+                            f"{stale_tool_workspace}/project/result.py": {
+                                "kind": "update_file",
+                            }
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"Keep this historical reference: {stale_tool_workspace}",
+                    },
+                },
+                {
                     "type": "world_state",
                     "payload": {
                         "state": {
@@ -9772,9 +10642,169 @@ class ResumeSessionTests(unittest.TestCase):
                                         "status": "available",
                                     }
                                 },
-                                "filesystem": f"<path>{old_workspace}</path>",
+                                "filesystem": (
+                                    f"<path>{old_workspace}</path>"
+                                    f"<skill>{stale_codex_home}/skills/example/SKILL.md</skill>"
+                                ),
                             }
                         }
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "PCR workspace isolation requirement:\n"
+                                    f"- Treat {old_workspace} as the only writable workspace.\n"
+                                    f"- Skill: {stale_codex_home}/skills/example/SKILL.md"
+                                ),
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-old-workspace",
+                        "input": (
+                            "const r = await tools.exec_command({"
+                            f"cmd: \"cat {stale_codex_home}/skills/example/SKILL.md\", "
+                            f"workdir: \"{stale_tool_workspace}/project\""
+                            "}); text(r.output);"
+                        ),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-old-workspace",
+                        "output": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"saved_path={stale_tool_workspace}/project/result.json\n"
+                                    f"skill_path={stale_codex_home}/skills/example/SKILL.md"
+                                ),
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "example",
+                        "arguments": json.dumps(
+                            {
+                                "cwd": stale_tool_workspace,
+                                "path": stale_tool_workspace + "/input.txt",
+                            }
+                        ),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"The old run was stored at {stale_tool_workspace} "
+                                    f"with Codex home {stale_codex_home}."
+                                ),
+                            },
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "<environment_context>\n"
+                                    f"<cwd>{stale_tool_workspace}</cwd>\n"
+                                    f"<codex_home>{stale_codex_home}</codex_home>\n"
+                                    "</environment_context>"
+                                ),
+                            },
+                        ],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "<skills_instructions>\n"
+                                    f"Workspace: {stale_tool_workspace}\n"
+                                    f"Skill: {stale_codex_home}/skills/example/SKILL.md"
+                                ),
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "payload": {
+                        "message": (
+                            f"Continue in {stale_tool_workspace} with "
+                            f"{stale_codex_home}/skills/example/SKILL.md"
+                        ),
+                        "replacement_history": [
+                            {
+                                "type": "message",
+                                "role": "developer",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            f"Use {stale_tool_workspace} and "
+                                            f"{stale_codex_home}/skills/example/SKILL.md"
+                                        ),
+                                    }
+                                ],
+                            },
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            f"Keep this historical reference: {stale_tool_workspace} "
+                                            f"and {stale_codex_home}."
+                                        ),
+                                    },
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "<environment_context>\n"
+                                            f"<cwd>{stale_tool_workspace}</cwd>\n"
+                                            f"<codex_home>{stale_codex_home}</codex_home>\n"
+                                            "</environment_context>"
+                                        ),
+                                    },
+                                ],
+                            },
+                            {
+                                "type": "custom_tool_call",
+                                "name": "exec",
+                                "call_id": "call-compacted-workspace",
+                                "input": (
+                                    f'{{"workdir":"{stale_tool_workspace}",'
+                                    f'"skill":"{stale_codex_home}/skills/example/SKILL.md"}}'
+                                ),
+                            },
+                        ],
                     },
                 },
             ]
@@ -9798,12 +10828,16 @@ class ResumeSessionTests(unittest.TestCase):
 
             prepare_agent_codex_home(real_home, agent_home, agent_workspace, session_id)
 
-            isolated_rollout = agent_home / "sessions" / "2026" / "07" / f"rollout-{session_id}.jsonl"
+            isolated_rollout = agent_home / "sessions" / "2026" / "07" / rollout.name
             isolated_records = [json.loads(line) for line in isolated_rollout.read_text(encoding="utf-8").splitlines()]
             target = str(agent_workspace)
             self.assertEqual(isolated_records[0]["payload"]["cwd"], target)
             self.assertEqual(isolated_records[1]["payload"]["cwd"], target)
             self.assertEqual(isolated_records[1]["payload"]["workspace_roots"], [target])
+            self.assertEqual(
+                isolated_records[1]["payload"]["skills_context"],
+                str(agent_home) + "/skills/example/SKILL.md",
+            )
             self.assertEqual(
                 isolated_records[1]["payload"]["permission_profile"]["file_system"]["entries"][1]["path"]["path"],
                 target + "/.git",
@@ -9818,6 +10852,10 @@ class ResumeSessionTests(unittest.TestCase):
             )
             self.assertEqual(isolated_records[2]["payload"]["thread_settings"]["cwd"], target)
             self.assertEqual(
+                isolated_records[2]["payload"]["thread_settings"]["codex_home"],
+                str(agent_home),
+            )
+            self.assertEqual(
                 isolated_records[2]["payload"]["thread_settings"]["permission_profile"]["file_system"]["entries"][0]["path"]["path"],
                 target + "/.codex",
             )
@@ -9825,9 +10863,75 @@ class ResumeSessionTests(unittest.TestCase):
                 isolated_records[2]["payload"]["thread_settings"]["file_system_sandbox_policy"]["entries"][0]["path"]["path"],
                 target + "/generated",
             )
-            environment = isolated_records[3]["payload"]["state"]["environments"]
+            self.assertEqual(
+                isolated_records[3]["payload"]["stdout"],
+                f"M {target}/project/result.py",
+            )
+            self.assertEqual(
+                list(isolated_records[3]["payload"]["changes"]),
+                [f"{target}/project/result.py"],
+            )
+            self.assertIn(
+                stale_tool_workspace,
+                isolated_records[4]["payload"]["message"],
+            )
+            environment = isolated_records[5]["payload"]["state"]["environments"]
             self.assertEqual(environment["environments"]["local"]["cwd"], target)
-            self.assertEqual(environment["filesystem"], f"<path>{target}</path>")
+            self.assertEqual(
+                environment["filesystem"],
+                (
+                    f"<path>{target}</path>"
+                    f"<skill>{agent_home}/skills/example/SKILL.md</skill>"
+                ),
+            )
+            self.assertIn(target, isolated_records[6]["payload"]["content"][0]["text"])
+            self.assertNotIn(old_workspace, isolated_records[6]["payload"]["content"][0]["text"])
+            self.assertIn(
+                str(agent_home) + "/skills/example/SKILL.md",
+                isolated_records[6]["payload"]["content"][0]["text"],
+            )
+            self.assertIn(target + "/project", isolated_records[7]["payload"]["input"])
+            self.assertNotIn(stale_tool_workspace, isolated_records[7]["payload"]["input"])
+            self.assertIn(
+                str(agent_home) + "/skills/example/SKILL.md",
+                isolated_records[7]["payload"]["input"],
+            )
+            self.assertEqual(
+                isolated_records[8]["payload"]["output"][0]["text"],
+                (
+                    f"saved_path={target}/project/result.json\n"
+                    f"skill_path={agent_home}/skills/example/SKILL.md"
+                ),
+            )
+            rebound_arguments = json.loads(isolated_records[9]["payload"]["arguments"])
+            self.assertEqual(rebound_arguments["cwd"], target)
+            self.assertEqual(rebound_arguments["path"], target + "/input.txt")
+            self.assertIn(stale_tool_workspace, isolated_records[10]["payload"]["content"][0]["text"])
+            self.assertIn(stale_codex_home, isolated_records[10]["payload"]["content"][0]["text"])
+            generated_user_context = isolated_records[10]["payload"]["content"][1]["text"]
+            self.assertIn(target, generated_user_context)
+            self.assertIn(str(agent_home), generated_user_context)
+            generated_context = isolated_records[11]["payload"]["content"][0]["text"]
+            self.assertIn(target, generated_context)
+            self.assertIn(str(agent_home) + "/skills/example/SKILL.md", generated_context)
+            compacted_history = isolated_records[12]["payload"]["replacement_history"]
+            self.assertIn(target, isolated_records[12]["payload"]["message"])
+            self.assertIn(
+                str(agent_home) + "/skills/example/SKILL.md",
+                isolated_records[12]["payload"]["message"],
+            )
+            compacted_developer = compacted_history[0]["content"][0]["text"]
+            self.assertIn(target, compacted_developer)
+            self.assertIn(str(agent_home) + "/skills/example/SKILL.md", compacted_developer)
+            compacted_user = compacted_history[1]["content"][0]["text"]
+            self.assertIn(stale_tool_workspace, compacted_user)
+            self.assertIn(stale_codex_home, compacted_user)
+            compacted_user_context = compacted_history[1]["content"][1]["text"]
+            self.assertIn(target, compacted_user_context)
+            self.assertIn(str(agent_home), compacted_user_context)
+            compacted_tool = compacted_history[2]["input"]
+            self.assertIn(target, compacted_tool)
+            self.assertIn(str(agent_home) + "/skills/example/SKILL.md", compacted_tool)
             self.assertIn(old_workspace, rollout.read_text(encoding="utf-8"))
 
     def test_promote_codex_session_rebinds_state_and_rollout_to_workspace(self) -> None:
@@ -9955,7 +11059,7 @@ class ResumeSessionTests(unittest.TestCase):
             workspace.mkdir()
             agent_workspace.mkdir(parents=True)
 
-            session_id = "019f-import-test"
+            session_id = "33333333-3333-4333-8333-333333333333"
             isolated_sessions = isolated_home / "sessions" / "2026" / "07" / "07"
             isolated_sessions.mkdir(parents=True)
             isolated_rollout = isolated_sessions / f"rollout-2026-07-07T00-00-00-{session_id}.jsonl"

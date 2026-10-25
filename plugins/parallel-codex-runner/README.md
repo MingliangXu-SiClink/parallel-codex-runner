@@ -17,7 +17,7 @@ Requirements:
 From the repository root, install PCR and its MCP server:
 
 ```bash
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
 ```
 
@@ -92,6 +92,7 @@ Runs and additional candidate batches estimated above 5 GiB require a separate c
 | `pcr_get_resume_history` | Read a selected session's visible conversation in pages. |
 | `pcr_list_models` | List cached models and compatible reasoning efforts. |
 | `pcr_list_runs` | Recover retained or interrupted plugin runs after restart. |
+| `pcr_list_conversations` / `pcr_get_conversation` | Read durable conversations as ordered Turns and Agent candidates. |
 
 Each run owns one persistent worker process. Initial candidates, retries,
 additional candidates, and finalization all execute in that same process and
@@ -107,13 +108,18 @@ Plugin control state is stored in the platform user-state directory, or under `P
 
 The plugin writes an internal marker into each run directory and validates the workspace, run root, candidate path, and marker before diffing, syncing, or deleting data. Completed diffs are persisted before candidate cleanup, so they remain reviewable after a restart.
 
-The defaults are a six-hour active-run TTL, seven-day retained-artifact period,
-and 20 GiB plugin storage quota. Override them with
-`PCR_PLUGIN_RUN_TTL_SECONDS`, `PCR_PLUGIN_RETENTION_SECONDS`, and
-`PCR_PLUGIN_STORAGE_QUOTA_BYTES`. Explicit stop and discard actions remain the
-fastest way to release resources. `keep_workspaces=true` retains both candidate
-workspaces and their isolated `meta/agent_*/codex_home` directories; disabling
-it removes both.
+Runs have no execution time limit by default. Set `PCR_PLUGIN_RUN_TTL_SECONDS`
+to a positive number only to opt into an operation timeout; unset or `0` means
+unlimited. Timing out never deletes partial work or isolated Codex sessions.
+Explicit stop and discard actions remain available.
+
+The separate defaults for artifact retention and plugin storage are seven days
+and 20 GiB, configurable with `PCR_PLUGIN_RETENTION_SECONDS` and
+`PCR_PLUGIN_STORAGE_QUOTA_BYTES`. Retention never cleans an active run, and pcrd
+retains conversation history. `keep_workspaces=true` retains candidate workspaces
+and their isolated `meta/agent_*/codex_home` directories after finalization;
+disabling it permits cleanup only when results are accepted or discarded, or
+the artifact-retention policy expires.
 
 Finalization uses a durable journal. If PCR cannot prove whether a sync finished,
 it will not sync a second time. Inspect the original workspace and resolve the
@@ -127,7 +133,7 @@ Validate the plugin and its Skill from the repository root:
 
 ```bash
 python3 -m unittest tests.test_plugin_package tests.test_plugin_runtime
-python3 -m compileall -q parallel_codex_runner_core plugins/parallel-codex-runner/scripts
+python3 -m compileall -q src plugins/parallel-codex-runner/scripts
 git diff --check
 ```
 
@@ -135,7 +141,7 @@ The repository marketplace is defined in [`.agents/plugins/marketplace.json`](..
 
 ## Troubleshooting
 
-- **MCP server cannot start:** run `python3 -m pip install --force-reinstall .` again. The plugin-local launcher discovers a compatible absolute Python interpreter; set `PCR_PYTHON` when the App must use a specific environment.
+- **MCP server cannot start:** run `python3 -m pip install --upgrade .` again. The plugin-local launcher discovers a compatible absolute Python interpreter; set `PCR_PYTHON` when the App must use a specific environment.
 - **Run continues after the MCP server restarts:** this is intentional. Use `pcr_stop_run` or `pcr_discard_run`; TTL cleanup handles abandoned workers.
 - **Codex CLI not found:** ensure the same environment can run `codex --version`.
 - **Run interrupted after restart:** inspect it with `pcr_list_runs`, then retry eligible Agents or discard the retained run.

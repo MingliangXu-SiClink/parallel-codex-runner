@@ -1,0 +1,14 @@
+; Append only after backing up and validating the existing frpc configuration.
+; This syntax is compatible with the existing FRP 0.44 INI configuration.
+
+[pcr-relay-http]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 8080
+remote_port = 80
+
+[pcr-relay-https]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 8443
+remote_port = 443

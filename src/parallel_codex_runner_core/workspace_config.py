@@ -1,0 +1,576 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+from platformdirs import user_state_path
+
+from .models import DEFAULT_FOLLOW_UP_DELAY_SECONDS
+from .synthesis import (
+    normalize_synthesis_effort,
+    normalize_synthesis_fast,
+    normalize_synthesis_model,
+)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+
+_PROCESS_LOCK = threading.Lock()
+_CONFIG_VERSION = 1
+
+
+def default_workspace_config_path() -> Path:
+    override = os.environ.get("PCR_WORKSPACE_CONFIG_PATH", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return user_state_path("parallel-codex-runner", appauthor=False) / "workspace_config.json"
+
+
+@dataclass(frozen=True)
+class WorkspaceSettings:
+    """The TUI settings remembered for one workspace."""
+
+    agents: int | None = None
+    synthesis_agents: int | None = None
+    execution: str | None = None
+    max_parallel: int | None = None
+    subagents: bool | None = None
+    subagents_limit: int | None = None
+    recommend_by: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    fast: bool | None = None
+    synthesis_model: str | None = None
+    synthesis_effort: str | None = None
+    synthesis_fast: bool | None = None
+    follow_up_delay: int | None = None
+    sync_back: bool | None = None
+    keep_workspaces: bool | None = None
+    resume_session_id: str | None = None
+    resume_include_non_interactive: bool | None = None
+    runs_dir: str | None = None
+    codex_bin: str | None = None
+    present_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        repr=False,
+        compare=False,
+    )
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "WorkspaceSettings | None":
+        if not isinstance(value, dict):
+            return None
+
+        def positive_int(raw: object, *, allow_zero: bool = False) -> int | None:
+            if isinstance(raw, bool):
+                return None
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                return None
+            if parsed > 0 or (allow_zero and parsed == 0):
+                return parsed
+            return None
+
+        def optional_text(raw: object) -> str | None:
+            text = str(raw or "").strip()
+            return text or None
+
+        execution = optional_text(value.get("EXECUTION"))
+        if execution is not None:
+            execution = execution.lower()
+            if execution not in {"parallel", "serial"}:
+                execution = None
+
+        max_parallel_raw = value.get("MAX_PARALLEL")
+        max_parallel: int | None
+        if max_parallel_raw is None or str(max_parallel_raw).strip().lower() in {
+            "",
+            "auto",
+            "default",
+            "none",
+        }:
+            max_parallel = None
+        else:
+            max_parallel = positive_int(max_parallel_raw)
+
+        recommend_by = optional_text(value.get("RECOMMEND_BY"))
+        if recommend_by is not None:
+            recommend_by = recommend_by.lower()
+            if recommend_by not in {"duration", "reasoning_tokens"}:
+                recommend_by = None
+
+        def optional_bool(raw: object) -> bool | None:
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                normalized = raw.strip().lower()
+                if normalized in {"yes", "y", "true", "on", "1"}:
+                    return True
+                if normalized in {"no", "n", "false", "off", "0"}:
+                    return False
+            return None
+
+        effort = optional_text(value.get("EFFORT"))
+        if effort is not None and effort.lower() in {"auto", "default", "none", "clear"}:
+            effort = None
+
+        resume = optional_text(value.get("RESUME"))
+        if resume is not None and resume.upper() == "NO":
+            resume = None
+
+        try:
+            synthesis_fast = normalize_synthesis_fast(
+                value.get("SYNTHESIS_FAST")
+            )
+        except argparse.ArgumentTypeError:
+            synthesis_fast = None
+
+        present_fields = frozenset(
+            field_name
+            for json_name, field_name in {
+                "AGENTS": "agents",
+                "SYNTHESIS_AGENTS": "synthesis_agents",
+                "EXECUTION": "execution",
+                "MAX_PARALLEL": "max_parallel",
+                "SUBAGENTS": "subagents",
+                "SUBAGENTS_LIMIT": "subagents_limit",
+                "RECOMMEND_BY": "recommend_by",
+                "MODEL": "model",
+                "EFFORT": "effort",
+                "FAST": "fast",
+                "SYNTHESIS_MODEL": "synthesis_model",
+                "SYNTHESIS_EFFORT": "synthesis_effort",
+                "SYNTHESIS_FAST": "synthesis_fast",
+                "FOLLOW_UP_DELAY": "follow_up_delay",
+                "SYNC_BACK": "sync_back",
+                "KEEP_WORKSPACES": "keep_workspaces",
+                "RESUME": "resume_session_id",
+                "RESUME_INCLUDE_NON_INTERACTIVE": "resume_include_non_interactive",
+                "RUNS_DIR": "runs_dir",
+                "CODEX_BIN": "codex_bin",
+            }.items()
+            if json_name in value
+        )
+        settings = cls(
+            agents=positive_int(value.get("AGENTS")),
+            synthesis_agents=positive_int(value.get("SYNTHESIS_AGENTS"), allow_zero=True),
+            execution=execution,
+            max_parallel=max_parallel,
+            subagents=optional_bool(value.get("SUBAGENTS")),
+            subagents_limit=positive_int(value.get("SUBAGENTS_LIMIT")),
+            recommend_by=recommend_by,
+            model=(
+                None
+                if optional_text(value.get("MODEL")) in {None, "default", "none"}
+                else optional_text(value.get("MODEL"))
+            ),
+            effort=effort.lower() if effort else None,
+            fast=optional_bool(value.get("FAST")),
+            synthesis_model=normalize_synthesis_model(
+                value.get("SYNTHESIS_MODEL")
+            ),
+            synthesis_effort=normalize_synthesis_effort(
+                value.get("SYNTHESIS_EFFORT")
+            ),
+            synthesis_fast=synthesis_fast,
+            follow_up_delay=positive_int(
+                value.get("FOLLOW_UP_DELAY"),
+                allow_zero=True,
+            ),
+            sync_back=optional_bool(value.get("SYNC_BACK")),
+            keep_workspaces=optional_bool(value.get("KEEP_WORKSPACES")),
+            resume_session_id=resume,
+            resume_include_non_interactive=optional_bool(
+                value.get("RESUME_INCLUDE_NON_INTERACTIVE")
+            ),
+            runs_dir=optional_text(value.get("RUNS_DIR")),
+            codex_bin=optional_text(value.get("CODEX_BIN")),
+            present_fields=present_fields,
+        )
+        return settings if present_fields else None
+
+    @classmethod
+    def from_runtime(
+        cls,
+        agents: int,
+        synthesis_agents: int,
+        args: Any,
+        resume_session_id: str,
+    ) -> "WorkspaceSettings":
+        serial = bool(getattr(args, "serial", False))
+        raw_max_parallel = getattr(args, "max_parallel", None)
+        try:
+            raw_max_parallel_int = int(raw_max_parallel) if raw_max_parallel is not None else None
+        except (TypeError, ValueError):
+            raw_max_parallel_int = None
+        serial = serial or raw_max_parallel_int == 1
+        max_parallel = 1 if serial else raw_max_parallel
+        if max_parallel is not None:
+            try:
+                max_parallel = int(max_parallel)
+            except (TypeError, ValueError):
+                max_parallel = None
+        model = str(getattr(args, "model", None) or "").strip() or None
+        effort = str(getattr(args, "effort", None) or "").strip().lower() or None
+        fast = getattr(args, "fast", None)
+        if not isinstance(fast, bool):
+            fast = None
+        synthesis_model = normalize_synthesis_model(
+            getattr(args, "synthesis_model", None)
+        )
+        synthesis_effort = normalize_synthesis_effort(
+            getattr(args, "synthesis_effort", None)
+        )
+        try:
+            synthesis_fast = normalize_synthesis_fast(
+                getattr(args, "synthesis_fast", None)
+            )
+        except argparse.ArgumentTypeError:
+            synthesis_fast = None
+        return cls(
+            agents=int(agents),
+            synthesis_agents=int(synthesis_agents),
+            execution="serial" if serial else "parallel",
+            max_parallel=max_parallel,
+            subagents=bool(getattr(args, "subagents", False)),
+            subagents_limit=int(getattr(args, "subagents_limit", 8)),
+            recommend_by=str(getattr(args, "recommend_by", "reasoning_tokens")),
+            model=model,
+            effort=effort,
+            fast=fast,
+            synthesis_model=synthesis_model,
+            synthesis_effort=synthesis_effort,
+            synthesis_fast=synthesis_fast,
+            follow_up_delay=int(
+                getattr(
+                    args,
+                    "follow_up_delay",
+                    DEFAULT_FOLLOW_UP_DELAY_SECONDS,
+                )
+            ),
+            sync_back=not bool(getattr(args, "no_sync_back", False)),
+            keep_workspaces=bool(getattr(args, "keep_workspaces", False)),
+            resume_session_id=str(resume_session_id or "").strip() or None,
+            resume_include_non_interactive=bool(
+                getattr(args, "resume_include_non_interactive", False)
+            ),
+            runs_dir=str(getattr(args, "runs_dir", None) or "").strip() or None,
+            codex_bin=str(getattr(args, "codex_bin", "codex") or "codex").strip(),
+            present_fields=frozenset(
+                {
+                    "agents",
+                    "synthesis_agents",
+                    "execution",
+                    "max_parallel",
+                    "subagents",
+                    "subagents_limit",
+                    "recommend_by",
+                    "model",
+                    "effort",
+                    "fast",
+                    "synthesis_model",
+                    "synthesis_effort",
+                    "synthesis_fast",
+                    "follow_up_delay",
+                    "sync_back",
+                    "keep_workspaces",
+                    "resume_session_id",
+                    "resume_include_non_interactive",
+                    "runs_dir",
+                    "codex_bin",
+                }
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "AGENTS": self.agents,
+            "SYNTHESIS_AGENTS": self.synthesis_agents,
+            "EXECUTION": self.execution,
+            "MAX_PARALLEL": self.max_parallel if self.max_parallel is not None else "auto",
+            "SUBAGENTS": self.subagents,
+            "SUBAGENTS_LIMIT": self.subagents_limit,
+            "RECOMMEND_BY": self.recommend_by,
+            "MODEL": self.model or "",
+            "EFFORT": self.effort or "auto",
+            "FAST": self.fast if self.fast is not None else "AUTO",
+            "SYNTHESIS_MODEL": self.synthesis_model or "default",
+            "SYNTHESIS_EFFORT": self.synthesis_effort or "auto",
+            "SYNTHESIS_FAST": (
+                "AUTO" if self.synthesis_fast is None else self.synthesis_fast
+            ),
+            "FOLLOW_UP_DELAY": self.follow_up_delay,
+            "SYNC_BACK": self.sync_back,
+            "KEEP_WORKSPACES": self.keep_workspaces,
+            "RESUME": self.resume_session_id or "NO",
+            "RESUME_INCLUDE_NON_INTERACTIVE": self.resume_include_non_interactive,
+            "RUNS_DIR": self.runs_dir or "",
+            "CODEX_BIN": self.codex_bin or "codex",
+        }
+
+    def apply_to_args(self, args: Any, explicit_settings: set[str] | frozenset[str] = frozenset()) -> None:
+        def present(name: str) -> bool:
+            return name in self.present_fields
+
+        if present("agents") and self.agents is not None and "agents" not in explicit_settings:
+            args.num_agents = self.agents
+        if present("synthesis_agents") and self.synthesis_agents is not None and "synthesis_agents" not in explicit_settings:
+            args.synthesis_agents = self.synthesis_agents
+        if (
+            present("execution")
+            and self.execution is not None
+            and "execution" not in explicit_settings
+            and "max_parallel" not in explicit_settings
+        ):
+            args.serial = self.execution == "serial"
+        if (
+            present("max_parallel")
+            and "max_parallel" not in explicit_settings
+            and "execution" not in explicit_settings
+            and self.execution is not None
+        ):
+            args.max_parallel = self.max_parallel
+            if self.execution == "serial" and args.max_parallel is None:
+                args.max_parallel = 1
+        if present("subagents") and self.subagents is not None and "subagents" not in explicit_settings:
+            args.subagents = self.subagents
+        if present("subagents_limit") and self.subagents_limit is not None and "subagents_limit" not in explicit_settings:
+            args.subagents_limit = self.subagents_limit
+        if present("recommend_by") and self.recommend_by is not None and "recommend_by" not in explicit_settings:
+            args.recommend_by = self.recommend_by
+        if present("model") and "model" not in explicit_settings:
+            args.model = self.model or None
+        if present("effort") and "effort" not in explicit_settings:
+            args.effort = self.effort or None
+        if present("fast") and "fast" not in explicit_settings:
+            args.fast = self.fast
+        if present("synthesis_model") and "synthesis_model" not in explicit_settings:
+            args.synthesis_model = self.synthesis_model
+        if present("synthesis_effort") and "synthesis_effort" not in explicit_settings:
+            args.synthesis_effort = self.synthesis_effort
+        if present("synthesis_fast") and "synthesis_fast" not in explicit_settings:
+            args.synthesis_fast = self.synthesis_fast
+        if (
+            present("follow_up_delay")
+            and self.follow_up_delay is not None
+            and "follow_up_delay" not in explicit_settings
+        ):
+            args.follow_up_delay = self.follow_up_delay
+        if present("sync_back") and self.sync_back is not None and "sync_back" not in explicit_settings:
+            args.no_sync_back = not self.sync_back
+        if present("keep_workspaces") and self.keep_workspaces is not None and "keep_workspaces" not in explicit_settings:
+            args.keep_workspaces = self.keep_workspaces
+        if present("resume_session_id") and "resume" not in explicit_settings:
+            args.resume_session_id = self.resume_session_id
+        if (
+            present("resume_include_non_interactive")
+            and self.resume_include_non_interactive is not None
+            and "resume_include_non_interactive" not in explicit_settings
+        ):
+            args.resume_include_non_interactive = self.resume_include_non_interactive
+        if present("runs_dir") and "runs_dir" not in explicit_settings:
+            args.runs_dir = self.runs_dir or None
+        if present("codex_bin") and "codex_bin" not in explicit_settings:
+            args.codex_bin = self.codex_bin or "codex"
+
+
+class WorkspaceConfigStore:
+    """Atomically persist settings keyed by canonical workspace path."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = (path or default_workspace_config_path()).expanduser().resolve()
+        self.lock_path = self.path.with_suffix(f"{self.path.suffix}.lock")
+
+    @staticmethod
+    def context_key(workspace: Path | str) -> str:
+        return str(Path(workspace).expanduser().resolve())
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _PROCESS_LOCK:
+            with self.lock_path.open("a+b") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _read_unlocked(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"version": _CONFIG_VERSION, "defaults": {}, "workspaces": {}}
+        if not isinstance(payload, dict):
+            return {"version": _CONFIG_VERSION, "defaults": {}, "workspaces": {}}
+        defaults = payload.get("defaults")
+        if not isinstance(defaults, dict):
+            defaults = {}
+        workspaces = payload.get("workspaces")
+        if not isinstance(workspaces, dict):
+            workspaces = {}
+        return {
+            "version": _CONFIG_VERSION,
+            "defaults": defaults,
+            "workspaces": workspaces,
+        }
+
+    def _write_unlocked(self, payload: dict[str, Any]) -> None:
+        temporary = self.path.with_name(
+            f".{self.path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                temporary.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temporary, self.path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def load(self, workspace: Path | str) -> WorkspaceSettings | None:
+        try:
+            with self._locked():
+                payload = self._read_unlocked()
+                value = payload["workspaces"].get(self.context_key(workspace))
+                return WorkspaceSettings.from_mapping(value)
+        except OSError:
+            return None
+
+    def load_defaults(self) -> WorkspaceSettings | None:
+        """Load the defaults copied into newly registered workspaces."""
+
+        try:
+            with self._locked():
+                return WorkspaceSettings.from_mapping(
+                    self._read_unlocked()["defaults"]
+                )
+        except OSError:
+            return None
+
+    def load_many(
+        self,
+        workspaces: list[Path | str] | tuple[Path | str, ...],
+    ) -> dict[str, WorkspaceSettings]:
+        """Load multiple workspace configs under one file lock."""
+
+        keys = [self.context_key(workspace) for workspace in workspaces]
+        try:
+            with self._locked():
+                values = self._read_unlocked()["workspaces"]
+                return {
+                    key: settings
+                    for key in keys
+                    if (
+                        settings := WorkspaceSettings.from_mapping(
+                            values.get(key)
+                        )
+                    )
+                    is not None
+                }
+        except OSError:
+            return {}
+
+    def save(self, workspace: Path | str, settings: WorkspaceSettings) -> bool:
+        try:
+            with self._locked():
+                payload = self._read_unlocked()
+                workspaces = payload["workspaces"]
+                workspaces[self.context_key(workspace)] = settings.to_mapping()
+                self._write_unlocked(payload)
+            return True
+        except OSError:
+            return False
+
+    def update(
+        self,
+        workspace: Path | str,
+        values: dict[str, object],
+    ) -> WorkspaceSettings | None:
+        """Atomically merge display-keyed values into one workspace config."""
+
+        try:
+            with self._locked():
+                payload = self._read_unlocked()
+                workspaces = payload["workspaces"]
+                key = self.context_key(workspace)
+                current = workspaces.get(key)
+                merged = dict(current) if isinstance(current, dict) else {}
+                merged.update(values)
+                settings = WorkspaceSettings.from_mapping(merged)
+                if settings is None:
+                    return None
+                workspaces[key] = settings.to_mapping()
+                self._write_unlocked(payload)
+                return settings
+        except OSError:
+            return None
+
+    def update_defaults(
+        self,
+        values: dict[str, object],
+    ) -> WorkspaceSettings | None:
+        """Atomically merge values into the new-workspace defaults."""
+
+        try:
+            with self._locked():
+                payload = self._read_unlocked()
+                current = payload.get("defaults")
+                merged = dict(current) if isinstance(current, dict) else {}
+                merged.update(values)
+                settings = WorkspaceSettings.from_mapping(merged)
+                if settings is None:
+                    return None
+                payload["defaults"] = settings.to_mapping()
+                self._write_unlocked(payload)
+                return settings
+        except OSError:
+            return None
+
+    def initialize_from_defaults(
+        self,
+        workspace: Path | str,
+    ) -> WorkspaceSettings | None:
+        """Initialize an unconfigured workspace without replacing old settings."""
+
+        try:
+            with self._locked():
+                payload = self._read_unlocked()
+                workspaces = payload["workspaces"]
+                key = self.context_key(workspace)
+                existing = WorkspaceSettings.from_mapping(workspaces.get(key))
+                if existing is not None:
+                    return existing
+                defaults = WorkspaceSettings.from_mapping(payload.get("defaults"))
+                if defaults is None:
+                    return None
+                mapping = defaults.to_mapping()
+                mapping["RESUME"] = "NO"
+                mapping["RESUME_INCLUDE_NON_INTERACTIVE"] = False
+                settings = WorkspaceSettings.from_mapping(mapping)
+                if settings is None:
+                    return None
+                workspaces[key] = settings.to_mapping()
+                self._write_unlocked(payload)
+                return settings
+        except OSError:
+            return None

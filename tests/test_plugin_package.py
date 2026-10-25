@@ -80,6 +80,21 @@ class PluginPackageTests(unittest.TestCase):
             ).is_file()
         )
 
+    def test_source_layout_and_plugin_launcher_agree(self) -> None:
+        with (ROOT / "pyproject.toml").open("rb") as handle:
+            setuptools = tomllib.load(handle)["tool"]["setuptools"]
+        launcher = (PLUGIN_ROOT / "scripts" / "launch_server.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(setuptools["package-dir"][""], "src")
+        self.assertTrue((ROOT / "src" / "parallel_codex_runner.py").is_file())
+        self.assertTrue(
+            (ROOT / "src" / "parallel_codex_runner_core" / "app.py").is_file()
+        )
+        self.assertIn('SOURCE_ROOT="$REPO_ROOT/src"', launcher)
+        self.assertIn('PYTHONPATH="$SOURCE_ROOT', launcher)
+
 
 if __name__ == "__main__":
     unittest.main()

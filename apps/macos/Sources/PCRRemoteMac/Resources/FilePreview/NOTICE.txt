@@ -1,0 +1,12 @@
+Offline, pinned preview dependencies:
+
+docx-preview 0.4.0 (git 191d3e0db009da578fbe4da70d55305cd8d50226)
+https://github.com/VolodymyrBaydalka/docxjs
+Apache-2.0; see docx-preview-LICENSE.txt
+npm tarball SHA-1: 95800aafa393453e7b48dc79fbefc46af8da86e3
+
+JSZip 3.10.1
+https://github.com/Stuk/jszip
+MIT; see jszip-LICENSE.txt
+
+No CDN or runtime network access is used by the preview renderer.

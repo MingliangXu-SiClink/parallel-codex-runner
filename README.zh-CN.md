@@ -68,7 +68,7 @@ Textual 已包含在本仓库中，并带有 PCR 针对中文输入和终端宽�
 在项目检出目录中，将 PCR 安装为普通 wheel 包：
 
 ```bash
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 ```
 
 `pip` 会先构建 wheel，再把它安装到当前 Python 环境中。这个命令会替换
@@ -143,7 +143,7 @@ Codex，PCR 在后台保留并运行隔离候选；全部结束后，Codex 比�
 
 ```bash
 # 将 PCR 与 MCP Server 安装为普通 wheel
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 
 # 检查运行环境
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
@@ -163,6 +163,24 @@ codex plugin add parallel-codex-runner@personal
 ```
 
 插件不会把“运行完成”或“推荐结果”当作修改项目的授权。只有明确接受某个成功 Agent 后才会回写。工具说明、重启恢复和常见问题见[插件使用指南](plugins/parallel-codex-runner/README.zh-CN.md)。
+
+## 远程客户端（实验阶段）
+
+两个原生客户端现在都是顶层应用：
+
+- [`apps/macos/`](apps/macos/) 是 SwiftUI 编写的 **Parallel Codex** Mac 应用；
+- [`apps/android/`](apps/android/) 是 Kotlin / Compose 编写的 **Parallel Codex** Android 应用。
+
+Python Mac 守护进程位于 `src/parallel_codex_runner_core/remote/`，共享协议、中继服务
+与部署配置位于 `remote/`。配对后的手机可以切换多台 Mac、浏览 Mac 当前账户有权
+访问的任意目录、管理多个 Workspace、启动 PCR 任务并选择 Agent。路径、Prompt
+与响应只在 Android 和 Mac 之间解密，项目文件不会上传到中继服务。仍与有效
+Mac 保持配对的手机还可以通过私有更新通道安装已签名的新版本；服务端不开放
+APK 公网目录，下载必须经过登录校验和绑定设备的短时单次票据。
+
+这部分目前是开发阶段代码，并不是已上线的托管服务。对公网开放前，必须完成
+[远程安全说明](remote/SECURITY.md) 中的发布要求。安装方式与各端说明从
+[PCR Remote 指南](remote/README.zh-CN.md) 开始。
 
 ## 使用 TUI
 
@@ -188,7 +206,7 @@ Agent 完成后，标题会显示运行时间和 reasoning token 信息。当前
 4. 将界面停留在你希望保留的成功 Agent 上；
 5. 输入下一轮需求，或者运行 `/accept`。
 
-`RECOMMEND_BY` 只负责给出建议，不会覆盖你的明确选择。继续对话、主动采用、退出，或者切换工作区和恢复会话时，PCR 会以当前显示的成功 Agent 为准，并最终采用这条分支。
+`RECOMMEND_BY` 只负责给出建议，不会覆盖你的明确选择。终端界面中，继续对话、主动采用、退出或切换恢复来源，按相应操作的规则处理当前显示的成功 Agent。macOS 客户端是独立查看界面：关闭窗口、退出、更新或浏览结果都不等于确认采用，不会因此同步成果或停止其他 Agent；下次打开仍保留候选及其原采用状态，可以继续比较并选择其他 Agent。详见 [macOS 客户端约定](apps/macos/README.md#closing-the-client)。
 
 不必等所有 Agent 全部完成。如果某个 Agent 已经给出了满意结果，你可以直接从它继续；PCR 会停止其余任务、同步当前分支，再以它的工作区和 Codex 会话为基础开始下一轮。
 
@@ -335,6 +353,16 @@ PCR 会在目标工作区外创建本轮运行目录。系统盘中的项目统�
 ```
 
 每个 Agent 都有自己的工作目录和临时 `CODEX_HOME`。
+
+### 远端环境
+
+工作区隔离约束针对本机项目文件，不禁止用户授权的远端任务。每个候选和综合 Agent 都可以使用已有的 SSH 访问、远端命令和文件传输，在任务授权的主机与项目范围内修改代码、运行实验。不需要额外开启 PCR 模式；远端访问控制和项目自身的限制仍然有效。
+
+远端以用户的项目结构为准，不再强制套用 PCR 时间戳和 Agent 编号目录。新方案使用用户指定或项目约定的方案文件夹，已有方案原位继续；只有实际并发写冲突时才建立必要的命名副本或 worktree，通过已有调度器或锁协调。仍有会话或作业依赖的旧执行目录不得为统一格式而搬动。
+
+整理、移动、删除或部署操作针对真实授权目标，先核对路径、权限与在用引用。同一共享操作只有用户明确指定的执行者可以实际执行；未指定时由候选 Agent 1 执行，其他候选与综合只检查或提出建议。取得锁不代表可以重复已完成的操作，必须先核对已有完成记录；归属或完成状态不清楚时不得修改。这是注入给 Agent 的执行指引，不是操作系统沙箱，也不是任意 SSH 命令的强制去重网关。
+
+远端任务和文件不属于本机回写与候选清理范围。采用或放弃一个候选，不会自动采用、停止或回退它在远端的工作。Agent 应在本机工作区与最终回复中记录远端主机、工作目录、任务标识和产物路径，便于核验。
 
 ### 原始工作区是 Git 仓库
 
@@ -504,49 +532,53 @@ TUI 创建工作区之前，PCR 会估算以下内容的总大小：
 
 ## 开发
 
-正式使用时建议采用普通 wheel 安装（`python3 -m pip install --force-reinstall .`）。PCR 不再把自身源码复制到临时运行快照。Python 会把已经导入的模块保留在内存中，因此正在运行的 CLI 会始终使用启动时加载的代码；TUI 还会在启动时一次性导入所需的 PCR 与内置 Textual 模块，并拒绝对这些模块执行显式 reload。
+正式使用时建议采用普通 wheel 安装（`python3 -m pip install --upgrade .`）。PCR 不再把自身源码复制到临时运行快照。Python 会把已经导入的模块保留在内存中，因此正在运行的 CLI 会始终使用启动时加载的代码；TUI 还会在启动时一次性导入所需的 PCR 与内置 Textual 模块，并拒绝对这些模块执行显式 reload。
 
 可编辑安装（`python3 -m pip install -e .`）同样遵循“进程生命周期固定版本”：源码发生变化后，需要重启 PCR 才会加载新实现。每个插件 Run 只创建一个长期存活的 Worker；初始候选、追加候选、重试和最终采用都通过文件 IPC 交给同一个 Worker，所以运行期间的源码修改不会替换这次 Run 使用的实现。如果 Worker 意外崩溃，PCR 会明确报告该 Run 已无法继续，而不会用另一版本的源码悄悄启动替代 Worker。
 
 运行项目检查：
 
 ```bash
-python3 -m unittest discover -s tests
-python3 -m compileall -q parallel_codex_runner.py parallel_codex_runner_core
+PYTHONPATH=src python3 -m unittest discover -s tests
+python3 -m compileall -q src
 git diff --check
 ```
 
 内置 Textual 的行为由针对性兼容测试覆盖：
 
 ```bash
-python3 -m unittest tests.test_vendored_textual
+PYTHONPATH=src python3 -m unittest tests.test_vendored_textual
 ```
 
-固定的 Textual 版本、保留的源码结构与本地补丁清单见 [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md)。
+固定的 Textual 版本、保留的源码结构与本地补丁清单见 [`src/parallel_codex_runner_core/_vendor/textual/PCR_PATCHES.md`](src/parallel_codex_runner_core/_vendor/textual/PCR_PATCHES.md)。
 
 <details>
 <summary><strong>项目结构</strong></summary>
 
 | 路径 | 职责 |
 | --- | --- |
-| `parallel_codex_runner.py` | 包入口与兼容导入。 |
-| `parallel_codex_runner_core/app.py` | CLI 编排、Agent 执行、结果汇总与会话提升。 |
-| `parallel_codex_runner_core/runtime_pinning.py` | TUI 与插件 Worker 的模块预加载和 reload 保护。 |
-| `parallel_codex_runner_core/synthesis.py` | 第二阶段上下文生成与推荐优先级。 |
-| `parallel_codex_runner_core/tui_textual.py` | 交互式 TUI 与候选审查流程。 |
-| `parallel_codex_runner_core/workspace.py` | 空间估算、隔离 Git 克隆、复制、清理与回写。 |
-| `parallel_codex_runner_core/codex_cli.py` | Codex 能力检测与命令构造。 |
-| `parallel_codex_runner_core/codex_models.py` | 模型缓存与兼容 Effort 选择。 |
-| `parallel_codex_runner_core/prompt_history.py` | 持久化输入历史。 |
-| `parallel_codex_runner_core/workspace_config.py` | 按 workspace 持久化 TUI 配置。 |
-| `parallel_codex_runner_core/diffing.py` | 支持删除操作的工作区 Diff。 |
-| `parallel_codex_runner_core/models.py` | 共享的运行和会话数据模型。 |
-| `parallel_codex_runner_core/plugin_runtime.py` | 插件运行使用的持久化审查控制器。 |
-| `parallel_codex_runner_core/plugin_mcp.py` | Codex App 插件调用的本地 MCP 工具。 |
-| `parallel_codex_runner_core/plugin/` | 持久化状态、事件索引、长期 Worker IPC 和产物路径校验。 |
+| `src/` | 可安装的 Python 运行时与 CLI 源码。 |
+| `src/parallel_codex_runner.py` | 包入口与兼容导入。 |
+| `src/parallel_codex_runner_core/app.py` | CLI 编排、Agent 执行、结果汇总与会话提升。 |
+| `src/parallel_codex_runner_core/runtime_pinning.py` | TUI 与插件 Worker 的模块预加载和 reload 保护。 |
+| `src/parallel_codex_runner_core/synthesis.py` | 第二阶段上下文生成与推荐优先级。 |
+| `src/parallel_codex_runner_core/tui_textual.py` | 交互式 TUI 与候选审查流程。 |
+| `src/parallel_codex_runner_core/workspace.py` | 空间估算、隔离 Git 克隆、复制、清理与回写。 |
+| `src/parallel_codex_runner_core/codex_cli.py` | Codex 能力检测与命令构造。 |
+| `src/parallel_codex_runner_core/codex_models.py` | 模型缓存与兼容 Effort 选择。 |
+| `src/parallel_codex_runner_core/prompt_history.py` | 持久化输入历史。 |
+| `src/parallel_codex_runner_core/workspace_config.py` | 按 workspace 持久化 TUI 配置。 |
+| `src/parallel_codex_runner_core/diffing.py` | 支持删除操作的工作区 Diff。 |
+| `src/parallel_codex_runner_core/models.py` | 共享的运行和会话数据模型。 |
+| `src/parallel_codex_runner_core/plugin_runtime.py` | 插件运行使用的持久化审查控制器。 |
+| `src/parallel_codex_runner_core/plugin_mcp.py` | Codex App 插件调用的本地 MCP 工具。 |
+| `src/parallel_codex_runner_core/plugin/` | 持久化状态、事件索引、长期 Worker IPC 和产物路径校验。 |
 | `plugins/parallel-codex-runner/` | 插件清单、Skill、运行检查和插件文档。 |
+| `apps/macos/` | 原生 SwiftUI Mac 控制中心。 |
+| `apps/android/` | 原生 Kotlin / Compose Android 客户端。 |
+| `remote/` | 共享通信协议、中继服务、部署模板和远程功能文档。 |
 | `.agents/plugins/marketplace.json` | 仓库内的 Codex 插件 Marketplace。 |
-| `vendor/textual/` | 内置 Textual 与 PCR 的终端输入补丁。 |
+| `src/parallel_codex_runner_core/_vendor/textual/` | 内置 Textual 与 PCR 的终端输入补丁。 |
 | `tests/` | 回归测试。 |
 
 </details>
@@ -557,4 +589,4 @@ python3 -m unittest tests.test_vendored_textual
 
 ## 许可证
 
-PCR 使用 [MIT License](LICENSE)。内置 Textual 保留其上游 [MIT License](vendor/textual/LICENSE)。
+PCR 使用 [MIT License](LICENSE)。内置 Textual 保留其上游 [MIT License](src/parallel_codex_runner_core/_vendor/TEXTUAL_LICENSE)。

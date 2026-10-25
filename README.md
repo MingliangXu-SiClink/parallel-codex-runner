@@ -68,7 +68,7 @@ Textual is included in this repository, including PCR's Chinese input and termin
 From a checkout, install PCR as a regular wheel package:
 
 ```bash
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 ```
 
 `pip` builds the wheel and installs it into the active Python environment.
@@ -147,7 +147,7 @@ repository as a local marketplace, and install the plugin:
 
 ```bash
 # Install PCR and its MCP server as a regular wheel
-python3 -m pip install --force-reinstall .
+python3 -m pip install --upgrade .
 
 # Verify the runtime
 python3 plugins/parallel-codex-runner/scripts/check_runtime.py
@@ -168,6 +168,26 @@ Compare their patches with me and do not sync anything until I choose.
 ```
 
 The plugin never treats completion or its recommendation as permission to modify the project. Sync-back happens only after a successful Agent is explicitly accepted. See the [plugin guide](plugins/parallel-codex-runner/README.md) for its tools, recovery behavior, and troubleshooting.
+
+## Remote Clients (Experimental)
+
+The native clients are first-class top-level applications:
+
+- [`apps/macos/`](apps/macos/) contains the SwiftUI **Parallel Codex** Mac app.
+- [`apps/android/`](apps/android/) contains the Kotlin/Compose **Parallel Codex** Android app.
+
+The Python Mac daemon remains in `src/parallel_codex_runner_core/remote/`; shared
+protocol, relay, and deployment code lives in `remote/`. A paired phone can switch between multiple Macs,
+browse any directory available to the Mac account, maintain multiple workspaces,
+start PCR runs, and choose an Agent. Paths, prompts, and responses are encrypted
+between Android and Mac; project files are never uploaded to the relay. An active
+paired phone can also install signed Android releases through the relay's private,
+authenticated, one-use-ticket update channel; there is no public APK directory.
+
+This is development-stage code, not a hosted service. Before exposing it to the
+internet, complete the release requirements in the [remote security
+notes](remote/SECURITY.md). Setup and component documentation starts in the
+[PCR Remote guide](remote/README.md).
 
 ## Using the TUI
 
@@ -193,7 +213,7 @@ A useful review loop is:
 4. leave the TUI on the successful Agent you want;
 5. enter a follow-up prompt or run `/accept`.
 
-`RECOMMEND_BY` only controls the suggestion. It does not override the successful Agent you are viewing. When you continue the conversation, accept, exit, or change workspace/resume context, PCR finalizes the displayed successful Agent and uses that branch.
+`RECOMMEND_BY` only controls the suggestion. It does not override the successful Agent you are viewing. In the terminal UI, continuing the conversation, accepting, exiting, or changing workspace/resume context uses the displayed successful Agent according to that action's finalization policy. The macOS viewer is independent: closing, quitting, updating or browsing never confirms adoption or stops other Agents; reopening retains the candidates and their original states. See [the macOS client contract](apps/macos/README.md#closing-the-client).
 
 This also works before every Agent has finished. If one result is already good enough, continue from that Agent; PCR stops the remaining work, syncs the chosen branch, and starts the next round from its workspace and Codex session.
 
@@ -347,6 +367,34 @@ this default.
 ```
 
 Each Agent receives its own working directory and temporary `CODEX_HOME`.
+
+### Remote environments
+
+The workspace restriction applies to local project files, not to a remote task
+authorized by the user. Every candidate and synthesis Agent can use existing
+SSH access, remote commands, and file transfer within the task's authorized
+hosts and project scope. No additional PCR mode or remote-access toggle is
+required; remote access controls and project-specific rules still apply.
+
+The user's remote project structure takes precedence over execution identity.
+New schemes use user-requested or project-standard folders; existing schemes
+continue in their specified directories. Only actual concurrent write conflicts
+require a named copy or worktree and coordination through existing locks or
+schedulers. Never move an existing execution directory while a session or job
+depends on it merely to normalize its name.
+
+Authorized organization, moves, deletion and deployment operate on the real
+targets after checking scope and active references. Only the user-designated
+executor, otherwise candidate Agent 1, performs a shared mutation; other
+candidates and synthesis Agents inspect or propose it. A lock is not permission
+to repeat completed work. Check completion evidence first and do not mutate if
+ownership or completion is uncertain. This is Agent guidance, not an OS sandbox
+or an enforced deduplication gateway for arbitrary SSH commands.
+
+Remote jobs and files are not part of local sync-back or candidate cleanup.
+Selecting or discarding a candidate does not automatically adopt, stop, or roll
+back its remote work. Agents record remote host, workspace, job identifiers,
+and result paths in their local workspace and final response for inspection.
 
 ### When the workspace is a Git repository
 
@@ -517,7 +565,7 @@ Run records stay under `.codex_parallel_runs/<timestamp>/` by default.
 ## Development
 
 Use a regular wheel installation for normal use
-(`python3 -m pip install --force-reinstall .`). PCR does not copy its own source
+(`python3 -m pip install --upgrade .`). PCR does not copy its own source
 into temporary runtime snapshots. Python keeps
 already imported modules in memory, so an active CLI process continues with the
 code it loaded at startup. The TUI eagerly imports its PCR and vendored Textual
@@ -534,42 +582,46 @@ replacement from a different source version.
 Run the project checks:
 
 ```bash
-python3 -m unittest discover -s tests
-python3 -m compileall -q parallel_codex_runner.py parallel_codex_runner_core
+PYTHONPATH=src python3 -m unittest discover -s tests
+python3 -m compileall -q src
 git diff --check
 ```
 
 Vendored Textual behavior is covered by the focused compatibility tests:
 
 ```bash
-python3 -m unittest tests.test_vendored_textual
+PYTHONPATH=src python3 -m unittest tests.test_vendored_textual
 ```
 
-See [`vendor/textual/PCR_PATCHES.md`](vendor/textual/PCR_PATCHES.md) for the pinned revision, retained source layout, and local patch inventory.
+See [`src/parallel_codex_runner_core/_vendor/textual/PCR_PATCHES.md`](src/parallel_codex_runner_core/_vendor/textual/PCR_PATCHES.md) for the pinned revision, retained source layout, and local patch inventory.
 
 <details>
 <summary><strong>Project layout</strong></summary>
 
 | Path | Responsibility |
 | --- | --- |
-| `parallel_codex_runner.py` | Package entry point and compatibility imports. |
-| `parallel_codex_runner_core/app.py` | CLI orchestration, Agent execution, summaries, and session promotion. |
-| `parallel_codex_runner_core/runtime_pinning.py` | TUI and plugin-worker module preloading and reload protection. |
-| `parallel_codex_runner_core/synthesis.py` | Second-stage context generation and recommendation priority. |
-| `parallel_codex_runner_core/tui_textual.py` | Interactive TUI and review workflow. |
-| `parallel_codex_runner_core/workspace.py` | Workspace estimation, isolated Git clones, copying, cleanup, and sync-back. |
-| `parallel_codex_runner_core/codex_cli.py` | Codex capability detection and command construction. |
-| `parallel_codex_runner_core/codex_models.py` | Model cache and compatible effort selection. |
-| `parallel_codex_runner_core/prompt_history.py` | Persistent prompt history. |
-| `parallel_codex_runner_core/workspace_config.py` | Per-workspace TUI configuration persistence. |
-| `parallel_codex_runner_core/diffing.py` | Delete-aware workspace diff generation. |
-| `parallel_codex_runner_core/models.py` | Shared run and session data models. |
-| `parallel_codex_runner_core/plugin_runtime.py` | Persistent review-mode controller for plugin runs. |
-| `parallel_codex_runner_core/plugin_mcp.py` | Local MCP tools used by the Codex App plugin. |
-| `parallel_codex_runner_core/plugin/` | Durable state, indexed events, persistent worker IPC, and artifact validation. |
+| `src/` | Installable Python runtime and CLI source. |
+| `src/parallel_codex_runner.py` | Package entry point and compatibility imports. |
+| `src/parallel_codex_runner_core/app.py` | CLI orchestration, Agent execution, summaries, and session promotion. |
+| `src/parallel_codex_runner_core/runtime_pinning.py` | TUI and plugin-worker module preloading and reload protection. |
+| `src/parallel_codex_runner_core/synthesis.py` | Second-stage context generation and recommendation priority. |
+| `src/parallel_codex_runner_core/tui_textual.py` | Interactive TUI and review workflow. |
+| `src/parallel_codex_runner_core/workspace.py` | Workspace estimation, isolated Git clones, copying, cleanup, and sync-back. |
+| `src/parallel_codex_runner_core/codex_cli.py` | Codex capability detection and command construction. |
+| `src/parallel_codex_runner_core/codex_models.py` | Model cache and compatible effort selection. |
+| `src/parallel_codex_runner_core/prompt_history.py` | Persistent prompt history. |
+| `src/parallel_codex_runner_core/workspace_config.py` | Per-workspace TUI configuration persistence. |
+| `src/parallel_codex_runner_core/diffing.py` | Delete-aware workspace diff generation. |
+| `src/parallel_codex_runner_core/models.py` | Shared run and session data models. |
+| `src/parallel_codex_runner_core/plugin_runtime.py` | Persistent review-mode controller for plugin runs. |
+| `src/parallel_codex_runner_core/plugin_mcp.py` | Local MCP tools used by the Codex App plugin. |
+| `src/parallel_codex_runner_core/plugin/` | Durable state, indexed events, persistent worker IPC, and artifact validation. |
 | `plugins/parallel-codex-runner/` | Plugin manifest, Skill, runtime check, and plugin documentation. |
+| `apps/macos/` | Native SwiftUI Mac control center. |
+| `apps/android/` | Native Kotlin/Compose Android client. |
+| `remote/` | Shared wire protocol, relay service, deployment templates, and remote-system documentation. |
 | `.agents/plugins/marketplace.json` | Repository-local Codex plugin marketplace. |
-| `vendor/textual/` | Vendored Textual and PCR's terminal-input patches. |
+| `src/parallel_codex_runner_core/_vendor/textual/` | Vendored Textual and PCR's terminal-input patches. |
 | `tests/` | Regression tests. |
 
 </details>
@@ -580,4 +632,4 @@ Issues and pull requests are welcome. Describe the user-visible problem, keep un
 
 ## License
 
-PCR is available under the [MIT License](LICENSE). Vendored Textual retains its upstream [MIT license](vendor/textual/LICENSE).
+PCR is available under the [MIT License](LICENSE). Vendored Textual retains its upstream [MIT license](src/parallel_codex_runner_core/_vendor/TEXTUAL_LICENSE).

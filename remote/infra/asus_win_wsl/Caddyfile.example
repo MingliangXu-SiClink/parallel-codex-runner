@@ -1,0 +1,20 @@
+{
+    http_port 8080
+    https_port 8443
+}
+
+pcr.example.com {
+    reverse_proxy 127.0.0.1:8765
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

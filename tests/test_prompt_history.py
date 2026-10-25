@@ -290,7 +290,11 @@ class PromptHistoryTuiTests(unittest.TestCase):
                 r"y &= \text{value}"
                 r"\end{aligned}\]"
             )
-            app = tui_textual.PcrTextualApp(parse_args([]))
+            workspace = tempfile.TemporaryDirectory()
+            self.addCleanup(workspace.cleanup)
+            app = tui_textual.PcrTextualApp(
+                parse_args(["--workspace", workspace.name])
+            )
             with mock.patch.object(
                 tui_textual,
                 "list_resume_sessions",
