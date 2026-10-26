@@ -603,6 +603,9 @@ internal fun MainViewModel.finishQueuedFollowUpEditing() {
 internal fun MainViewModel.updateQueuedFollowUp(itemId: String, prompt: String) {
     val previous = state.value.followUpQueue
     if (previous.none { it.id == itemId }) return
+    // Only reset the countdown if the prompt actually changed; merely
+    // re-saving the same text should preserve the remaining countdown time.
+    val promptChanged = previous.any { it.id == itemId && it.prompt != prompt }
     mutableState.update { current ->
         current.copy(
             followUpQueue = current.followUpQueue.map { item ->
@@ -625,7 +628,7 @@ internal fun MainViewModel.updateQueuedFollowUp(itemId: String, prompt: String) 
         )
     }
     val runId = queuedRunId ?: state.value.visibleRunId ?: return
-    syncQueuedFollowUpMutation(runId, previous, state.value.followUpQueue, true)
+    syncQueuedFollowUpMutation(runId, previous, state.value.followUpQueue, promptChanged)
 }
 
 internal fun MainViewModel.removeQueuedFollowUp(itemId: String) {
@@ -1027,6 +1030,25 @@ private suspend fun MainViewModel.processBackgroundFollowUp(
         followUpQueuesByContext[nextKey] = merged
         if (deadline != null) followUpDeadlinesByContext[nextKey] = deadline
         scheduleMobileStateSave()
+        // Refresh visible state so the countdown and queuedRunId reflect the
+        // new run. Without this the UI shows a stale queue bound to the old run.
+        if (state.value.selectedMacId == context.macId &&
+            state.value.selectedWorkspaceId == context.workspaceId
+        ) {
+            queuedRunId = latestRunId.takeIf { merged.isNotEmpty() }
+            mutableState.update { current ->
+                current.copy(
+                    followUpQueue = if (state.value.visibleRunId == latestRunId) {
+                        merged.map { it.asUiItem() }
+                    } else {
+                        current.followUpQueue
+                    },
+                    followUpSecondsRemaining = deadline?.let { d ->
+                        followUpCountdownSeconds(d, System.currentTimeMillis())
+                    }?.takeIf { merged.isNotEmpty() },
+                )
+            }
+        }
         return
     }
 

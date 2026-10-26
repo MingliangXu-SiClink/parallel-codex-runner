@@ -460,11 +460,11 @@ class PcrTextualCommandMixin:
             self._command_error("Usage: /kill [agent]")
             return
         if not self.running:
-            self.status = "No active run"
+            self.status = "No active run; nothing to stop"
             self._sync()
             return
         if self.cancel_event is not None and self.cancel_event.is_set():
-            self.status = "The run is already stopping"
+            self.status = "The run is already stopping; please wait"
             self._sync()
             return
 
