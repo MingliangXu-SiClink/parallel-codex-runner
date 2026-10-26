@@ -621,6 +621,12 @@ extension AppModel {
             self.notifiedRunIDs.remove(
                 MachineContextKey.task(machineID: context.machineID, runID: context.runID)
             )
+            // Adding more agents means we should wait for all of them
+            // before dispatching a follow-up. Cancel the active countdown.
+            if !self.followUpQueue.isEmpty {
+                self.cancelFollowUpCountdown()
+                self.followUpDeadline = nil
+            }
             self.beginPolling(context.runID)
         }
     }
