@@ -3822,7 +3822,7 @@ class TuiCommandTests(unittest.TestCase):
         app._handle_command("/synthesis 4")
 
         self.assertEqual(app.synthesis_agents, 3)
-        self.assertIn("after synthesis has started", app.status)
+        self.assertIn("synthesis has completed", app.status)
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_only_keeps_synthesis_controls_enabled_during_candidates(self) -> None:

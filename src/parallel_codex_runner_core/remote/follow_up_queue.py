@@ -1214,17 +1214,22 @@ class FollowUpQueueCoordinator:
                 expected_run_id=source_run_id,
             )
             return
-        if not latest_run_id:
-            return
-        if latest_run_id != source_run_id:
+
+        # Check if the follow-up was already dispatched and completed in a different run
+        if latest_run_id and latest_run_id != source_run_id:
             if self._matches_dispatched_follow_up(
                 latest_run_id,
                 workspace_id=workspace_id,
                 source_run_id=source_run_id,
                 head=head,
             ):
+                # Already completed elsewhere, mark as complete
                 self._complete(workspace_id, item_id, latest_run_id)
-            else:
+                return
+
+            # Legacy items without enqueued_run_id should pause when the run changes.
+            # New items with explicit enqueued_run_id continue on their bound run.
+            if not head.get("enqueued_run_id"):
                 # A workspace may receive a new Run from another client or a
                 # different conversation while this message is waiting. Never
                 # retarget the message silently: its selected Agent and resume
@@ -1235,7 +1240,10 @@ class FollowUpQueueCoordinator:
                     expected_item_id=item_id,
                     expected_run_id=source_run_id,
                 )
-            return
+                return
+
+        # Continue executing on source_run_id (for explicitly bound items)
+        # or latest_run_id (when they match)
         try:
             run = self.controller.manager.get_run(source_run_id, include_events=False)
         except Exception:

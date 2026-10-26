@@ -1449,7 +1449,7 @@ else:
                 ),
             )
             if started and event.from_follow_up_queue:
-                self._consume_follow_up(event.prompt)
+                self._consume_follow_up(event.follow_up_id)
             elif not started and not event.from_follow_up_queue:
                 self._restore_prompt_after_storage_abort(event.prompt)
                 self._sync()

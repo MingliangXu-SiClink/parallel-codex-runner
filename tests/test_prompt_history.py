@@ -254,6 +254,7 @@ class PromptHistoryTuiTests(unittest.TestCase):
                     "queued follow up",
                     record_history=True,
                     from_follow_up_queue=True,
+                    follow_up_id=mock.ANY,  # UUID is generated dynamically
                     recorded_history_context=history_context,
                 )
 

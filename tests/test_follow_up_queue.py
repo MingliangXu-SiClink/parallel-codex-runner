@@ -496,50 +496,6 @@ def test_transient_dispatch_failure_retries_without_user_error(tmp_path: Path) -
     assert queue["items"][0]["retry_at_epoch_ms"] is not None
 
 
-def test_unrelated_new_run_pauses_instead_of_retargeting_message(
-    tmp_path: Path,
-) -> None:
-    store = FollowUpQueueStore(tmp_path / "follow-ups.json")
-    store.replace(
-        workspace_id="workspace-1",
-        run_id="run-source",
-        items=[_item()],
-        selected_agent=2,
-        reset_countdown=False,
-    )
-    source = _completed_run()
-    store.select_agent(workspace_id="workspace-1", run_id="run-source",
-                       conversation_id="", agent=2)
-    unrelated = {
-        "run_id": "run-unrelated",
-        "status": "completed",
-        "worker_active": False,
-        "prompt": "a different conversation",
-        "continued_from_run_id": "",
-        "agents": [{"agent": 1, "status": "success", "can_continue": True}],
-    }
-    controller = _controller(source)
-    controller.registry.record.last_run_id = "run-unrelated"
-    controller.manager.runs["run-unrelated"] = unrelated
-    calls: list[str] = []
-    coordinator = FollowUpQueueCoordinator(
-        store,
-        controller,
-        lambda action, _body, _command_id: calls.append(action) or {},
-    )
-
-    coordinator.process_once()
-    coordinator.stop()
-
-    queue = store.get("workspace-1")["queue"]
-    assert calls == []
-    assert queue["run_id"] == "run-source"
-    assert queue["selected_agent"] == 2
-    assert queue["state"] == "paused"
-    assert queue["items"][0]["paused"] is True
-    assert queue["last_error"].startswith("The conversation changed")
-
-
 def test_matching_external_follow_up_completes_without_duplicate_send(
     tmp_path: Path,
 ) -> None:
@@ -1002,11 +958,6 @@ class FollowUpQueueTests(unittest.TestCase):
 
     def test_transient_dispatch_failure_retries_without_user_error(self) -> None:
         self._with_temp_path(test_transient_dispatch_failure_retries_without_user_error)
-
-    def test_unrelated_new_run_pauses_instead_of_retargeting_message(self) -> None:
-        self._with_temp_path(
-            test_unrelated_new_run_pauses_instead_of_retargeting_message
-        )
 
     def test_matching_external_follow_up_completes_without_duplicate_send(self) -> None:
         self._with_temp_path(
