@@ -4263,7 +4263,7 @@ class TuiCommandTests(unittest.TestCase):
             app._handle_command("/accept")
 
         finalize.assert_not_called()
-        self.assertEqual(app.status, "Cannot accept while sync back is disabled")
+        self.assertEqual(app.status, "Cannot accept while sync back is disabled; turn it on with /syncback")
 
     @unittest.skipIf(getattr(tui_textual, "PcrTextualApp", None) is None, "textual is not installed")
     def test_tui_reject_excludes_agent_from_recommendation(self) -> None:

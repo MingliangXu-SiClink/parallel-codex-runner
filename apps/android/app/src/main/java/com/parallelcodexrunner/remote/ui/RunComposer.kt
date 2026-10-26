@@ -124,9 +124,17 @@ internal fun RunComposer(state: MainUiState, viewModel: MainViewModel) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
-                    Icons.Default.Schedule,
+                    if (state.followUpQueue.first().paused) {
+                        Icons.Default.Schedule
+                    } else {
+                        Icons.Default.Schedule
+                    },
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = if (state.followUpQueue.first().paused) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(Modifier.width(7.dp))
@@ -156,17 +164,30 @@ internal fun RunComposer(state: MainUiState, viewModel: MainViewModel) {
                                 appText("等待可继续的 Agent", "Waiting for an available Agent")
                             },
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = if (state.followUpQueue.first().paused) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
                         )
                     }
+                    // Show the paused error reason if available, otherwise show the prompt preview
+                    val firstItem = state.followUpQueue.first()
+                    val previewText = if (firstItem.paused && firstItem.lastError.isNotBlank()) {
+                        firstItem.lastError
+                    } else {
+                        firstItem.prompt.replace('\n', ' ').replace('\r', ' ')
+                    }
                     Text(
-                        state.followUpQueue.first().prompt
-                            .replace('\n', ' ')
-                            .replace('\r', ' '),
+                        previewText,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (firstItem.paused && firstItem.lastError.isNotBlank()) {
+                            MaterialTheme.colorScheme.error.copy(alpha = 0.8f)
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 }
                 Icon(

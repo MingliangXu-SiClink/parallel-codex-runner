@@ -279,16 +279,19 @@ class PcrTextualCommandMixin:
             self._command_error(f"Unknown agent: {idx}")
             return
         if self._agent_has_pending_batch(idx):
-            self.status = f"AGENT-{idx:03d} is already running or queued"
+            self.status = f"AGENT-{idx:03d} is already running or queued; wait for it to finish"
             self._sync()
             return
         result_status = result.get("status") if isinstance(result, dict) else pane.status
         if result_status not in {"failed", "error", "killed"}:
-            self.status = f"AGENT-{idx:03d} is not failed or killed"
+            self.status = (
+                f"AGENT-{idx:03d} is not failed or killed; "
+                "/retry only works on failed agents"
+            )
             self._sync()
             return
         if not self._can_extend_current_run():
-            self.status = "No current question is available to retry"
+            self.status = "No current question is available to retry; start a new run first"
             self._sync()
             return
         if not self.running and not self.candidate_batches:
@@ -348,7 +351,7 @@ class PcrTextualCommandMixin:
             self._command_error("Usage: /more <positive integer>")
             return
         if not self._can_extend_current_run():
-            self.status = "No current question is available for more candidates"
+            self.status = "No current question is available for more candidates; start a new run first"
             self._sync()
             return
 

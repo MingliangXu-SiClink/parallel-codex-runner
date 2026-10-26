@@ -173,6 +173,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     internal val backgroundFollowUpJobs = mutableMapOf<String, Job>()
     internal var uiForeground = true
     internal var followUpEditing = false
+    internal var followUpQueueSnapshotBeforeEditing: List<Pair<String, String>>? = null
     internal var queuedRunId: String? = null
     internal var pendingFolderCreation: PendingFolderCreation? = null
     internal var pendingRunNavigation: PendingRunNavigation? = null
