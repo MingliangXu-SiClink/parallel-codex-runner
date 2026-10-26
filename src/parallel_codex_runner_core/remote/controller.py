@@ -209,7 +209,6 @@ class RemoteController:
             "followups.enqueue",
             "followups.reconcile_enqueue",
             "followups.select_agent",
-            "followups.rebind",
             "followups.clear",
         }
     )
@@ -384,7 +383,6 @@ class RemoteController:
             "followups.enqueue": self._followups_enqueue,
             "followups.reconcile_enqueue": self._followups_reconcile_enqueue,
             "followups.select_agent": self._followups_select_agent,
-            "followups.rebind": self._followups_rebind,
             "followups.clear": self._followups_clear,
         }
         classified_actions = self.READ_ONLY_ACTIONS | self.MUTATING_ACTIONS
@@ -1774,86 +1772,6 @@ class RemoteController:
             item=request.body.get("item"), original_queue=original,
             ancestor_run_ids=self._follow_up_ancestors(workspace_id, run_id, conversation_id),
         )
-
-    def _followups_rebind(self, request: RemoteRequest) -> dict[str, Any]:
-        """Rebind paused follow-up queue to a new run context."""
-        workspace_id = self._text(request.body, "workspace_id")
-        new_run_id = self._text(request.body, "new_run_id")
-        conversation_id = self._text(request.body, "conversation_id", required=False)
-
-        # Validate workspace exists
-        current = self.registry.require(workspace_id)
-
-        # Check if target run is current
-        if current.last_run_id != new_run_id:
-            raise RemoteControllerError(
-                "follow_up_stale_target",
-                "The target run is no longer current. Open the latest turn first."
-            )
-
-        # Get target run and validate it's eligible
-        run = self.manager.get_run(new_run_id, include_events=False)
-        if not run:
-            raise RemoteControllerError(
-                "follow_up_run_not_found",
-                "Target run not found."
-            )
-
-        # Check if run is still active
-        status = str(run.get("status") or "").lower()
-        if run.get("worker_active") or status in {"running", "starting", "preparing"}:
-            raise RemoteControllerError(
-                "follow_up_target_busy",
-                "Wait for the target run to finish before rebinding."
-            )
-
-        # Check for eligible agent
-        eligible = FollowUpQueueCoordinator._source_agent({}, run)
-        if eligible is None:
-            raise RemoteControllerError(
-                "follow_up_no_eligible_agent",
-                "No successful agent in the target run can continue the queue."
-            )
-
-        # Atomic rebind operation
-        def rebind_operation(queue: dict[str, Any]) -> bool:
-            if queue.get("run_id") == new_run_id:
-                return False  # Already bound to this run
-
-            # Only rebind if queue is paused
-            if queue.get("state") != "paused":
-                return False
-
-            # Reset all paused items
-            for item in queue.get("items", []):
-                if item.get("paused"):
-                    item["paused"] = False
-                    item["retry_at"] = None
-                    item["last_error"] = ""
-                    item["enqueued_run_id"] = new_run_id
-
-            # Update queue state
-            from .protocol import utc_now
-            queue.update({
-                "run_id": new_run_id,
-                "conversation_id": conversation_id or "",
-                "state": "waiting",
-                "selected_agent": None,
-                "selection_source": None,
-                "deadline": None,
-                "last_error": "",
-                "updated_at": utc_now(),
-            })
-            return True
-
-        changed = self.follow_up_queues.mutate(workspace_id, rebind_operation)
-        if not changed:
-            raise RemoteControllerError(
-                "follow_up_rebind_not_needed",
-                "Queue is not paused or already bound to the target run."
-            )
-
-        return self.follow_up_queues.get(workspace_id)
 
     def _followups_clear(self, request: RemoteRequest) -> dict[str, Any]:
         run_id = self._text(request.body, "run_id", required=False)
