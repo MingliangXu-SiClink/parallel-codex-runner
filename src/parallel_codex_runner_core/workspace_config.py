@@ -59,6 +59,7 @@ class WorkspaceSettings:
     resume_include_non_interactive: bool | None = None
     runs_dir: str | None = None
     codex_bin: str | None = None
+    follow_up_queue: list[dict[str, Any]] = field(default_factory=list)
     present_fields: frozenset[str] = field(
         default_factory=frozenset,
         repr=False,
@@ -158,9 +159,19 @@ class WorkspaceSettings:
                 "RESUME_INCLUDE_NON_INTERACTIVE": "resume_include_non_interactive",
                 "RUNS_DIR": "runs_dir",
                 "CODEX_BIN": "codex_bin",
+                "FOLLOW_UP_QUEUE": "follow_up_queue",
             }.items()
             if json_name in value
         )
+
+        # Parse follow-up queue
+        follow_up_queue: list[dict[str, Any]] = []
+        raw_queue = value.get("FOLLOW_UP_QUEUE")
+        if isinstance(raw_queue, list):
+            for item in raw_queue:
+                if isinstance(item, dict):
+                    follow_up_queue.append(item)
+
         settings = cls(
             agents=positive_int(value.get("AGENTS")),
             synthesis_agents=positive_int(value.get("SYNTHESIS_AGENTS"), allow_zero=True),
@@ -195,6 +206,7 @@ class WorkspaceSettings:
             ),
             runs_dir=optional_text(value.get("RUNS_DIR")),
             codex_bin=optional_text(value.get("CODEX_BIN")),
+            follow_up_queue=follow_up_queue,
             present_fields=present_fields,
         )
         return settings if present_fields else None
@@ -206,6 +218,7 @@ class WorkspaceSettings:
         synthesis_agents: int,
         args: Any,
         resume_session_id: str,
+        follow_up_queue: list[dict[str, Any]] | None = None,
     ) -> "WorkspaceSettings":
         serial = bool(getattr(args, "serial", False))
         raw_max_parallel = getattr(args, "max_parallel", None)
@@ -266,6 +279,7 @@ class WorkspaceSettings:
             ),
             runs_dir=str(getattr(args, "runs_dir", None) or "").strip() or None,
             codex_bin=str(getattr(args, "codex_bin", "codex") or "codex").strip(),
+            follow_up_queue=follow_up_queue or [],
             present_fields=frozenset(
                 {
                     "agents",
@@ -316,6 +330,7 @@ class WorkspaceSettings:
             "RESUME_INCLUDE_NON_INTERACTIVE": self.resume_include_non_interactive,
             "RUNS_DIR": self.runs_dir or "",
             "CODEX_BIN": self.codex_bin or "codex",
+            "FOLLOW_UP_QUEUE": self.follow_up_queue,
         }
 
     def apply_to_args(self, args: Any, explicit_settings: set[str] | frozenset[str] = frozenset()) -> None:

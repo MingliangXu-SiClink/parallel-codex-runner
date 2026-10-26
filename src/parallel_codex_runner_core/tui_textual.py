@@ -568,14 +568,47 @@ else:
             if settings is None:
                 return False
             settings.apply_to_args(self.args, self._workspace_config_explicit)
+
+            # Restore follow_up_queue from saved settings, converting list to tuple
+            if settings.follow_up_queue:
+                restored_queue: list[QueuedFollowUp] = []
+                for item_dict in settings.follow_up_queue:
+                    if isinstance(item_dict, dict):
+                        context = tuple(item_dict["context"]) if item_dict.get("context") else None
+                        recorded_context = tuple(item_dict["recorded_history_context"]) if item_dict.get("recorded_history_context") else None
+
+                        restored_queue.append(QueuedFollowUp(
+                            prompt=item_dict.get("prompt", ""),
+                            record_history=item_dict.get("record_history", False),
+                            context=context,
+                            recorded_history_context=recorded_context,
+                            id=item_dict.get("id"),
+                        ))
+                self.follow_up_queue = restored_queue
+
             return True
 
         def _persist_workspace_settings(self) -> bool:
+            # Serialize follow_up_queue to dicts with list-based contexts
+            queue_dicts: list[dict[str, Any]] = []
+            for item in self.follow_up_queue:
+                context_list = list(item.context) if item.context else None
+                recorded_context_list = list(item.recorded_history_context) if item.recorded_history_context else None
+
+                queue_dicts.append({
+                    "prompt": item.prompt,
+                    "record_history": item.record_history,
+                    "context": context_list,
+                    "recorded_history_context": recorded_context_list,
+                    "id": item.id,
+                })
+
             settings = WorkspaceSettings.from_runtime(
                 self.num_agents,
                 self.synthesis_agents,
                 self.args,
                 self.resume_session_id,
+                follow_up_queue=queue_dicts,
             )
             return self.workspace_config_store.save(self.workspace, settings)
 
