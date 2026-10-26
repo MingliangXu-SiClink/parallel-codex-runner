@@ -263,6 +263,16 @@ internal fun MainViewModel.addMoreAgents(count: Int) {
         if (isCurrentRunMutation(it)) {
             loadRun(it.runId)
             beginPolling(it.runId)
+            // Adding more agents means we should wait for all of them (including
+            // the new ones) before dispatching a follow-up. Cancel any active
+            // countdown so the queue waits for the new batch to complete.
+            if (state.value.followUpQueue.isNotEmpty()) {
+                followUpTask?.cancel()
+                followUpTask = null
+                mutableState.update { current ->
+                    current.copy(followUpSecondsRemaining = null)
+                }
+            }
         }
     }
 }
