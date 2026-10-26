@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pcr-relay"
-version = "0.1.20"
+version = "0.1.21"
 description = "Authenticated opaque-message relay for PCR Remote."
 requires-python = ">=3.12"
 dependencies = [

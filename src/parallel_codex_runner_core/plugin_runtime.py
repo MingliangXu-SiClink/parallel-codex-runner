@@ -5953,24 +5953,37 @@ class PluginRunManager:
             max_lines,
         )
         with self._resume_condition:
-            cached = self._resume_cache.get(cache_key)
+            while True:
+                cached = self._resume_cache.get(cache_key)
+                if cached is not None:
+                    break
+                if cache_key not in self._resume_inflight:
+                    self._resume_inflight.add(cache_key)
+                    break
+                self._resume_condition.wait()
+
         if cached is None:
-            resume_error = subagent_resume_error(get_codex_home(), session_id)
-            if resume_error:
-                raise PluginRunError(resume_error)
             try:
-                history = load_codex_session_history(
-                    get_codex_home(),
-                    session_id,
-                    session.rollout_path or None,
-                    max_lines=max_lines,
-                )
-            except Exception as exc:
-                raise PluginRunError(
-                    f"Cannot load Codex history for {session_id}: {exc}"
-                ) from exc
-            with self._resume_condition:
-                self._resume_cache.put(cache_key, (session, list(history)))
+                resume_error = subagent_resume_error(get_codex_home(), session_id)
+                if resume_error:
+                    raise PluginRunError(resume_error)
+                try:
+                    history = load_codex_session_history(
+                        get_codex_home(),
+                        session_id,
+                        session.rollout_path or None,
+                        max_lines=max_lines,
+                    )
+                except Exception as exc:
+                    raise PluginRunError(
+                        f"Cannot load Codex history for {session_id}: {exc}"
+                    ) from exc
+                with self._resume_condition:
+                    self._resume_cache.put(cache_key, (session, list(history)))
+            finally:
+                with self._resume_condition:
+                    self._resume_inflight.discard(cache_key)
+                    self._resume_condition.notify_all()
         else:
             _cached_session, history = cached
         if legacy_current_prompt:

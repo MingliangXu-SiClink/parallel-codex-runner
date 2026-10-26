@@ -14,6 +14,10 @@ certificate authority's international validators even though UFW allows port
 `/usr/local/sbin/`, and `validation-window.conf` at
 `/etc/systemd/system/pcr-relay-cert-renew.service.d/validation-window.conf`.
 Reload systemd. Renewal must run through that service, not bare Certbot.
+The renewal drop-in requires Nginx as well as ordering after it: `After=` alone
+does not start a stopped or failed web server. A timer-triggered renewal now
+starts the existing Nginx service before opening the temporary validation window.
+It does not restart an already running server or change its shared routes.
 
 The exception exists only during renewal, affects only TCP 80's geographic
 filter, and does not bypass IP blocklists or UFW. `ExecStopPost` removes it on
