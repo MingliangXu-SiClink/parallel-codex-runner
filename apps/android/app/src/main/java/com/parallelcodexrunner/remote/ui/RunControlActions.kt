@@ -152,6 +152,12 @@ internal fun MainViewModel.acceptAgent(agent: Int) {
             }
             promotedSessionId(result)?.let(::applyPromotedSession)
             loadRun(it.runId)
+            // After accepting an agent, trigger follow-up queue if items are
+            // waiting. The run just finalized, so the continuation source is now
+            // known and the countdown should start fresh.
+            if (state.value.followUpQueue.isNotEmpty()) {
+                reconcileFollowUpQueue(resetCountdown = true)
+            }
         }
     }
 }

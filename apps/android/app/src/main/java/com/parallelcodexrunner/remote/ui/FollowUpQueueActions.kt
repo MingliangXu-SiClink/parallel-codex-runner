@@ -580,6 +580,7 @@ internal fun MainViewModel.clearQueuedFollowUps(context: RunMutationContext) {
 
 internal fun MainViewModel.beginQueuedFollowUpEditing() {
     followUpEditing = true
+    followUpQueueSnapshotBeforeEditing = state.value.followUpQueue.map { it.id to it.prompt }
     followUpTask?.cancel()
     followUpTask = null
     removeFollowUpDeadline(queuedRunId ?: state.value.visibleRunId)
@@ -587,9 +588,15 @@ internal fun MainViewModel.beginQueuedFollowUpEditing() {
 }
 
 internal fun MainViewModel.finishQueuedFollowUpEditing() {
+    val snapBefore = followUpQueueSnapshotBeforeEditing
+    followUpQueueSnapshotBeforeEditing = null
     followUpEditing = false
     if (state.value.followUpQueue.isNotEmpty()) {
-        reconcileFollowUpQueue(resetCountdown = true)
+        // Only reset the countdown if the user actually changed the queue.
+        // Merely browsing and closing the editor should preserve the remaining time.
+        val snapAfter = state.value.followUpQueue.map { it.id to it.prompt }
+        val changed = snapBefore == null || snapBefore != snapAfter
+        reconcileFollowUpQueue(resetCountdown = changed)
     }
 }
 

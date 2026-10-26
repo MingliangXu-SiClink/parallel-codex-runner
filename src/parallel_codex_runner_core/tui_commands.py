@@ -197,18 +197,25 @@ class PcrTextualCommandMixin:
         pane = self.agents.get(self.selected_agent)
         result = pane.result if pane is not None else None
         if not self._has_pending_run() or not isinstance(result, dict):
-            self.status = "No finished agent is available to accept"
+            self.status = "No finished agent to accept; wait for agents to complete or select a finished one"
             self._sync()
             return
         if result.get("status") != "success":
-            self.status = f"AGENT-{self.selected_agent:03d} is not successful"
+            self.status = (
+                f"AGENT-{self.selected_agent:03d} did not succeed; "
+                "use /retry to try again or select another agent"
+            )
             self._sync()
             return
         if self._pending_sync_disabled():
-            self.status = "Cannot accept while sync back is disabled"
+            self.status = "Cannot accept while sync back is disabled; turn it on with /syncback"
             self._sync()
             return
         if self.running:
+            if self.pending_accept_agent is not None:
+                self.status = f"Already stopping to accept AGENT-{self.pending_accept_agent:03d}; please wait"
+                self._sync()
+                return
             self.pending_accept_agent = self.selected_agent
             self.queued_prompt = ""
             self.queued_agent = None
@@ -380,6 +387,11 @@ class PcrTextualCommandMixin:
 
         self.candidate_batches.append(CandidateBatch(indices))
         self._mark_detail_dirty()
+        if self.follow_up_source_finalized:
+            self.follow_up_source_finalized = False
+            self.follow_up_ready = False
+            self.follow_up_continue_at = None
+            self._follow_up_countdown_second = None
         if self.running:
             self.status = f"Queued {count} additional candidates"
             self._sync()
@@ -1673,6 +1685,10 @@ class PcrTextualCommandMixin:
         self.recommended_agent = None
         self.pending_accept_agent = None
         self.queued_agent = None
+        self.follow_up_continue_at = None
+        self.follow_up_ready = False
+        self.follow_up_source_finalized = False
+        self._follow_up_countdown_second = None
         self.detail_history.clear()
         self.command_history.clear()
         self._mark_detail_dirty()

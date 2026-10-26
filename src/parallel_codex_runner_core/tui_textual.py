@@ -2483,6 +2483,7 @@ else:
                 self.cancel_event = None
                 self.active_batch_indices.clear()
                 self.live_candidate_indices.clear()
+                self.follow_up_source_finalized = False
                 if self.pending_accept_agent is not None or (
                     self.queued_prompt and self.queued_agent is not None
                 ):
@@ -2498,7 +2499,10 @@ else:
                             "queued follow-up is waiting for /retry or /more"
                         )
                 else:
-                    self.status = f"Run failed: {payload.get('message') or ''}"
+                    self.status = (
+                        f"Run failed: {payload.get('message') or ''}; "
+                        "use /retry or /more to try again"
+                    )
                     if self._cleanup_after_pending_run():
                         self._clear_pending_run()
             elif kind == "candidate_batch_finished":
@@ -2551,7 +2555,10 @@ else:
                     self._finish_cancelled_runner()
                 elif not self._launch_next_pending_stage():
                     self._recompute_recommendation()
-                    self.status = f"Additional candidates failed: {payload.get('message') or ''}"
+                    self.status = (
+                        f"Additional candidates failed: {payload.get('message') or ''}; "
+                        "use /retry to retry failed agents"
+                    )
                     self._notify_completion_if_background()
                     self._select_recommended_agent_after_completion()
                     self._schedule_follow_up_after_completion()
