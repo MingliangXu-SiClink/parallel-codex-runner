@@ -710,7 +710,7 @@ class PcrTextualCommandMixin:
                 return False
 
         self._sync()
-        return False
+        return True
 
     def _follow_up_context(self) -> tuple[str, str]:
         return (
@@ -736,6 +736,7 @@ class PcrTextualCommandMixin:
         self.follow_up_queue = [
             QueuedFollowUp(
                 item.prompt,
+                id=item.id,
                 record_history=item.record_history,
                 context=context,
                 recorded_history_context=item.recorded_history_context,
