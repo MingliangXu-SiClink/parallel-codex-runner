@@ -852,6 +852,7 @@ class PcrTextualCommandMixin:
                     rebuilt.append(
                         QueuedFollowUp(
                             prompt,
+                            id=source.id,
                             record_history=source.record_history,
                             context=source.context,
                             recorded_history_context=recorded_history_context,
