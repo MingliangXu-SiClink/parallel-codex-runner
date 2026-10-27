@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import shlex
@@ -228,6 +229,24 @@ def command_suggestions(value: str) -> list[str]:
         for command, description in TEXTUAL_COMMANDS
         if command.startswith(text)
     ][:MAX_SUGGESTIONS]
+
+
+def closest_command(name: str) -> str | None:
+    """Return the closest known command name if it looks like a typo, else None.
+
+    Only suggests for input that doesn't already match as a prefix (those are
+    handled by command_suggestions for autocomplete). Strips the argument
+    portion from command names before matching.
+    """
+    if not name.startswith("/"):
+        return None
+    # Skip if it's already a valid prefix — that's an autocomplete scenario.
+    if any(cmd.split()[0].startswith(name) for cmd, _ in TEXTUAL_COMMANDS):
+        return None
+    # Match against the bare command name (before any argument description).
+    known = [command.split()[0] for command, _ in TEXTUAL_COMMANDS]
+    matches = difflib.get_close_matches(name, known, n=1, cutoff=0.55)
+    return matches[0] if matches else None
 
 
 _PROMPT_CONTROL_TRANSLATION = {

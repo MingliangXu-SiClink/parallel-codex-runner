@@ -35,6 +35,7 @@ from .tui_common import (
     HELP_TEXT,
     SYNTHESIS_INFO_LABELS,
     UNKNOWN_RESUME_MODEL,
+    closest_command,
     fast_control_value,
     fast_setting_value,
 )
@@ -181,7 +182,11 @@ class PcrTextualCommandMixin:
         if name == "/resume":
             self._handle_resume(args)
             return
-        self._command_error(f"Unknown command: {name}")
+        suggestion = closest_command(name)
+        if suggestion:
+            self._command_error(f"Unknown command: {name} — did you mean {suggestion}?")
+        else:
+            self._command_error(f"Unknown command: {name} — type /help to see all commands")
 
     def _handle_accept(self, args: list[str]) -> None:
         if args:
