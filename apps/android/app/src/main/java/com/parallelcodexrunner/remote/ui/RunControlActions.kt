@@ -200,6 +200,15 @@ internal fun MainViewModel.retryAgent(agent: Int) {
         if (isCurrentRunMutation(it)) {
             loadRun(it.runId)
             beginPolling(it.runId)
+            // A retry restarts the agent, so any active follow-up countdown
+            // must wait for the retried agent to finish, just like addMoreAgents.
+            if (state.value.followUpQueue.isNotEmpty()) {
+                followUpTask?.cancel()
+                followUpTask = null
+                mutableState.update { current ->
+                    current.copy(followUpSecondsRemaining = null)
+                }
+            }
         }
     }
 }

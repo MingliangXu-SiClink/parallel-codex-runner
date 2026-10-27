@@ -335,6 +335,13 @@ class PcrTextualCommandMixin:
         )
         pane.status = "retry queued"
         self._mark_detail_dirty(pane)
+        # A retry restarts the agent, so any already-armed follow-up countdown
+        # must wait for this new attempt to finish, just like /more does.
+        if self.follow_up_source_finalized:
+            self.follow_up_source_finalized = False
+            self.follow_up_ready = False
+            self.follow_up_continue_at = None
+            self._follow_up_countdown_second = None
         if self.running:
             self.status = f"Retry queued for AGENT-{idx:03d}"
             self._sync()
