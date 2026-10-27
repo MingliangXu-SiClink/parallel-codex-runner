@@ -436,6 +436,12 @@ extension AppModel {
             self.notifiedRunIDs.remove(
                 MachineContextKey.task(machineID: context.machineID, runID: context.runID)
             )
+            // A retry restarts the agent, so any active follow-up countdown
+            // must wait for the retried agent to finish, just like addMoreAgents.
+            if !self.followUpQueue.isEmpty {
+                self.cancelFollowUpCountdown()
+                self.followUpDeadline = nil
+            }
             self.beginPolling(context.runID)
         }
     }
