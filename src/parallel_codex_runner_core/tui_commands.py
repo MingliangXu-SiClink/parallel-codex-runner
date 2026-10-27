@@ -251,7 +251,12 @@ class PcrTextualCommandMixin:
             self._command_error(f"Unknown agent: {self.selected_agent}")
             return
         if pane.rejected:
-            self.status = f"AGENT-{pane.idx:03d} is already excluded from recommendations"
+            # Toggle: un-reject if already rejected (mirrors macOS toggleSelectedAgentRejection)
+            pane.rejected = False
+            if not self.running or self.recommended_agent is not None:
+                self._recompute_recommendation()
+            self.status = f"AGENT-{pane.idx:03d} restored to recommendations"
+            self._mark_detail_dirty(pane)
             self._sync()
             return
         pane.rejected = True
