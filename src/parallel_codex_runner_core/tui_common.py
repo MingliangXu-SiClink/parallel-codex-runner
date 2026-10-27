@@ -15,7 +15,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/status", "show current run configuration"),
     ("/config", "show current run configuration"),
     ("/accept", "finalize the currently displayed successful agent"),
-    ("/reject", "exclude the currently displayed agent from recommendations"),
+    ("/reject", "toggle excluding the currently displayed agent from recommendations"),
     ("/retry [agent]", "rerun a failed or killed agent on a fresh workspace"),
     ("/more <n>", "add more candidates for the current question"),
     ("/queue [n]", "edit, remove, or reorder queued follow-up questions"),
