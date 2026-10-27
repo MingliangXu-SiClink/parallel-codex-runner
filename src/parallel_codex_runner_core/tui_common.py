@@ -191,6 +191,8 @@ TUI_TIPS: tuple[str, ...] = (
     "大型工作区会在复制前估算空间，并在预计超过 5 GiB 时请求确认。",
     "SUBAGENTS 默认关闭；启用后可用 SUBAGENTS_LIMIT 控制每个 PCR Agent 的嵌套数量。",
     "当前 Agent 未完成时提交的新问题会排队；FOLLOW_UP_DELAY 控制自动续接前的选择时间。",
+    "队列按 Workspace 独立保存；切换 Workspace 后队列互不影响，切回时自动恢复。",
+    "/reject 可切换排除状态：再次输入 /reject 可将已排除的 Agent 恢复到推荐范围。",
 )
 
 
