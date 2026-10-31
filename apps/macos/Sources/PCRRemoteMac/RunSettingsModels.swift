@@ -74,6 +74,34 @@ enum RunFastMode: String, CaseIterable, Codable, Identifiable, Sendable {
     }
 }
 
+struct AgentSpecEntry: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID
+    var model: String
+    var count: Int
+    var effort: String
+    var fast: RunFastMode
+
+    init(id: UUID = UUID(), model: String = "", count: Int = 1,
+         effort: String = "", fast: RunFastMode = .automatic) {
+        self.id = id
+        self.model = model
+        self.count = count
+        self.effort = effort
+        self.fast = fast
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, model, count, effort, fast }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        count = max(1, try c.decodeIfPresent(Int.self, forKey: .count) ?? 1)
+        effort = try c.decodeIfPresent(String.self, forKey: .effort) ?? ""
+        fast = try c.decodeIfPresent(RunFastMode.self, forKey: .fast) ?? .automatic
+    }
+}
+
 struct RunSettings: Codable, Equatable, Sendable {
     var agents = 4
     var synthesisAgents = 2
@@ -96,6 +124,11 @@ struct RunSettings: Codable, Equatable, Sendable {
     var resumeIncludeNonInteractive = false
     var runsDirectory = ""
     var codexExecutable = "codex"
+    var agentSpecs: [AgentSpecEntry] = []
+
+    var effectiveAgentCount: Int {
+        agentSpecs.isEmpty ? agents : agentSpecs.reduce(0) { $0 + $1.count }
+    }
 
     var displayedMaxParallel: Int {
         if execution == .serial { return 1 }
@@ -126,6 +159,7 @@ struct RunSettings: Codable, Equatable, Sendable {
         case resumeIncludeNonInteractive
         case runsDirectory
         case codexExecutable
+        case agentSpecs
     }
 
     init(from decoder: Decoder) throws {
@@ -175,6 +209,7 @@ struct RunSettings: Codable, Equatable, Sendable {
             ?? runsDirectory
         codexExecutable = try container.decodeIfPresent(String.self, forKey: .codexExecutable)
             ?? codexExecutable
+        agentSpecs = try container.decodeIfPresent([AgentSpecEntry].self, forKey: .agentSpecs) ?? []
     }
 
     mutating func apply(_ configuration: RunConfiguration) {
@@ -298,6 +333,7 @@ struct RunSettings: Codable, Equatable, Sendable {
         }
         if fields.contains(.runsDirectory) { merged.runsDirectory = runsDirectory }
         if fields.contains(.codexExecutable) { merged.codexExecutable = codexExecutable }
+        merged.agentSpecs = agentSpecs  // local-only, never overwritten by remote
         return merged
     }
 

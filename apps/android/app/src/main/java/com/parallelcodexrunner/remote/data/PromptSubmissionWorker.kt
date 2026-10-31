@@ -146,6 +146,7 @@ class PromptSubmissionWorker(
                     resumeSessionId = submission.resumeSessionId,
                     confirmLargeRun = submission.confirmLargeRun,
                     commandId = submission.commandId,
+                    agentSpecs = submission.agentSpecs,
                 )
             }
             if (response["status"]?.jsonPrimitive?.content == "confirmation_required") {

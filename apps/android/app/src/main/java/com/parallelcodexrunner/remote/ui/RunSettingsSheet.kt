@@ -59,6 +59,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
+import com.parallelcodexrunner.remote.data.AgentSpec
 import com.parallelcodexrunner.remote.data.CodexModelOptions
 import com.parallelcodexrunner.remote.data.CodexOption
 import com.parallelcodexrunner.remote.data.RemoteRunSettings
@@ -71,6 +72,7 @@ private data class SettingChoice(
 
 private data class RunSettingsActions(
     val agents: (Int) -> Unit,
+    val agentSpecs: (List<AgentSpec>) -> Unit,
     val synthesisAgents: (Int) -> Unit,
     val execution: (String) -> Unit,
     val automaticMaxParallel: (Boolean) -> Unit,
@@ -191,6 +193,7 @@ internal fun RunSettingsSheet(
                         synthesisEditable = synthesisEditable,
                         actions = RunSettingsActions(
                             agents = viewModel::setAgents,
+                            agentSpecs = viewModel::setAgentSpecs,
                             synthesisAgents = viewModel::setSynthesisAgents,
                             execution = viewModel::setExecution,
                             automaticMaxParallel = viewModel::setAutomaticMaxParallel,
@@ -347,6 +350,13 @@ internal fun GeneralConversationSettingsSheet(
                         synthesisEditable = true,
                         actions = RunSettingsActions(
                             agents = { value -> update(false) { it.copy(agents = value) } },
+                            agentSpecs = { value ->
+                                update(false) {
+                                    val total = if (value.isNotEmpty())
+                                        value.sumOf { s -> s.count.coerceAtLeast(1) } else it.agents
+                                    it.copy(agentSpecs = value, agents = total)
+                                }
+                            },
                             synthesisAgents = { value ->
                                 update(false) { it.copy(synthesisAgents = value) }
                             },
@@ -435,11 +445,12 @@ private fun LazyListScope.runSettingsItems(
 ) {
     item { SettingsSectionTitle(appText("运行", "Run")) }
     item {
-        SettingsStepperRow(
-            label = appText("候选 Agent", "Candidate Agents"),
-            value = settings.agents,
-            range = 1..maximumAgentCount,
-            onValue = actions.agents,
+        AgentSpecsSection(
+            settings = settings,
+            maximumAgentCount = maximumAgentCount,
+            primaryOptions = primaryOptions,
+            onAgents = actions.agents,
+            onAgentSpecs = actions.agentSpecs,
         )
     }
     item {
@@ -737,6 +748,192 @@ private fun SettingsNumberRow(
                     }
                 },
         )
+    }
+}
+
+@Composable
+private fun AgentSpecsSection(
+    settings: RemoteRunSettings,
+    maximumAgentCount: Int,
+    primaryOptions: CodexModelOptions?,
+    onAgents: (Int) -> Unit,
+    onAgentSpecs: (List<AgentSpec>) -> Unit,
+) {
+    val language = LocalAppLanguage.current
+    if (settings.agentSpecs.isEmpty()) {
+        Column(Modifier.fillMaxWidth()) {
+            SettingsStepperRow(
+                label = appText("候选 Agent", "Candidate Agents"),
+                value = settings.agents,
+                range = 1..maximumAgentCount,
+                onValue = onAgents,
+            )
+            TextButton(
+                onClick = {
+                    onAgentSpecs(
+                        listOf(
+                            AgentSpec(
+                                model = settings.model.takeIf { it.isNotBlank() },
+                                count = settings.agents.coerceAtLeast(1),
+                            ),
+                        ),
+                    )
+                },
+                modifier = Modifier.padding(start = 4.dp),
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(appText("使用多个模型", "Use multiple models"))
+            }
+        }
+    } else {
+        val total = settings.agentSpecs.sumOf { it.count.coerceAtLeast(1) }
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        appText("候选 Agent", "Candidate Agents"),
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        appText("多模型 · 共 $total 个", "Multi-model · $total total"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = { onAgentSpecs(emptyList()) }) {
+                    Text(appText("单模型", "Single model"))
+                }
+            }
+            settings.agentSpecs.forEachIndexed { index, spec ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 56.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        appText("模型 ${index + 1}", "Model ${index + 1}"),
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.Medium,
+                    )
+                    val choices = modelChoices(
+                        primaryOptions, null, spec.model.orEmpty(), language,
+                    )
+                    var expanded by remember(settings.agentSpecs, index) { mutableStateOf(false) }
+                    Box {
+                        OutlinedButton(
+                            onClick = { expanded = true },
+                            modifier = Modifier.widthIn(min = 130.dp, max = 180.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        ) {
+                            Text(
+                                choices.firstOrNull { it.value == spec.model.orEmpty() }?.label
+                                    ?: spec.model?.ifBlank { null }
+                                    ?: appText("默认", "Default"),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.KeyboardArrowDown,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                            choices.forEach { choice ->
+                                DropdownMenuItem(
+                                    text = { Text(choice.label) },
+                                    onClick = {
+                                        expanded = false
+                                        val updated = settings.agentSpecs.toMutableList()
+                                        updated[index] = spec.copy(model = choice.value.ifBlank { null })
+                                        onAgentSpecs(updated)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                val updated = settings.agentSpecs.toMutableList()
+                                updated[index] = spec.copy(
+                                    count = (spec.count - 1).coerceAtLeast(1),
+                                )
+                                onAgentSpecs(updated)
+                            },
+                            enabled = spec.count > 1,
+                            modifier = Modifier.size(38.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Remove,
+                                contentDescription = appText("减少数量", "Decrease count"),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                        Text(
+                            spec.count.coerceAtLeast(1).toString(),
+                            modifier = Modifier.width(32.dp),
+                            style = MaterialTheme.typography.titleMedium,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                        )
+                        IconButton(
+                            onClick = {
+                                val updated = settings.agentSpecs.toMutableList()
+                                updated[index] = spec.copy(
+                                    count = (spec.count + 1).coerceAtMost(maximumAgentCount),
+                                )
+                                onAgentSpecs(updated)
+                            },
+                            enabled = spec.count < maximumAgentCount,
+                            modifier = Modifier.size(38.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = appText("增加数量", "Increase count"),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = {
+                            val updated = settings.agentSpecs.filterIndexed { i, _ -> i != index }
+                            onAgentSpecs(updated)
+                        },
+                        modifier = Modifier.size(38.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.Remove,
+                            contentDescription = appText("删除模型", "Remove model"),
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+            TextButton(
+                onClick = {
+                    onAgentSpecs(settings.agentSpecs + AgentSpec(count = 1))
+                },
+                enabled = settings.agentSpecs.size < maximumAgentCount,
+                modifier = Modifier.padding(start = 4.dp),
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(appText("添加模型", "Add model"))
+            }
+        }
     }
 }
 

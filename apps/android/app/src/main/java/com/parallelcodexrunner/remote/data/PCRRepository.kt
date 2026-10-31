@@ -560,13 +560,16 @@ class PCRRepository(
         resumeSessionId: String,
         confirmLargeRun: Boolean,
         commandId: String? = null,
+        agentSpecs: List<AgentSpec> = emptyList(),
     ): JsonObject = command(
         mac,
         "turns.start",
         buildJsonObject {
             put("workspace_id", workspaceId)
             put("prompt", prompt)
-            put("num_agents", agents)
+            val effectiveAgents = if (agentSpecs.isNotEmpty())
+                agentSpecs.sumOf { it.count.coerceAtLeast(1) } else agents
+            put("num_agents", effectiveAgents)
             put("synthesis_agents", synthesisAgents)
             if (!settings.automaticMaxParallel) {
                 put("max_parallel", settings.maxParallel)
@@ -593,6 +596,18 @@ class PCRRepository(
             put("codex_bin", settings.codexBin.ifBlank { "codex" })
             if (resumeSessionId.isNotBlank()) {
                 put("resume_session_id", resumeSessionId)
+            }
+            if (agentSpecs.isNotEmpty()) {
+                putJsonArray("agent_specs") {
+                    agentSpecs.forEach { spec ->
+                        add(buildJsonObject {
+                            spec.model?.takeIf { it.isNotBlank() }?.let { put("model", it) }
+                            spec.effort?.takeIf { it.isNotBlank() }?.let { put("effort", it) }
+                            spec.fast?.let { put("fast", it) }
+                            put("count", spec.count.coerceAtLeast(1))
+                        })
+                    }
+                }
             }
         },
         commandId = commandId,

@@ -66,7 +66,7 @@ struct ExecutionEditContext: Hashable {
 }
 
 enum ExecutionConfigurationEdit {
-    case count(Int), model(String), effort(String), fast(RunFastMode)
+    case count(Int), model(String), effort(String), fast(RunFastMode), specs([AgentSpecEntry])
 }
 
 private struct ExecutionCatalogContext: Hashable { let machine: String; let online: Bool }
@@ -97,6 +97,10 @@ extension AppModel {
                 || value == settings[keyPath: stage.effort] else { return false }
             settings[keyPath: stage.effort] = value
         case .fast(let value): settings[keyPath: stage.fast] = value
+        case .specs(let value):
+            guard stage == .candidates else { return false }
+            settings.agentSpecs = value
+            if !value.isEmpty { settings.agents = max(1, value.reduce(0) { $0 + $1.count }) }
         }
         if stage == .synthesis { scheduleSynthesisSettingsUpdate() }
         else { rememberCurrentSettings() }
@@ -354,6 +358,20 @@ private struct ExecutionStageView: View {
     }
 
     var body: some View {
+        Group {
+            if stage == .candidates && !settings.agentSpecs.isEmpty {
+                multiModelBody
+            } else {
+                singleModelBody
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(stage.title(language))
+        .onChange(of: ExecutionEditContext(model)) { _ in editingCustomCount = false }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: locked)
+    }
+
+    private var singleModelBody: some View {
         ExecutionStageLayout(scale: textSize.scale) {
             HStack(spacing: 5 * textSize.scale) {
                 Image(systemName: stage == .candidates ? "square.stack.3d.up" : "arrow.triangle.merge")
@@ -398,10 +416,78 @@ private struct ExecutionStageView: View {
             .accessibilityLabel(language.text("综合配置已锁定", "Synthesis configuration locked"))
             .help(locked ? language.text("综合已开始，显示本轮实际配置", "Synthesis has started. Showing the configuration in use.") : scope)
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(stage.title(language))
-        .onChange(of: ExecutionEditContext(model)) { _ in editingCustomCount = false }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: locked)
+    }
+
+    @ViewBuilder
+    private var multiModelBody: some View {
+        let context = ExecutionEditContext(model)
+        VStack(alignment: .leading, spacing: 4 * textSize.scale) {
+            HStack(spacing: 5 * textSize.scale) {
+                Image(systemName: "square.stack.3d.up")
+                    .foregroundStyle(stage.tint)
+                Text(stage.title(language)).foregroundStyle(.secondary)
+                Text("×").foregroundStyle(.secondary)
+                Text("\(settings.agentSpecs.reduce(0) { $0 + $1.count })")
+                    .monospacedDigit().foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                if !scope.isEmpty {
+                    Text(scope).appScaledSystemFont(size: 10).foregroundStyle(.tertiary)
+                }
+            }
+            .appScaledSystemFont(size: 11, weight: .medium)
+            .padding(.horizontal, 5)
+            .frame(minHeight: 24 * textSize.scale)
+
+            ForEach(Array(settings.agentSpecs.enumerated()), id: \.element.id) { _, spec in
+                AgentSpecRow(
+                    spec: spec,
+                    choices: stage.modelChoices(in: model),
+                    displayTitle: specModelTitle(spec.model),
+                    range: 1...model.effectiveMaximumAgentCount,
+                    update: { newSpec in
+                        var specs = settings.agentSpecs
+                        if let i = specs.firstIndex(where: { $0.id == spec.id }) { specs[i] = newSpec }
+                        Task { await model.editExecutionConfiguration(.specs(specs), stage: stage, context: context) }
+                    },
+                    remove: {
+                        let specs = settings.agentSpecs.filter { $0.id != spec.id }
+                        Task { await model.editExecutionConfiguration(.specs(specs), stage: stage, context: context) }
+                    }
+                )
+            }
+
+            HStack(spacing: 0) {
+                Button {
+                    var specs = settings.agentSpecs
+                    specs.append(AgentSpecEntry(count: 1))
+                    Task { await model.editExecutionConfiguration(.specs(specs), stage: stage, context: context) }
+                } label: {
+                    HStack(spacing: 4 * textSize.scale) {
+                        Image(systemName: "plus.circle").appScaledSystemFont(size: 10)
+                        Text(language.text("添加模型", "Add model"))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+                Button {
+                    Task { await model.editExecutionConfiguration(.specs([]), stage: stage, context: context) }
+                } label: {
+                    Text(language.text("单模型", "Single model")).foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+            .appScaledSystemFont(size: 10)
+            .padding(.horizontal, 5)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .disabled(locked || model.isRunOperationInProgress)
+    }
+
+    private func specModelTitle(_ value: String) -> String {
+        if value.isEmpty { return language.text("选择模型", "Select model") }
+        let label = model.codexModelCatalog?.first(where: { $0.value == value })?.label ?? value
+        return label.isEmpty ? value : codexModelDisplayName(label)
     }
 
     private var countPicker: some View {
@@ -419,7 +505,11 @@ private struct ExecutionStageView: View {
                 ExecutionCountPopUp(title: "\(stage.title(language)) · \(language.text("数量", "Count"))",
                     value: value, choices: choices, select: { count in
                         Task { await model.editExecutionConfiguration(.count(count), stage: stage, context: context) }
-                    }, custom: { editingCustomCount = true })
+                    }, custom: { editingCustomCount = true },
+                    enterMultiModel: stage == .candidates ? {
+                        let spec = AgentSpecEntry(model: settings.model, count: max(1, settings.agents))
+                        Task { await model.editExecutionConfiguration(.specs([spec]), stage: stage, context: context) }
+                    } : nil)
                     .frame(width: max(32, CGFloat(String(value).count) * 7 + 20) * textSize.scale)
             }
         }
@@ -484,6 +574,57 @@ private struct ExecutionStageView: View {
         case .fast:
             return RunFastMode.allCases.map { CodexOption(label: $0.title(language: language), value: $0.rawValue, selected: false) }
         }
+    }
+}
+
+private struct AgentSpecRow: View {
+    @Environment(\.appTextSize) private var textSize
+    @Environment(\.appLanguage) private var language
+    let spec: AgentSpecEntry
+    let choices: [CodexOption]
+    let displayTitle: String
+    let range: ClosedRange<Int>
+    let update: (AgentSpecEntry) -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 5 * textSize.scale) {
+            ExecutionOptionMenu(
+                title: language.text("候选模型", "Candidate model"),
+                identifier: "configuration.spec.\(spec.id).model",
+                choices: choices,
+                selection: spec.model,
+                select: { value in var s = spec; s.model = value; update(s) }
+            ) {
+                HStack(spacing: 4 * textSize.scale) {
+                    Text(displayTitle)
+                        .appScaledSystemFont(size: 13, weight: .semibold)
+                        .foregroundStyle(spec.model.isEmpty ? .secondary : .primary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .appScaledSystemFont(size: 9, weight: .medium)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 5)
+                .frame(minHeight: 22 * textSize.scale)
+                .contentShape(Rectangle())
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text("×").foregroundStyle(.secondary)
+                .appScaledSystemFont(size: 11)
+            ExecutionCountEditor(
+                title: language.text("候选模型", "Candidate model"),
+                value: spec.count, range: range,
+                commit: { count in var s = spec; s.count = count; update(s) }
+            )
+            Button(action: remove) {
+                Image(systemName: "minus.circle")
+                    .appScaledSystemFont(size: 11)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 5)
     }
 }
 
@@ -603,6 +744,7 @@ private struct ExecutionCountPopUp: NSViewRepresentable {
     let choices: [Int]
     let select: (Int) -> Void
     let custom: () -> Void
+    var enterMultiModel: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -620,8 +762,10 @@ private struct ExecutionCountPopUp: NSViewRepresentable {
     func updateNSView(_ button: NSPopUpButton, context: Context) {
         context.coordinator.parent = self
         let customTitle = language.text("自定", "Custom")
-        if button.itemArray.filter({ !$0.isSeparatorItem }).map(\.tag) != choices + [-1]
-            || button.lastItem?.title != customTitle {
+        let multiTitle = language.text("多模型…", "Multi-model…")
+        let expectedTags = choices + [-1] + (enterMultiModel == nil ? [] : [-2])
+        if button.itemArray.filter({ !$0.isSeparatorItem }).map(\.tag) != expectedTags
+            || button.lastItem?.title != (enterMultiModel == nil ? customTitle : multiTitle) {
             button.removeAllItems()
             for value in choices {
                 button.addItem(withTitle: String(value))
@@ -630,6 +774,11 @@ private struct ExecutionCountPopUp: NSViewRepresentable {
             button.menu?.addItem(.separator())
             button.addItem(withTitle: customTitle)
             button.lastItem?.tag = -1
+            if enterMultiModel != nil {
+                button.menu?.addItem(.separator())
+                button.addItem(withTitle: multiTitle)
+                button.lastItem?.tag = -2
+            }
         }
         button.font = .monospacedDigitSystemFont(ofSize: 11 * textSize.scale, weight: .medium)
         button.isEnabled = enabled
@@ -650,7 +799,10 @@ private struct ExecutionCountPopUp: NSViewRepresentable {
         @objc func selected(_ button: NSPopUpButton) {
             guard parent.enabled, let item = button.selectedItem, !item.isSeparatorItem else { return }
             if item.tag == -1 { parent.custom() }
+            else if item.tag == -2 { parent.enterMultiModel?() }
             else { parent.select(item.tag) }
+            // Snap back so the popup reflects the real selection, not the action item.
+            button.selectItem(withTag: parent.value)
         }
     }
 }

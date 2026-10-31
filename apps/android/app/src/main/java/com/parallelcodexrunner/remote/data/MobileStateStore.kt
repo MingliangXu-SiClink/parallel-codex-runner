@@ -83,6 +83,7 @@ data class PendingPromptSubmission(
     val sourceAgent: Int? = null,
     val resumeSessionId: String = "",
     val confirmLargeRun: Boolean = false,
+    val agentSpecs: List<AgentSpec> = emptyList(),
     val attempt: Int = 0,
     val status: String = STATUS_PENDING,
     val error: String = "",

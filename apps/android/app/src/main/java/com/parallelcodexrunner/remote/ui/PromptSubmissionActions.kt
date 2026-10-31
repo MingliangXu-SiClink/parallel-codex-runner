@@ -101,6 +101,7 @@ internal fun MainViewModel.startRun(confirmLargeRun: Boolean = false) {
         sourceAgent = sourceAgent?.number,
         resumeSessionId = effectiveResumeSessionId(settings, lastResumeSessionId),
         confirmLargeRun = confirmLargeRun || hasLargeStorageApproval(),
+        agentSpecs = settings.agentSpecs,
     )
     val contextKey = workspaceSettingsKey(mac.deviceId, workspaceId)
     persistPromptSubmission(contextKey, submission)

@@ -1,6 +1,15 @@
 package com.parallelcodexrunner.remote.ui
 
+import com.parallelcodexrunner.remote.data.AgentSpec
 import kotlinx.coroutines.flow.update
+
+fun MainViewModel.setAgentSpecs(value: List<AgentSpec>) = updateRunSettings {
+    val total = if (value.isNotEmpty()) value.sumOf { it.count.coerceAtLeast(1) } else it.agents
+    it.copy(
+        agentSpecs = value,
+        agents = if (value.isNotEmpty()) total else it.agents,
+    )
+}
 
 fun MainViewModel.setPrompt(value: String) {
     mutableState.update { current ->

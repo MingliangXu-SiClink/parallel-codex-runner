@@ -21,6 +21,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/queue [n]", "edit, remove, or reorder queued follow-up questions"),
     ("/diff", "toggle the full workspace diff for the current agent"),
     ("/kill [agent]", "stop a running agent while queued agents continue normally"),
+    ("/agents [model*count ...]", "configure multi-model candidates (e.g. /agents o3*2 astra*3)"),
     ("/numofagents <n>", "set the number of agents for the next run"),
     ("/maxparallel <n|auto>", "limit how many agents may run concurrently"),
     ("/serial", "run agents one at a time"),
@@ -68,7 +69,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the current Detail view when safe"),
     ("/exit", "stop active agents, clean up, and quit"),
 )
-MAX_SUGGESTIONS = 15
+MAX_SUGGESTIONS = 16
 UNKNOWN_RESUME_MODEL = "__pcr_unknown_resume_model__"
 TIP_ROTATION_SECONDS = 10.0
 TIP_ICON_REFRESH_SECONDS = 0.1

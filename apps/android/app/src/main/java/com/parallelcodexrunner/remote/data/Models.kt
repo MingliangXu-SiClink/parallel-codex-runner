@@ -174,6 +174,15 @@ data class RemoteRunSettings(
     @SerialName("resume_include_non_interactive") val resumeIncludeNonInteractive: Boolean = false,
     @SerialName("runs_dir") val runsDir: String = "",
     @SerialName("codex_bin") val codexBin: String = "codex",
+    @SerialName("agent_specs") val agentSpecs: List<AgentSpec> = emptyList(),
+)
+
+@Serializable
+data class AgentSpec(
+    val model: String? = null,
+    val effort: String? = null,
+    val fast: Boolean? = null,
+    val count: Int = 1,
 )
 
 @Serializable
@@ -316,6 +325,7 @@ internal fun RemoteRunSettings.normalized(): RemoteRunSettings = copy(
     },
     runsDir = runsDir.trim(),
     codexBin = codexBin.trim().ifBlank { "codex" },
+    agentSpecs = agentSpecs.map { it.copy(count = it.count.coerceIn(1, MAX_AGENT_COUNT)) },
 )
 
 private fun normalizedFastMode(value: String): String =

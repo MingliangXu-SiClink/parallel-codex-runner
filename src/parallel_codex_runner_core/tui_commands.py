@@ -19,7 +19,9 @@ from .diffing import build_workspace_diff_text
 from .models import (
     AGENT_ROLE_CANDIDATE,
     DEFAULT_SUBAGENTS_LIMIT,
+    AgentSpec,
     CodexHistoryEntry,
+    normalize_agent_specs,
 )
 from .limits import MAX_AGENT_COUNT
 from .paths import absolute_path_for_display, choose_run_base
@@ -115,8 +117,11 @@ class PcrTextualCommandMixin:
         if name in {"/kill", "/killagent", "/kill-agent"}:
             self._handle_kill(args)
             return
-        if name in {"/numofagents", "/agents"}:
+        if name == "/numofagents":
             self._handle_numofagents(args)
+            return
+        if name == "/agents":
+            self._handle_agents(args)
             return
         if name in {"/maxparallel", "/max-parallel"}:
             self._handle_maxparallel(args)
@@ -1832,3 +1837,144 @@ class PcrTextualCommandMixin:
 
     def _show_status(self) -> None:
         self._show_text(self._tree_text())
+
+    def _parse_agents_arg(self, token: str) -> AgentSpec | None:
+        """Parse one token like 'o3*2', 'astra*3', or plain '5'.
+
+        Formats accepted:
+          model*count   e.g. o3*2
+          model         e.g. o3  (count defaults to 1)
+          count         e.g. 5   (model defaults to current, backward compat)
+        """
+        token = token.strip()
+        if "*" in token:
+            parts = token.split("*", 1)
+            model_part = parts[0].strip()
+            try:
+                count = max(1, int(parts[1].strip()))
+            except ValueError:
+                return None
+            if not model_part:
+                return None
+            return AgentSpec(model=model_part or None, count=count)
+        # No '*' — could be bare model name or bare integer
+        try:
+            count = int(token)
+            if count <= 0:
+                return None
+            return AgentSpec(count=count)  # backward-compat: no model override
+        except ValueError:
+            if token:
+                return AgentSpec(model=token, count=1)
+            return None
+
+    def _handle_agents(self, args: list[str]) -> None:
+        """Multi-model agent configuration.
+
+        Usage examples:
+          /agents                          — show current config
+          /agents 5                        — 5 agents, all default model (same as /numofagents 5)
+          /agents o3*2 astra*3             — 2 agents with o3, 3 with astra
+          /agents o3*2 codex-6-astra*3 o4-mini*1
+        """
+        if not args:
+            current = getattr(self.args, "agent_specs", None)
+            if current:
+                parts = []
+                from collections import defaultdict
+                for spec in current:
+                    m = spec.get("model") or "default"
+                    c = spec.get("count", 1)
+                    parts.append(f"{m}*{c}")
+                self._show_setting("agents=" + " ".join(parts))
+            else:
+                self._show_setting(f"agents={self.num_agents}")
+            return
+
+        # Check if it's a simple integer (backward compat with /numofagents)
+        if len(args) == 1:
+            try:
+                value = int(args[0])
+                if 0 < value <= MAX_AGENT_COUNT:
+                    if not self._prepare_config_change("agent count"):
+                        return
+                    preserve_completed_run = self._has_pending_run()
+                    self.num_agents = value
+                    self.args.num_agents = value
+                    self.args.agent_specs = None  # clear any multi-model config
+                    if not preserve_completed_run:
+                        self.selected_agent = min(self.selected_agent, value)
+                        self.agents = {idx: AgentPane(idx) for idx in range(1, value + 1)}
+                        self.recommended_agent = None
+                        self._mark_detail_dirty()
+                    self.run_info_rows = self._base_info_rows()
+                    self._show_setting(f"Next run will use {value} agents")
+                    return
+                elif value <= 0:
+                    self.status = "agents must be > 0"
+                    self._sync()
+                    return
+                else:
+                    self.status = f"agents must be <= {MAX_AGENT_COUNT}"
+                    self._sync()
+                    return
+            except ValueError:
+                pass  # not a plain integer — fall through to spec parsing
+
+        # Parse multi-model spec tokens
+        parsed: list[AgentSpec] = []
+        for token in args:
+            spec = self._parse_agents_arg(token)
+            if spec is None:
+                self._command_error(
+                    f"Invalid agent spec: {token!r}\n"
+                    "Usage: /agents [model*count ...]\n"
+                    "Examples: /agents o3*2 astra*3  |  /agents o3*2  |  /agents 5"
+                )
+                return
+            parsed.append(spec)
+
+        total = sum(s.count for s in parsed)
+        if total <= 0:
+            self.status = "agents must be > 0"
+            self._sync()
+            return
+        if total > MAX_AGENT_COUNT:
+            self.status = f"Total agents ({total}) must be <= {MAX_AGENT_COUNT}"
+            self._sync()
+            return
+
+        # Check if any spec has an explicit model (otherwise just a count change)
+        has_models = any(s.model is not None for s in parsed)
+
+        if not self._prepare_config_change("agent config"):
+            return
+
+        preserve_completed_run = self._has_pending_run()
+        self.num_agents = total
+        self.args.num_agents = total
+
+        if has_models:
+            # Store expanded specs so run_once can apply per-agent model
+            from .models import expand_agent_specs
+            expanded = expand_agent_specs(parsed)
+            self.args.agent_specs = [
+                {"idx": idx, **s.to_dict()}
+                for idx, s in enumerate(expanded, start=1)
+            ]
+            desc_parts = []
+            for spec in parsed:
+                m = spec.model or "default"
+                desc_parts.append(f"{m}×{spec.count}" if spec.count > 1 else m)
+            desc = ", ".join(desc_parts)
+        else:
+            self.args.agent_specs = None
+            desc = f"{total} agents"
+
+        if not preserve_completed_run:
+            self.selected_agent = min(self.selected_agent, total)
+            self.agents = {idx: AgentPane(idx) for idx in range(1, total + 1)}
+            self.recommended_agent = None
+            self._mark_detail_dirty()
+        self.run_info_rows = self._base_info_rows()
+        self._show_setting(f"Next run: {desc}")

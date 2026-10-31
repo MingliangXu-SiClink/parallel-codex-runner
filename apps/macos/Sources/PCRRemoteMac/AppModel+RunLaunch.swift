@@ -46,10 +46,13 @@ extension AppModel {
         settings: RunSettings,
         confirmLargeRun: Bool
     ) -> RunStartBody {
-        RunStartBody(
+        let specEntries = settings.agentSpecs.isEmpty
+            ? nil : settings.agentSpecs.map { AgentSpecServerEntry($0) }
+        let agentCount = specEntries.map { $0.reduce(0) { $0 + $1.count } } ?? max(1, settings.agents)
+        return RunStartBody(
                 workspaceId: workspaceID,
                 prompt: prompt,
-                numAgents: max(1, settings.agents),
+                numAgents: agentCount,
                 maxParallel: settings.execution == .serial
                     ? 1
                     : (settings.automaticMaxParallel ? nil : max(1, settings.maxParallel)),
@@ -72,7 +75,8 @@ extension AppModel {
                 subagents: settings.subagents,
                 subagentsLimit: max(1, settings.subagentsLimit),
                 runsDir: settings.runsDirectory.isEmpty ? nil : settings.runsDirectory,
-                codexBin: settings.codexExecutable.isEmpty ? "codex" : settings.codexExecutable
+                codexBin: settings.codexExecutable.isEmpty ? "codex" : settings.codexExecutable,
+                agentSpecs: specEntries
             )
     }
 

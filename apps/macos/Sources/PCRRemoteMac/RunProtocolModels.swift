@@ -13,6 +13,20 @@ struct CodexOption: Codable, Identifiable, Hashable, Sendable {
     var id: String { value }
 }
 
+struct AgentSpecServerEntry: Encodable, Sendable {
+    let model: String?
+    let effort: String?
+    let fast: Bool?
+    let count: Int
+
+    init(_ spec: AgentSpecEntry) {
+        model = spec.model.isEmpty ? nil : spec.model
+        effort = spec.effort.isEmpty ? nil : spec.effort
+        fast = spec.fast.requestValue
+        count = max(1, spec.count)
+    }
+}
+
 func codexModelDisplayName(_ value: String) -> String {
     guard value.hasPrefix("gpt-"), value.count > 4 else { return value }
     let parts = value.dropFirst(4).split(separator: "-")
@@ -258,6 +272,7 @@ struct RunStartBody: Encodable, Sendable {
     let subagentsLimit: Int
     let runsDir: String?
     let codexBin: String
+    let agentSpecs: [AgentSpecServerEntry]?
 }
 
 struct PromptCommandReceiptBody<Body: Encodable & Sendable>: Encodable, Sendable {
