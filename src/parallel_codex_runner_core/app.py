@@ -6268,7 +6268,7 @@ def _run_once(
                 raise ValueError(f"cannot retry unknown first-stage agent: {idx}")
             known_candidate_indices.add(idx)
         command, codex_home = _prepare_additional_agent(
-            args=args,
+            args=agent_spec_execution_args(args, getattr(args, "agent_specs", None), idx),
             idx=idx,
             run_root=run_root,
             workspace=workspace,
