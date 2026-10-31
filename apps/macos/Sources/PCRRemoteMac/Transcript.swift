@@ -898,7 +898,7 @@ enum TranscriptFormatter {
 
     static func reasoningPresentationText(_ text: String) -> String {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return value }
+        guard !value.isEmpty, value.contains("*") else { return value }
         let boundaryPattern = #"\*{2,3}[\t ]+\*{2,3}"#
         let separated = value.replacingOccurrences(
             of: boundaryPattern,
@@ -915,6 +915,7 @@ enum TranscriptFormatter {
     }
 
     static func markdownPresentationText(_ text: String) -> String {
+        guard text.contains("**") else { return text }
         var inCodeFence = false
         return text
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -942,25 +943,26 @@ enum TranscriptFormatter {
     }
 
     static func assistantPresentationText(_ text: String) -> String {
-        var value = text.replacingOccurrences(
-            of: #"(?is)<oai-mem-citation\b[^>]*>.*?</oai-mem-citation\s*>"#,
-            with: "",
-            options: .regularExpression
-        )
-        // During streaming the closing tag may not have arrived yet. Hide the
-        // incomplete metadata tail immediately instead of briefly rendering
-        // protocol bookkeeping as part of the Agent answer.
-        if let unfinished = value.range(
-            of: #"(?is)<oai-mem-citation\b[^>]*>"#,
-            options: .regularExpression
-        ) {
-            value.removeSubrange(unfinished.lowerBound..<value.endIndex)
+        var value = text
+        if value.contains("<") {
+            value = value.replacingOccurrences(
+                of: #"(?is)<oai-mem-citation\b[^>]*>.*?</oai-mem-citation\s*>"#,
+                with: "",
+                options: .regularExpression
+            )
+            // A streaming metadata tail is not part of the Agent answer.
+            if let unfinished = value.range(
+                of: #"(?is)<oai-mem-citation\b[^>]*>"#,
+                options: .regularExpression
+            ) {
+                value.removeSubrange(unfinished.lowerBound..<value.endIndex)
+            }
+            value = value.replacingOccurrences(
+                of: #"(?is)</?oai-mem-citation\s*>"#,
+                with: "",
+                options: .regularExpression
+            )
         }
-        value = value.replacingOccurrences(
-            of: #"(?is)</?oai-mem-citation\s*>"#,
-            with: "",
-            options: .regularExpression
-        )
         value = value.replacingOccurrences(
             of: #"\n[\t ]*\n(?:[\t ]*\n)+"#,
             with: "\n\n",
@@ -1104,6 +1106,7 @@ enum TranscriptFormatter {
         streamedBlocks = NativeImageTranscript.project(streamedBlocks)
 
         for (index, entry) in history.enumerated() {
+            guard !(entry.category == "user" && entry.inputOrigin == "pcr_recovery") else { continue }
             let text = cleaned(entry.text)
             guard !text.isEmpty else { continue }
             let kind = historyKind(entry.category)
@@ -1685,7 +1688,8 @@ enum TranscriptFormatter {
     }
 
     private static func equivalentAssistantPresentation(_ lhs: String, _ rhs: String) -> Bool {
-        equivalent(
+        if lhs == rhs { return true }
+        return equivalent(
             markdownVisibleFingerprint(assistantPresentationText(lhs)),
             markdownVisibleFingerprint(assistantPresentationText(rhs))
         )

@@ -125,9 +125,16 @@ class AutomaticRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(start["params"]["input"][0]["text"] == adapter.RECOVERY_INPUT for start in starts[1:]))
         self.assertTrue(all(start["params"]["threadId"] == "private-thread" for start in starts))
         self.assertEqual(len({start["params"]["clientUserMessageId"] for start in starts}), 8)
+        self.assertNotIn("parallel_codex_runner_recovery", starts[0]["params"].get("additionalContext", {}))
+        for start in starts[1:]:
+            context = start["params"]["additionalContext"]["parallel_codex_runner_recovery"]
+            self.assertEqual(context["kind"], "application")
+            self.assertEqual(context["value"], adapter.RECOVERY_CONTEXT + "\n" + adapter.RECOVERY_ID_PREFIX
+                + start["params"]["clientUserMessageId"])
         self.assertEqual(existing.read_bytes(), b"existing trained result")
         self.assertEqual(self.state()["stage"], "completed")
         self.assertEqual(self.state()["recoveries"], 7)
+        self.assertEqual(self.state()["input_origin"], adapter.RECOVERY_ORIGIN)
         self.assertEqual(len(self.peers), 1)
         self.assertEqual(self.output.read_text(), "completed without restarting the job")
 

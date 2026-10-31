@@ -2,7 +2,24 @@ import Foundation
 
 @MainActor
 extension AppModel {
+    // Resolve only new messages; replayed outboxes must keep their original payload and receipt identity.
+    func settingsWithConcreteModelsForNewPrompt(_ value: RunSettings) -> RunSettings? {
+        var snapshot = value
+        for stage in ExecutionStage.allCases {
+            let context = CodexModelOptionsContext(machineID: currentMachineContextID, model: snapshot[keyPath: stage.model])
+            let selection = resolvedCodexModel(current: context.model, options: modelOptionsCache.options(for: context))
+            guard !selection.isEmpty || (stage == .synthesis && snapshot.synthesisAgents == 0) else {
+                errorMessage = appLanguage.text("请先选择\(stage.title(.chinese))使用的具体模型。",
+                    "Select a model for \(stage.title(.english).lowercased()) first.")
+                return nil
+            }
+            snapshot[keyPath: stage.model] = selection
+        }
+        return snapshot
+    }
+
     func updatePrimaryModel(_ model: String) async {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let workspaceContext = ExecutionEditContext(self)
         let changed = settings.model != model
         var next = settings
@@ -91,6 +108,7 @@ extension AppModel {
     }
 
     func updateSynthesisModel(_ model: String) async {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let workspaceContext = ExecutionEditContext(self)
         let changed = settings.synthesisModel != model
         var next = settings
@@ -288,7 +306,7 @@ extension AppModel {
             ?? WorkspaceSettingField.all
         settingsByWorkspace[workspaceKey] = settings
         self.desktopStateStore.saveSettings(settingsByWorkspace)
-        if !changedFields.isEmpty {
+        if !changedFields.isEmpty, selectedWorkspace != nil {
             scheduleRemoteSettingsSave(
                 workspaceID: workspaceID,
                 settings: settings,

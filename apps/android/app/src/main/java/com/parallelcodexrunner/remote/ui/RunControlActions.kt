@@ -2,6 +2,7 @@ package com.parallelcodexrunner.remote.ui
 
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -35,47 +36,27 @@ internal fun MainViewModel.selectAgent(agent: Int, userInitiated: Boolean = true
 
     val cachedSnapshot = runStateStore[context.second]
     val wasWorking = !isTerminalRunStatus(snapshot.runStatus) || cachedSnapshot?.workerActive == true
-    val hasCachedTranscript = cachedSnapshot
-        ?.agentTranscripts
-        ?.containsKey(agent) == true
-    mutableState.update { it.copy(pendingAgentSelection = agent) }
+    val confirmSource = userInitiated && !wasWorking && snapshot.finalizedAgent == null &&
+        snapshot.canMutateVisibleRun() && snapshot.agentSummaries.any { it.number == agent && it.canContinue }
+    applyAgentSelection(context.second, agent, userInitiated)
+    mutableState.update { it.copy(pendingAgentSelection = agent.takeIf { confirmSource }) }
     agentSelectionJob = viewModelScope.launch {
+        val reading = async { runCatching { loadAgent(context.first, context.second, agent) } }
         try {
-            if (userInitiated && !wasWorking &&
-                snapshot.finalizedAgent == null && snapshot.canMutateVisibleRun() &&
-                snapshot.agentSummaries.any { it.number == agent && it.canContinue } &&
+            if (confirmSource &&
                 repository.systemCapabilities(context.first).supports("followups.select_agent")
             ) {
                 val response = repository.selectFollowUpAgent(
                     context.first, context.second.workspaceId, runId, agent,
                 )
-                applyDaemonFollowUpQueue(context.first.deviceId, context.second.workspaceId, response.queue)
-            }
-            if (!isVisibleRun(context.second) || state.value.pendingAgentSelection != agent) return@launch
-            if (hasCachedTranscript) {
-                prewarmVisibleMarkdown(checkNotNull(cachedSnapshot).copy(selectedAgent = agent))
-                if (!isVisibleRun(context.second) ||
-                    state.value.pendingAgentSelection != agent
-                ) {
-                    return@launch
+                if (isVisibleRun(context.second) && state.value.selectedAgent == agent) {
+                    applyDaemonFollowUpQueue(context.first.deviceId, context.second.workspaceId, response.queue)
                 }
-                if (wasWorking && runStateStore[context.second]?.reviewSelectionEstablished == true) {
-                    mutableState.update { it.copy(pendingAgentSelection = null) }
-                    return@launch
-                }
-                applyAgentSelection(context.second, agent, userInitiated)
             }
-            loadAgent(context.first, context.second, agent)
-            if (!hasCachedTranscript &&
-                isVisibleRun(context.second) &&
-                state.value.pendingAgentSelection == agent
-            ) {
-                if (wasWorking && runStateStore[context.second]?.reviewSelectionEstablished == true) {
-                    mutableState.update { it.copy(pendingAgentSelection = null) }
-                    return@launch
-                }
-                applyAgentSelection(context.second, agent, userInitiated)
+            if (isVisibleRun(context.second) && state.value.selectedAgent == agent) {
+                mutableState.update { it.copy(pendingAgentSelection = null) }
             }
+            reading.await().getOrThrow()
             if (isVisibleRun(context.second) && state.value.selectedAgent == agent) {
                 beginPolling(runId)
             }
@@ -137,28 +118,36 @@ internal fun MainViewModel.acceptAgent(agent: Int) {
     }
     if (!available) return
     val context = currentRunMutationContext() ?: return
-    executeRunMutation(context) {
+    executeRunMutation(context, afterMutation = {
+        // Reading history is not part of saving. Retain the captured identity
+        // even if the user left this workspace while the receipt was pending.
+        if (isCurrentRunMutation(it) && state.value.followUpQueue.isNotEmpty()) {
+            reconcileFollowUpQueue(resetCountdown = false)
+        }
+        loadRun(it.mac, WorkspaceRunKey(it.mac.deviceId, it.workspaceId, it.runId))
+    }) {
         val result = repository.acceptAgent(
             it.mac,
             it.runId,
             agent,
             it.settings,
         )
+        val key = WorkspaceRunKey(it.mac.deviceId, it.workspaceId, it.runId)
+        // In-flight reads began before this receipt and may still say completed.
+        runRequestIds[key] = ++nextConversationRequestId
+        val saved = runStateStore.update(key) { previous ->
+            previous.applyingSaveReceipt(key, agent, result)
+        }
         if (isCurrentRunMutation(it)) {
+            mutableState.update { current -> current.projectRun(saved, promptDrafts = promptDraftsByContext) }
             result["workspace_revision"]?.jsonPrimitive?.intOrNull?.let { revision ->
                 mutableState.update { current ->
                     current.copy(workspaceRevision = revision)
                 }
             }
             promotedSessionId(result)?.let(::applyPromotedSession)
-            loadRun(it.runId)
-            // After accepting an agent, trigger follow-up queue if items are
-            // waiting. The run just finalized, so the continuation source is now
-            // known and the countdown should start fresh.
-            if (state.value.followUpQueue.isNotEmpty()) {
-                reconcileFollowUpQueue(resetCountdown = true)
-            }
         }
+        scheduleMobileStateSave()
     }
 }
 
@@ -181,27 +170,30 @@ internal fun MainViewModel.retryAgent(agent: Int) {
     if (!snapshot.canMutateVisibleRun()) return
     if (snapshot.agentSummaries.none { it.number == agent && it.canRetry }) return
     val context = currentRunMutationContext() ?: return
-    executeRunMutation(context) {
-        repository.retryAgent(it.mac, it.runId, agent)
+    executeRunMutation(context, afterMutation = {
+        if (isCurrentRunMutation(it)) {
+            beginPolling(it.runId)
+            loadRun(it.runId)
+        }
+    }) {
+        val receipt = repository.retryAgent(it.mac, it.runId, agent)
         if (isCurrentRunMutation(it)) resetAgentCompletionViewed(agent)
         val runKey = WorkspaceRunKey(it.mac.deviceId, it.workspaceId, it.runId)
         val requestKey = runKey to agent
         agentRequestIds[requestKey] = (agentRequestIds[requestKey] ?: 0) + 1
-        runStateStore.update(runKey) { stored ->
-            stored.copy(agentTranscripts = stored.agentTranscripts - agent)
+        runRequestIds[runKey] = (runRequestIds[runKey] ?: 0) + 1
+        val updated = runStateStore.update(runKey) { stored ->
+            stored.applyingRetryReceipt(runKey, agent, receipt)
         }
         mutableState.update {
             if (isCurrentRunMutation(context)) {
-                it.copy(agentTranscripts = it.agentTranscripts - agent)
+                it.projectRun(updated)
             } else {
                 it
             }
         }
         if (isCurrentRunMutation(it)) {
-            loadRun(it.runId)
-            beginPolling(it.runId)
-            // A retry restarts the agent, so any active follow-up countdown
-            // must wait for the retried agent to finish, just like addMoreAgents.
+            // The resumed Agent must finish before an existing queue can continue.
             if (state.value.followUpQueue.isNotEmpty()) {
                 followUpTask?.cancel()
                 followUpTask = null

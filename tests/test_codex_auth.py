@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from parallel_codex_runner_core import app, codex_app_server as adapter
+from parallel_codex_runner_core import app, codex_app_server as adapter, codex_auth
 from parallel_codex_runner_core.codex_auth import (SOURCE_ENV, changed_auth_for_block, file_auth,
                                                   install_for_start, selected_home, supports_file_auth)
 from parallel_codex_runner_core.codex_usage import CodexUsageReader
@@ -63,6 +63,51 @@ class FileAuthTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.private / "auth.json").stat().st_mode), 0o600)
         self.assertEqual(list(self.private.glob(".pcr-auth-*")), [])
 
+    def test_legacy_token_store_preserves_identity_and_recovers_original_account_boundary(self):
+        expected = file_auth(self.source)
+        previous = file_auth(self.private)
+        history = self.private / "sessions"
+        history.mkdir()
+        (history / "original.jsonl").write_text("original thread and tool outcomes")
+        for null_mode in (False, True):
+            with self.subTest(null_mode=null_mode):
+                value = fixture_auth("a")
+                if null_mode:
+                    value["auth_mode"] = None
+                else:
+                    value.pop("auth_mode")
+                    value.pop("OPENAI_API_KEY")
+                source_bytes = json.dumps(value).encode()
+                (self.source / "auth.json").write_bytes(source_bytes)
+                self.assertEqual(file_auth(self.source).identity, expected.identity)
+                blocked = {"error": {"codexErrorInfo": "unauthorized"},
+                           "auth": {"identity": previous.identity}}
+                self.assertTrue(changed_auth_for_block(blocked, self.private))
+                installed = install_for_start(self.source, self.private)
+                self.assertEqual(installed.identity, expected.identity)
+                self.assertEqual((self.source / "auth.json").read_bytes(), source_bytes)
+                self.assertEqual((history / "original.jsonl").read_text(), "original thread and tool outcomes")
+
+    def test_legacy_inference_rejects_conflicting_auth_and_incomplete_token_identity(self):
+        for change in ("apikey", "provider", "account", "access", "id-token", "tokens"):
+            with self.subTest(change=change):
+                value = fixture_auth("a")
+                value.pop("auth_mode")
+                if change == "apikey":
+                    value["OPENAI_API_KEY"] = "synthetic-api-key"
+                elif change == "provider":
+                    value["auth_mode"] = "apikey"
+                elif change == "account":
+                    value["tokens"]["account_id"] = "different-workspace"
+                elif change == "access":
+                    value["tokens"]["access_token"] = ""
+                elif change == "id-token":
+                    value["tokens"]["id_token"] = "invalid"
+                else:
+                    value["tokens"] = {}
+                (self.source / "auth.json").write_text(json.dumps(value))
+                self.assertIsNone(file_auth(self.source))
+
     def test_keyring_auto_api_and_custom_providers_are_not_mistaken_for_file_identity(self):
         for config in ('cli_auth_credentials_store="keyring"', 'cli_auth_credentials_store="auto"',
                        'model_provider="custom"', 'profile="custom"', '[model_providers.openai]\nname="override"'):
@@ -87,6 +132,88 @@ class FileAuthTests(unittest.TestCase):
         with patch("parallel_codex_runner_core.codex_auth.file_auth", side_effect=[first, newer]):
             self.assertIsNone(install_for_start(self.source, self.private))
         self.assertEqual((self.private / "auth.json").read_bytes(), before)
+
+    def test_unchanged_config_is_parsed_once_but_auth_is_never_cached(self):
+        (self.source / "config.toml").write_text('cli_auth_credentials_store="file"')
+        with patch.object(codex_auth.tomllib, "loads", wraps=codex_auth.tomllib.loads) as parse:
+            for _ in range(5):
+                self.assertTrue(supports_file_auth(self.source))
+                self.assertEqual(file_auth(self.source).account, "a")
+            self.write(self.source, "new-account")
+            self.assertEqual(file_auth(self.source).account, "new-account")
+            self.assertEqual(parse.call_count, 1)
+
+    def test_cached_config_rechecks_environment_and_managed_files(self):
+        (self.source / "config.toml").write_text('cli_auth_credentials_store="file"')
+        self.assertTrue(supports_file_auth(self.source))
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fixture"}):
+            self.assertFalse(supports_file_auth(self.source))
+        self.assertTrue(supports_file_auth(self.source))
+        managed = self.source / "managed_config.toml"
+        managed.touch()
+        self.assertFalse(supports_file_auth(self.source))
+        managed.unlink()
+        self.assertTrue(supports_file_auth(self.source))
+
+    def test_cached_config_detects_in_place_changes_and_atomic_replacement(self):
+        path = self.source / "config.toml"
+        allowed = 'cli_auth_credentials_store="file"'
+        denied = 'cli_auth_credentials_store="auto"'
+        path.write_text(allowed)
+        self.assertTrue(supports_file_auth(self.source))
+        initial = path.stat()
+        path.write_text(denied)
+        os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+        self.assertFalse(supports_file_auth(self.source))
+        replacement = self.source / "next-config.toml"
+        replacement.write_text(allowed)
+        os.utime(replacement, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+        replacement.replace(path)
+        self.assertTrue(supports_file_auth(self.source))
+        path.write_text("invalid [toml")
+        self.assertFalse(supports_file_auth(self.source))
+        path.unlink()
+        self.assertTrue(supports_file_auth(self.source))
+
+    def test_cached_config_follows_logical_home_switch(self):
+        (self.source / "config.toml").write_text('cli_auth_credentials_store="file"')
+        (self.private / "config.toml").write_text('cli_auth_credentials_store="auto"')
+        link = self.root / "selected"
+        link.symlink_to(self.source)
+        self.assertTrue(supports_file_auth(link))
+        link.unlink()
+        link.symlink_to(self.private)
+        self.assertFalse(supports_file_auth(link))
+
+    def test_changed_config_during_parse_is_not_cached_as_allowed(self):
+        path = self.source / "config.toml"
+        path.write_text('cli_auth_credentials_store="file"')
+        parse = codex_auth.tomllib.loads
+
+        def changed(text):
+            value = parse(text)
+            path.write_text('cli_auth_credentials_store="auto"')
+            return value
+
+        with patch.object(codex_auth.tomllib, "loads", side_effect=changed):
+            self.assertFalse(supports_file_auth(self.source))
+        self.assertFalse(supports_file_auth(self.source))
+
+    def test_replaced_config_during_parse_is_not_used_for_current_account(self):
+        path = self.source / "config.toml"
+        path.write_text('cli_auth_credentials_store="file"')
+        parse = codex_auth.tomllib.loads
+
+        def replaced(text):
+            value = parse(text)
+            replacement = path.with_suffix('.new')
+            replacement.write_text('cli_auth_credentials_store="auto"')
+            replacement.replace(path)
+            return value
+
+        with patch.object(codex_auth.tomllib, "loads", side_effect=replaced):
+            self.assertFalse(supports_file_auth(self.source))
+        self.assertFalse(supports_file_auth(self.source))
 
     def test_logical_source_path_follows_switcher_symlink(self):
         link = self.root / "selected"

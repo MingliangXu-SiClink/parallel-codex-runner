@@ -15,8 +15,11 @@ from unittest.mock import patch
 
 from parallel_codex_runner_core import app, plugin_runtime
 from parallel_codex_runner_core.plugin import worker
+from parallel_codex_runner_core.plugin import lifecycle
 from parallel_codex_runner_core.plugin.lifecycle import WORKER_PROTOCOL_VERSION
 from parallel_codex_runner_core.plugin.state import ManagedRun
+from parallel_codex_runner_core.remote.controller import RemoteController
+from parallel_codex_runner_core.remote.ipc import PcrdClient, PcrdServer
 
 
 @unittest.skipUnless(os.name == "posix", "Retained execution ownership uses POSIX locks")
@@ -140,6 +143,42 @@ class InPlaceRecoveryTests(unittest.TestCase):
                         manager.retry_agent(run.run_id, 1)
                     start.assert_not_called()
                 self.assertEqual((Path(run.results[1]["workspace_dir"]) / "trained.bin").read_bytes(), b"completed experiment")
+            finally:
+                manager.close(wait_seconds=0)
+
+    def test_active_candidate_channel_requires_retained_capability_and_rejects_synthesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            run = self.fixture(root)
+            manager, checkpoint, checkpoint_path = self.manager(root, run)
+            run.status, run.worker_state, run.worker_operation = "running", "busy", "initial"
+            checkpoint.update(active=True, operation="initial")
+            checkpoint_path.write_text(json.dumps(checkpoint))
+            channel = lifecycle.worker_candidate_requests_path(manager.state_dir, run.run_id)
+            lifecycle.write_json_atomic(channel, {"accepting": True, "requests": []})
+            try:
+                self.assertFalse(manager.get_run(run.run_id)["agents"][0]["can_retry"])
+                with self.assertRaisesRegex(plugin_runtime.PluginRunError, "does not support in-place retry"):
+                    manager.retry_agent(run.run_id, 1)
+                self.assertEqual(lifecycle.read_json(channel)["requests"], [])
+                self.assertEqual(run.agent_statuses[1], "failed")
+                lifecycle.initialize_candidate_requests(channel)
+                run.results[2]["role"] = run.agent_roles[2] = "synthesis"
+                meta = Path(run.results[2]["meta_dir"])
+                for name in ("status.json", "command.json"):
+                    value = json.loads((meta / name).read_text())
+                    value["role"] = "synthesis"
+                    (meta / name).write_text(json.dumps(value))
+                self.assertFalse(manager.get_run(run.run_id)["agents"][1]["can_retry"])
+                with self.assertRaisesRegex(plugin_runtime.PluginRunError, "Synthesis retry must wait"):
+                    manager.retry_agent(run.run_id, 2)
+                manager.retry_agent(run.run_id, 1)
+                self.assertEqual(lifecycle.read_json(channel)["requests"], [{"idx": 1, "retry": True}])
+                self.assertEqual(run.worker_pid, os.getpid())
+                self.assertEqual(run.worker_operation, "initial")
+                self.assertFalse((manager.control_dir / run.run_id / "stop").exists())
+                original = Path(run.results[2]["workspace_dir"]) / "trained.bin"
+                self.assertEqual(original.read_bytes(), b"completed experiment")
             finally:
                 manager.close(wait_seconds=0)
 
@@ -475,7 +514,93 @@ class InPlaceRecoveryTests(unittest.TestCase):
     def test_dead_busy_worker_recovers_failed_and_accepted_candidates_without_replaying_original_input(self):
         self._assert_native_recovery(orphaned=True)
 
-    def _assert_native_recovery(self, orphaned=False):
+    def test_external_shutdown_resumes_cancelled_candidates_without_replaying_input(self):
+        self._assert_native_recovery(external_role="candidate")
+
+    def test_external_shutdown_resumes_cancelled_synthesis_without_replaying_input(self):
+        self._assert_native_recovery(external_role="synthesis")
+
+    def test_configuration_recovery_submits_original_synthesis_input_once_in_retained_home(self):
+        self._assert_native_recovery(configuration=True)
+
+    def test_normal_candidate_retry_uses_the_idle_worker_and_resumes_the_original_execution(self):
+        self._assert_native_recovery(normal_role="candidate")
+
+    def test_normal_synthesis_retry_preserves_its_original_context_and_other_results(self):
+        self._assert_native_recovery(normal_role="synthesis")
+
+    def test_synthesis_recovery_reports_actual_success_count(self):
+        self._assert_native_recovery(external_role="synthesis", fail_second=True)
+
+    def test_configuration_failure_with_submission_or_tool_evidence_is_not_reset(self):
+        for change in ("thread_id", "turn_id", "client_message_id", "tool"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                run = self.fixture(Path(tmp).resolve())
+                meta = Path(run.results[1]["meta_dir"])
+                receipt = json.loads((meta / "execution_recovery.json").read_text())
+                error = {"code": -32600, "message": "failed to load configuration: duplicate key"}
+                receipt.update(stage="blocked", thread_id="", turn_id="", client_message_id="", error=error)
+                events = [{"type": "error", "error": error}]
+                if change == "tool":
+                    events.insert(0, {"type": "item.started", "item": {"type": "command_execution"}})
+                else:
+                    receipt[change] = "accepted"
+                (meta / "stdout.log").write_text("\n".join(map(json.dumps, events)))
+                (meta / "execution_recovery.json").write_text(json.dumps(receipt))
+                self.assertFalse(app.configuration_failed_before_input(meta, receipt))
+                with self.assertRaises(ValueError):
+                    self.preparation(run)
+
+    def external_shutdown(self, manager, run, checkpoint, path):
+        old_pid = 999999999
+        checkpoint.update(pid=old_pid, alive=False, active=False, stop_reason="shutdown", exit_code=130)
+        path.write_text(json.dumps(checkpoint))
+        run.status, run.completion_reason, run.worker_state, run.worker_pid = "cancelled", "cancelled", "stopped", None
+        control = manager.control_dir / run.run_id
+        control.mkdir(parents=True, exist_ok=True)
+        for signal in ("stop", "shutdown"):
+            (control / signal).write_text(str(old_pid) + "\n")
+        manager._append_event_locked(run, {"type": "batch_finished", "cancelled": True})
+        manager._append_event_locked(run, {"type": "plugin_worker_stopped", "pid": old_pid, "reason": "shutdown"})
+        for idx, result in run.results.items():
+            result["status"] = run.agent_statuses[idx] = "cancelled"
+            meta = Path(result["meta_dir"])
+            (meta / "status.json").write_text(json.dumps(result))
+            (meta / "execution_stop").write_text("cancelled")
+            receipt = json.loads((meta / "execution_recovery.json").read_text())
+            receipt.update(stage="stopped", error=None)
+            (meta / "execution_recovery.json").write_text(json.dumps(receipt))
+        manager._save_state_locked()
+
+    def test_external_shutdown_never_revives_user_stop_or_live_owner(self):
+        for change in ("user-stop", "agent-stop", "signal-owner", "alive", "successful"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run = self.fixture(root)
+                manager, checkpoint, path = self.manager(root, run)
+                try:
+                    self.external_shutdown(manager, run, checkpoint, path)
+                    control = manager.control_dir / run.run_id
+                    if change in ("user-stop", "agent-stop"):
+                        manager._append_event_locked(run, {"type": "run_stop_requested" if change == "user-stop" else "agent_stop_requested", "idx": 1})
+                    elif change == "signal-owner":
+                        (control / "stop").write_text(str(os.getpid()))
+                    elif change == "alive":
+                        checkpoint["alive"] = True
+                        path.write_text(json.dumps(checkpoint))
+                    else:
+                        run.results[1]["status"] = "success"
+                    before = (control / "stop").read_bytes()
+                    with patch.object(manager, "_start_additional_batch") as start:
+                        with self.assertRaises(plugin_runtime.PluginRunError):
+                            manager.resume_external_shutdown_agents(run.run_id, [1, 2])
+                        start.assert_not_called()
+                    self.assertEqual((control / "stop").read_bytes(), before)
+                    self.assertTrue((Path(run.results[1]["meta_dir"]) / "execution_stop").exists())
+                finally:
+                    manager.close(wait_seconds=0)
+
+    def _assert_native_recovery(self, orphaned=False, external_role=None, configuration=False, fail_second=False, normal_role=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             run = self.fixture(root)
@@ -493,6 +618,7 @@ if "--version" in sys.argv:
 assert sys.argv[1] == "app-server"
 meta = Path(os.environ["CODEX_HOME"]).parent
 saved = json.loads((meta / "execution_recovery.json").read_text())
+thread_id = saved["thread_id"] or json.loads((meta / "command.json").read_text())["command"][-2]
 def emit(value):
     print(json.dumps(value), flush=True)
 for line in sys.stdin:
@@ -503,8 +629,8 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"userAgent": "codex/0.159.2"}
     elif method == "thread/resume":
-        assert request["params"]["threadId"] == saved["thread_id"]
-        result = {"thread": {"id": saved["thread_id"], "cwd": os.getcwd()}}
+        assert request["params"]["threadId"] == thread_id
+        result = {"thread": {"id": thread_id, "cwd": os.getcwd()}}
     elif method == "thread/turns/list":
         result = {"data": [{"id": saved["turn_id"],
             "status": "failed" if saved["error"] else "interrupted", "error": saved["error"]}]}
@@ -513,16 +639,19 @@ for line in sys.stdin:
             "id": "original-job", "type": "commandExecution", "status": "completed"}}], "nextCursor": None}
     elif method == "turn/start":
         params = request["params"]
-        assert params["threadId"] == saved["thread_id"]
-        assert params["input"][0]["text"] == "Continue the unfinished task from its saved progress, without restarting completed work."
+        assert params["threadId"] == thread_id
+        expected = "original expensive task" if saved["stage"] == "ready" else "Continue the unfinished task from its saved progress, without restarting completed work."
+        assert params["input"][0]["text"] == expected
         with (meta / "resume-starts.jsonl").open("a") as output:
             output.write(json.dumps(params) + "\\n")
         turn = {"id": "recovered-turn", "status": "completed", "error": None}
-        emit({"method": "turn/started", "params": {"threadId": saved["thread_id"], "turn": turn}})
+        if (meta / "fail-on-resume").exists():
+            turn.update(status="failed", error={"message": "Context window exceeded", "codexErrorInfo": "contextWindowExceeded"})
+        emit({"method": "turn/started", "params": {"threadId": thread_id, "turn": turn}})
         emit({"id": key, "result": {"turn": turn}})
-        emit({"method": "item/completed", "params": {"threadId": saved["thread_id"], "turnId": turn["id"],
-            "item": {"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": "Resumed " + saved["thread_id"]}}})
-        emit({"method": "turn/completed", "params": {"threadId": saved["thread_id"], "turn": turn}})
+        emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn["id"],
+            "item": {"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": "Resumed " + thread_id}}})
+        emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}})
         continue
     else:
         raise AssertionError(method)
@@ -534,6 +663,8 @@ for line in sys.stdin:
                 result = run.results[idx]
                 meta, home = Path(result["meta_dir"]), Path(result["codex_home"])
                 recorded = json.loads((meta / "command.json").read_text())
+                if external_role or configuration or normal_role:
+                    result["role"] = recorded["role"] = run.agent_roles[idx] = external_role or normal_role or "synthesis"
                 recorded["command"][0] = str(executable)
                 result["command"] = recorded["command"]
                 (meta / "command.json").write_text(json.dumps(recorded))
@@ -547,11 +678,31 @@ for line in sys.stdin:
                     home / f"sessions/rollout-thread-{idx}.jsonl")]
             source_home = root / "source-home"
             source_home.mkdir()
+            if fail_second:
+                (Path(run.results[2]["meta_dir"]) / "fail-on-resume").touch()
             with patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
                 manager, checkpoint, checkpoint_path = self.manager(root, run)
                 process = None
+                server = None
+                controller = None
                 old_operation_id = run.run_id + "-old-executed-operation"
-                if orphaned:
+                if configuration:
+                    checkpoint.update(pid=999999999, alive=False, active=False, stop_reason="shutdown", exit_code=0)
+                    checkpoint_path.write_text(json.dumps(checkpoint))
+                    run.worker_state, run.worker_pid = "stopped", None
+                    for idx, result in run.results.items():
+                        meta = Path(result["meta_dir"])
+                        result["codex_thread_id"] = None
+                        (meta / "status.json").write_text(json.dumps(result))
+                        receipt = json.loads((meta / "execution_recovery.json").read_text())
+                        error = {"code": -32600, "message": "failed to load configuration: config.toml:12: duplicate key"}
+                        receipt.update(stage="blocked", thread_id="", turn_id="", client_message_id="", error=error)
+                        (meta / "execution_recovery.json").write_text(json.dumps(receipt))
+                        (meta / "stdout.log").write_text(json.dumps({"type": "error", "error": error}) + "\n")
+                    manager._save_state_locked()
+                elif external_role:
+                    self.external_shutdown(manager, run, checkpoint, checkpoint_path)
+                elif orphaned:
                     old_pid = 999999999
                     checkpoint.update(pid=old_pid, active=True, operation="initial", operation_id=old_operation_id)
                     checkpoint_path.write_text(json.dumps(checkpoint))
@@ -576,7 +727,49 @@ for line in sys.stdin:
                     checkpoint_path.write_text(json.dumps({**checkpoint, "alive": False, "stop_reason": "shutdown"}))
 
                 try:
-                    if orphaned:
+                    if normal_role:
+                        original_second = dict(run.results[2])
+                        (Path(run.run_root) / "synthesis_context.md").write_text("original synthesis inputs")
+                        worker_python = os.environ.get("PCR_RETRY_WORKER_PYTHON", sys.executable)
+                        process = subprocess.Popen([worker_python, "-m", "parallel_codex_runner_core.plugin.worker",
+                            "--state-dir", str(manager.state_dir), "--run-id", run.run_id],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            if json.loads(checkpoint_path.read_text()).get("pid") == process.pid:
+                                break
+                            time.sleep(0.01)
+                        self.assertIsNone(process.poll())
+                        run.worker_pid = process.pid
+                        manager._worker_processes[run.run_id] = process
+                        manager._save_state_locked()
+                        self.assertTrue(manager.get_run(run.run_id)["agents"][0]["can_retry"])
+                        controller = RemoteController(state_dir=root / "remote", manager=manager)
+                        server = PcrdServer(root / "retry.sock", controller)
+                        server_thread = server.start_thread()
+                        client = PcrdClient(root / "retry.sock", timeout=5)
+                        result = client.request("runs.retry_agent", {"run_id": run.run_id, "agent": 1},
+                            command_id="original-retry-1")
+                        replay = client.request("runs.retry_agent", {"run_id": run.run_id, "agent": 1},
+                            command_id="original-retry-1")
+                        self.assertTrue(replay["command_replayed"])
+                        self.assertEqual(result["worker_pid"], process.pid)
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            current = manager.get_run(run.run_id)
+                            if current["status"] == "completed":
+                                break
+                            time.sleep(0.05)
+                        self.assertEqual(run.results[1]["status"], "success", run.results[1])
+                        self.assertEqual(run.results[2], original_second)
+                        self.assertFalse((Path(run.results[2]["meta_dir"]) / "resume-starts.jsonl").exists())
+                        self.assertEqual((Path(run.run_root) / "synthesis_context.md").read_text(), "original synthesis inputs")
+                        result = client.request("runs.retry_agent", {"run_id": run.run_id, "agent": 2})
+                    elif configuration:
+                        result = manager.recover_configuration_failures(run.run_id, [1, 2])
+                    elif external_role:
+                        result = manager.resume_external_shutdown_agents(run.run_id, [1, 2])
+                    elif orphaned:
                         save_state = manager._save_state_locked
                         unpublished_checks = []
 
@@ -607,16 +800,21 @@ for line in sys.stdin:
                             break
                         time.sleep(0.05)
                     self.assertEqual(current["status"], "completed", current)
-                    self.assertEqual({idx: value["status"] for idx, value in run.results.items()}, {1: "success", 2: "success"},
+                    self.assertEqual({idx: value["status"] for idx, value in run.results.items()}, {1: "success", 2: "failed" if fail_second else "success"},
                         {idx: (value.get("error"), value.get("stderr_tail"), value.get("stdout_tail"))
                          for idx, value in run.results.items()})
+                    if external_role == "synthesis":
+                        events = [json.loads(line) for line in manager._events.event_path(run.run_id).read_text().splitlines()]
+                        finished = [event for event in events if event.get("type") == "synthesis_finished"]
+                        self.assertEqual(finished[-1]["success"], 1 if fail_second else 2)
                     for idx in (1, 2):
                         meta = Path(run.run_root) / "meta" / f"agent_{idx:03d}"
                         starts = (meta / "resume-starts.jsonl").read_text().splitlines()
                         self.assertEqual(len(starts), 1)
                         self.assertEqual(json.loads(starts[0])["threadId"], f"thread-{idx}")
                         self.assertEqual((meta / "final_message.md").read_text(), f"Resumed thread-{idx}")
-                        self.assertTrue((meta / "stdout.log").read_text().startswith("all original tool events\n"))
+                        if not configuration:
+                            self.assertTrue((meta / "stdout.log").read_text().startswith("all original tool events\n"))
                         for path, inode, contents in before[idx]:
                             self.assertEqual((path.stat().st_ino, path.read_bytes()), (inode, contents))
                     if compatible_python := os.environ.get("PCR_RECOVERY_COMPAT_PYTHON"):
@@ -634,8 +832,14 @@ finally:
 ''', str(manager.state_dir), run.run_id], text=True)
                         old_reader = json.loads(check)
                         self.assertEqual(old_reader, {"status": "completed", "available": True,
-                            "worker_pid": process.pid, "agents": ["success", "success"]})
+                            "worker_pid": process.pid, "agents": ["success", "failed" if fail_second else "success"]})
                 finally:
+                    if server is not None:
+                        server.shutdown()
+                        server.server_close()
+                        server_thread.join(timeout=5)
+                    if controller is not None:
+                        controller.close()
                     if process is None:
                         process = manager._worker_processes.get(run.run_id)
                     if process is not None:
@@ -646,6 +850,8 @@ finally:
                         except subprocess.TimeoutExpired:
                             process.terminate()
                             process.wait(timeout=5)
+                        if process.stderr:
+                            process.stderr.close()
                     manager._worker_processes.clear()
                     manager.close(wait_seconds=0)
 

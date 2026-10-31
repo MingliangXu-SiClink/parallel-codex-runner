@@ -36,6 +36,7 @@ data class MobileTranscriptBlock(
     val isHistorical: Boolean = false,
     val isFinalAnswer: Boolean = false,
     val operation: WorkOperationRecord? = null,
+    val inputOrigin: String = "",
 )
 
 @Serializable
@@ -58,6 +59,8 @@ object MobileTranscriptFormatter {
     )
     private val unfinishedMemoryCitation = Regex("(?is)<oai-mem-citation\\b[^>]*>")
     private val memoryCitationTag = Regex("(?is)</?oai-mem-citation\\s*>")
+    private val repeatedBlankLines = Regex("\\n[\\t ]*\\n(?:[\\t ]*\\n)+")
+    private val whitespace = Regex("\\s+")
     private val codexFileCitation = Regex(
         """:codex-file-citation\{(?:(?:[^"{}\\]|\\.)|"(?:[^"\\]|\\.)*")*\}"""
     )
@@ -83,7 +86,8 @@ object MobileTranscriptFormatter {
         transcript: MobileAgentTranscript,
     ): List<MobileTranscriptBlock> {
         val values = mutableListOf<MobileTranscriptBlock>()
-        history.forEach { append(it, values) }
+        history.filterNot { it.kind == MobileTranscriptKind.USER && it.inputOrigin == "pcr_recovery" }
+            .forEach { append(it, values) }
         val currentTurnStart = values.size
         cleaned(prompt).takeIf(String::isNotEmpty)?.let {
             // runs.history already ends at the current run's rollout boundary.
@@ -156,6 +160,7 @@ object MobileTranscriptFormatter {
                     text = presentationText(kind, text),
                     isHistorical = true,
                     isFinalAnswer = kind == MobileTranscriptKind.OUTPUT,
+                    inputOrigin = entry.inputOrigin,
                 ))
             }
         }
@@ -487,15 +492,17 @@ object MobileTranscriptFormatter {
     }
 
     internal fun assistantPresentationText(text: String): String {
-        var value = memoryCitationBlock.replace(text, "")
-        unfinishedMemoryCitation.find(value)?.let { match ->
-            value = value.substring(0, match.range.first)
+        var value = text
+        if (text.contains("oai-mem-citation", ignoreCase = true)) {
+            value = memoryCitationBlock.replace(value, "")
+            unfinishedMemoryCitation.find(value)?.let { match ->
+                value = value.substring(0, match.range.first)
+            }
+            value = memoryCitationTag.replace(value, "")
         }
-        value = memoryCitationTag.replace(value, "")
-            .replace(Regex("\\n[\\t ]*\\n(?:[\\t ]*\\n)+"), "\n\n")
-            .trim()
+        value = repeatedBlankLines.replace(value, "\n\n").trim()
         value = deduplicateMirroredFinalAnswer(value)
-        return codexFileCitationsToMarkdown(value)
+        return if (":codex-file-citation" in value) codexFileCitationsToMarkdown(value) else value
     }
 
     private fun presentationText(kind: MobileTranscriptKind, text: String): String = when (kind) {
@@ -561,10 +568,10 @@ object MobileTranscriptFormatter {
     private fun cleaned(value: String): String = value.trim()
 
     private fun equivalent(left: String, right: String): Boolean =
-        left.split(Regex("\\s+")).joinToString(" ") == right.split(Regex("\\s+")).joinToString(" ")
+        left == right || left.split(whitespace).joinToString(" ") == right.split(whitespace).joinToString(" ")
 
     internal fun equivalentAssistantPresentation(left: String, right: String): Boolean =
-        equivalent(
+        left == right || equivalent(
             markdownVisibleFingerprint(assistantPresentationText(left)),
             markdownVisibleFingerprint(assistantPresentationText(right)),
         )

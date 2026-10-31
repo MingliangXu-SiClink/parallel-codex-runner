@@ -116,7 +116,27 @@ def command_string(value: object) -> str:
     return ""
 
 
+def strip_shell_command_wrapper(command: str) -> str:
+    # Shell unwrapping is cosmetic. Preserve large scripts verbatim instead of
+    # letting shlex's per-character concatenation monopolize request threads.
+    if len(command) > 16 * 1024:
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if (len(parts) == 3
+            and PurePosixPath(parts[0]).name in {"bash", "dash", "ksh", "sh", "zsh"}
+            and parts[1] in {"-c", "-lc"}):
+        return parts[2]
+    return command
+
+
 def command_arguments(command: str) -> list[str] | None:
+    # This is display classification, not execution. Long scripts stay intact
+    # as generic commands rather than spending unbounded time in shlex.
+    if len(command) > 16 * 1024 or any(char in command for char in ("$", "`", "\n")):
+        return None
     try:
         tokens = shlex.split(command)
         if len(tokens) == 3 and PurePosixPath(tokens[0]).name in {"sh", "bash", "zsh"} and tokens[1] in {"-c", "-lc"}:

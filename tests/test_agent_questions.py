@@ -413,6 +413,111 @@ class AsyncQuestionTests(unittest.TestCase):
             self.assertEqual(store.pending_count(), 1)
             self.assertEqual(store.blocking_count(), 0)
 
+    def test_late_import_cannot_replace_newer_cursor_or_reopen_delivered_answer(self):
+        for rotate, import_new in ((False, True), (True, True), (True, False)):
+            with self.subTest(rotate=rotate, import_new=import_new), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "stdout.log"
+                prefix = [{"type": "thread.started", "thread_id": "thread"},
+                          {"type": "turn.started", "turn_id": "turn"}]
+                path.write_text("\n".join(map(json.dumps, prefix)) + "\n")
+                store = QuestionStore(root, async_only=True)
+                store.import_async_output(path)
+                original = {"type": "item.completed", "item": async_item()}
+                with path.open("a") as output:
+                    output.write(json.dumps(original) + "\n")
+                entered, release = threading.Event(), threading.Event()
+
+                def slow_parse(*args):
+                    if not entered.is_set():
+                        entered.set()
+                        if not release.wait(5):
+                            raise RuntimeError("test reader was not released")
+                    return async_questions(*args)
+
+                with patch("parallel_codex_runner_core.agent_questions.async_questions", side_effect=slow_parse), \
+                     ThreadPoolExecutor(max_workers=1) as pool:
+                    late = pool.submit(store.import_async_output, path)
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        changed = async_item()
+                        changed["id"] = "new-question"
+                        next_row = {"type": "item.completed", "item": changed}
+                        if rotate:
+                            path.rename(root / "old-output.log")
+                            path.write_text("\n".join(map(json.dumps, prefix + [next_row])) + "\n")
+                        else:
+                            with path.open("a") as output:
+                                output.write(json.dumps(next_row) + "\n")
+                        if import_new:
+                            store.import_async_output(path)
+                            record = store.snapshot()[0]
+                            store.answer(record["id"], record["connection_id"], "original-answer",
+                                         {record["questions"][0]["id"]: {"answers": ["B"]}})
+                            self.assertTrue(store.async_delivery(record["id"], "queued", "sent"))
+                        with store.connection() as db:
+                            expected = tuple(db.execute("SELECT * FROM async_projection WHERE id=1").fetchone())
+                        records = store.snapshot()
+                    finally:
+                        release.set()
+                    late.result(timeout=2)
+                self.assertEqual(store.snapshot(), records)
+                with store.connection() as db:
+                    self.assertEqual(tuple(db.execute("SELECT * FROM async_projection WHERE id=1").fetchone()), expected)
+                store.import_async_output(path)
+                self.assertEqual(len(store.snapshot()), 1 if rotate else 2)
+                if import_new:
+                    self.assertEqual(store.get(record["id"])["delivery"], "sent")
+                    self.assertEqual(store.get(record["id"])["answer_id"], "original-answer")
+
+    def test_projection_cursor_and_questions_commit_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "stdout.log"
+            second = async_item()
+            second["id"] = "second-question"
+            rows = [{"type": "thread.started", "thread_id": "thread"},
+                    {"type": "turn.started", "turn_id": "turn"},
+                    {"type": "item.completed", "item": async_item()},
+                    {"type": "item.completed", "item": second}]
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            store = QuestionStore(root, async_only=True)
+            insert = QuestionStore._open_async_record
+
+            def fail_second(db, params):
+                if params["itemId"] == "second-question":
+                    raise OSError("injected interruption before cursor commit")
+                return insert(db, params)
+
+            with patch.object(QuestionStore, "_open_async_record", side_effect=fail_second), self.assertRaises(OSError):
+                store.import_async_output(path)
+            self.assertEqual(store.snapshot(), [])
+            with store.connection() as db:
+                self.assertIsNone(db.execute("SELECT * FROM async_projection WHERE id=1").fetchone())
+            store.import_async_output(path)
+            self.assertEqual(len(store.snapshot()), 2)
+            with store.connection() as db:
+                self.assertEqual(db.execute("SELECT cursor FROM async_projection WHERE id=1").fetchone()[0], path.stat().st_size)
+
+    def test_reused_question_identity_does_not_block_later_questions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "stdout.log"
+            store = QuestionStore(root)
+            key = store.open_async(async_questions("thread", "turn", async_item()))
+            changed = async_item()
+            changed["questions"][0]["title"] = "Changed question"
+            next_item = async_item()
+            next_item["id"] = "next-question"
+            rows = [{"type": "thread.started", "thread_id": "thread"},
+                    {"type": "turn.started", "turn_id": "turn"},
+                    {"type": "item.completed", "item": changed},
+                    {"type": "item.completed", "item": next_item}]
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            store.import_async_output(path)
+            self.assertEqual(len(store.snapshot()), 2)
+            self.assertEqual(store.get(key)["questions"][0]["question"], "Choose a direction")
+
     def test_idle_reply_reuses_workspace_home_agent_and_archives_the_original_receipt(self):
         from parallel_codex_runner_core.async_answers import run_idle_answer
         with tempfile.TemporaryDirectory() as tmp:

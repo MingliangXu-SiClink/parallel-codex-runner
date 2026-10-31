@@ -86,6 +86,53 @@ def make_result(
 
 
 class PluginRunManagerTests(unittest.TestCase):
+    def test_history_classification_does_not_block_manager_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PluginRunManager(Path(tmp) / "state")
+            entered, release, healthy = threading.Event(), threading.Event(), threading.Event()
+            errors = []
+            run = ManagedRun(run_id="pcr-20261027T120000Z-1234abcd", prompt="fixture",
+                workspace=tmp, config={}, status="completed", worker_pid=os.getpid(),
+                worker_protocol=WORKER_PROTOCOL_VERSION, worker_state="idle", event_count=1)
+            manager._runs[run.run_id] = run
+            manager._events.append(run.run_id, {"type": "fixture", "idx": 1})
+
+            def classify(_event):
+                entered.set()
+                release.wait(5)
+                return {"kind": "output"}
+
+            def read_history():
+                try:
+                    manager.get_events(run.run_id, transcript_kinds={"output"})
+                except Exception as error:
+                    errors.append(error)
+
+            def check_health():
+                try:
+                    manager.health()
+                    healthy.set()
+                except Exception as error:
+                    errors.append(error)
+
+            reader = threading.Thread(target=read_history)
+            checker = threading.Thread(target=check_health)
+            try:
+                with mock.patch("parallel_codex_runner_core.remote.transcript.transcript_item", side_effect=classify):
+                    reader.start()
+                    self.assertTrue(entered.wait(2))
+                    checker.start()
+                    self.assertTrue(healthy.wait(1), "Historical classification blocked the management plane")
+            finally:
+                release.set()
+                reader.join(5)
+                if checker.ident is not None:
+                    checker.join(5)
+                manager.close()
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(checker.is_alive())
+            self.assertEqual(errors, [])
+
     def test_completion_cause_survives_failed_adoption_and_state_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = PluginRunManager(Path(tmp) / "state")
@@ -2186,7 +2233,7 @@ class PluginRunManagerTests(unittest.TestCase):
             finally:
                 manager.close()
 
-    def test_failed_agent_can_retry_after_its_partial_workspace_was_removed(self) -> None:
+    def test_failed_agent_cannot_retry_after_its_original_workspace_was_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = PluginRunManager(root / "state")
@@ -2203,9 +2250,9 @@ class PluginRunManagerTests(unittest.TestCase):
 
                 summary = manager.get_run(run_id)
                 self.assertFalse(summary["agents"][0]["workspace_available"])
-                self.assertTrue(summary["agents"][0]["can_retry"])
+                self.assertFalse(summary["agents"][0]["can_retry"])
                 detail = manager.get_agent(run_id, 1)
-                self.assertTrue(detail["can_retry"])
+                self.assertFalse(detail["can_retry"])
             finally:
                 manager.close()
 
@@ -3067,7 +3114,7 @@ class PluginRunManagerTests(unittest.TestCase):
             finally:
                 manager.close()
 
-    def test_retry_and_add_agents_reuse_the_verified_run(self) -> None:
+    def test_retry_without_native_receipt_is_rejected_but_add_agents_still_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -3144,11 +3191,9 @@ class PluginRunManagerTests(unittest.TestCase):
                         runs_dir=str(runs_dir),
                     )
                     manager.wait_for_run(started["run_id"], timeout_seconds=5)
-                    manager.retry_agent(started["run_id"], 1)
-                    retried = manager.wait_for_run(
-                        started["run_id"], timeout_seconds=5
-                    )
-                    self.assertEqual(retried["agents"][0]["status"], "success")
+                    with self.assertRaisesRegex(PluginRunError, "no new task was started"):
+                        manager.retry_agent(started["run_id"], 1)
+                    self.assertEqual(manager.get_run(started["run_id"])["agents"][0]["status"], "killed")
                     manager.add_agents(started["run_id"], 1)
                     expanded = manager.wait_for_run(
                         started["run_id"], timeout_seconds=5
@@ -4238,7 +4283,7 @@ for line in sys.stdin:
             finally:
                 manager.close()
 
-    def test_retry_is_queued_to_the_existing_persistent_worker(self) -> None:
+    def test_retry_without_receipt_is_not_sent_to_the_idle_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = PluginRunManager(root / "state")
@@ -4262,15 +4307,15 @@ for line in sys.stdin:
                     "enqueue_worker_operation",
                     return_value=("retry-operation", root / "request.json"),
                 ) as enqueue:
-                    retried = manager.retry_agent(run_id, 1)
-
-                self.assertEqual(retried["worker_pid"], os.getpid())
-                self.assertEqual(retried["worker_operation"], "retry")
-                self.assertEqual(enqueue.call_args.args[1:3], (run_id, "retry"))
+                    with self.assertRaisesRegex(PluginRunError, "no new task was started"):
+                        manager.retry_agent(run_id, 1)
+                enqueue.assert_not_called()
+                self.assertEqual(run.worker_pid, os.getpid())
+                self.assertEqual(run.agent_statuses[1], "failed")
             finally:
                 manager.close()
 
-    def test_retry_and_more_join_an_active_persistent_candidate_stage(self) -> None:
+    def test_unverifiable_retry_does_not_pollute_active_stage_or_prevent_more(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = PluginRunManager(root / "state")
@@ -4313,14 +4358,14 @@ for line in sys.stdin:
                 failed = next(
                     agent for agent in summary["agents"] if agent["agent"] == 1
                 )
-                self.assertTrue(failed["can_retry"])
+                self.assertFalse(failed["can_retry"])
                 self.assertTrue(summary["can_add_agents"])
                 self.assertTrue(summary["can_update_synthesis"])
 
-                retried = manager.retry_agent(run_id, 1)
-                self.assertEqual(retried["status"], "running")
-                self.assertEqual(retried["worker_operation"], "initial")
-                self.assertEqual(retried["agents"][0]["status"], "queued")
+                with self.assertRaisesRegex(PluginRunError, "no new task was started"):
+                    manager.retry_agent(run_id, 1)
+                self.assertEqual(run.worker_operation, "initial")
+                self.assertEqual(run.agent_statuses[1], "failed")
 
                 with self.patched_storage():
                     expanded = manager.add_agents(run_id, 1, confirm_large_run=True)
@@ -4336,7 +4381,6 @@ for line in sys.stdin:
                 self.assertEqual(
                     control["requests"],
                     [
-                        {"idx": 1, "retry": True},
                         {"idx": 3, "retry": False},
                     ],
                 )
@@ -4398,7 +4442,7 @@ for line in sys.stdin:
             finally:
                 manager.close()
 
-    def test_synthesis_retry_keeps_its_role_in_the_persistent_worker(self) -> None:
+    def test_synthesis_retry_without_receipt_never_regenerates_its_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = PluginRunManager(root / "state")
@@ -4429,16 +4473,11 @@ for line in sys.stdin:
                     "enqueue_worker_operation",
                     return_value=("retry-operation", root / "request.json"),
                 ) as enqueue:
-                    retried = manager.retry_agent(run_id, 3)
-
-                request = enqueue.call_args.args[3]
-                self.assertEqual(request["agent_role"], "synthesis")
-                self.assertFalse(request["refresh_synthesis"])
-                retried_agent = next(
-                    agent for agent in retried["agents"] if agent["agent"] == 3
-                )
-                self.assertEqual(retried_agent["role"], "synthesis")
-                self.assertEqual(retried_agent["status"], "queued")
+                    with self.assertRaisesRegex(PluginRunError, "no new task was started"):
+                        manager.retry_agent(run_id, 3)
+                enqueue.assert_not_called()
+                self.assertEqual(run.agent_statuses[3], "failed")
+                self.assertEqual(run.agent_roles[3], "synthesis")
             finally:
                 manager.close()
 
@@ -4480,6 +4519,62 @@ for line in sys.stdin:
 
 
 class EventLogTests(unittest.TestCase):
+    def test_filtered_pages_bound_scanning_and_keep_resume_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events = EventLog(Path(tmp))
+            run_id = "pcr-20260713T120000Z-1234abcd"
+            for index in range(2_100):
+                events.append(run_id, {"type": "agent_line", "idx": 2, "text": str(index)})
+            expected = events.append(run_id, {"type": "agent_line", "idx": 1, "text": "answer"})
+            page = events.read(run_id, agent=1, limit=10)
+            self.assertEqual(page["events"], [])
+            self.assertTrue(page["has_more"])
+            self.assertGreater(page["next_cursor"], 0)
+            self.assertLessEqual(page["next_cursor"], 1_000)
+            cursor = page["next_cursor"]
+            received = []
+            restarted = EventLog(Path(tmp))
+            for _ in range(5):
+                page = restarted.read(run_id, agent=1, cursor=cursor, limit=10)
+                received.extend(event["event_id"] for event in page["events"])
+                cursor = page["next_cursor"]
+                if not page["has_more"]:
+                    break
+            self.assertFalse(page["has_more"])
+            self.assertEqual(received, [expected])
+
+    def test_transcript_filter_does_not_hold_event_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events = EventLog(Path(tmp))
+            run_id = "pcr-20260713T120000Z-1234abcd"
+            events.append(run_id, {"type": "agent_line", "idx": 1, "text": "command"})
+            entered = threading.Event()
+            release = threading.Event()
+            counted = threading.Event()
+
+            def slow_filter(_event):
+                entered.set()
+                release.wait(3)
+                return {"kind": "command"}
+
+            def count_events():
+                events.count(run_id)
+                counted.set()
+
+            with mock.patch("parallel_codex_runner_core.remote.transcript.transcript_item", side_effect=slow_filter):
+                reader = threading.Thread(target=lambda: events.read(run_id, transcript_kinds={"output"}))
+                counter = threading.Thread(target=count_events)
+                reader.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    counter.start()
+                    self.assertTrue(counted.wait(1), "summary reads must not wait for transcript parsing")
+                finally:
+                    release.set()
+                    reader.join(3)
+                    if counter.ident is not None:
+                        counter.join(3)
+
     def test_lazily_indexes_complete_lines_and_discards_partial_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             events = EventLog(Path(tmp))

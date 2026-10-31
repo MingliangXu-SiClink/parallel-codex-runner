@@ -165,15 +165,19 @@ class QuestionStore:
         params = validate_questions(params)
         if params.get("kind") != "async":
             raise QuestionError("Expected a native async question")
+        with self.connection(create=True) as db:
+            return self._open_async_record(db, params)
+
+    @staticmethod
+    def _open_async_record(db, params: dict[str, Any]) -> str:
         identity = [params[key] for key in ("threadId", "turnId", "itemId")]
         key = hashlib.sha256(_json(["async", *identity]).encode()).hexdigest()
         encoded, now = _json(params), time.time()
-        with self.connection(create=True) as db:
-            old = db.execute("SELECT payload FROM requests WHERE id=?", (key,)).fetchone()
-            if old is not None and old["payload"] != encoded:
-                raise QuestionError("Async question identity was reused with different questions")
-            db.execute("INSERT OR IGNORE INTO requests(id,connection_id,native_id,payload,state,created,updated) "
-                       "VALUES(?,?,?,?, 'open',?,?)", (key, "async:" + params["threadId"], _json(params["itemId"]), encoded, now, now))
+        old = db.execute("SELECT payload FROM requests WHERE id=?", (key,)).fetchone()
+        if old is not None and old["payload"] != encoded:
+            raise QuestionError("Async question identity was reused with different questions")
+        db.execute("INSERT OR IGNORE INTO requests(id,connection_id,native_id,payload,state,created,updated) "
+                   "VALUES(?,?,?,?, 'open',?,?)", (key, "async:" + params["threadId"], _json(params["itemId"]), encoded, now, now))
         return key
 
     def queued_async(self) -> list[dict[str, Any]]:
@@ -203,10 +207,12 @@ class QuestionStore:
         with self.connection(create=True) as db:
             db.execute("CREATE TABLE IF NOT EXISTS async_projection (id INTEGER PRIMARY KEY, cursor INTEGER, thread TEXT, turn TEXT, skipping INTEGER, inode INTEGER)")
             row = db.execute("SELECT * FROM async_projection WHERE id=1").fetchone()
+            baseline = tuple(row) if row is not None else None
             cursor, thread, turn, skipping, inode = ((row["cursor"], row["thread"], row["turn"], row["skipping"], row["inode"])
                 if row else (0, "", "", False, 0))
         # Older live owners already emit the structured fields. Import only
         # their original log, incrementally; never infer choices from Markdown.
+        questions = []
         with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
             stat = os.fstat(source.fileno())
             if stat.st_size == cursor and stat.st_ino == inode:
@@ -238,10 +244,28 @@ class QuestionStore:
                     elif event.get("type") == "item.completed" and thread and turn:
                         params = async_questions(thread, turn, event.get("item", {}))
                         if params:
-                            self.open_async(params)
+                            questions.append(params)
                 except (ValueError, TypeError, KeyError):
                     continue
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM async_projection WHERE id=1").fetchone()
+            if (tuple(current) if current is not None else None) != baseline:
+                return
+            try:
+                current_source = path.lstat()
+            except OSError:
+                return
+            if (current_source.st_ino != stat.st_ino or current_source.st_dev != stat.st_dev
+                or current_source.st_size < cursor):
+                return
+            # The original rows and their cursor commit together. Late imports
+            # cannot overwrite a newer source or reopen an answered question.
+            for params in questions:
+                try:
+                    self._open_async_record(db, params)
+                except QuestionError:
+                    continue
             db.execute("INSERT INTO async_projection VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "cursor=excluded.cursor,thread=excluded.thread,turn=excluded.turn,skipping=excluded.skipping,inode=excluded.inode "
                 "WHERE async_projection.inode != excluded.inode OR async_projection.cursor <= excluded.cursor",

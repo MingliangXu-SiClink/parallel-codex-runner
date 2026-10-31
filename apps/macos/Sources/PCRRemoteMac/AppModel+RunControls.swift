@@ -6,10 +6,13 @@ extension AppModel {
         _ agent: Int,
         manageFollowUpQueue: Bool = true
     ) async {
-        workspaceEntryDefaultNavigationRequestID = nil
         guard let run = activeRun,
               let targetAgent = run.agents.first(where: { $0.agent == agent }),
               let workspaceID = selectedWorkspaceID else { return }
+        workspaceEntryDefaultNavigationRequestID = nil
+
+        focusConversationRead(key: WorkspaceRunViewKey(machineID: currentMachineContextID,
+            workspaceID: workspaceID, runID: run.runId), agent: agent, force: true)
 
         if selectedAgent == agent {
             if pendingAgentSelection == agent { return }

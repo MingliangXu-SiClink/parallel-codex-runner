@@ -19,6 +19,7 @@ from typing import Any
 from parallel_codex_runner_core.agent_questions import QuestionError, QuestionOwner, async_questions, async_reply
 from parallel_codex_runner_core.codex_auth import (SOURCE_ENV, FileAuth, changed_auth_for_block,
     file_auth, install_for_start, selected_home, supports_file_auth)
+from parallel_codex_runner_core.history_origins import RECOVERY_INPUT, RECOVERY_ORIGIN, RECOVERY_ID_PREFIX
 
 
 PROCESS_POLL_SECONDS = 0.2
@@ -26,7 +27,6 @@ LARGE_RESUME_BYTES = 128 * 1024 * 1024
 MIN_APPLICATION_CONTEXT_VERSION = (0, 159, 2)
 RECOVERY_MIN_DELAY = 10.0
 RECOVERY_MAX_DELAY = 300.0
-RECOVERY_INPUT = "Continue the unfinished task from its saved progress, without restarting completed work."
 RECOVERY_CONTEXT = (
     "PCR is recovering the same interrupted task in the original writable workspace and thread. "
     "The original user's request and permission boundaries still apply. This is not a new task. "
@@ -413,7 +413,11 @@ class EventAdapter:
         self.turn_id = turn_id
         if self.recovery is not None:
             self.recovery.update(stage="accepted", turn_id=turn_id)
-        self.emit({"type": "turn.started", "turn_id": turn_id})
+        event = {"type": "turn.started", "turn_id": turn_id}
+        if self.recovery is not None and self.recovery.state.get("input_origin") == RECOVERY_ORIGIN:
+            event.update(input_origin=RECOVERY_ORIGIN,
+                         client_message_id=self.recovery.state.get("client_message_id"))
+        self.emit(event)
 
 
 def require_application_context_support(user_agent: str) -> None:
@@ -445,6 +449,7 @@ def has_question_channel(output: Path) -> bool:
 
 async def _run_once(command: list[str], prompt: str, *, additional_developer_instructions: str | None = None,
                     recovery: AgentRecovery | None = None) -> int:
+    attempt_started = time.monotonic()
     server, params, output, resume = parse_exec_command(command)
     question_channel = has_question_channel(output)
     if recovery is not None and recovery.state.get("thread_id"):
@@ -470,7 +475,8 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
     adapter = EventAdapter(lambda event: print(json.dumps(event, ensure_ascii=False), flush=True), recovery)
 
     def phase(name: str) -> None:
-        adapter.emit({"type": "pcr.phase", "phase": name})
+        adapter.emit({"type": "pcr.phase", "phase": name, "emitted_at": time.time(),
+                      "elapsed_seconds": time.monotonic() - attempt_started, "native_pid": process.pid})
 
     async def send(message: dict[str, Any]) -> None:
         # Honor cancellation even when buffered reads and drain() do not yield.
@@ -766,6 +772,7 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
             return legacy.returncode or 0
         await send({"method": "initialized"})
         if bound_auth is not None:
+            phase("authenticating")
             try:
                 account = await request("account/read", {"refreshToken": False})
             except AppServerError as error:
@@ -884,8 +891,14 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
                     raise AccountPending("Selected account changed before submission; input was not sent")
                 if recovery is not None:
                     message_id = str(uuid.uuid4())
-                    recovery.update(stage="submitting", client_message_id=message_id, turn_id="")
+                    recovery.update(stage="submitting", client_message_id=message_id, turn_id="",
+                                    input_origin=RECOVERY_ORIGIN if recovering else "user")
                     turn_params["clientUserMessageId"] = message_id
+                    if recovering:
+                        # A per-input identity keeps provenance explicit even
+                        # when native history deduplicates unchanged context.
+                        turn_params["additionalContext"]["parallel_codex_runner_recovery"]["value"] += (
+                            "\n" + RECOVERY_ID_PREFIX + message_id)
                 phase("submitting")
                 turn = await request("turn/start", turn_params)
                 if turn is not None:

@@ -5,12 +5,20 @@ struct TranscriptLinkOrigin: Codable, Hashable, Sendable {
     let agent: Int
 }
 
-struct CodexOption: Decodable, Identifiable, Hashable, Sendable {
+struct CodexOption: Codable, Identifiable, Hashable, Sendable {
     let label: String
     let value: String
     let selected: Bool
 
     var id: String { value }
+}
+
+func codexModelDisplayName(_ value: String) -> String {
+    guard value.hasPrefix("gpt-"), value.count > 4 else { return value }
+    let parts = value.dropFirst(4).split(separator: "-")
+    guard let version = parts.first else { return value }
+    let suffix = parts.dropFirst().map { $0.prefix(1).uppercased() + $0.dropFirst() }
+    return (["GPT-\(version)"] + suffix).joined(separator: " ")
 }
 
 func codexOptionChoices(
@@ -30,14 +38,26 @@ func codexOptionChoices(
     return result
 }
 
-func localizedDefaultModelLabel(
-    _ effectiveModel: String?,
-    language: AppLanguage
-) -> String {
-    let effective = effectiveModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return effective.isEmpty
-        ? language.text("默认", "Default")
-        : language.text("默认（\(effective)）", "Default (\(effective))")
+func resolvedCodexModel(current: String, options: CodexModelOptions?) -> String {
+    [current, options?.effectiveModel ?? "", options?.configuredModel ?? ""]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty } ?? ""
+}
+
+func codexModelChoices(
+    dynamic: [CodexOption]?, current: String, effective: String
+) -> [CodexOption] {
+    let selection = current.isEmpty ? effective : current
+    var result: [CodexOption] = []
+    for option in dynamic ?? [] where !option.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        guard !result.contains(where: { $0.value == option.value }) else { continue }
+        result.append(CodexOption(label: codexModelDisplayName(option.label), value: option.value,
+                                  selected: option.value == selection))
+    }
+    if !selection.isEmpty, !result.contains(where: { $0.value == selection }) {
+        result.append(CodexOption(label: codexModelDisplayName(selection), value: selection, selected: true))
+    }
+    return result
 }
 
 func localizedCodexEffortLabel(_ value: String, language: AppLanguage) -> String {
@@ -101,15 +121,18 @@ func localizedAutomaticCodexLabel(
     return language.text("自动（\(localized)）", "Automatic (\(localized))")
 }
 
-struct CodexModelOptions: Decodable, Sendable {
+struct CodexModelOptions: Codable, Sendable {
     let configuredModel: String?
     let configuredEffort: String?
     let configuredServiceTier: String?
     let effectiveModel: String?
     let effectiveEffort: String?
     let effectiveFast: String?
-    let models: [CodexOption]
+    var models: [CodexOption]
     let efforts: [CodexOption]
+    var catalogContext: String? = nil
+    var catalogRefreshing: Bool? = nil
+    var catalogRevision: Int? = nil
 }
 
 struct ResumeSessionList: Decodable, Sendable {
@@ -157,6 +180,7 @@ struct ResumeHistoryEntry: Codable, Hashable, Sendable {
     var linkOrigin: TranscriptLinkOrigin? = nil
     var question: AgentQuestionPresentation? = nil
     var questions: [AgentQuestionPresentation]? = nil
+    var inputOrigin: String? = nil
 }
 
 struct GetRunBody: Encodable, Sendable {
@@ -199,6 +223,16 @@ struct GetAgentBody: Encodable, Sendable {
     let conversationItemsOnly: Bool
     let finalMessageCursor: Int
     let finalMessageMaxBytes: Int = 192 * 1024
+}
+
+struct RunTranscriptBody: Encodable, Sendable {
+    let runId: String
+    let cursor: Int
+    var agent: Int? = nil
+    var conversationItemsOnly: Bool = false
+    var limit: Int = 256
+    let maxBytes: Int = 512 * 1024
+    let transcriptItemsOnly: Bool = true
 }
 
 struct RunStartBody: Encodable, Sendable {

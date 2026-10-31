@@ -38,13 +38,19 @@ class CodexModelRegistry:
     configured_model: str | None = None
     configured_effort: str | None = None
     configured_service_tier: str | None = None
+    catalog_revision: int = 0
 
     @classmethod
     def load(
         cls, codex_home: Path, *, model_cache_path: Path | None = None,
     ) -> "CodexModelRegistry":
         codex_home = codex_home.expanduser()
-        models = _load_model_info(model_cache_path or codex_home / "models_cache.json")
+        try:
+            payload = json.loads((model_cache_path or codex_home / "models_cache.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        models = _load_model_info(payload)
+        revision = payload.get("catalog_revision", 0) if isinstance(payload, dict) else 0
         configured_model, configured_effort, configured_service_tier = (
             _load_config_defaults(codex_home / "config.toml")
         )
@@ -53,6 +59,7 @@ class CodexModelRegistry:
             configured_model=configured_model,
             configured_effort=configured_effort,
             configured_service_tier=configured_service_tier,
+            catalog_revision=revision if type(revision) is int and revision >= 0 else 0,
         )
 
     def effective_model(self, model: str | None) -> str | None:
@@ -176,11 +183,7 @@ def _normalized_effort(value: Any) -> str | None:
     return normalized.lower() if normalized else None
 
 
-def _load_model_info(path: Path) -> dict[str, CodexModelInfo]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+def _load_model_info(payload: Any) -> dict[str, CodexModelInfo]:
     records = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(records, list):
         return {}

@@ -251,6 +251,7 @@ def initialize_candidate_requests(path: Path) -> None:
             path,
             {
                 "accepting": True,
+                "retained_retry": True,
                 "requests": [],
             },
         )
@@ -291,7 +292,7 @@ def enqueue_candidate_requests(
         write_json_atomic(
             path,
             {
-                "accepting": True,
+                **payload,
                 "requests": requests,
             },
         )

@@ -85,7 +85,7 @@ extension AppModel {
                                self.workspaceContextGeneration == generation,
                                self.activeRun?.runId == run.runId {
                                 if let currentRun = self.activeRun {
-                                    await self.reconcileFollowUpQueue(for: currentRun, resetCountdown: true)
+                                    await self.reconcileFollowUpQueue(for: currentRun, resetCountdown: false)
                                 }
                             }
                         }

@@ -3,6 +3,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from parallel_codex_runner_core import visible_paths
 
 from parallel_codex_runner_core.visible_paths import (
     WorkspacePathMapping,
@@ -14,6 +17,34 @@ from parallel_codex_runner_core.visible_paths import (
 
 
 class VisibleWorkspacePathTests(unittest.TestCase):
+    def test_many_prior_workspaces_normalize_each_reference_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mappings = tuple(WorkspacePathMapping.create(root / f"old-{i}", root) for i in range(128))
+            text = "`not-a-workspace-path`"
+            with mock.patch.object(visible_paths, "_lexical_absolute", wraps=visible_paths._lexical_absolute) as normalize:
+                self.assertEqual(rewrite_workspace_references(text, mappings), text)
+            normalize.assert_called_once()
+
+    def test_ancestor_lookup_preserves_mapping_order_and_lexical_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "old"
+            target = root / "accepted"
+            other = root / "other"
+            target.mkdir()
+            other.mkdir()
+            (target / "result.md").write_text("first")
+            (other / "result.md").write_text("second")
+            mappings = (WorkspacePathMapping.create(source, target),
+                        WorkspacePathMapping.create(source, other))
+            text = f"`{source}/unused/../result.md:42#section`"
+            self.assertEqual(rewrite_workspace_references(text, mappings),
+                             f"`{target}/result.md:42#section`")
+            (target / "result.md").unlink()
+            self.assertEqual(rewrite_workspace_references(text, mappings),
+                             f"`{other}/result.md:42#section`")
+
     def test_incomplete_markdown_links_cannot_stall_history_reading(self) -> None:
         script = """
 from pathlib import Path

@@ -8,6 +8,167 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct WorkspaceReadinessTests {
+    @Test func historyReadStartsBeforeMainThreadCanRenderTheNextFrame() throws {
+        let fixture = try Fixture(workspaceCount: 1)
+        defer { fixture.close() }
+        let key = fixture.keys[0]
+        let run = try fixture.server.run(key.runID)
+        fixture.model.scheduleConversationHistoryRead(key: key, run: run, target: .local)
+        // Simulate synchronous AppKit layout after selecting an uncached run.
+        // Network I/O must already be progressing, not queued behind that frame.
+        let deadline = Date().addingTimeInterval(0.5)
+        while fixture.server.historyRequestCount == 0 && Date() < deadline { usleep(1_000) }
+        #expect(fixture.server.historyRequestCount == 1)
+    }
+
+    @Test func slowHistoryPresentationCoalescesPaintsWithoutDroppingEntries() async throws {
+        let fixture = try Fixture(workspaceCount: 1)
+        defer { fixture.close() }
+        fixture.server.historyPages = 3
+        let read = ConversationReadProjection.history(client: fixture.model.client,
+            target: .local, runID: fixture.keys[0].runID)
+        defer { read.task.cancel() }
+        // No consumer has painted yet. At most one cumulative snapshot is kept.
+        await read.task.value
+        var received: [ConversationHistoryRead.Page] = []
+        for try await page in read.pages { received.append(page) }
+        #expect(received.map { $0.entries.compactMap(\.id) }
+            == [["saved-run-0-0", "saved-run-0-1", "saved-run-0-2"]])
+        #expect(received.map(\.complete) == [true])
+        #expect(fixture.server.historyRequestCount == 3)
+        #expect(fixture.server.commandCount == 0)
+    }
+
+    @Test func cancelledHistoryReadDoesNotContinuePaginationOrPublishCompletion() async throws {
+        let fixture = try Fixture(workspaceCount: 1)
+        defer { fixture.close() }
+        fixture.server.historyPages = 3
+        fixture.server.holdHistory()
+        let read = ConversationReadProjection.history(client: fixture.model.client,
+            target: .local, runID: fixture.keys[0].runID)
+        try await waitUntil { fixture.server.historyRequestCount == 1 }
+        read.task.cancel()
+        fixture.server.releaseHistory()
+        await read.task.value
+        var received = 0
+        do {
+            for try await _ in read.pages { received += 1 }
+            Issue.record("Cancelled history must not be reported complete")
+        } catch is CancellationError {} catch { Issue.record(error) }
+        #expect(received == 0)
+        #expect(fixture.server.historyRequestCount == 1)
+    }
+
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PCR_READONLY_NAVIGATION_PROBE"] != nil))
+    func productionReadOnlyNavigationRendersOriginalHistoryAndCurrentBody() async throws {
+        struct Expected: Decodable {
+            struct Branch: Decodable { let agent: Int; let cursor: Int; let marker: String }
+            let workspaceID: String
+            let runID: String
+            let historyIDs: [String]
+            let branches: [Branch]
+        }
+        let root = URL(fileURLWithPath: try #require(ProcessInfo.processInfo.environment["PCR_READONLY_NAVIGATION_PROBE"]))
+        if let home = ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] {
+            let support = try #require(FileManager.default.urls(for: .applicationSupportDirectory,
+                in: .userDomainMask).first)
+            try #require(support.path.hasPrefix(home + "/"))
+            #expect(TranscriptLayoutMetricsStore.shared.count == 0,
+                "A cold-render run must not borrow the installed application's layout measurements")
+            print("Cold native layout cache verified in the isolated home")
+        }
+        try String(ProcessInfo.processInfo.processIdentifier).write(to: root.appendingPathComponent("test-pid"), atomically: true, encoding: .utf8)
+        let expected = try JSONDecoder().decode([Expected].self,
+            from: Data(contentsOf: root.appendingPathComponent("expected.json")))
+        let client = PcrdClient(socketURL: root.appendingPathComponent("s"), tokenURL: root.appendingPathComponent("t"))
+        let windowID = UUID()
+        let directory = root.appendingPathComponent("isolated-model")
+        let model = AppModel(client: client, windowID: windowID,
+            desktopStateStore: DesktopStateStore(windowID: windowID, directory: directory),
+            runViewStateStore: WorkspaceRunViewStateStore(diskCache: WorkspaceRunDiskCache(directory: directory.appendingPathComponent("cache"))))
+        defer {
+            model.stopWindowObservation()
+            _ = model.desktopStateStore.flushPendingWrites()
+            _ = model.runViewStateStore.flushPendingWrites(timeout: 3)
+        }
+        let listing: WorkspaceList = try await client.call("workspaces.list", body: EmptyBody())
+        model.workspaces = listing.workspaces
+        model.machines = [RelayMachine(deviceId: "local", kind: "machine", name: "Read-only test",
+            publicKey: "fixture-key", status: "online", online: true, lastSeenAt: nil)]
+        model.selectedMachineID = "local"
+        model.nextMachineDirectoryRefresh = .distantFuture
+        model.systemCapabilitiesByMachine[model.currentMachineContextID] = try await client.call("system.capabilities", body: EmptyBody())
+        let surface = NativeSurface(model: model)
+        defer { surface.close() }
+        var measurements: [[String: Any]] = []
+        for destination in expected {
+            for branch in destination.branches {
+                let began = ContinuousClock.now
+                if model.selectedWorkspaceID != destination.workspaceID {
+                    await model.selectWorkspace(destination.workspaceID)
+                }
+                let selectedWorkspaceAt = ContinuousClock.now
+                try await waitUntil { model.activeRun?.runId == destination.runID }
+                let loadedRunAt = ContinuousClock.now
+                await model.selectAgent(branch.agent)
+                let selectedAgentAt = ContinuousClock.now
+                var renderSeconds = 0.0
+                do { try await waitUntil(timeout: .seconds(15)) {
+                    let renderBegan = ContinuousClock.now
+                    surface.update()
+                    let renderDuration = renderBegan.duration(to: .now)
+                    renderSeconds += Double(renderDuration.components.seconds) + Double(renderDuration.components.attoseconds) / 1e18
+                    guard model.activeRun?.runId == destination.runID,
+                          model.selectedAgent == branch.agent,
+                          let transcript = model.transcripts[branch.agent],
+                          max(transcript.cursor, transcript.conversation?.cursor ?? 0) >= branch.cursor,
+                          Set(model.resumeHistory.compactMap(\.id)).isSuperset(of: destination.historyIDs) else { return false }
+                    return branch.marker.isEmpty || surface.texts.contains { $0.contains(branch.marker) }
+                } } catch {
+                    print("Read-only navigation mismatch: run=\(model.activeRun?.runId ?? "none"), agent=\(model.selectedAgent ?? 0), history=\(model.resumeHistory.count)/\(destination.historyIDs.count), workCursor=\(model.transcripts[branch.agent]?.cursor ?? -1), bodyCursor=\(model.transcripts[branch.agent]?.conversation?.cursor ?? -1)/\(branch.cursor), visibleMarker=\(surface.texts.contains { $0.contains(branch.marker) })")
+                    throw error
+                }
+                let elapsed = began.duration(to: .now)
+                let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                measurements.append(["workspace": destination.workspaceID, "run": destination.runID,
+                    "agent": branch.agent, "seconds": seconds, "historyEntries": model.resumeHistory.count,
+                    "originalCursor": branch.cursor])
+                print("Read-only production native navigation: \(destination.runID) / \(branch.agent): \(seconds) s")
+                print("Navigation stages: workspace=\(began.duration(to: selectedWorkspaceAt)), run=\(selectedWorkspaceAt.duration(to: loadedRunAt)), agent=\(loadedRunAt.duration(to: selectedAgentAt)), render=\(renderSeconds) s")
+                #expect(elapsed < .seconds(1))
+                #expect(!surface.window.isVisible && !surface.window.isKeyWindow)
+            }
+        }
+        try JSONSerialization.data(withJSONObject: measurements, options: [.prettyPrinted, .sortedKeys])
+            .write(to: root.appendingPathComponent("measurements.json"))
+        try surface.framePNG().write(to: root.appendingPathComponent("native-render.png"))
+    }
+
+    @Test func typingBeforeColdConversationResolutionKeepsTheDraft() throws {
+        let fixture = try Fixture(workspaceCount: 2)
+        defer { fixture.close() }
+        let model = fixture.model
+        model.selectedWorkspaceID = fixture.keys[0].workspaceID
+        model.selectedConversationID = nil
+        model.preparePromptHistoryContext()
+        let provisional = model.promptDraftContext
+        #expect(!provisional.isEmpty)
+        model.updatePrompt("Draft typed while the conversation index is loading")
+        model.selectedConversationID = "resolved-conversation"
+        model.preparePromptHistoryContext()
+        #expect(model.prompt == "Draft typed while the conversation index is loading")
+        #expect(model.promptDraftContext != provisional)
+        #expect(model.promptDraftsByContext[provisional] == nil)
+        model.flushPromptDraftPersistence()
+        #expect(fixture.model.desktopStateStore.loadSnapshot().promptDraftsByContext[
+            model.promptDraftContext] == model.prompt)
+        model.suspendPromptHistoryContext()
+        model.selectedWorkspaceID = fixture.keys[1].workspaceID
+        model.selectedConversationID = nil
+        model.preparePromptHistoryContext()
+        #expect(model.prompt.isEmpty)
+    }
+
     @Test(arguments: [false, true], [false, true])
     func saveReceiptSurvivesWorkspaceSwitchAndLostReply(lostReply: Bool, returnBeforeReply: Bool) async throws {
         let fixture = try Fixture(workspaceCount: 2)
@@ -227,6 +388,34 @@ struct WorkspaceReadinessTests {
         #expect(model.runViewStateStore.flushPendingWrites(timeout: 3))
         #expect(WorkspaceRunDiskCache(directory: fixture.cacheDirectory).record(for: key)?.runSummary?.syncedBack == true)
         #expect(fixture.server.count("turns.finalize") == 1)
+    }
+
+    @Test func lateRunReadPublishesTheNewerKnownCompletionWithoutRewindingContent() async throws {
+        let fixture = try Fixture(workspaceCount: 1, running: true)
+        defer { fixture.close() }
+        let model = fixture.model, key = fixture.keys[0]
+        let original = try fixture.server.run(key.runID)
+        model.selectedWorkspaceID = key.workspaceID
+        model.activeRun = original
+        model.selectedAgent = 1
+        model.prompt = "Unsent next question"
+        model.transcripts[1] = AgentTranscript(sourceRunID: key.runID, sourceAgent: 1,
+            cursor: 7, hasMore: false, finalMessage: "Current completed answer",
+            finalMessageHasMore: false, finalMessageReadStatus: "success")
+        fixture.server.finish()
+        fixture.server.advanceWork()
+        let completed = try fixture.server.run(key.runID)
+        #expect(!completed.isWorking && completed.eventCount > original.eventCount)
+        model.runSummariesByContext[key] = completed
+        fixture.server.installRun(original)
+        #expect(model.activeRun?.isWorking == true)
+        try await model.loadRun(key.runID, loadDetailPages: 0,
+            expectedWorkspaceID: key.workspaceID, target: .local)
+        #expect(model.activeRun?.isWorking == false)
+        #expect(model.activeRun?.eventCount == completed.eventCount)
+        #expect(model.prompt == "Unsent next question")
+        #expect(model.transcripts[1]?.finalMessage == "Current completed answer")
+        #expect(fixture.server.commandCount == 0)
     }
 
     private func savedRun(_ original: RunSummary, pending: Bool = false) throws -> RunSummary {
@@ -986,6 +1175,208 @@ struct WorkspaceReadinessTests {
         #expect(fixture.server.commandCount == 0)
     }
 
+    @Test func workspaceReentryShowsCachedHistoryAndNewOutputWithinOneSecond() async throws {
+        let fixture = try Fixture(workspaceCount: 5, running: true, liveWorkOnly: true, configured: true)
+        defer { fixture.close() }
+        fixture.start()
+        try await waitUntil { fixture.keys.allSatisfy { fixture.ready($0, terminal: false) } }
+        await fixture.model.selectWorkspace(fixture.keys[0].workspaceID)
+        await fixture.model.selectWorkspace(fixture.keys[1].workspaceID)
+        fixture.server.advanceWork()
+        let surface = NativeSurface(model: fixture.model)
+        defer { surface.close() }
+        var slowest = Duration.zero
+        for agent in [8, 3, 6, 2, 7, 4, 5, 1] {
+            for key in fixture.keys {
+                let began = ContinuousClock.now
+                await fixture.model.selectWorkspace(key.workspaceID)
+                await fixture.model.selectAgent(agent, manageFollowUpQueue: false)
+                try await waitUntil(timeout: .seconds(1)) {
+                    surface.update(); surface.updateLayout()
+                    return surface.texts.contains { $0.contains("Saved history \(key.runID)") }
+                        && surface.texts.contains { $0.contains(fixture.server.workText(key.runID, agent, cursor: 6)) }
+                }
+                let elapsed = began.duration(to: .now)
+                #expect(elapsed < .seconds(1))
+                slowest = max(slowest, elapsed)
+            }
+        }
+        print("Native history plus source-new output across 40 branches: slowest=\(slowest)")
+        #expect(fixture.server.commandCount == 0, "Unexpected actions: \(fixture.server.unexpectedActions)")
+    }
+
+    @Test func sharedRunStreamFillsFortyBranchesWithoutPerAgentWorkScans() async throws {
+        let fixture = try Fixture(workspaceCount: 5, running: true, liveWorkOnly: true,
+            configured: true, sharedRunPages: true)
+        defer { fixture.close() }
+        fixture.start()
+        try await waitUntil(timeout: .seconds(3)) { fixture.keys.allSatisfy { key in
+            guard let state = fixture.model.runViewStateStore.snapshot(for: key), state.historyLoaded == true else { return false }
+            return (1...8).allSatisfy { state.transcripts[$0]?.cursor == 64 }
+        } }
+        #expect(fixture.server.individualWorkReads == 0)
+        #expect(fixture.server.count("runs.events") >= 5)
+        fixture.server.advanceWork(by: 8)
+        try await waitUntil(timeout: .seconds(1)) { fixture.keys.allSatisfy { key in
+            (1...8).allSatisfy { fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[$0]?.cursor == 72 }
+        } }
+        let surface = NativeSurface(model: fixture.model)
+        defer { surface.close() }
+        for key in fixture.keys {
+            for agent in 1...8 {
+                let began = ContinuousClock.now
+                await fixture.model.selectWorkspace(key.workspaceID)
+                await fixture.model.selectAgent(agent, manageFollowUpQueue: false)
+                try await waitUntil(timeout: .seconds(1)) {
+                    surface.update()
+                    return surface.texts.contains { $0.contains("Saved history \(key.runID)") }
+                        && surface.texts.contains { $0.contains(fixture.server.workText(key.runID, agent, cursor: 63 + agent)) }
+                }
+                #expect(began.duration(to: .now) < .seconds(1))
+                let transcript = try #require(fixture.model.transcripts[agent])
+                #expect(transcript.inputRequests != nil)
+                #expect(transcript.blocks.allSatisfy { !$0.text.contains("Agent \(agent % 8 + 1) page") })
+            }
+        }
+        #expect(fixture.server.commandCount == 0)
+    }
+
+    @Test func sharedRunOutputDoesNotWaitForSlowAgentMetadataAndRetainsTerminalAnswer() async throws {
+        let fixture = try Fixture(workspaceCount: 1, running: true, sharedRunPages: true)
+        defer { fixture.close() }
+        let key = fixture.keys[0]
+        fixture.server.holdAgent(runID: key.runID, agent: 1)
+        fixture.start()
+        try await waitUntil(timeout: .seconds(1)) {
+            fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[1]?.cursor == 64
+        }
+        #expect(fixture.server.heldAgentReads == 1)
+        #expect(fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[1]?.blocks.isEmpty == false)
+        fixture.server.releaseAgent()
+        fixture.server.finish()
+        fixture.model.runSummariesByContext[key] = try fixture.server.run(key.runID)
+        try await waitUntil { (1...8).allSatisfy {
+            let transcript = fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[$0]
+            return transcript?.finalMessage == fixture.server.answer(key.runID, $0)
+                && transcript?.finalMessageReadStatus == "success" && transcript?.finalMessageHasMore == false
+        } }
+        #expect(fixture.server.individualWorkReads == 0)
+        #expect(fixture.server.commandCount == 0)
+    }
+
+    @Test func sharedRunNavigationRendersUncachedLiveIncrementWithinOneSecond() async throws {
+        let fixture = try Fixture(workspaceCount: 5, running: true, liveWorkOnly: true,
+            configured: true, sharedRunPages: true)
+        defer { fixture.close() }
+        fixture.start()
+        try await waitUntil { fixture.keys.allSatisfy { key in
+            guard let state = fixture.model.runViewStateStore.snapshot(for: key), state.historyLoaded == true else { return false }
+            return (1...8).allSatisfy { state.transcripts[$0]?.cursor == 64 }
+        } }
+        let surface = NativeSurface(model: fixture.model)
+        defer { surface.close() }
+        var head = 64
+        var slowest = Duration.zero
+        for agent in [8, 3, 6, 2, 7, 4, 5, 1] {
+            for key in fixture.keys {
+                fixture.server.advanceWork(by: 8)
+                head += 8
+                let began = ContinuousClock.now
+                await fixture.model.selectWorkspace(key.workspaceID)
+                await fixture.model.selectAgent(agent, manageFollowUpQueue: false)
+                let rendered: () -> Bool = {
+                    surface.update(); surface.updateLayout()
+                    // A long history scrolls out of the viewport; it must remain
+                    // in the same timeline while its new live tail is painted.
+                    return fixture.model.selectedTranscriptBlocks.contains { $0.text.contains("Saved history \(key.runID)") }
+                        && surface.texts.contains { $0.contains(fixture.server.workText(key.runID, agent, cursor: head - 9 + agent)) }
+                }
+                while !rendered(), began.duration(to: .now) < .seconds(1) {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                #expect(rendered(), "run=\(key.runID) agent=\(agent) expectedHead=\(head) visibleCursor=\(fixture.model.transcripts[agent]?.cursor ?? -1)")
+                let elapsed = began.duration(to: .now)
+                #expect(elapsed < .seconds(1))
+                slowest = max(slowest, elapsed)
+            }
+        }
+        print("Shared-stream source-new navigation across 40 branches: slowest=\(slowest)")
+        #expect(fixture.server.commandCount == 0, "Unexpected actions: \(fixture.server.unexpectedActions)")
+    }
+
+    @Test func selectingLegacySharedStreamBypassesItsBackgroundPollDelay() async throws {
+        let fixture = try Fixture(workspaceCount: 1, running: true, liveWorkOnly: true,
+            configured: true, sharedRunPages: true)
+        defer { fixture.close() }
+        let key = fixture.keys[0]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        fixture.model.systemCapabilitiesByMachine[key.machineID] = try decoder.decode(SystemCapabilities.self,
+            from: Data(#"{"daemon_version":"fixture","actions":[],"supports_run_transcript_pages":true,"supports_run_conversation_pages":false}"#.utf8))
+        fixture.model.selectedWorkspaceID = key.workspaceID
+        fixture.model.activeRun = try fixture.server.run(key.runID)
+        fixture.model.selectedAgent = 8
+        fixture.start()
+        try await waitUntil {
+            fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[8]?.cursor == 64
+        }
+        fixture.server.advanceWork(by: 8)
+        let began = ContinuousClock.now
+        let reads = fixture.server.count("runs.events")
+        fixture.model.focusConversationRead(key: key, agent: 8, force: true)
+        while fixture.model.transcripts[8]?.cursor != 72, began.duration(to: .now) < .milliseconds(300) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(fixture.model.transcripts[8]?.cursor == 72,
+            "Shared focus: reads=\(reads)->\(fixture.server.count("runs.events")), visible=\(fixture.model.transcripts[8]?.cursor ?? -1), stored=\(fixture.model.runViewStateStore.snapshot(for: key)?.transcripts[8]?.cursor ?? -1), focus=\(fixture.model.focusedConversationHistoryKey ?? "none")")
+        #expect(began.duration(to: .now) < .milliseconds(300))
+        #expect(fixture.server.commandCount == 0)
+    }
+
+    @Test func focusedBodyAndHistoryRenderWhileMetadataAndFullWorkAreBlocked() async throws {
+        let fixture = try Fixture(workspaceCount: 1, running: true, liveWorkOnly: true,
+            configured: true, sharedRunPages: true)
+        defer { fixture.close() }
+        let key = fixture.keys[0]
+        fixture.server.holdAgent(runID: key.runID, agent: 1)
+        fixture.server.holdWorkBackfill = true
+        fixture.start()
+        let surface = NativeSurface(model: fixture.model)
+        defer { surface.close() }
+        let began = ContinuousClock.now
+        await fixture.model.selectWorkspace(key.workspaceID)
+        await fixture.model.selectAgent(1, manageFollowUpQueue: false)
+        try await waitUntil(timeout: .seconds(1)) {
+            surface.update(); surface.updateLayout()
+            return fixture.model.selectedTranscriptBlocks.contains { $0.text.contains("Saved history \(key.runID)") }
+                && surface.texts.contains { $0.contains(fixture.server.workText(key.runID, 1, cursor: 56)) }
+        }
+        #expect(began.duration(to: .now) < .seconds(1))
+        #expect(fixture.model.transcripts[1]?.cursor == 0)
+        #expect(fixture.model.transcripts[1]?.conversation?.cursor == 64)
+        #expect(fixture.model.transcripts[1]?.inputRequests == nil)
+        print("Cold body and history while metadata and work are held: \(began.duration(to: .now))")
+        fixture.server.releaseAgent()
+        try await waitUntil { fixture.model.transcripts[1]?.cursor == 64
+            && fixture.model.transcripts[1]?.inputRequests != nil }
+        #expect(fixture.server.commandCount == 0)
+    }
+
+    @Test func aggregateStatusFailureIsNotReportedAsLostConnection() async throws {
+        let fixture = try Fixture(workspaceCount: 1, running: true)
+        defer { fixture.close() }
+        fixture.server.supportsPing = true
+        let refresh = Task { await fixture.model.refresh() }
+        try await waitUntil(timeout: .seconds(1)) {
+            fixture.model.daemonOnline && fixture.server.healthReadsHeld == 1
+        }
+        #expect(fixture.model.connectionErrorMessage == nil)
+        fixture.server.release()
+        await refresh.value
+        #expect(fixture.model.daemonOnline)
+        #expect(fixture.model.connectionErrorMessage == nil)
+        #expect(fixture.model.statusRefreshErrorMessage != nil)
+    }
+
     @Test func runningNativeBranchesStayPreparedAsOutputAdvancesWithoutSelectingThem() async throws {
         let fixture = try Fixture(workspaceCount: 1, running: true, liveWorkOnly: true)
         defer { fixture.close() }
@@ -1372,7 +1763,7 @@ struct WorkspaceReadinessTests {
         #expect(model.conversationNavigationTarget == nil)
         #expect(model.activeRun?.runId == run.runId)
         #expect(!model.isViewingEarlierConversationTurn)
-        try await waitUntil { fixture.server.historyRequestCount == 2 }
+        try await waitUntil { fixture.server.historyRequestCount == 2 && model.resumeHistory.count == 1 }
         #expect(model.resumeHistory.count == 1)
         fixture.server.releaseHistory()
         try await waitUntil { model.resumeHistory.count == 3 }
@@ -1674,7 +2065,7 @@ struct WorkspaceReadinessTests {
         try await waitUntil { fixture.server.heldAgentReads > 0 }
         let newer = AgentTranscript(sourceRunID: key.runID, sourceAgent: 7, cursor: 6, hasMore: false,
             finalMessage: "Newer complete answer", finalMessageCursor: 21, finalMessageHasMore: false,
-            finalMessageID: "newer", finalMessageReadStatus: "success")
+            finalMessageID: "newer", finalMessageReadStatus: "success", inputRequests: [], questionAnchors: [:])
         fixture.model.transcripts[7] = newer
         fixture.model.cacheVisibleRunViewState()
         fixture.server.releaseAgent()
@@ -1900,6 +2291,7 @@ struct WorkspaceReadinessTests {
         private var requests: [String] = []
         private var concurrent = 0
         private var maximum = 0
+        private var workReads = 0
         private var heldAgents = 0
         private var heldHealth = 0
         private var running: Bool
@@ -1914,17 +2306,22 @@ struct WorkspaceReadinessTests {
         private var nonWorkRecentTail = false
         private var agentTotal = 8
         var holdWorkBackfill = false
+        var supportsPing = false
+        let sharedRunPages: Bool
         let liveWorkOnly: Bool
 
-        init(running: Bool, liveWorkOnly: Bool = false) {
+        init(running: Bool, liveWorkOnly: Bool = false, sharedRunPages: Bool = false) {
             self.running = running
             self.liveWorkOnly = liveWorkOnly
+            self.sharedRunPages = sharedRunPages
+            if sharedRunPages { eventTotal = 64 }
             healthGate.enter(); agentGate.enter(); historyGate.enter(); runGate.enter(); finalizeGate.enter()
         }
         private func locked<T>(_ operation: () throws -> T) rethrows -> T {
             lock.lock(); defer { lock.unlock() }; return try operation()
         }
         var maximumConcurrentReads: Int { locked { maximum } }
+        var individualWorkReads: Int { locked { workReads } }
         var agentRequestCount: Int { locked { requests.filter { $0 == "runs.agent" }.count } }
         var historyRequestCount: Int { locked { requests.filter { $0 == "runs.history" }.count } }
         var heldAgentReads: Int { locked { heldAgents } }
@@ -1944,7 +2341,7 @@ struct WorkspaceReadinessTests {
         }
         func releaseRun() { if locked({ let first = !runReleased; runReleased = true; return first }) { runGate.leave() } }
         var unexpectedActions: [String] { locked { requests.filter {
-            !["system.health", "system.capabilities", "relay.status", "turns.get", "runs.agent", "runs.history"].contains($0)
+            !["system.ping", "system.health", "system.capabilities", "relay.status", "controller.status", "turns.get", "runs.agent", "runs.history", "runs.events"].contains($0)
         } } }
         var commandCount: Int { unexpectedActions.count }
         func count(_ action: String) -> Int { locked { requests.filter { $0 == action }.count } }
@@ -1957,7 +2354,7 @@ struct WorkspaceReadinessTests {
         func holdHistory(after cursor: Int = 0) { locked { historyHeld = true; historyHoldCursor = cursor } }
         func finish() { locked { running = false } }
         func finishRun(_ runID: String) { locked { _ = finishedRunIDs.insert(runID) } }
-        func advanceWork() { locked { eventTotal += 1 } }
+        func advanceWork(by count: Int = 1) { locked { eventTotal += count } }
         func simulateLongWorkBacklog(agentCount: Int = 8, nonWorkTail: Bool = false) {
             locked { eventTotal = 240_000; longWorkBacklog = true; agentTotal = agentCount; nonWorkRecentTail = nonWorkTail }
         }
@@ -2037,12 +2434,14 @@ struct WorkspaceReadinessTests {
             return ["run_id": runID, "agent": agent, "name": "Agent \(agent)",
                 "status": locked { running } ? "running" : "success", "reasoning_token_counts": [:],
                 "rejected": false, "recommended": false, "finalized": false, "final_message": "",
-                "stdout_tail": "", "stderr_tail": "",
+                "stdout_tail": "", "stderr_tail": "", "input_requests": [],
                 "final_message_page": ["cursor": offset, "next_cursor": end, "has_more": end < bytes.count,
                     "total_bytes": bytes.count, "message_id": "artifact-\(text)",
                     "text": String(decoding: bytes[offset..<end], as: UTF8.self)],
                 "transcript_page": ["schema_version": 1, "cursor": cursor, "next_cursor": next,
-                    "has_more": next < total, "total": total, "items": liveWorkOnly && cursor < total ? (cursor..<next).map {
+                    "has_more": next < total, "total": total, "items": liveWorkOnly && cursor < total ? (cursor..<next).filter {
+                        !sharedRunPages || $0 % 8 + 1 == agent
+                    }.map {
                         ["id": "live-\(runID)-\(agent)-\($0)", "event_id": $0,
                          "kind": "output", "text": workText(runID, agent, cursor: $0),
                          "activity_type": "assistant_progress"]
@@ -2060,6 +2459,8 @@ struct WorkspaceReadinessTests {
             let runID = body["run_id"] as? String ?? "run-0"
             let agent = body["agent"] as? Int ?? 1
             locked { requests.append(action) }
+            if action == "runs.agent", body["include_events"] as? Bool == true,
+               body["conversation_items_only"] as? Bool != true { locked { workReads += 1 } }
             if ["runs.agent", "runs.history", "turns.get"].contains(action) {
                 locked { concurrent += 1; maximum = max(maximum, concurrent) }
             }
@@ -2074,6 +2475,10 @@ struct WorkspaceReadinessTests {
             if action == "runs.agent", holdWorkBackfill,
                body["include_events"] as? Bool == true,
                (!locked({ longWorkBacklog }) || (body["cursor"] as? Int ?? 0) < 240_000 - AgentRecentWork.initialEventWindow),
+               body["conversation_items_only"] as? Bool != true, locked({ !agentReleased }) {
+                locked { heldAgents += 1 }; _ = agentGate.wait(timeout: .now() + 15)
+            }
+            if action == "runs.events", holdWorkBackfill,
                body["conversation_items_only"] as? Bool != true, locked({ !agentReleased }) {
                 locked { heldAgents += 1 }; _ = agentGate.wait(timeout: .now() + 15)
             }
@@ -2108,6 +2513,20 @@ struct WorkspaceReadinessTests {
                 reply = ["ok": true, "body": detailBody(runID: runID, agent: agent,
                     cursor: body["cursor"] as? Int ?? 0, finalCursor: body["final_message_cursor"] as? Int ?? 0,
                     conversationOnly: body["conversation_items_only"] as? Bool == true)]
+            } else if action == "runs.events", sharedRunPages {
+                let cursor = body["cursor"] as? Int ?? 0
+                let total = locked { eventTotal }
+                let next = min(cursor + 32, total)
+                reply = ["ok": true, "body": ["schema_version": 1, "run_id": runID,
+                    "cursor": cursor, "next_cursor": next, "total": total, "has_more": next < total,
+                    "agents": (1...locked { agentTotal }).filter { branch in
+                        (body["agent"] as? Int).map { $0 == branch } ?? true
+                    }.map { branch in
+                        ["agent": branch, "items": (cursor..<next).filter { $0 % 8 + 1 == branch }.map { event in
+                            ["id": "live-\(runID)-\(branch)-\(event)", "event_id": event, "kind": "output",
+                             "text": workText(runID, branch, cursor: event), "activity_type": "assistant_progress"]
+                        }] as [String: Any]
+                    }]]
             } else if action == "runs.history" {
                 let cursor = body["cursor"] as? Int ?? 0
                 let next = cursor + 1
@@ -2118,7 +2537,14 @@ struct WorkspaceReadinessTests {
                     "cursor": invalidHistory ? cursor + 1 : cursor,
                     "next_cursor": next, "has_more": next < pages, "total_entries": pages]]
             } else if action == "system.capabilities" {
-                reply = ["ok": true, "body": ["daemon_version": "0.1.86", "actions": ["system.health"]]]
+                reply = ["ok": true, "body": ["daemon_version": "0.1.86",
+                    "supports_run_transcript_pages": sharedRunPages,
+                    "supports_run_conversation_pages": sharedRunPages,
+                    "actions": supportsPing ? ["system.health", "system.ping"] : ["system.health"]]]
+            } else if action == "system.ping", supportsPing {
+                reply = ["ok": true, "body": ["status": "ok"]]
+            } else if action == "controller.status" {
+                reply = ["ok": true, "body": ["paired": true, "selected_machine_id": "local"]]
             } else {
                 reply = ["ok": false, "error": ["code": "fixture_offline", "message": "Read-only fixture"]]
             }
@@ -2138,7 +2564,8 @@ struct WorkspaceReadinessTests {
         let destinations: [RemoteWorkspace]
         let keys: [WorkspaceRunViewKey]
 
-        init(workspaceCount: Int, running: Bool = false, liveWorkOnly: Bool = false) throws {
+        init(workspaceCount: Int, running: Bool = false, liveWorkOnly: Bool = false, configured: Bool = false,
+             sharedRunPages: Bool = false) throws {
             directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-ready-\(UUID().uuidString.prefix(8))")
             cacheDirectory = directory.appendingPathComponent("cache")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2158,7 +2585,7 @@ struct WorkspaceReadinessTests {
             }
             try #require(bound == 0 && Darwin.listen(descriptor, 128) == 0)
             _ = fcntl(descriptor, F_SETFL, O_NONBLOCK)
-            let server = Server(running: running, liveWorkOnly: liveWorkOnly); self.server = server
+            let server = Server(running: running, liveWorkOnly: liveWorkOnly, sharedRunPages: sharedRunPages); self.server = server
             source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .global())
             source.setEventHandler { @Sendable in
                 while true {
@@ -2178,18 +2605,31 @@ struct WorkspaceReadinessTests {
                 publicKey: "fixture-key", status: "online", online: true, lastSeenAt: nil)]
             model.selectedMachineID = "local"
             model.nextMachineDirectoryRefresh = .distantFuture
-            destinations = try (0..<workspaceCount).map { try Self.workspace($0, running: running) }
+            destinations = try (0..<workspaceCount).map { try Self.workspace($0, running: running, configured: configured) }
             let machineID = model.currentMachineContextID
+            if sharedRunPages {
+                let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                model.systemCapabilitiesByMachine[machineID] = try decoder.decode(SystemCapabilities.self,
+                    from: Data(#"{"daemon_version":"fixture","actions":[],"supports_run_transcript_pages":true,"supports_run_conversation_pages":true}"#.utf8))
+            }
             keys = destinations.map { WorkspaceRunViewKey(machineID: machineID,
                 workspaceID: $0.workspaceId, runID: $0.lastRunId) }
             model.workspaces = destinations
             model.selectedWorkspaceID = "reader"
         }
-        static func workspace(_ index: Int, running: Bool, lastRunID: String? = nil) throws -> RemoteWorkspace {
-            try JSONDecoder().decode(RemoteWorkspace.self, from: JSONSerialization.data(withJSONObject: [
+        static func workspace(_ index: Int, running: Bool, lastRunID: String? = nil, configured: Bool = false) throws -> RemoteWorkspace {
+            var value: [String: Any] = [
                 "workspaceId": "workspace-\(index)", "name": "Workspace \(index)", "path": "/qa/workspace-\(index)",
                 "lastRunId": lastRunID ?? "run-\(index)", "lastResumeSessionId": "", "runStatus": running ? "running" : "completed",
-                "runWorkerActive": running, "selected": false, "available": true, "readable": true, "writable": true]))
+                "runWorkerActive": running, "selected": false, "available": true, "readable": true, "writable": true]
+            if configured {
+                value["settings"] = ["configured": true, "agents": 8, "synthesisAgents": 0, "followUpDelay": 0,
+                    "execution": "parallel", "automaticMaxParallel": true, "maxParallel": 8,
+                    "subagents": false, "subagentsLimit": 1, "recommendBy": "tokens", "model": "fixture-model",
+                    "effort": "high", "fastMode": "off", "synthesisModel": "fixture-model", "synthesisEffort": "high",
+                    "synthesisFastMode": "off", "syncBack": true, "keepWorkspaces": true, "resumeSessionId": ""]
+            }
+            return try JSONDecoder().decode(RemoteWorkspace.self, from: JSONSerialization.data(withJSONObject: value))
         }
         func workspace(_ index: Int, running: Bool) throws -> RemoteWorkspace { try Self.workspace(index, running: running) }
         func start() {

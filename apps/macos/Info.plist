@@ -24,11 +24,21 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-    <string>0.1.475</string>
+	<string>0.1.497</string>
 	<key>CFBundleVersion</key>
-    <string>475</string>
+	<string>497</string>
     <key>UTExportedTypeDeclarations</key>
     <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.parallelcodexrunner.sidebar-workspace</string>
+            <key>UTTypeDescription</key>
+            <string>Parallel Codex workspace</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+        </dict>
         <dict>
             <key>UTTypeIdentifier</key>
             <string>com.parallelcodexrunner.queued-message</string>

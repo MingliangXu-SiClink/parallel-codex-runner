@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -327,6 +328,51 @@ class CodexModelCacheTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 2)
                 self.assertIsNone(manager._snapshot_path)
                 self.assertEqual(manager._retry_after, 0)
+
+    def test_transient_version_failure_does_not_poison_catalog_discovery_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "codex"
+            executable.write_text("CLI", encoding="utf-8")
+            manager = CodexModelCacheManager(str(executable), root / "real", lambda *_args: None,
+                cache_root=root / "cache")
+
+            def refresh(version, path):
+                write_model_cache(path, version)
+                payload = json.loads(path.read_text())
+                payload.update(pcr_catalog_schema=1, source="model/list")
+                path.write_text(json.dumps(payload))
+                return True
+
+            with mock.patch("subprocess.run", side_effect=[
+                subprocess.TimeoutExpired([str(executable), "--version"], 5),
+                subprocess.CompletedProcess([], 0, "codex-cli 0.159.2", ""),
+            ]) as run, mock.patch("parallel_codex_runner_core.codex_model_cache.time.monotonic", return_value=100) as clock, \
+                    mock.patch.object(manager, "_refresh_catalog_locked", side_effect=refresh):
+                self.assertIsNone(manager.catalog_path())
+                self.assertIsNone(manager.catalog_path())
+                self.assertEqual(run.call_count, 1, "Failed discovery must back off rather than spawn per click")
+                clock.return_value = 131
+                recovered = manager.catalog_path()
+                self.assertIsNotNone(recovered, "The same live manager must retry after a transient CLI failure")
+                self.assertTrue(valid_model_catalog(recovered, "0.159.2"))
+                self.assertEqual(run.call_count, 2)
+
+    def test_replacing_a_failed_cli_bypasses_only_its_old_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "codex"
+            executable.write_text("old CLI", encoding="utf-8")
+            manager = CodexModelCacheManager(str(executable), root / "real", lambda *_args: None,
+                cache_root=root / "cache")
+            with mock.patch("subprocess.run", side_effect=[OSError("temporarily unavailable"),
+                    subprocess.CompletedProcess([], 0, "codex-cli 0.159.2", "")]) as run:
+                self.assertIsNone(manager._version_locked())
+                replacement = root / "new-cli"
+                replacement.write_text("replacement CLI", encoding="utf-8")
+                replacement.replace(executable)
+                self.assertEqual(manager._version_locked(), "0.159.2")
+                self.assertEqual(run.call_count, 2)
 
     def test_concurrent_populate_runs_only_one_prewarm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

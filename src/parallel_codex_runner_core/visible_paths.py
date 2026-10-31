@@ -7,6 +7,7 @@ import os
 import re
 import urllib.parse
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -49,6 +50,27 @@ class WorkspacePathMapping:
             source_root=_lexical_absolute(source_root),
             target_root=_lexical_absolute(target_root),
         )
+
+
+class WorkspaceReferenceState:
+    """Filesystem predicates used by one reusable visible-history projection."""
+
+    def __init__(self) -> None:
+        self.paths: dict[tuple[Path, bool], bool] = {}
+
+    @staticmethod
+    def _check(path: Path, directory: bool) -> bool:
+        return path.is_dir() if directory else path.exists() or path.is_symlink()
+
+    def available(self, path: Path, *, directory: bool = False) -> bool:
+        key = path, directory
+        if key not in self.paths:
+            self.paths[key] = self._check(path, directory)
+        return self.paths[key]
+
+    def is_current(self) -> bool:
+        return all(self._check(path, directory) == available
+                   for (path, directory), available in self.paths.items())
 
 
 def load_session_workspace_mappings(
@@ -137,16 +159,17 @@ def record_session_workspace_mapping(
 def rewrite_workspace_references(
     text: str,
     mappings: Iterable[WorkspacePathMapping],
+    *, state: WorkspaceReferenceState | None = None,
 ) -> str:
     """Rewrite only verifiable project references from accepted Agent copies."""
 
     text = codex_file_citations_to_markdown(text)
-
+    state = state if state is not None else WorkspaceReferenceState()
     active = tuple(
         mapping
         for mapping in mappings
         if mapping.source_root != mapping.target_root
-        and mapping.target_root.is_dir()
+        and state.available(mapping.target_root, directory=True)
     )
     if not text or not active:
         return text
@@ -155,11 +178,11 @@ def rewrite_workspace_references(
         body = match.group("body")
         if body.startswith("<") and body.endswith(">"):
             destination = body[1:-1]
-            rewritten = _rewrite_reference(destination, active)
+            rewritten = _rewrite_reference(destination, active, state=state)
             body = f"<{rewritten}>"
         else:
             destination, remainder = _split_markdown_destination(body)
-            body = _rewrite_reference(destination, active) + remainder
+            body = _rewrite_reference(destination, active, state=state) + remainder
         return match.group("prefix") + body + match.group("suffix")
 
     value = _MARKDOWN_DESTINATION.sub(markdown, text)
@@ -169,26 +192,28 @@ def rewrite_workspace_references(
         leading = body[: len(body) - len(body.lstrip())]
         trailing = body[len(body.rstrip()) :]
         core = body.strip()
-        rewritten = _rewrite_reference(core, active)
+        rewritten = _rewrite_reference(core, active, state=state)
         return match.group("fence") + leading + rewritten + trailing + match.group("fence")
 
     value = _INLINE_CODE.sub(inline_code, value)
-    value = _FILE_URI.sub(lambda match: _rewrite_reference(match.group(0), active), value)
+    value = _FILE_URI.sub(lambda match: _rewrite_reference(match.group(0), active, state=state), value)
 
     for mapping in active:
-        source = re.escape(str(mapping.source_root))
-        naked = re.compile(
-            source
-            + r"(?=$|[/\s<>\"'`\]\[():?#])"
-            + r"(?:/[^\s<>\"'`\]\[()]*)?"
-            + r"(?::\d+(?::\d+)?)?"
-            + r"(?:[?#][^\s<>\"'`\]\[()]*)?"
-        )
+        naked = _naked_reference_pattern(str(mapping.source_root))
         value = naked.sub(
-            lambda match: _rewrite_reference(match.group(0), (mapping,)),
+            lambda match: _rewrite_reference(match.group(0), (mapping,), state=state),
             value,
         )
     return value
+
+
+@lru_cache(maxsize=512)
+def _naked_reference_pattern(source: str) -> re.Pattern[str]:
+    return re.compile(re.escape(source)
+        + r"(?=$|[/\s<>\"'`\]\[():?#])"
+        + r"(?:/[^\s<>\"'`\]\[()]*)?"
+        + r"(?::\d+(?::\d+)?)?"
+        + r"(?:[?#][^\s<>\"'`\]\[()]*)?")
 
 
 def codex_file_citations_to_markdown(text: str) -> str:
@@ -243,6 +268,7 @@ def _split_markdown_destination(value: str) -> tuple[str, str]:
 def _rewrite_reference(
     value: str,
     mappings: tuple[WorkspacePathMapping, ...],
+    *, state: WorkspaceReferenceState | None = None,
 ) -> str:
     leading = value[: len(value) - len(value.lstrip())]
     trailing_space = value[len(value.rstrip()) :]
@@ -272,14 +298,16 @@ def _rewrite_reference(
     if line_match:
         raw_path = raw_path[: line_match.start()]
 
+    candidate = _lexical_absolute(raw_path)
+    # Build ancestors once instead of repeating pathlib's parent walk for every
+    # old Agent workspace. Path equality preserves platform case semantics.
+    ancestors = {candidate, *candidate.parents}
     for mapping in mappings:
-        candidate = _lexical_absolute(raw_path)
-        try:
-            relative = candidate.relative_to(mapping.source_root)
-        except ValueError:
+        if mapping.source_root not in ancestors:
             continue
+        relative = candidate.relative_to(mapping.source_root)
         target = mapping.target_root / relative
-        if not (target.exists() or target.is_symlink()):
+        if not (state.available(target) if state is not None else target.exists() or target.is_symlink()):
             continue
         mapped_path = str(target) + line_suffix
         if is_file_uri:

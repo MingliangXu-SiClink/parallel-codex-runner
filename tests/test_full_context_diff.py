@@ -79,6 +79,7 @@ def live_manager(review):
     manager._lock = threading.RLock()
     manager._artifacts = store
     manager._live_diffs = LiveDiffSnapshots()
+    manager._reconcile_read_events = Mock(return_value=True)
     manager._require_run_locked = Mock(return_value=run)
     return manager
 
@@ -138,6 +139,30 @@ def test_live_diff_io_does_not_hold_the_run_manager_lock(review):
         return "No workspace changes."
     manager._artifacts.live_diff = build
     manager.get_diff(review[1].run_id, 1)
+    assert available == [True]
+
+
+def test_completed_diff_io_does_not_hold_the_run_manager_lock(review):
+    manager = live_manager(review)
+    store, run, _, candidate = review
+    run.agent_statuses[1] = "success"
+    run.results[1] = {"status": "success", "workspace_dir": str(candidate)}
+    persist = store.persist_diff
+    available = []
+
+    def build(*args, **kwargs):
+        def check():
+            acquired = manager._lock.acquire(timeout=0.2)
+            available.append(acquired)
+            if acquired:
+                manager._lock.release()
+        thread = threading.Thread(target=check)
+        thread.start()
+        thread.join()
+        return persist(*args, **kwargs)
+
+    store.persist_diff = build
+    assert "+updated 150" in manager.get_diff(run.run_id, 1)["text"]
     assert available == [True]
 
 

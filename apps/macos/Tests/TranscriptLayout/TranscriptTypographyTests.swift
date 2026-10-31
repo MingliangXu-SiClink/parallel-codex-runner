@@ -4,6 +4,50 @@ import Testing
 
 extension TranscriptLayoutTests {
     @Test
+    func nativeMarkdownParsingPreservesFoundationRunsAndPresentationIntents() throws {
+        let sources = [
+            "## 标题\n\n正文 **重点** 和 *强调*，`code`，~~removed~~。",
+            "1. first\n   - nested **item**\n   - 中文\n2. second\n\n> quoted\n\n---",
+            "| Key | Value |\n| :--- | ---: |\n| **a** | [b](report.md) |\n\n```swift\nlet x = 1\n```",
+            "[link](https://example.com) ![image](result.png) <https://example.com> &amp; \\*literal\\*",
+            "First\nsecond  \nthird\n\nUnicode 👩🏽‍💻 e\u{301} 中文",
+            "Unclosed **bold and [link]( and `inline\n\n    indented code",
+        ]
+        for source in sources {
+            let options = __NSAttributedStringMarkdownParsingOptions()
+            options.interpretedSyntax = .full
+            let native = try NSAttributedString(__markdownString: source, options: options, baseURL: nil)
+            let swift = try AttributedString(markdown: source, options: .init(interpretedSyntax: .full))
+            #expect(native.isEqual(to: NSAttributedString(swift)))
+        }
+    }
+
+    @Test
+    @MainActor
+    func unformattedParagraphFastPathPreservesTextAndDoesNotSwallowMarkdown() throws {
+        for source in ["Readable English and 中文正文", "已有计算仍在运行，继续核对原始输出。", "结果是 64，保持相同条件"] {
+            #expect(TranscriptTextRenderer.isUnformattedParagraph(source))
+            let reference = try AttributedString(markdown: source, options: .init(interpretedSyntax: .full))
+            for kind in [TranscriptKind.user, .output] {
+                let rendered = TranscriptTextRenderer.attributedText(for:
+                    TranscriptBlock(id: "plain", kind: kind, text: source),
+                    textSize: .standard, accentColor: .orange, appearance: .dark)
+                #expect(rendered.string == String(reference.characters))
+                let parsed = TranscriptTextRenderer.attributedText(for:
+                    TranscriptBlock(id: "parsed", kind: kind, text: source + "  "),
+                    textSize: .standard, accentColor: .orange, appearance: .dark)
+                #expect(!TranscriptTextRenderer.isUnformattedParagraph(source + "  "))
+                #expect(rendered.isEqual(to: parsed))
+            }
+        }
+        for source in ["", " leading", "trailing ", "\tcode", "    code", "**bold**", "1. item", "+ item", "- item",
+                       "# heading", "[link](https://example.com)", "<b>html</b>", "a &amp; b", "`code`", "\\*literal",
+                       "$x$", "first\nsecond", "| table |", "a\0b", "~~deleted~~"] {
+            #expect(!TranscriptTextRenderer.isUnformattedParagraph(source))
+        }
+    }
+
+    @Test
     @MainActor
     func replyTypographyDoesNotChangeWhenStreamingBecomesFinalOrHistorical() throws {
         for size in AppTextSize.allCases {

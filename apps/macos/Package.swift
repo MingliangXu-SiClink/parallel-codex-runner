@@ -7,7 +7,7 @@ let package = Package(
     defaultLocalization: "en",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "ParallelCodex", targets: ["PCRRemoteMac"])
+        .executable(name: "ParallelCodex", targets: ["PCRRemoteMacLauncher"])
     ],
     dependencies: [
         .package(path: "Vendor/HighlighterSwift"),
@@ -19,6 +19,11 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
+            name: "PCRRemoteMacLauncher",
+            dependencies: ["PCRRemoteMac"],
+            path: "Sources/PCRRemoteMacLauncher"
+        ),
+        .target(
             name: "PCRRemoteMac",
             dependencies: [
                 .product(name: "Highlighter", package: "HighlighterSwift"),

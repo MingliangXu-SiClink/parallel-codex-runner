@@ -360,6 +360,19 @@ struct RemoteTranscriptPage: Decodable, Sendable {
     let oversizedEvent: Bool?
 }
 
+struct RunTranscriptPage: Decodable, Sendable {
+    struct Branch: Decodable, Sendable {
+        let agent: Int
+        let items: [RemoteTranscriptItem]
+    }
+    let runId: String
+    let cursor: Int
+    let nextCursor: Int
+    let hasMore: Bool
+    let total: Int
+    let agents: [Branch]
+}
+
 struct FinalMessagePage: Decodable, Sendable {
     let cursor: Int
     let nextCursor: Int

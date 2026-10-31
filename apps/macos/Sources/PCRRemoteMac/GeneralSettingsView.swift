@@ -192,12 +192,7 @@ struct GeneralConversationSettingsView: View {
         RunSettingsSection("Codex") {
             RunSettingsGrid(density: density) {
                 RunSettingsRow("Model") {
-                    Picker(model.appLanguage.localized("Model"), selection: primaryModelBinding) {
-                        ForEach(primaryModels) { option in
-                            Text(option.label).tag(option.value)
-                        }
-                    }
-                    .labelsHidden()
+                    modelPicker(title: model.appLanguage.localized("Model"), choices: primaryModels, selection: primaryModelBinding)
                 }
                 RunSettingsRow("Effort") {
                     Picker(
@@ -239,15 +234,7 @@ struct GeneralConversationSettingsView: View {
                     )
                 }
                 RunSettingsRow("Model") {
-                    Picker(
-                        model.appLanguage.localized("Synthesis model"),
-                        selection: synthesisModelBinding
-                    ) {
-                        ForEach(synthesisModels) { option in
-                            Text(option.label).tag(option.value)
-                        }
-                    }
-                    .labelsHidden()
+                    modelPicker(title: model.appLanguage.localized("Synthesis model"), choices: synthesisModels, selection: synthesisModelBinding)
                 }
                 RunSettingsRow("Effort") {
                     Picker(
@@ -319,15 +306,24 @@ struct GeneralConversationSettingsView: View {
     }
 
     private var primaryModels: [CodexOption] {
-        codexOptionChoices(
+        codexModelChoices(
             dynamic: primaryModelCatalog,
             current: model.defaultSettings.model,
-            fallbackLabel: localizedDefaultModelLabel(
-                model.defaultPrimaryModelOptions?.effectiveModel
-                    ?? model.defaultSynthesisModelOptions?.effectiveModel,
-                language: model.appLanguage
-            )
+            effective: resolvedCodexModel(current: model.defaultSettings.model, options: model.defaultPrimaryModelOptions)
         )
+    }
+
+    private func modelPicker(title: String, choices: [CodexOption], selection: Binding<String>) -> some View {
+        ExecutionOptionMenu(title: title, choices: choices, selection: selection.wrappedValue,
+                            select: { selection.wrappedValue = $0 }) {
+            HStack(spacing: 6) {
+                Text(choices.first(where: { $0.value == selection.wrappedValue })?.label
+                     ?? model.appLanguage.text("选择模型", "Select model"))
+                Image(systemName: "chevron.down").appScaledTextStyle(.caption)
+            }
+            .frame(minHeight: 24)
+        }
+        .disabled(choices.isEmpty)
     }
 
     private var primaryEfforts: [CodexOption] {
@@ -340,14 +336,10 @@ struct GeneralConversationSettingsView: View {
     }
 
     private var synthesisModels: [CodexOption] {
-        codexOptionChoices(
+        codexModelChoices(
             dynamic: synthesisModelCatalog,
             current: model.defaultSettings.synthesisModel,
-            fallbackLabel: localizedDefaultModelLabel(
-                model.defaultSynthesisModelOptions?.effectiveModel
-                    ?? model.defaultPrimaryModelOptions?.effectiveModel,
-                language: model.appLanguage
-            )
+            effective: resolvedCodexModel(current: model.defaultSettings.synthesisModel, options: model.defaultSynthesisModelOptions)
         )
     }
 
@@ -372,14 +364,14 @@ struct GeneralConversationSettingsView: View {
 
     private var primaryModelBinding: Binding<String> {
         Binding(
-            get: { model.defaultSettings.model },
+            get: { resolvedCodexModel(current: model.defaultSettings.model, options: model.defaultPrimaryModelOptions) },
             set: { value in Task { await model.updateDefaultPrimaryModel(value) } }
         )
     }
 
     private var synthesisModelBinding: Binding<String> {
         Binding(
-            get: { model.defaultSettings.synthesisModel },
+            get: { resolvedCodexModel(current: model.defaultSettings.synthesisModel, options: model.defaultSynthesisModelOptions) },
             set: { value in Task { await model.updateDefaultSynthesisModel(value) } }
         )
     }

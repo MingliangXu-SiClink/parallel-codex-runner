@@ -100,6 +100,40 @@ struct ExecutionConfigurationTests {
         #expect(model.settings == original && model.pendingPromptSubmission == nil)
     }
 
+    @Test func bothStageMenusUseConcreteModelsWithoutEditingLegacySettingsWhileBrowsing() async throws {
+        _ = NSApplication.shared
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let model = fixture.model
+        model.settings.model = ""
+        model.settings.synthesisModel = ""
+        let original = model.settings
+        let options = CodexModelOptions(configuredModel: "gpt-6-astra", configuredEffort: nil,
+            configuredServiceTier: nil, effectiveModel: "gpt-6-astra", effectiveEffort: nil, effectiveFast: nil,
+            models: [CodexOption(label: "default (gpt-6-astra)", value: "", selected: true),
+                     CodexOption(label: "gpt-6-astra", value: "gpt-6-astra", selected: false),
+                     CodexOption(label: "gpt-6.1-sol", value: "gpt-6.1-sol", selected: false)], efforts: [])
+        _ = try await model.modelOptionsCache.refresh(context: model.primaryModelOptionsContext) { options }
+        for stage in ExecutionStage.allCases {
+            #expect(stage.modelTitle(in: model) == "GPT-6 Astra")
+            #expect(stage.modelSelection(in: model) == "gpt-6-astra")
+            #expect(stage.modelChoices(in: model).map(\.value) == ["gpt-6-astra", "gpt-6.1-sol"])
+        }
+        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(model))
+        let window = makeWindow(size: host.fittingSize, scheme: .dark)
+        defer { window.close() }
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        let popups = descendants(host).compactMap { $0 as? NSPopUpButton }
+            .filter { $0.identifier?.rawValue.hasSuffix(".model") == true }
+        #expect(popups.count == 2)
+        for popup in popups {
+            #expect(popup.itemArray.compactMap { $0.representedObject as? String } == ["gpt-6-astra", "gpt-6.1-sol"])
+            #expect(popup.selectedItem?.representedObject as? String == "gpt-6-astra")
+        }
+        #expect(model.settings == original && model.pendingPromptSubmission == nil)
+    }
+
     @Test func collapsedSummaryStaysOneLineAtEveryZoomAndTheEditorIsAnIndependentSurface() async throws {
         _ = NSApplication.shared
         let fixture = try Fixture()
@@ -424,7 +458,7 @@ struct ExecutionConfigurationTests {
     @Test func optionMenusKeepOnlyTheirLabelInThePanelRegardlessOfOptionCount() throws {
         _ = NSApplication.shared
         for size in [AppTextSize.standard, .extraLarge] {
-            let models = ["Codex 默认", "GPT-6.1 Sol", "GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna"].map {
+            let models = ["GPT-6.1 Sol", "GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna"].map {
                 CodexOption(label: $0, value: $0, selected: false)
             }
             var previousSize: CGSize?
@@ -755,10 +789,14 @@ struct ExecutionConfigurationTests {
         try selectOption(try optionButton("synthesis.effort", in: surface), value: "")
         try await Task.sleep(for: .milliseconds(40))
         #expect(model.settings.effort.isEmpty && model.settings.synthesisEffort.isEmpty)
-        try selectOption(try optionButton("candidates.model", in: surface), value: "")
-        try selectOption(try optionButton("synthesis.model", in: surface), value: "")
+        for stage in ["candidates", "synthesis"] {
+            #expect(try optionButton("\(stage).model", in: surface).itemArray
+                .allSatisfy { ($0.representedObject as? String)?.isEmpty == false })
+        }
+        try selectOption(try optionButton("candidates.model", in: surface), value: "gpt-6.1-sol")
+        try selectOption(try optionButton("synthesis.model", in: surface), value: "gpt-6-astra")
         try await Task.sleep(for: .milliseconds(60))
-        #expect(model.settings.model.isEmpty && model.settings.synthesisModel.isEmpty)
+        #expect(model.settings.model == "gpt-6.1-sol" && model.settings.synthesisModel == "gpt-6-astra")
         #expect(surface.frame == original)
         #expect(model.prompt == "Retained draft" && model.pendingPromptSubmission == nil)
         #expect(model.promptOutboxByWorkspace.isEmpty && model.followUpQueue.isEmpty)
@@ -845,6 +883,28 @@ struct ExecutionConfigurationTests {
         #expect(button.itemArray.map(\.title) == ["Same model label", "Same model label"])
         try selectOption(button, value: "model-b")
         #expect(selections == ["model-b"])
+    }
+
+    @Test func unavailableCatalogIsAnExplicitMenuStatusAndRetryNeverChangesTheModel() throws {
+        _ = NSApplication.shared
+        var retries = 0
+        let choices = [CodexOption(label: "GPT-6 Astra", value: "gpt-6-astra", selected: true)]
+        let host = NSHostingView(rootView: ExecutionOptionMenu(title: "Model", error: "Directory unavailable",
+            retry: { retries += 1 }, choices: choices, selection: "gpt-6-astra",
+            select: { _ in Issue.record("Retry must not select a model") }) { Text("GPT-6 Astra") }
+            .environment(\.appLanguage, .english))
+        let window = makeWindow(size: host.fittingSize, scheme: .dark)
+        defer { window.close() }
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        let button = try #require(descendants(host).compactMap { $0 as? NSPopUpButton }.first)
+        #expect(button.itemArray.compactMap { $0.representedObject as? String } == ["gpt-6-astra"])
+        #expect(button.itemArray.first { $0.title == "Model list unavailable" }?.isEnabled == false)
+        let retryIndex = try #require(button.itemArray.firstIndex { $0.title == "Reload models" })
+        button.selectItem(at: retryIndex)
+        #expect(button.sendAction(try #require(button.action), to: button.target))
+        #expect(retries == 1 && button.selectedItem?.representedObject as? String == "gpt-6-astra")
+        #expect(!window.isVisible && !window.isKeyWindow)
     }
 
     private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }

@@ -108,10 +108,12 @@ def valid_model_catalog(path: Path, version: str, *, max_age_seconds: float | No
         return False
     if (not isinstance(payload, dict) or payload.get("pcr_catalog_schema") != 1
             or payload.get("source") != "model/list" or payload.get("client_version") != version
-            or not isinstance(payload.get("models"), list)):
+            or not isinstance(payload.get("models"), list) or not payload["models"]):
         return False
     if any(not isinstance(model, dict) or not isinstance(model.get("slug"), str)
            or not model["slug"] for model in payload["models"]):
+        return False
+    if not any(model.get("visibility") != "hide" for model in payload["models"]):
         return False
     fetched = _parse_timestamp(payload.get("fetched_at"))
     if fetched is None:
@@ -165,10 +167,13 @@ class CodexModelCacheManager:
         self._lock = threading.Lock()
         self._client_version: Optional[str] = None
         self._executable_fingerprint: tuple[object, ...] | None = None
+        self._version_retry_after = 0.0
         self._snapshot_path: Optional[Path] = None
         self._retry_after = 0.0
         self._catalog_path: Path | None = None
         self._catalog_retry_after = 0.0
+        self._catalog_refresh_lock = threading.Lock()
+        self._catalog_refresh_thread: threading.Thread | None = None
 
     def populate(self, agent_codex_home: Path) -> bool:
         """Copy a fresh matching cache into one Agent home, or safely fall back."""
@@ -208,7 +213,45 @@ class CodexModelCacheManager:
             self._lock.release()
 
     def catalog_path(self) -> Optional[Path]:
-        """Read menu metadata, independently of Codex's internal cache writer."""
+        """Serve committed metadata first; discovery only updates that result."""
+        version = self._known_version()
+        identity = self._version_identity()
+        if version:
+            snapshot = self._persistent_snapshot_path(version).with_name(MODEL_CATALOG_FILENAME)
+            if valid_model_catalog(snapshot, version, max_age_seconds=None):
+                if not valid_model_catalog(snapshot, version):
+                    self._start_catalog_refresh()
+                # Recheck identity without probing or waiting for the refresh lock.
+                if (identity == self._version_identity() and version == self._known_version()
+                        and snapshot == self._persistent_snapshot_path(version).with_name(MODEL_CATALOG_FILENAME)):
+                    return snapshot
+        return self._discover_catalog()
+
+    def context_key(self) -> str:
+        """Opaque execution/account/config identity, without launching Codex."""
+        value = (self._version_identity(), self._persistent_snapshot_path("").parent.name)
+        return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+    @property
+    def catalog_refreshing(self) -> bool:
+        thread = self._catalog_refresh_thread
+        return bool(thread and thread.is_alive())
+
+    def _start_catalog_refresh(self) -> None:
+        with self._catalog_refresh_lock:
+            if self.catalog_refreshing or time.monotonic() < self._catalog_retry_after:
+                return
+
+            def refresh() -> None:
+                if self._discover_catalog() is None:
+                    self._catalog_retry_after = max(self._catalog_retry_after, self._version_retry_after)
+
+            self._catalog_refresh_thread = threading.Thread(
+                target=refresh, name="pcr-model-catalog-refresh", daemon=True)
+            self._catalog_refresh_thread.start()
+
+    def _discover_catalog(self) -> Optional[Path]:
+        """Cold discovery and atomic refresh never discard a committed catalog."""
         try:
             with self._lock:
                 version = self._version_locked()
@@ -223,7 +266,7 @@ class CodexModelCacheManager:
                     if valid_model_catalog(snapshot, version):
                         return snapshot
                     if not snapshot.exists():
-                        for previous in (native, self.real_codex_home / MODEL_CACHE_FILENAME):
+                        for previous in (native,):
                             if valid_model_cache(previous, version):
                                 if previous == native:
                                     return native
@@ -248,7 +291,7 @@ class CodexModelCacheManager:
                     if valid_model_catalog(snapshot, version, max_age_seconds=None):
                         return snapshot
                     if not snapshot.exists():
-                        for previous in (native, self.real_codex_home / MODEL_CACHE_FILENAME):
+                        for previous in (native,):
                             if valid_model_cache(previous, version, max_age_seconds=None):
                                 return previous
                     return None
@@ -289,10 +332,18 @@ class CodexModelCacheManager:
             for name in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_RUN_ID"):
                 environment.pop(name, None)
             models = read_model_catalog(self.codex_bin, temporary_home, environment, self.prewarm_timeout_seconds)
+            if not any(model.get("visibility") != "hide" for model in models):
+                return False
             if (self._version_locked() != version
                     or snapshot != self._persistent_snapshot_path(version).with_name(MODEL_CATALOG_FILENAME)):
                 return False
+            try:
+                revision = json.loads(snapshot.read_text()).get("catalog_revision", 0)
+            except (OSError, ValueError, AttributeError):
+                revision = 0
+            revision = revision if type(revision) is int and revision >= 0 else 0
             payload = {"pcr_catalog_schema": 1, "source": "model/list", "client_version": version,
+                "catalog_revision": revision + 1,
                 "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(), "models": models}
             snapshot.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with temporary.open("w", encoding="utf-8") as handle:
@@ -330,12 +381,17 @@ class CodexModelCacheManager:
             self._executable_fingerprint is None
             or fingerprint == self._executable_fingerprint
         ):
-            return self._client_version or None
+            if self._client_version:
+                return self._client_version
+            if time.monotonic() < self._version_retry_after:
+                return None
         self._executable_fingerprint = fingerprint
         self._snapshot_path = None
         self._retry_after = 0.0
         self._catalog_path = None
         self._catalog_retry_after = 0.0
+        # A transient --version failure must not disable discovery for this process's lifetime.
+        self._version_retry_after = time.monotonic() + 30.0
         try:
             completed = subprocess.run(
                 [self.codex_bin, "--version"],
@@ -355,6 +411,7 @@ class CodexModelCacheManager:
             return None
         self._client_version = match.group(1) if match else ""
         if self._client_version:
+            self._version_retry_after = 0.0
             try:
                 self.cache_root.mkdir(parents=True, exist_ok=True)
                 record = self._version_record()

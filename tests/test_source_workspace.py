@@ -1,4 +1,5 @@
 import sys
+import json
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import Mock
@@ -106,14 +107,15 @@ def test_deferred_review_retry_and_cleanup_keep_source_edits(local_agent):
     assert not (root / "workspaces" / "agent_001").exists()
     assert (root / "workspaces" / "baseline" / "existing.txt").read_text() == "user edit\n"
     (workspace / "between.txt").write_text("do not roll back")
-    results = app.run_additional_agents(
-        args, "retry", [1], root, workspace, retry_indices={1},
-        progress_callback=lambda _: None,
-    )
-    result = results[0]
+    with pytest.raises(FileNotFoundError):
+        app.run_additional_agents(
+            args, "retry", [1], root, workspace, retry_indices={1},
+            progress_callback=lambda _: None,
+        )
+    result = AgentResult(**json.loads((root / "meta/agent_001/status.json").read_text()))
     assert result.workspace_dir == str(workspace.resolve())
     assert (workspace / "between.txt").read_text() == "do not roll back"
-    assert (workspace / "reply.txt").read_text() == "retry"
+    assert (workspace / "reply.txt").read_text() == "first"
     run = ManagedRun(
         run_id="source-qa", prompt="first", workspace=str(workspace.resolve()),
         run_root=str(root), artifact_token="owned-qa",

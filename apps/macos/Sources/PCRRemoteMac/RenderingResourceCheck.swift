@@ -4,6 +4,12 @@ enum RenderingResourceCheck {
     @MainActor
     static func failures() async -> [String] {
         _ = NSApplication.shared
+        var result: [String] = []
+        for (language, expected) in [(AppLanguage.chinese, "\u{6267}\u{884c}\u{65b9}\u{5f0f}"), (.english, "Execution")] {
+            if language.localized("Execution") != expected {
+                result.append("Packaged execution configuration localization did not load: \(language.rawValue)")
+            }
+        }
         if Bundle.main.bundleURL.pathExtension == "app" {
             for name in ["SwiftMath_SwiftMath", "Highlighter_Highlighter"] {
                 guard let url = Bundle.main.url(forResource: name, withExtension: "bundle"),
@@ -24,7 +30,7 @@ enum RenderingResourceCheck {
                 equations += 1
             }
         }
-        var result = equations == 2 ? [] : ["Math attachments did not render."]
+        if equations != 2 { result.append("Math attachments did not render.") }
         if let shell = FilePreviewSession.shellURL {
             if Bundle.main.bundleURL.pathExtension == "app",
                let resources = Bundle.main.resourceURL,

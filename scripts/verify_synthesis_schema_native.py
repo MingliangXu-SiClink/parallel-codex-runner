@@ -1,4 +1,4 @@
-"""Exercise v61 history isolation with real Codex and loopback-only model traffic."""
+"""Exercise v62 history isolation with real Codex and loopback-only model traffic."""
 
 import asyncio
 import hashlib
@@ -90,11 +90,21 @@ async def verify(root, port):
     home = root / "source-home"
     home.mkdir()
     selected = await execute(root / "seed", home, port)
+    # Exercise the schema the installed CLI actually creates before testing
+    # a desktop-migrated history. Migration fixtures must not hide this path.
+    fresh_source = app.AgentCodexSource(home, selected, root / "fresh-source")
+    try:
+        private = root / "fresh-private-home"
+        workspace = root / "fresh-resume"
+        app.prepare_agent_codex_home(home, private, workspace, selected, fresh_source)
+        await execute(workspace, private, port, selected)
+    finally:
+        fresh_source.close()
     database = home / "state_5.sqlite"
     contract = json.loads((Path(__file__).resolve().parents[1] / "tests/fixtures/codex-state-v61.json").read_text())
     with closing(sqlite3.connect(database)) as db:
         latest = db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0]
-        assert latest in (58, 59, 60, 61), ("native_schema_version", latest)
+        assert latest in (58, 59, 60, 61, 62), ("native_schema_version", latest)
         for version, table in ((59, "idx_thread_attachments_identity_thread"), (60, "guardian_review_feedback"), (61, "thread_read_receipts")):
             if latest < version:
                 for kind, name, owner, sql in contract["schema"]:
@@ -103,8 +113,15 @@ async def verify(root, port):
                 _, description, success, checksum = next(m for m in contract["migrations"] if m[0] == version)
                 db.execute("INSERT INTO _sqlx_migrations VALUES (?,?,'2026-10-16',?,?,0)",
                     (version, description, success, bytes.fromhex(checksum)))
+        if latest < 62:
+            upgrade = json.loads((Path(__file__).resolve().parents[1] / "tests/fixtures/codex-state-v62-migration.json").read_text())
+            for statement in upgrade["statements"]:
+                db.execute(statement)
+            db.execute("INSERT INTO _sqlx_migrations VALUES (?,?,'2026-10-28',1,?,0)",
+                (upgrade["version"], upgrade["description"], bytes.fromhex(upgrade["checksum"])))
         db.execute("""INSERT INTO threads (id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode)
             VALUES ('unrelated','/nonexistent/unrelated',1,1,'cli','test','/unrelated','unrelated','{}','never')""")
+        db.execute("UPDATE threads SET attached_thread_parent_id='unrelated' WHERE id=?", (selected,))
         for thread in (selected, "unrelated"):
             db.execute("INSERT OR REPLACE INTO guardian_review_feedback VALUES (?,?,?)", (thread, thread, f"{thread}-private-review".encode()))
             db.execute("INSERT OR REPLACE INTO thread_read_receipts VALUES (?,NULL,'fixture-revision',NULL)", (thread,))
@@ -130,17 +147,18 @@ async def verify(root, port):
             app.prepare_agent_codex_home(home, private, workspace, selected, source)
             with closing(sqlite3.connect(private / "state_5.sqlite")) as db:
                 assert db.execute("SELECT id FROM threads").fetchall() == [(selected,)]
+                assert db.execute("SELECT attached_thread_parent_id FROM threads").fetchall() == [("unrelated",)]
                 assert db.execute("SELECT thread_id FROM guardian_review_feedback").fetchall() == [(selected,)]
                 assert db.execute("SELECT thread_id FROM thread_read_receipts").fetchall() == [(selected,)]
             await execute(workspace, private, port, selected)
     finally:
         source.close()
     assert hashlib.sha256(database.read_bytes()).hexdigest() == original
-    assert len(Responses.requests) == 4
+    assert len(Responses.requests) == 5
     for request in Responses.requests[1:]:
         assert "SCHEMA-HISTORY-SENTINEL" in json.dumps(request["input"])
         assert "unrelated-private-review" not in json.dumps(request)
-    print(json.dumps({"real_native_resume_count": 3, "native_requests": 4, "same_original_thread": True,
+    print(json.dumps({"real_native_resume_count": 4, "native_requests": 5, "fresh_cli_schema_resumed": True, "desktop_state_migration": 62, "same_original_thread": True,
         "history_retained": True, "unrelated_rows_excluded": True, "original_database_unchanged": True,
         "provider_scope": "loopback-only", "real_user_turns_submitted": 0}))
 

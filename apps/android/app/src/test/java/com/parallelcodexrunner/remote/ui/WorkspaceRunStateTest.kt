@@ -5,7 +5,11 @@ import com.parallelcodexrunner.remote.data.RemoteRunSettings
 import com.parallelcodexrunner.remote.data.RemoteWorkspace
 import com.parallelcodexrunner.remote.data.generated.ConversationRecord
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -13,6 +17,138 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WorkspaceRunStateTest {
+    @Test fun coldConversationLookupDecodesOnlyTheSelectedRunAndDoesNotTouchItsRevision() = runBlocking {
+        val directory = Files.createTempDirectory("pcr-cache-indexed-navigation").toFile()
+        val keyBytes = ByteArray(32) { 23 }
+        try {
+            val writer = WorkspaceRunDiskCache(directory, keyBytes)
+            val keys = (0 until 40).map { WorkspaceRunKey("mac", "workspace-$it", "run-$it") }
+            keys.forEachIndexed { index, key ->
+                writer.writeNow(key, WorkspaceRunSnapshot(conversationId = "conversation-$index",
+                    prompt = "private-history-$index ".repeat(10_000)))
+            }
+            val reader = WorkspaceRunDiskCache(directory, keyBytes)
+            val target = reader.cacheFileForTest(keys[27])
+            val modified = Files.getLastModifiedTime(target.toPath())
+            val indexedStart = System.nanoTime()
+            val loaded = reader.loadConversation("mac", "workspace-27", "conversation-27")
+            val indexedMillis = (System.nanoTime() - indexedStart) / 1_000_000.0
+            assertEquals(keys[27], loaded?.key)
+            assertEquals("private-history-27 ".repeat(10_000), loaded?.snapshot?.prompt)
+            assertEquals(1, reader.recordDecodeCount)
+            assertNull(reader.loadConversation("mac", "workspace-27", "missing"))
+            assertEquals(1, reader.recordDecodeCount)
+            assertEquals(modified, Files.getLastModifiedTime(target.toPath()))
+            val encrypted = reader.catalogFileForTest().readText()
+            assertFalse(encrypted.contains("workspace-27"))
+            assertFalse(encrypted.contains("conversation-27"))
+            assertFalse(encrypted.contains("private-history"))
+            reader.catalogFileForTest().delete()
+            val legacy = WorkspaceRunDiskCache(directory, keyBytes)
+            val legacyStart = System.nanoTime()
+            assertEquals(keys[27], legacy.loadConversation("mac", "workspace-27", "conversation-27")?.key)
+            val legacyMillis = (System.nanoTime() - legacyStart) / 1_000_000.0
+            assertEquals(41, legacy.recordDecodeCount)
+            println("cache_navigation_benchmark={\"runs\":40,\"indexed_decodes\":1,\"legacy_decodes\":41," +
+                "\"indexed_millis\":$indexedMillis,\"legacy_millis\":$legacyMillis}")
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun catalogRebuildsAfterLegacyOrInterruptedPublicationAndKeepsContextsSeparate() = runBlocking {
+        val directory = Files.createTempDirectory("pcr-cache-index-rebuild").toFile()
+        val keyBytes = ByteArray(32) { 25 }
+        try {
+            val writer = WorkspaceRunDiskCache(directory, keyBytes)
+            val key = WorkspaceRunKey("mac", "workspace", "run")
+            writer.writeNow(key, WorkspaceRunSnapshot(conversationId = "before", prompt = "first"))
+            val oldCatalog = writer.catalogFileForTest().readBytes()
+            val reader = WorkspaceRunDiskCache(directory, keyBytes)
+            assertEquals("first", reader.loadConversation("mac", "workspace", "before")?.snapshot?.prompt)
+            val oldModified = Files.getLastModifiedTime(writer.cacheFileForTest(key).toPath())
+            writer.writeNow(key, WorkspaceRunSnapshot(conversationId = "after!", prompt = "later"))
+            // Same size and mtime, different atomic replacement inode.
+            Files.setLastModifiedTime(writer.cacheFileForTest(key).toPath(), oldModified)
+            writer.catalogFileForTest().writeBytes(oldCatalog)
+            assertNull(reader.loadConversation("mac", "workspace", "before"))
+            assertEquals("later", reader.loadConversation("mac", "workspace", "after!")?.snapshot?.prompt)
+            writer.catalogFileForTest().delete()
+            val legacy = WorkspaceRunDiskCache(directory, keyBytes)
+            assertEquals("later", legacy.loadConversation("mac", "workspace", "after!")?.snapshot?.prompt)
+            assertNull(legacy.loadConversation("other-mac", "workspace", "after!"))
+            assertNull(legacy.loadConversation("mac", "other-workspace", "after!"))
+            writer.catalogFileForTest().writeText("incomplete catalog")
+            val repaired = WorkspaceRunDiskCache(directory, keyBytes)
+            assertEquals("later", repaired.loadConversation("mac", "workspace", "after!")?.snapshot?.prompt)
+            repaired.removeWhereNow { it == key }
+            assertNull(WorkspaceRunDiskCache(directory, keyBytes)
+                .loadConversation("mac", "workspace", "after!"))
+            assertTrue(directory.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun invalidNewestCachedRunFallsBackAndPruningHonorsReadRecency() = runBlocking {
+        val directory = Files.createTempDirectory("pcr-cache-index-pruning").toFile()
+        val keyBytes = ByteArray(32) { 27 }
+        try {
+            val cache = WorkspaceRunDiskCache(directory, keyBytes, capacity = 2)
+            val first = WorkspaceRunKey("mac", "workspace", "run-1")
+            val second = first.copy(runId = "run-2")
+            val third = first.copy(runId = "run-3")
+            cache.writeNow(first, WorkspaceRunSnapshot(conversationId = "conversation", prompt = "first"))
+            cache.writeNow(second, WorkspaceRunSnapshot(conversationId = "conversation", prompt = "second"))
+            cache.cacheFileForTest(second).writeText("invalid ciphertext")
+            assertEquals(first, cache.loadConversation("mac", "workspace", "conversation")?.key)
+            cache.writeNow(second, WorkspaceRunSnapshot(conversationId = "other", prompt = "second"))
+            assertEquals("first", cache.load(first)?.prompt)
+            cache.writeNow(third, WorkspaceRunSnapshot(conversationId = "third", prompt = "third"))
+            assertEquals("first", cache.load(first)?.prompt)
+            assertNull(cache.load(second))
+            assertEquals(third, cache.loadConversation("mac", "workspace", "third")?.key)
+            cache.clearNow()
+            assertNull(cache.loadConversation("mac", "workspace", "conversation"))
+            assertNull(cache.load(first))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun navigationReadsRemainAvailableDuringAnotherSnapshotEncodingAndRemovalWins() = runBlocking {
+        val directory = Files.createTempDirectory("pcr-cache-read-write").toFile()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val first = WorkspaceRunKey("mac", "workspace", "first")
+        val second = first.copy(runId = "second")
+        try {
+            val cache = WorkspaceRunDiskCache(directory, ByteArray(32) { 12 }, encodeRecord = { envelope ->
+                if (envelope.snapshot.prompt == "blocked write") {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                WorkspaceRunDiskCache.encodeRecord(envelope)
+            })
+            cache.writeNow(first, WorkspaceRunSnapshot(prompt = "original"))
+            cache.writeNow(second, WorkspaceRunSnapshot(prompt = "other workspace"))
+            val writing = launch(kotlinx.coroutines.Dispatchers.IO) {
+                cache.writeNow(first, WorkspaceRunSnapshot(prompt = "blocked write"))
+            }
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                withTimeout(1000) {
+                    assertEquals("original", cache.load(first)?.prompt)
+                    assertEquals("other workspace", cache.load(second)?.prompt)
+                }
+                val removing = launch { cache.removeWhereNow { it == first } }
+                release.countDown()
+                writing.join()
+                removing.join()
+                assertNull(cache.load(first))
+                assertEquals("other workspace", cache.load(second)?.prompt)
+                assertTrue(directory.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+            } finally {
+                release.countDown()
+                writing.join()
+            }
+        } finally { directory.deleteRecursively() }
+    }
+
     @Test
     fun coldStartDoesNotPresentPersistedDevicePresenceAsLiveState() {
         val cached = listOf(

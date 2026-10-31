@@ -106,9 +106,13 @@ extension AppModel {
     }
 
     func currentPromptDraftContext() -> String {
-        guard let workspaceID = selectedWorkspaceID,
-              let conversationID = selectedConversationID,
-              !conversationID.isEmpty else { return "" }
+        guard let workspaceID = selectedWorkspaceID else { return "" }
+        guard let conversationID = selectedConversationID,
+              !conversationID.isEmpty else {
+            // Keep typing during cold navigation. Once the conversation is
+            // resolved, preparePromptHistoryContext migrates this same draft.
+            return currentPromptHistoryContext()
+        }
         return machineConversationContextKey(
             workspaceID: workspaceID,
             conversationID: conversationID
@@ -126,6 +130,7 @@ extension AppModel {
         NativeMultilineEditorCommitRegistry.shared.commitPendingText()
         queueIssue = nil
         queueEditRequest = nil
+        let unassignedDraft = promptDraftContext.isEmpty && !prompt.isEmpty ? prompt : nil
 
         if draftChanged, !promptDraftContext.isEmpty {
             if prompt.isEmpty {
@@ -157,7 +162,7 @@ extension AppModel {
                 self.desktopStateStore.savePromptDrafts(promptDraftsByContext)
                 migratedDraft = draft
             } else {
-                migratedDraft = nil
+                migratedDraft = unassignedDraft
             }
             promptHistoryDraft = migratedDraft ?? ""
             prompt = promptHistoryDraft

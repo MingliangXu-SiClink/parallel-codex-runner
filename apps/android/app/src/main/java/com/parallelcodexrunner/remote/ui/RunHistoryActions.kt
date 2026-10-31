@@ -5,10 +5,12 @@ import com.parallelcodexrunner.remote.data.RelayDevice
 import com.parallelcodexrunner.remote.data.ResumeHistoryEntry
 import com.parallelcodexrunner.remote.data.RemoteRunSettings
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 
 internal fun RemoteRunSettings.forConversationHistory(
     runId: String?,
@@ -132,13 +134,9 @@ internal fun MainViewModel.loadRunHistory(
     mac: RelayDevice,
     key: WorkspaceRunKey,
 ) {
-    val requestId = ++nextConversationRequestId
-    runHistoryRequestIds[key] = requestId
     viewModelScope.launch {
         try {
-            conversationReadStore.read(key, ConversationReadTarget.History) {
-                loadRunHistoryPages(mac, key, requestId)
-            }
+            readSharedRunHistory(mac, key)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
@@ -153,9 +151,15 @@ internal suspend fun MainViewModel.preloadRunHistory(
     key: WorkspaceRunKey,
 ) {
     if (key in loadedRunHistories) return
-    val requestId = ++nextConversationRequestId
-    runHistoryRequestIds[key] = requestId
-    conversationReadStore.read(key, ConversationReadTarget.History) {
+    readSharedRunHistory(mac, key)
+}
+
+private suspend fun MainViewModel.readSharedRunHistory(mac: RelayDevice, key: WorkspaceRunKey) {
+    conversationReadStore.readShared(viewModelScope, key, ConversationReadTarget.History) {
+        // Only the owning reader receives an identity. Joining it must not
+        // invalidate a page already in flight and restart history at cursor zero.
+        val requestId = ++nextConversationRequestId
+        runHistoryRequestIds[key] = requestId
         loadRunHistoryPages(mac, key, requestId)
     }
 }
@@ -175,10 +179,9 @@ private suspend fun MainViewModel.loadRunHistoryPages(
         if (runHistoryRequestIds[key] != requestId) return
         val startingIndex = entries.size
         entries += page.entries
-        blocks += MobileTranscriptFormatter.historyBlocks(
-            page.entries,
-            startingIndex = startingIndex,
-        )
+        blocks += withContext(Dispatchers.Default) {
+            MobileTranscriptFormatter.historyBlocks(page.entries, startingIndex = startingIndex)
+        }
         if (runHistoryRequestIds[key] != requestId) return
         val updated = runStateStore.update(key) { current ->
             current.copy(

@@ -180,10 +180,18 @@ func mergeConversationHistory(
     // same prompt or answer. Keep a longer optimistic projection only until the
     // server has flushed it, then replace it atomically and discard attempt-only
     // work from permanent history.
-    guard authoritative.count >= optimisticConversationCount else { return current }
+    let evidence = (current + authoritative).filter {
+        $0.category == "user" && $0.inputOrigin == "pcr_recovery" && !$0.id.isEmpty
+    }
+    let recoveryByID = Dictionary(evidence.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let retained = authoritative.count >= optimisticConversationCount ? authoritative : current
     let questions = current.flatMap { AgentQuestionTranscript.historyQuestions(in: $0) }
-    return authoritative.map { entry in
+    return retained.map { entry in
         var value = entry
+        if let known = recoveryByID[entry.id], known.turnId == entry.turnId,
+           known.category == entry.category, known.text == entry.text {
+            value.inputOrigin = known.inputOrigin
+        }
         let candidates = questions.filter { !$0.request.turnId.isEmpty && $0.request.turnId == entry.turnId }
         value.questions = (entry.questions ?? []) + candidates
         value.questions = AgentQuestionTranscript.historyQuestions(in: value)

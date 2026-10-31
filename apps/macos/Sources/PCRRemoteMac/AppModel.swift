@@ -30,6 +30,8 @@ final class AppModel: ObservableObject {
     @Published var statusText = "Connecting"
     @Published var connectionLoading = true
     @Published var connectionErrorMessage: String?
+    @Published var statusRefreshErrorMessage: String?
+    var healthReadTasks: [String: Task<HealthResponse, Error>] = [:]
     @Published var liveConversationWarning: String?
     var liveConversationNeedsAction = false
     @Published var workspaces: [RemoteWorkspace] = []
@@ -141,11 +143,11 @@ final class AppModel: ObservableObject {
     @Published var loadingAgentKeys: Set<String> = []
     @Published var resumeSessions: [ResumeSession] = []
     @Published var resumeHistory: [ResumeHistoryEntry] = []
-    let modelOptionsCache = CodexModelOptionsCache()
+    let modelOptionsCache: CodexModelOptionsCache
     @Published var modelOptionsRevision = 0
     @Published var loadingPrimaryModelOptionsContexts: Set<CodexModelOptionsContext> = []
     var primaryModelOptionsLoading: Bool {
-        loadingPrimaryModelOptionsContexts.contains(primaryModelOptionsContext)
+        loadingPrimaryModelOptionsContexts.contains(primaryModelOptionsContext) && codexModelCatalog == nil
     }
     var primaryModelOptionsContext: CodexModelOptionsContext {
         CodexModelOptionsContext(machineID: currentMachineContextID, model: settings.model)
@@ -253,6 +255,10 @@ final class AppModel: ObservableObject {
     var conversationReadTasks: [WorkspaceRunViewKey: Task<Void, Never>] = [:]
     var conversationReadTokens: [WorkspaceRunViewKey: UUID] = [:]
     var conversationAgentReadTokens: [String: UUID] = [:]
+    var conversationReadDemands: [String: ClientReadDemand] = [:]
+    var focusedConversationReadKey: String?
+    var focusedConversationHistoryKey: String?
+    var conversationFocusRevision = 0
     var conversationHistoryTasks: [WorkspaceRunViewKey: Task<String?, Never>] = [:]
     var conversationHistoryTokens: [WorkspaceRunViewKey: UUID] = [:]
     var workspaceContextTask: Task<Void, Never>?
@@ -538,6 +544,8 @@ final class AppModel: ObservableObject {
          runViewStateStore: WorkspaceRunViewStateStore? = nil,
          questionAnswers: AgentAnswerOutbox? = nil) {
         self.client = client
+        modelOptionsCache = CodexModelOptionsCache(defaults:
+            client.socketURL == PcrdClient.standard.socketURL && !AppLaunchMode.isUISmokeTest ? .standard : nil)
         self.questionAnswers = questionAnswers ?? .shared
         self.conversationTrash = conversationTrash
         resultsInspectorVisibilityKey = "parallel-codex.results-inspector-visible."
@@ -652,6 +660,9 @@ final class AppModel: ObservableObject {
             remote: targetWorkspace.settings,
             preserving: dirtySettingsFieldsByWorkspace[destinationWorkspaceKey] ?? []
         )
+        // Restored settings are the comparison baseline, not a user edit.
+        // Leaving before slow hydration finishes must not write every field.
+        settingsByWorkspace[destinationWorkspaceKey] = settings
         preparePromptHistoryContext()
         workspaceContextLoadingID = workspaceID
         rememberWorkspaceSelection()
@@ -662,6 +673,7 @@ final class AppModel: ObservableObject {
         )
         restoreVisiblePromptSubmission()
         refreshVisibleRunOperationState()
+        focusVisibleConversationRead()
         if activeRun != nil || !resumeHistory.isEmpty { workspaceContextLoadingID = nil }
         let generation = workspaceContextGeneration
         workspaceContextTask?.cancel()
@@ -672,6 +684,7 @@ final class AppModel: ObservableObject {
             await self.restoreCachedWorkspaceConversation(workspace: targetWorkspace,
                 machineID: machineID, generation: generation)
             guard self.isCurrentWorkspaceContext(workspaceID, generation: generation) else { return }
+            self.focusVisibleConversationRead()
             // Destination reads must not queue behind the global health,
             // workspace directory, or native-session index refresh.
             let destination = self.reconciledWorkspaceHead(targetWorkspace, machineID: machineID)
@@ -892,7 +905,7 @@ final class AppModel: ObservableObject {
         case .loading, .enqueue, .blocked:
             return
         }
-        let snapshot = plan.settingsForSubmission(settings, run: activeRun)
+        guard let snapshot = settingsWithConcreteModelsForNewPrompt(plan.settingsForSubmission(settings, run: activeRun)) else { return }
         let target = client.currentTarget()
         let resumesConversation = sourceAgent != nil
             || usableResumeSessionID(snapshot.resumeSessionID) != nil

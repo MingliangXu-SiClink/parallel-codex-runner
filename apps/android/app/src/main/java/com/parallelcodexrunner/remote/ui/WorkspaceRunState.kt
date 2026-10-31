@@ -346,10 +346,19 @@ internal fun mergeConversationHistory(
     // flushed the whole optimistic conversation yet, keep the local projection
     // until the next refresh; otherwise replace it atomically with the source of
     // truth and drop attempt-only reasoning and commands from permanent history.
-    return if (authoritative.size < optimisticConversationCount) {
+    val recoveryById = (current + authoritative)
+        .filter { it.kind == MobileTranscriptKind.USER && it.inputOrigin == "pcr_recovery" && it.id.isNotBlank() }
+        .associateBy { it.id }
+    val retained = if (authoritative.size < optimisticConversationCount) {
         current
     } else {
         authoritative
+    }
+    return retained.map { entry ->
+        val known = recoveryById[entry.id]
+        if (known != null && known.kind == entry.kind && known.text == entry.text) {
+            entry.copy(inputOrigin = known.inputOrigin)
+        } else entry
     }
 }
 

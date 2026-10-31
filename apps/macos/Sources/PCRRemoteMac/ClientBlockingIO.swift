@@ -1,5 +1,46 @@
 import Foundation
 
+/// A navigation change promotes the existing queued read, never a duplicate RPC.
+final class ClientReadDemand: @unchecked Sendable {
+    private let lock = NSLock()
+    private var focused = false
+    private var pending: [UUID: @Sendable () -> Void] = [:]
+
+    func setFocused(_ value: Bool) {
+        lock.lock()
+        focused = value
+        let promote = value ? Array(pending.values) : []
+        lock.unlock()
+        for action in promote { action() }
+    }
+
+    func register(_ id: UUID, promote: @escaping @Sendable () -> Void) {
+        lock.lock()
+        pending[id] = promote
+        let now = focused
+        lock.unlock()
+        if now { promote() }
+    }
+
+    func remove(_ id: UUID) {
+        lock.lock()
+        pending.removeValue(forKey: id)
+        lock.unlock()
+    }
+}
+
+private final class ClientReadOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// Synchronous sockets and cache locks must never occupy Swift's cooperative pool.
 enum ClientBlockingIO {
     private static let backgroundRequests: OperationQueue = {
@@ -26,15 +67,22 @@ enum ClientBlockingIO {
     private static let cacheQueue = DispatchQueue(
         label: "com.parallelcodexrunner.conversation-cache", qos: .utility
     )
+    private static let cacheWriteQueue = DispatchQueue(
+        label: "com.parallelcodexrunner.conversation-cache-writes", qos: .utility
+    )
 
     static func transport<Value: Sendable>(
         priority: TaskPriority,
         isObservation: Bool,
         isLiveContent: Bool = false,
+        demand: ClientReadDemand? = nil,
         _ work: @escaping @Sendable () throws -> Value
     ) async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
+            let id = UUID(), once = ClientReadOnce()
             let operation: @Sendable () -> Void = {
+                guard once.claim() else { return }
+                demand?.remove(id)
                 do { continuation.resume(returning: try work()) }
                 catch { continuation.resume(throwing: error) }
             }
@@ -46,6 +94,13 @@ enum ClientBlockingIO {
                     : backgroundRequests
                 let request = BlockOperation(block: operation)
                 request.queuePriority = priority > .background ? .high : .low
+                demand?.register(id) {
+                    guard !request.isExecuting, !request.isFinished, !request.isCancelled else { return }
+                    request.cancel()
+                    // Use the same lane as a direct foreground request. An
+                    // obsolete in-flight read must not serialize the new focus.
+                    DispatchQueue.global(qos: .userInitiated).async(execute: operation)
+                }
                 queue.addOperation(request)
             } else {
                 let qos: DispatchQoS.QoSClass = priority >= .userInitiated ? .userInitiated
@@ -60,6 +115,14 @@ enum ClientBlockingIO {
     ) async -> Value {
         await withCheckedContinuation { continuation in
             cacheQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
+    static func cacheWrite<Value: Sendable>(
+        _ work: @escaping @Sendable () -> Value
+    ) async -> Value {
+        await withCheckedContinuation { continuation in
+            cacheWriteQueue.async { continuation.resume(returning: work()) }
         }
     }
 }

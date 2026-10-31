@@ -91,7 +91,7 @@ enum TranscriptTextRenderer {
         let alignment: NSTextAlignment
     }
 
-    private enum BlockRole: Equatable {
+    private enum BlockRole: Hashable {
         case paragraph
         case heading(Int)
         case unorderedItem(depth: Int)
@@ -310,9 +310,7 @@ enum TranscriptTextRenderer {
         guard width > 0, text.length > 0 else { return 1 }
         let storage = NSTextStorage(attributedString: text)
         let layout = NSLayoutManager()
-        let container = NSTextContainer(
-            containerSize: NSSize(width: width, height: .greatestFiniteMagnitude)
-        )
+        let container = NSTextContainer(containerSize: NSSize(width: width, height: .greatestFiniteMagnitude))
         container.lineFragmentPadding = 0
         container.widthTracksTextView = false
         container.heightTracksTextView = false
@@ -357,10 +355,17 @@ enum TranscriptTextRenderer {
         accentColor: AppAccentColor
     ) -> NSAttributedString {
         let source = TranscriptFormatter.markdownPresentationText(source)
+        if isUnformattedParagraph(source) {
+            return plain(source, block: transcript, textSize: textSize, accentColor: accentColor)
+        }
         let latex = LatexMarkdownExtractor.extract(source)
-        guard let parsed = try? AttributedString(
-            markdown: latex.markdown,
-            options: .init(interpretedSyntax: .full)
+        // Use Foundation's native Markdown result directly. Building the Swift
+        // attributed-string rope and slicing it back into NSString runs duplicates
+        // the entire transcript before AppKit can measure its first frame.
+        let parsing = __NSAttributedStringMarkdownParsingOptions()
+        parsing.interpretedSyntax = .full
+        guard let parsed = try? NSAttributedString(
+            __markdownString: latex.markdown, options: parsing, baseURL: nil
         ) else {
             return plain(
                 source,
@@ -374,8 +379,25 @@ enum TranscriptTextRenderer {
         var previousBlock: BlockInfo?
         let tableRegistry = MarkdownTableRegistry()
         let codeBlockRegistry = MarkdownCodeBlockRegistry(accentColor: accentColor.nsColor)
-        for run in parsed.runs {
-            let block = blockInfo(for: run.presentationIntent)
+        // Inline emphasis can split one paragraph into hundreds of runs. Its
+        // base font, resolved color and paragraph style only need building once.
+        var roleAttributes: [BlockRole: [NSAttributedString.Key: Any]] = [:]
+        func attributes(for role: BlockRole) -> [NSAttributedString.Key: Any] {
+            if let cached = roleAttributes[role] { return cached }
+            let value = baseAttributes(transcript: transcript, markdown: role,
+                textSize: textSize, accentColor: accentColor,
+                textBlock: tableRegistry.cell(for: role) ?? codeBlockRegistry.block(for: role))
+            roleAttributes[role] = value
+            return value
+        }
+        let text = parsed.string as NSString
+        let presentationKey = NSAttributedString.Key(AttributeScopes.FoundationAttributes.PresentationIntentAttribute.name)
+        let imageKey = NSAttributedString.Key(AttributeScopes.FoundationAttributes.ImageURLAttribute.name)
+        parsed.enumerateAttributes(in: NSRange(location: 0, length: parsed.length)) { run, range, _ in
+            let block = blockInfo(for: run[presentationKey] as? PresentationIntent)
+            let inline = (run[.inlinePresentationIntent] as? NSNumber).map {
+                InlinePresentationIntent(rawValue: $0.uintValue)
+            }
             if block != previousBlock {
                 appendBoundary(
                     from: previousBlock,
@@ -392,25 +414,18 @@ enum TranscriptTextRenderer {
 
             // Markdown treats a single newline as a space. User messages must
             // keep the line breaks they entered without disabling rich text.
-            let value = transcript.kind == .user && run.inlinePresentationIntent?.contains(.softBreak) == true
+            let value = transcript.kind == .user && inline?.contains(.softBreak) == true
                 ? "\n"
-                : String(parsed[run.range].characters)
-            guard !value.isEmpty else { continue }
-            var attributes = baseAttributes(
-                transcript: transcript,
-                markdown: block.role,
-                textSize: textSize,
-                accentColor: accentColor,
-                textBlock: tableRegistry.cell(for: block.role)
-                    ?? codeBlockRegistry.block(for: block.role)
-            )
-            applyInlineStyles(run.inlinePresentationIntent, to: &attributes)
-            if let link = run.link ?? run.imageURL {
-                attributes[.link] = link
-                attributes[.foregroundColor] = accentColor.nsColor
-                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                : text.substring(with: range)
+            guard !value.isEmpty else { return }
+            var styled = attributes(for: block.role)
+            applyInlineStyles(inline, to: &styled)
+            if let link = (run[.link] ?? run[imageKey]) as? URL {
+                styled[.link] = link
+                styled[.foregroundColor] = accentColor.nsColor
+                styled[.underlineStyle] = NSUnderlineStyle.single.rawValue
             }
-            output.append(NSAttributedString(string: value, attributes: attributes))
+            output.append(NSAttributedString(string: value, attributes: styled))
         }
         if let previousBlock,
            case .tableCell = previousBlock.role {
@@ -443,6 +458,17 @@ enum TranscriptTextRenderer {
             accentColor: accentColor
         )
         return output
+    }
+
+    private static let markdownSyntax = CharacterSet(charactersIn: "\\`*_{}[]()<>!|#~-&\n\r\t.$+:=\0")
+
+    static func isUnformattedParagraph(_ text: String) -> Bool {
+        // Only bypass parsing when Markdown cannot change this single line.
+        // Whitespace, escapes, list markers, entities, math and links all keep
+        // the existing rich-text path.
+        guard let first = text.first, !first.isWhitespace,
+              let last = text.last, !last.isWhitespace else { return false }
+        return text.rangeOfCharacter(from: markdownSyntax) == nil
     }
 
     private static func replaceLatexFragments(

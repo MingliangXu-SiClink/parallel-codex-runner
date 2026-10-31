@@ -5,6 +5,7 @@ import com.parallelcodexrunner.remote.data.RelayDevice
 import com.parallelcodexrunner.remote.data.RemoteCommandException
 import com.parallelcodexrunner.remote.data.RemoteWorkspace
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -13,6 +14,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
@@ -472,8 +474,8 @@ internal suspend fun MainViewModel.loadAgent(
 ) {
     val generation = contextGeneration
     try {
-        conversationReadStore.read(key, ConversationReadTarget.Agent(agent)) {
-            loadAgentPages(mac, key, agent, maxPages)
+        conversationReadStore.readShared(viewModelScope, key, ConversationReadTarget.Agent(agent), maxPages) { pageLimit ->
+            loadAgentPages(mac, key, agent, pageLimit)
         }
     } catch (error: Throwable) {
         if (generation == contextGeneration && recoverMissingRunHistory(mac, key, error)) return
@@ -485,7 +487,7 @@ private suspend fun MainViewModel.loadAgentPages(
     mac: RelayDevice,
     key: WorkspaceRunKey,
     agent: Int,
-    maxPages: Int,
+    pageLimit: () -> Int,
 ) {
     val requestKey = key to agent
     val requestId = ++nextConversationRequestId
@@ -496,7 +498,6 @@ private suspend fun MainViewModel.loadAgentPages(
         ?.recoverMissingCachedContent()
         ?: MobileAgentTranscript()
     var madeProgress: Boolean
-    var agentFinished: Boolean
     var pagesLoaded = 0
     do {
         val previousCursor = transcript.cursor
@@ -511,11 +512,15 @@ private suspend fun MainViewModel.loadAgentPages(
         val page = transcriptPage ?: eventPage
         val items = transcriptPage?.get("items")?.jsonArray
         val events = eventPage?.get("events")?.jsonArray
-        val blocks = when {
-            items != null -> MobileTranscriptFormatter.appendItems(transcript.blocks, items)
-            events != null -> MobileTranscriptFormatter.appendEvents(transcript.blocks, events)
-            else -> transcript.blocks
+        val currentBlocks = transcript.blocks
+        val blocks = withContext(Dispatchers.Default) {
+            when {
+                items != null -> MobileTranscriptFormatter.appendItems(currentBlocks, items)
+                events != null -> MobileTranscriptFormatter.appendEvents(currentBlocks, events)
+                else -> currentBlocks
+            }
         }
+        if (agentRequestIds[requestKey] != requestId) return
         val next = page?.get("next_cursor")?.jsonPrimitive?.intOrNull ?: previousCursor
         val hasMore = page?.get("has_more")?.jsonPrimitive?.booleanOrNull ?: false
         val error = listOfNotNull(
@@ -563,7 +568,7 @@ private suspend fun MainViewModel.loadAgentPages(
                         finalMessageId = "",
                     )
                     madeProgress = true
-                    agentFinished = true
+                    pagesLoaded += 1
                     continue
                 }
                 if (responseCursor == finalMessageCursor) {
@@ -626,19 +631,16 @@ private suspend fun MainViewModel.loadAgentPages(
         pagesLoaded += 1
         madeProgress = transcript.cursor > previousCursor ||
             transcript.finalMessageCursor > previousFinalMessageCursor
-        agentFinished = runStateStore[key]
-            ?.agents
-            .orEmpty()
-            .firstOrNull { it.number == agent }
-            ?.status
-            ?.let(::isTerminalAgentStatus) == true
-    } while (
-        (transcript.hasMore || transcript.finalMessageHasMore) &&
-        madeProgress &&
-        agentFinished &&
-        pagesLoaded < maxPages.coerceAtLeast(1)
-    )
+    } while (shouldReadNextAgentPage(transcript, madeProgress, pagesLoaded, pageLimit()))
 }
+
+internal fun shouldReadNextAgentPage(
+    transcript: MobileAgentTranscript,
+    madeProgress: Boolean,
+    pagesLoaded: Int,
+    maxPages: Int,
+): Boolean = (transcript.hasMore || transcript.finalMessageHasMore) && madeProgress &&
+    pagesLoaded < maxPages.coerceAtLeast(1)
 
 internal fun selectedAgentDetailHasMore(snapshot: WorkspaceRunSnapshot): Boolean {
     if (snapshot.selectedAgentDetailMissing()) return true

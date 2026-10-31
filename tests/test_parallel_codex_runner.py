@@ -2420,10 +2420,17 @@ class SynthesisTests(unittest.TestCase):
         )
 
     def test_targeted_synthesis_retry_keeps_other_synthesis_results_eligible(self) -> None:
+        from tests.test_in_place_agent_recovery import InPlaceRecoveryTests
+
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = root / "workspace"
-            workspace.mkdir()
+            retained = InPlaceRecoveryTests().fixture(Path(tmp).resolve())
+            root = Path(retained.run_root)
+            workspace = Path(retained.workspace)
+            for name in ("command.json", "status.json"):
+                path = root / "meta/agent_002" / name
+                value = json.loads(path.read_text())
+                value["role"] = "synthesis"
+                path.write_text(json.dumps(value))
             candidate = AgentResult(
                 **make_agent_result_data(1, root / "candidate-1")
             )
@@ -2450,7 +2457,7 @@ class SynthesisTests(unittest.TestCase):
             ) as run_additional:
                 app_core.run_synthesis_refresh(
                     args=args,
-                    prompt="review",
+                    prompt=retained.prompt,
                     run_root=root,
                     workspace=workspace,
                     recorded_results=[candidate, synthesis_two, synthesis_three],
@@ -2462,6 +2469,7 @@ class SynthesisTests(unittest.TestCase):
             kwargs = run_additional.call_args.kwargs
             self.assertEqual(kwargs["recommendation_excluded_indices"], {9})
             self.assertEqual(kwargs["synthesis_requested_agents"], 2)
+            self.assertEqual(set(kwargs["retained_execution_fingerprints"]), {2})
 
 
 class ReasoningEffortTests(unittest.TestCase):
@@ -3368,7 +3376,7 @@ class AdditionalAgentTests(unittest.TestCase):
         model_cache.start()
         self.addCleanup(model_cache.stop)
 
-    def test_additional_agents_use_global_indices_and_retry_fresh_workspaces(self) -> None:
+    def test_additional_agents_use_global_indices_and_refuse_retry_without_native_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -3418,39 +3426,38 @@ class AdditionalAgentTests(unittest.TestCase):
                         )
 
                         (run_root / "workspaces" / "agent_003" / "stale.txt").write_text(
-                            "must disappear",
+                            "must remain",
                             encoding="utf-8",
                         )
 
-                        retry_results = app_core.run_additional_agents(
-                            args=args,
-                            prompt="current question",
-                            agent_indices=[3],
-                            run_root=run_root,
-                            workspace=workspace,
-                            retry_indices={3},
-                            progress_callback=events.append,
-                            cancel_event=threading.Event(),
-                            agent_cancel_events={3: threading.Event()},
-                        )
+                        with self.assertRaises(FileNotFoundError):
+                            app_core.run_additional_agents(
+                                args=args,
+                                prompt="current question",
+                                agent_indices=[3],
+                                run_root=run_root,
+                                workspace=workspace,
+                                retry_indices={3},
+                                progress_callback=events.append,
+                                cancel_event=threading.Event(),
+                                agent_cancel_events={3: threading.Event()},
+                            )
 
             self.assertEqual({result.idx for result in results}, {3, 4})
             self.assertTrue(all(result.status == "success" for result in results))
-            self.assertEqual([result.idx for result in retry_results], [3])
             self.assertEqual(
                 (run_root / "workspaces" / "agent_003" / "ran.txt").read_text(encoding="utf-8"),
                 "current question",
             )
-            self.assertFalse((run_root / "workspaces" / "agent_003" / "stale.txt").exists())
-            self.assertTrue(any((run_root / "retry_history" / "agent_003").iterdir()))
+            self.assertEqual((run_root / "workspaces/agent_003/stale.txt").read_text(), "must remain")
+            self.assertFalse((run_root / "retry_history").exists())
             summary = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["recommend_by"], "duration")
             self.assertNotIn("best_by", summary)
             self.assertEqual([result["idx"] for result in summary["results"]], [3, 4])
             started = [event["idx"] for event in events if event.get("type") == "agent_process_started"]
-            self.assertEqual(len(started), 3)
+            self.assertEqual(len(started), 2)
             self.assertEqual(set(started[:2]), {3, 4})
-            self.assertEqual(started[2], 3)
             self.assertTrue(
                 all(call.kwargs["fast"] is True for call in build_command.call_args_list)
             )

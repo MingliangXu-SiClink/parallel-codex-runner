@@ -199,7 +199,7 @@ def test_one_preparation_failure_does_not_abort_other_agents(local_pipeline, mon
     assert (workspace / "base.txt").read_text() == "original\n"
 
 
-def test_preparation_failure_can_be_retried_in_the_same_candidate_stage(local_pipeline, monkeypatch):
+def test_retry_without_a_prepared_session_does_not_recopy_or_block_siblings(local_pipeline, monkeypatch):
     args, _ = local_pipeline
     args.live_candidate_coordinator = app.LiveCandidateCoordinator()
     copies = []
@@ -209,25 +209,24 @@ def test_preparation_failure_can_be_retried_in_the_same_candidate_stage(local_pi
         copies.append(destination.name)
         if destination.name == "agent_001" and copies.count("agent_001") == 1:
             raise OSError("temporary fixture copy failure")
-        if destination.name == "agent_002":
-            assert wait_for_fixture_file(destination.parent / "agent_001/reply.txt")
         shutil.copytree(source, destination)
 
     def report(event):
         if event.get("type") == "agent_finished" and event.get("idx") == 1:
-            if event["result"]["status"] == "error":
+            if event["result"]["status"] == "error" and not retries:
                 retries.append(args.live_candidate_coordinator.request_retry(1))
 
     monkeypatch.setattr(app, "copy_workspace", copy)
     assert app.run_once(args, "pipeline", progress_callback=report, print_output=False) == 0
     assert retries == [True]
-    assert copies.count("agent_001") == 2
+    assert copies.count("agent_001") == 1
     root = next(Path(args.runs_dir).iterdir())
     results = json.loads((root / "summary.json").read_text())["results"]
     assert {result["idx"]: result["status"] for result in results} == {
-        idx: "success" for idx in range(1, 6)
+        idx: "error" if idx == 1 else "success" for idx in range(1, 6)
     }
-    assert (root / "retry_history/agent_001").is_dir()
+    assert not (root / "retry_history/agent_001").exists()
+    assert not (root / "workspaces/agent_001/reply.txt").exists()
 
 
 def test_cancel_during_preparation_never_launches_or_prepares_queued_agents(local_pipeline, monkeypatch):

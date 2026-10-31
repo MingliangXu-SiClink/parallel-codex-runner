@@ -31,11 +31,18 @@ NATIVE_SCHEMAS = {
     "state": "3514187effc4a57f23f225f4ddf9af6d6b6c2d916bd6fee5d57e46b9ca718d54",
     "projection": "d96d7011e4abb80c78e9a5b2fdfa02a2f2132242039b67c119e38b0e6045488e",
 }
-# Migrations 60/61 add thread-scoped feedback and read state. The preceding
-# schema and all earlier migration checksums are unchanged.
+# Migrations 60/61 add thread-scoped feedback/read state. Migration 62 adds
+# attached-parent metadata and an index, not a new exported dependency.
 STATE_SCHEMA_UPGRADES = {
     "c9926f802f373d492219b83f560072fdec8ad299bfff58118b5d7bbc014f462a",
     "775759d3b4bf22114c958578473d0e273af0b5d8eefc564b5a0685700d404be8",
+    "d4fe6ba77187accbe0a53b228d6a818f84b59d41118c148a93d1121b4e67988b",
+}
+# The CLI creates state v58 / projection v7; the desktop app may have already
+# migrated those same histories. Fresh CLI sessions must also be resumable.
+FRESH_CLI_SCHEMAS = {
+    "state": "aa33eaa498e11f1abae347673af45dd9d665ddd594f711cacb2fee5e64495d10",
+    "projection": "dd203db893f379d1a096299af8237659d44c1a5c6c7d476dd80b1af8aeed8c72",
 }
 
 
@@ -66,7 +73,8 @@ def _schema(connection: sqlite3.Connection, kind: str) -> list[tuple[str, str, s
             "SELECT version,checksum FROM _sqlx_migrations ORDER BY version")]
         fingerprint = hashlib.sha256(json.dumps([sorted(rows, key=lambda row: (row[0], row[1])), migrations],
             ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-        if fingerprint != NATIVE_SCHEMAS[kind] and not (kind == "state" and fingerprint in STATE_SCHEMA_UPGRADES):
+        if (fingerprint not in {NATIVE_SCHEMAS[kind], FRESH_CLI_SCHEMAS[kind]}
+                and not (kind == "state" and fingerprint in STATE_SCHEMA_UPGRADES)):
             raise HistorySchemaCompatibilityError("Unsupported Codex history schema or migration; original history was not changed")
     supported_foreign_keys = {
         "threads": {("projects", "project_id", "id"), ("thread_sections", "thread_section_id", "id")},
@@ -105,8 +113,11 @@ def _selectors(connection: sqlite3.Connection, kind: str, identifiers: tuple[str
     if "rollout_path" in thread_columns:
         paths_where, paths_parameters = _in("rollout_path", rollout_paths)
         where, parameters = f"({where} OR {paths_where})", parameters + paths_parameters
-    scopes["threads"] = (where, parameters)
     selected = tuple(row[0] for row in connection.execute(f"SELECT id FROM threads WHERE {where}", parameters))
+    # Resolve aliases once in this read transaction. Reusing the rollout-path
+    # OR for every index budget/export otherwise rescans the entire registry.
+    where, parameters = _in("id", selected)
+    scopes["threads"] = (where, parameters)
     for table in ("thread_dynamic_tools", "thread_attachments", "guardian_review_feedback", "thread_read_receipts"):
         if table in tables:
             scopes[table] = _in("thread_id", selected)

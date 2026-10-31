@@ -158,9 +158,12 @@ final class TranscriptLayoutMetricsStore: @unchecked Sendable {
 
     private func trimEntries() {
         guard entries.count > maximumEntries else { return }
+        // Make room for a page of new measurements. Evicting one entry meant
+        // sorting all 12,000 entries again for every row on the main thread.
+        let retainedCount = max(1, maximumEntries - maximumEntries / 8)
         let retained = entries
             .sorted { $0.value.updatedAt > $1.value.updatedAt }
-            .prefix(maximumEntries)
+            .prefix(retainedCount)
         entries = Dictionary(uniqueKeysWithValues: retained.map { ($0.key, $0.value) })
     }
 

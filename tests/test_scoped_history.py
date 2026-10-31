@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from parallel_codex_runner_core import app
-from parallel_codex_runner_core.scoped_history import copy_scoped_database, scoped_database_bytes
+from parallel_codex_runner_core.scoped_history import _selectors, copy_scoped_database, scoped_database_bytes
 from . import test_prepared_history as fixtures
 
 
@@ -40,6 +40,29 @@ class ScopedHistoryTests(unittest.TestCase):
             connection.execute("INSERT INTO thread_history_projection_state VALUES ('aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa',?,3)", (self.rollout.stat().st_size,))
             connection.commit()
         return path
+
+    def test_state_alias_selection_is_resolved_once_then_uses_primary_keys(self):
+        state = self.home / "state_5.sqlite"
+        with closing(sqlite3.connect(state)) as connection:
+            connection.execute("INSERT INTO threads (id,cwd,rollout_path) VALUES ('alias','/same',?)",
+                               (str(self.rollout),))
+            connection.execute("INSERT INTO threads (id,cwd,rollout_path) VALUES ('unrelated','/other','/other/history')")
+            statements = []
+            connection.set_trace_callback(statements.append)
+            scopes = _selectors(connection, "state", ("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",),
+                                (str(self.rollout),))
+            where, args = scopes["threads"]
+            self.assertNotIn("rollout_path", where)
+            self.assertEqual(set(args), {"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa", "alias"})
+            self.assertEqual(sum("SELECT id FROM threads WHERE" in sql for sql in statements), 1)
+            plan = connection.execute(f"EXPLAIN QUERY PLAN SELECT * FROM threads WHERE {where}", args).fetchall()
+            self.assertTrue(any("SEARCH" in row[3] for row in plan), plan)
+            connection.commit()
+        target = self.root / "alias-copy.sqlite"
+        copy_scoped_database(state, target, "state", ("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",), (str(self.rollout),))
+        with closing(sqlite3.connect(target)) as connection:
+            self.assertEqual({row[0] for row in connection.execute("SELECT id FROM threads")},
+                             {"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa", "alias"})
 
     def test_export_keeps_schema_migration_identity_and_only_selected_cache(self):
         path = self.projection()

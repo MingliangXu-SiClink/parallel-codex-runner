@@ -99,6 +99,7 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
 class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
     def process(self):
         process = MagicMock()
+        process.pid = 12345
         process.stdin.drain = AsyncMock()
         process.wait = AsyncMock(return_value=0)
         process.returncode = None

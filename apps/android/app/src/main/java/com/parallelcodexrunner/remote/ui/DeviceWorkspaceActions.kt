@@ -1212,6 +1212,26 @@ fun MainViewModel.selectWorkspace(workspaceId: String) {
                     return@launch
                 }
                 restoreCachedWorkspaces(mac, preferredWorkspaceId = workspaceId)
+                cachedRunId?.let { runId ->
+                    val key = WorkspaceRunKey(mac.deviceId, workspaceId, runId)
+                    if (isVisibleRun(key)) {
+                        if (key !in loadedRunHistories) loadRunHistory(mac, key)
+                        runStateStore[key]?.selectedAgent?.let { agent ->
+                            // The selected transcript must not wait for the global
+                            // directory refresh or a sleeping background metadata poll.
+                            // loadAgent joins and promotes any existing scoped reader.
+                            viewModelScope.launch {
+                                try {
+                                    loadAgent(mac, key, agent)
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (_: Throwable) {
+                                    // The scoped read state retains the retryable error.
+                                }
+                            }
+                        }
+                    }
+                }
             }
             val refreshedGeneration = contextGeneration
             loadWorkspaces(

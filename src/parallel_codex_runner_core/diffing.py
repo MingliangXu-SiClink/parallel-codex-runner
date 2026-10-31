@@ -3,7 +3,10 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import shutil
 import stat
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional
@@ -157,12 +160,17 @@ def _entry_patch(
     to_file = f"b/{path_text}" if after is not None else "/dev/null"
     before_lines = before_text.splitlines(keepends=True)
     after_lines = after_text.splitlines(keepends=True)
+    context = max(len(before_lines), len(after_lines)) if full_context else 3
+    # SequenceMatcher is quadratic on repeated rows and holds the daemon's GIL.
+    # Keep small diffs in memory; use the existing Git engine for large texts.
+    if max(len(before_lines), len(after_lines)) > 10_000 and (git := shutil.which("git")):
+        return mode_text + _large_text_patch(git, before_data, after_data, from_file, to_file, context)
     diff_lines = difflib.unified_diff(
         before_lines,
         after_lines,
         fromfile=from_file,
         tofile=to_file,
-        n=max(len(before_lines), len(after_lines)) if full_context else 3,
+        n=context,
     )
     patch_parts: list[str] = []
     for line in diff_lines:
@@ -176,6 +184,24 @@ def _entry_patch(
             patch_parts.append("\\ No newline at end of file\n")
     patch = "".join(patch_parts)
     return mode_text + patch
+
+
+def _large_text_patch(git: str, before: bytes, after: bytes,
+                      from_file: str, to_file: str, context: int) -> str:
+    with tempfile.TemporaryDirectory(prefix="pcr-diff-") as directory:
+        root = Path(directory)
+        (root / "before").write_bytes(before)
+        (root / "after").write_bytes(after)
+        result = subprocess.run(
+            [git, "-c", "core.autocrlf=false", "diff", "--no-index", "--no-ext-diff",
+             "--no-textconv", "--no-color", "--text", "--histogram", f"--unified={context}",
+             "--", "before", "after"], cwd=root, capture_output=True,
+        )
+    if result.returncode not in (0, 1):
+        raise OSError(f"Cannot generate file diff: {result.stderr.decode('utf-8', errors='replace').strip()}")
+    patch = result.stdout.decode("utf-8")
+    _, marker, hunks = patch.partition("\n@@ ")
+    return f"--- {from_file}\n+++ {to_file}\n@@ {hunks}" if marker else ""
 
 
 def workspace_changes(

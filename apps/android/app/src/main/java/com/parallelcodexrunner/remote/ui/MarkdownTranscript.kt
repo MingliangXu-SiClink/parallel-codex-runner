@@ -64,6 +64,9 @@ import org.intellij.markdown.flavours.gfm.GFMTokenTypes.CELL
 import org.intellij.markdown.flavours.gfm.GFMTokenTypes.TABLE_SEPARATOR
 import org.intellij.markdown.parser.MarkdownParser
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -72,26 +75,49 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.Locale
 
-private object MarkdownTranscriptStateCache {
-    private const val MaxEntries = 256
-    private const val MaxCharacters = 4_000_000
-    private const val MaxSingleEntryCharacters = 300_000
+private const val MarkdownCacheMaxEntries = 256
+private const val MarkdownCacheMaxCharacters = 4_000_000
+private const val MarkdownCacheMaxSingleEntryCharacters = 300_000
 
-    private val states = LinkedHashMap<String, MarkdownState>(MaxEntries, 0.75f, true)
+// Prewarming must not parse entries that the cache will reject or evict before display.
+// This bounds preparation only; the transcript and on-demand rendering remain complete.
+internal fun markdownPrewarmContents(
+    contents: List<String>,
+    maxEntries: Int = MarkdownCacheMaxEntries,
+    maxCharacters: Int = MarkdownCacheMaxCharacters,
+    maxSingleEntryCharacters: Int = MarkdownCacheMaxSingleEntryCharacters,
+): List<String> {
+    val selected = LinkedHashSet<String>()
+    var characters = 0
+    for (content in contents.asReversed()) {
+        if (content.isEmpty() || content.length > maxSingleEntryCharacters || content in selected) continue
+        if (selected.size >= maxEntries || content.length > maxCharacters - characters) break
+        selected.add(content)
+        characters += content.length
+    }
+    return selected.toList().asReversed()
+}
+
+private object MarkdownTranscriptStateCache {
+
+    private val states = LinkedHashMap<String, MarkdownState>(MarkdownCacheMaxEntries, 0.75f, true)
     private var characterCount = 0
 
     @Synchronized
     fun get(content: String): MarkdownState? = states[content]
 
     @Synchronized
-    fun missing(contents: Collection<String>): List<String> = contents.filterNot(states::containsKey)
+    fun missing(contents: List<String>): List<String> = markdownPrewarmContents(contents).filter {
+        // Retain already parsed members of this batch ahead of unrelated LRU entries.
+        states[it] == null
+    }
 
     @Synchronized
     fun put(content: String, state: MarkdownState) {
-        if (content.isEmpty() || content.length > MaxSingleEntryCharacters) return
+        if (content.isEmpty() || content.length > MarkdownCacheMaxSingleEntryCharacters) return
         val previous = states.put(content, state)
         if (previous == null) characterCount += content.length
-        while (states.size > MaxEntries || characterCount > MaxCharacters) {
+        while (states.size > MarkdownCacheMaxEntries || characterCount > MarkdownCacheMaxCharacters) {
             val iterator = states.entries.iterator()
             if (!iterator.hasNext()) break
             val eldest = iterator.next()
@@ -170,6 +196,8 @@ private class PreparsedMarkdownState(
                 parser = parser,
                 referenceLinkHandler = referenceLinkHandler,
             ).first { it !is State.Loading }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Throwable) {
             State.Error(error, referenceLinkHandler)
         }
@@ -204,6 +232,7 @@ internal suspend fun prewarmVisibleMarkdown(snapshot: WorkspaceRunSnapshot) = wi
     val flavour = GFMFlavourDescriptor()
     val parser = MarkdownParser(flavour)
     contents.forEach { content ->
+        currentCoroutineContext().ensureActive()
         val state = preparseMarkdown(content, flavour, parser)
         MarkdownTranscriptStateCache.put(content, state)
     }

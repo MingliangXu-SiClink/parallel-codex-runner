@@ -62,11 +62,13 @@ import java.util.UUID
 private const val FIRST_FRAME_WAIT_TIMEOUT_MILLIS = 5_000L
 private const val NETWORK_LOSS_DEBOUNCE_MILLIS = 750L
 
-class MainViewModel(application: Application) : AndroidViewModel(application) {
+class MainViewModel internal constructor(
+    application: Application,
+    internal val repository: PCRRepository,
+) : AndroidViewModel(application) {
+    constructor(application: Application) : this(application, (application as PCRRemoteApplication).repository)
     internal val app = application as PCRRemoteApplication
     private val firstFrameDrawn = CompletableDeferred<Unit>()
-    internal val repository: PCRRepository =
-        app.repository
     internal val mobileStateStore = app.mobileStateStore
     private val restoredMobileState = mobileStateStore.load()
     internal val domainRepositories = ClientDomainRepositories(
@@ -940,6 +942,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     internal fun executeRunMutation(
         context: RunMutationContext,
+        afterMutation: suspend (RunMutationContext) -> Unit = {},
         block: suspend (RunMutationContext) -> Unit,
     ): Job? {
         if (isCurrentRunMutation(context) && state.value.pendingSubmission != null) {
@@ -949,16 +952,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshVisibleRunMutationState()
         return viewModelScope.launch {
             try {
-                block(context)
+                performRunMutation(
+                    mutate = { block(context) },
+                    release = {
+                        activeRunMutations.remove(context.key)
+                        refreshVisibleRunMutationState()
+                    },
+                    refresh = { afterMutation(context) },
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
                 if (isCurrentRunMutation(context)) {
                     showError(friendlyError(error, state.value.appLanguage))
                 }
-            } finally {
-                activeRunMutations.remove(context.key)
-                refreshVisibleRunMutationState()
             }
         }
     }

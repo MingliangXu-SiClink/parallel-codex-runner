@@ -6,7 +6,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -235,19 +235,31 @@ class JsonStateStore:
                 handle.close()
 
     def load_payload(self) -> Any:
+        return self.load_snapshot()[0]
+
+    def load_snapshot(self) -> tuple[Any, tuple[int, int, int, int] | None]:
+        # Writers replace an immutable file. Read its descriptor, not the writer
+        # lock, and bind the stamp to these bytes rather than a later pathname.
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
+            with self.path.open("r", encoding="utf-8") as source:
+                stat = os.fstat(source.fileno())
+                value = json.load(source)
         except FileNotFoundError:
-            return None
-        except (OSError, ValueError):
-            raise
-        return value
+            return None, None
+        return value, self.stamp(stat)
+
+    @staticmethod
+    def stamp(stat: os.stat_result) -> tuple[int, int, int, int]:
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
 
     def write_runs(self, runs: Dict[str, ManagedRun]) -> None:
+        names = tuple(item.name for item in fields(ManagedRun))
         payload = {
             "version": STATE_VERSION,
             "runs": [
-                run.to_dict()
+                # The caller owns the manager lock through serialization. An
+                # asdict deep copy of every archived result adds no isolation.
+                {name: getattr(run, name) for name in names}
                 for run in sorted(runs.values(), key=lambda item: item.created_at)
             ],
         }

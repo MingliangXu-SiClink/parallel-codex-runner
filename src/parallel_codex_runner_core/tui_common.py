@@ -3,11 +3,11 @@ from __future__ import annotations
 import difflib
 import json
 import re
-import shlex
 from pathlib import Path
 from typing import Any
 
 from .codex_cli import format_fast_mode
+from .work_operations import strip_shell_command_wrapper
 from rich.cells import cell_len
 
 TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -16,7 +16,7 @@ TEXTUAL_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/config", "show current run configuration"),
     ("/accept", "finalize the currently displayed successful agent"),
     ("/reject", "toggle excluding the currently displayed agent from recommendations"),
-    ("/retry [agent]", "rerun a failed or killed agent on a fresh workspace"),
+    ("/retry [agent]", "resume a failed agent in its original session and workspace"),
     ("/more <n>", "add more candidates for the current question"),
     ("/queue [n]", "edit, remove, or reorder queued follow-up questions"),
     ("/diff", "toggle the full workspace diff for the current agent"),
@@ -429,20 +429,6 @@ def split_command_detail(text: str) -> tuple[str, str]:
     if len(lines) > 1 and lines[-1].startswith(("✓ ", "✗ ", "× ", "· ")):
         completion = lines.pop()
     return "\n".join(lines).strip(), completion
-
-
-def strip_shell_command_wrapper(command: str) -> str:
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return command
-    if (
-        len(parts) == 3
-        and Path(parts[0]).name in {"bash", "dash", "ksh", "sh", "zsh"}
-        and parts[1] in {"-c", "-lc"}
-    ):
-        return parts[2]
-    return command
 
 
 def command_completion_display(completion: str) -> tuple[str, str]:

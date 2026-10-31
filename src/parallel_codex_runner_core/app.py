@@ -121,6 +121,8 @@ from .paths import (
 )
 from .resume_history import ResumeHistory, resolve_resume_history
 from .prepared_history import RolloutTemplate, clone_file
+from .history_cache import HistoryCandidate, HistoryReadCache
+from .history_origins import RECOVERY_CONTENT_KIND, RECOVERY_INPUT, RECOVERY_ORIGIN, retained_recovery_turns
 from .scoped_history import copy_scoped_database, scoped_database_bytes
 from .synthesis import (
     failed_synthesis_preparation_fingerprint,
@@ -132,6 +134,8 @@ from .synthesis import (
     preferred_recommendation_pool,
 )
 from .visible_paths import (
+    WorkspaceReferenceState,
+    WorkspacePathMapping,
     load_session_workspace_mappings,
     record_session_workspace_mapping,
     rewrite_workspace_references,
@@ -2499,9 +2503,24 @@ def load_codex_session_history(
     if path is None or not path.is_file():
         raise FileNotFoundError(f"Codex rollout not found for session {session_id}")
     path_mappings = load_session_workspace_mappings(codex_home, session_id)
+    cache = HistoryReadCache(codex_home, path, session_id, max_lines)
+    fingerprint = cache.fingerprint()
+    candidates = cache.load(fingerprint)
+    if candidates is None:
+        candidates = _read_codex_history_candidates(path, session_id, max_lines)
+        cache.store(fingerprint, candidates)
+    return _merge_codex_history_candidates(candidates, path_mappings)
 
+
+def _read_codex_history_candidates(
+    path: Path, session_id: str, max_lines: int | None,
+) -> List[Tuple[int, str, str, CodexHistoryEntry]]:
     candidates: List[Tuple[int, str, str, CodexHistoryEntry]] = []
     current_turn_id = ""
+    current_cwd = ""
+    recovery_turns: Set[str] = set()
+    checked_workspaces: Set[str] = set()
+    first_users: Dict[str, Tuple[str, str, Set[str]]] = {}
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line_number, line in enumerate(f):
             if max_lines is not None and line_number >= max(0, int(max_lines)):
@@ -2518,6 +2537,18 @@ def load_codex_session_history(
 
             obj_type = str(obj.get("type") or "")
             payload_type = str(payload.get("type") or "")
+            metadata = payload.get("internal_chat_message_metadata_passthrough")
+            turn_id = str(metadata.get("turn_id") or "") if isinstance(metadata, dict) else ""
+            resolved_turn_id = turn_id or current_turn_id
+            if obj_type == "turn_context":
+                current_cwd = str(payload.get("cwd") or current_cwd)
+                continue
+            if (obj_type == "response_item" and payload_type == "message"
+                    and payload.get("role") == "developer" and isinstance(metadata, dict)
+                    and RECOVERY_CONTENT_KIND in (metadata.get("content_item_kinds") or [])
+                    and resolved_turn_id):
+                recovery_turns.add(resolved_turn_id)
+                continue
             if obj_type == "event_msg" and payload_type == "task_started":
                 current_turn_id = str(payload.get("turn_id") or "")
                 continue
@@ -2530,6 +2561,7 @@ def load_codex_session_history(
                     raise ValueError(
                         f"Codex rollout session mismatch: expected {session_id}, found {rollout_session_id}"
                     )
+                current_cwd = str(payload.get("cwd") or current_cwd)
                 continue
             if obj_type == "event_msg":
                 source = "event"
@@ -2558,15 +2590,26 @@ def load_codex_session_history(
                     text = codex_history_text(payload.get("summary"))
 
             text = clean_codex_history_text(category, text)
-            if category == "output":
-                text = rewrite_workspace_references(text, path_mappings)
             if not category or not text:
                 continue
             if category == "user" and is_internal_codex_history_message(text):
                 continue
-            metadata = payload.get("internal_chat_message_metadata_passthrough")
-            turn_id = str(metadata.get("turn_id") or "") if isinstance(metadata, dict) else ""
-            resolved_turn_id = turn_id or current_turn_id
+            origin = ""
+            if category == "user" and resolved_turn_id:
+                first = first_users.get(resolved_turn_id)
+                if first is None:
+                    if text == RECOVERY_INPUT:
+                        if resolved_turn_id not in recovery_turns and current_cwd not in checked_workspaces:
+                            checked_workspaces.add(current_cwd)
+                            recovery_turns.update(retained_recovery_turns(current_cwd, session_id))
+                        if resolved_turn_id in recovery_turns:
+                            origin = RECOVERY_ORIGIN
+                    first_users[resolved_turn_id] = (text, origin, {source})
+                elif first[0] == text and source not in first[2]:
+                    # Native event/response mirrors share provenance. A later
+                    # human message in the same turn does not inherit it.
+                    origin = first[1]
+                    first[2].add(source)
             candidates.append(
                 (
                     line_number,
@@ -2577,18 +2620,30 @@ def load_codex_session_history(
                         text,
                         id=f"history:{session_id}:{line_number}",
                         turn_id=resolved_turn_id,
+                        input_origin=origin,
                     ),
                 )
             )
 
+    return candidates
+
+
+def _merge_codex_history_candidates(
+    candidates: Sequence[HistoryCandidate], path_mappings: Sequence[WorkspacePathMapping],
+) -> List[CodexHistoryEntry]:
+    reference_state = WorkspaceReferenceState()
     history: List[Tuple[str, str, CodexHistoryEntry]] = []
-    seen: Set[Tuple[str, str, str]] = set()
+    seen: Set[Tuple[str, str, str, str]] = set()
     for _line_number, source, turn_id, entry in sorted(candidates, key=lambda item: item[0]):
-        entry_key = (turn_id, entry.category, entry.text)
+        if entry.category == "output":
+            entry = replace(entry, text=rewrite_workspace_references(
+                entry.text, path_mappings, state=reference_state))
+        entry_key = (turn_id, entry.category, entry.text, entry.input_origin)
         if entry_key in seen:
             continue
         seen.add(entry_key)
-        if history and history[-1][2].category == entry.category:
+        if (history and history[-1][2].category == entry.category
+                and history[-1][2].input_origin == entry.input_origin):
             previous_source, previous_turn_id, previous = history[-1]
             same_turn = bool(turn_id and previous_turn_id and turn_id == previous_turn_id)
             equivalent_mirror = comparable_codex_history_text(
@@ -2612,6 +2667,7 @@ def load_codex_session_history(
                         f"{previous.text}\n{entry.text}",
                         id=previous.id,
                         turn_id=previous.turn_id or entry.turn_id,
+                        input_origin=entry.input_origin,
                     ),
                 )
                 continue
@@ -3875,7 +3931,8 @@ def agent_process_environment(
 
 def retained_agent_execution(
     meta_dir: Path, command: List[str], workspace: Path, codex_home: Path,
-    prompt: str, instructions: Optional[str],
+    prompt: str, instructions: Optional[str], *, allow_stopped: bool = False,
+    allow_configuration_failure: bool = False,
 ) -> bool:
     """A dead adapter may resume its receipt, never replay an unjournaled task."""
     from .plugin.lifecycle import pid_is_alive
@@ -3885,14 +3942,21 @@ def retained_agent_execution(
         value = json.loads((meta_dir / "execution_recovery.json").read_text(encoding="utf-8"))
         binding = [command, str(workspace.resolve()), str(codex_home.resolve()), prompt, instructions]
         identity = hashlib.sha256(json.dumps(binding, ensure_ascii=False).encode()).hexdigest()
+        if not isinstance(value, dict):
+            return False
+        stage = value.get("stage")
+        stage_is_resumable = stage in {"submitting", "accepted", "continuation_ready", "completed"}
+        if allow_stopped and stage == "stopped":
+            stage_is_resumable = True
+        if allow_configuration_failure and configuration_failed_before_input(meta_dir, value):
+            stage_is_resumable = True
         return (
-            isinstance(value, dict) and value.get("version") == 1 and value.get("identity") == identity
-            and (value.get("stage") in {"submitting", "accepted", "continuation_ready", "completed"}
-                 or retryable_blocked_execution(value, codex_home))
+            value.get("version") == 1 and value.get("identity") == identity
+            and (stage_is_resumable or retryable_blocked_execution(value, codex_home))
             and isinstance(value.get("native_pid"), int) and not isinstance(value["native_pid"], bool)
             and value["native_pid"] > 0
             and not pid_is_alive(value["native_pid"])
-            and not (meta_dir / "execution_stop").exists()
+            and (allow_stopped or not (meta_dir / "execution_stop").exists())
         )
     except (OSError, ValueError, TypeError):
         return False
@@ -4934,8 +4998,26 @@ def _retained_execution_lease(meta: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def configuration_failed_before_input(meta: Path, receipt: Dict[str, Any]) -> bool:
+    error = receipt.get("error") or {}
+    if (receipt.get("stage") != "blocked" or any(receipt.get(key) for key in
+        ("thread_id", "turn_id", "client_message_id")) or error.get("code") != -32600
+        or not str(error.get("message") or "").startswith("failed to load configuration:")):
+        return False
+    stdout = meta / "stdout.log"
+    if stdout.is_symlink():
+        return False
+    events = [json.loads(line) for line in stdout.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return bool(events) and events[-1].get("error") == error and all(
+        event.get("type") == "error" and event.get("error") == error
+        or event.get("type") == "pcr.phase" and event.get("phase") in {"initializing", "resume_slot", "resuming"}
+        for event in events)
+
+
 def _read_retained_execution(
-    run_root: Path, idx: int, workspace: Path, prompt: str,
+    run_root: Path, idx: int, workspace: Path, prompt: str, *,
+    expected_role: str = AGENT_ROLE_CANDIDATE,
+    allow_external_shutdown: bool = False,
 ) -> Tuple[List[str], Path, str]:
     """Validate an accepted execution without rebuilding its workspace or history."""
     from .codex_app_server import parse_exec_command
@@ -4958,64 +5040,104 @@ def _read_retained_execution(
     if status is None and not unfinished:
         raise ValueError("Missing result without an accepted unfinished execution")
     if unfinished:
-        status = {"idx": idx, "role": AGENT_ROLE_CANDIDATE, "workspace_dir": str(workspace),
+        status = {"idx": idx, "role": expected_role, "workspace_dir": str(workspace),
                   "codex_home": str(home), "command": recorded.get("command"), "status": "interrupted"}
     command = recorded.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command):
         raise ValueError("Invalid retained execution command")
-    _server, _params, output, _resume = parse_exec_command(command)
+    _server, _params, output, resume = parse_exec_command(command)
+    unsubmitted = configuration_failed_before_input(meta, receipt)
     if (
         not isinstance(instructions, str) or not instructions.strip()
         or recorded.get("idx") != idx or status.get("idx") != idx
-        or recorded.get("role") != AGENT_ROLE_CANDIDATE or status.get("role") != AGENT_ROLE_CANDIDATE
+        or recorded.get("role") != expected_role or status.get("role") != expected_role
         or recorded.get("cwd") != str(workspace) or status.get("workspace_dir") != str(workspace)
         or recorded.get("codex_home") != str(home) or status.get("codex_home") != str(home)
-        or status.get("command") != command or status.get("status") not in {"failed", "error", "interrupted"}
+        or status.get("command") != command
+        or status.get("status") not in ({"failed", "error", "interrupted"}
+            | ({"cancelled"} if allow_external_shutdown else set()))
         or recorded.get("additional_developer_instructions") != instructions
         or output != meta / "final_message.md" or output.is_symlink()
         or not workspace.is_dir() or not home.is_dir()
         or ((run_root / "prompt.txt").exists()
             and (run_root / "prompt.txt").read_text(encoding="utf-8") != prompt)
-        or not isinstance(receipt.get("thread_id"), str) or not receipt["thread_id"].strip()
-        or not isinstance(receipt.get("client_message_id"), str) or not receipt["client_message_id"].strip()
-        or not isinstance(receipt.get("turn_id"), str) or not receipt["turn_id"].strip()
-        or not retained_agent_execution(meta, command, workspace, home, prompt, instructions)
+        or (not unsubmitted and any(not isinstance(receipt.get(key), str) or not receipt[key].strip()
+                                   for key in ("thread_id", "client_message_id", "turn_id")))
+        or (unsubmitted and (status.get("codex_thread_id") or not resume
+                             or output.exists() and output.stat().st_size > 0))
+        or not retained_agent_execution(
+            meta, command, workspace, home, prompt, instructions,
+            allow_stopped=allow_external_shutdown,
+            allow_configuration_failure=unsubmitted,
+        )
     ):
         raise ValueError("Original execution receipt, command, workspace or stop state is not resumable")
-    rollout = find_rollout_path_for_session(home, receipt["thread_id"])
+    thread_id = resume if unsubmitted else receipt["thread_id"]
+    rollout = find_rollout_path_for_session(home, thread_id)
     if rollout is None or rollout.is_symlink() or not is_relative_to(rollout.resolve(), home):
         raise ValueError("Retained private execution history is unavailable")
     with rollout.open(encoding="utf-8") as stream:
         header = json.loads(stream.readline(128 * 1024))
-    if header.get("type") != "session_meta" or session_meta_thread_id(header.get("payload", {})) != receipt["thread_id"]:
+    if header.get("type") != "session_meta" or session_meta_thread_id(header.get("payload", {})) != thread_id:
         raise ValueError("Retained execution history belongs to a different thread")
-    binding = json.dumps([texts, prompt, str(workspace), str(rollout),
+    binding = json.dumps([texts, (meta / "stdout.log").read_text() if unsubmitted else None,
+                          prompt, str(workspace), str(rollout),
                           rollout.stat().st_size, rollout.stat().st_mtime_ns])
     return command, home, hashlib.sha256(binding.encode("utf-8")).hexdigest()
 
 
 def retained_execution_preparation(
-    run_root: Path, idx: int, workspace: Path, prompt: str,
+    run_root: Path, idx: int, workspace: Path, prompt: str, *,
+    expected_role: str = AGENT_ROLE_CANDIDATE,
+    allow_external_shutdown: bool = False,
 ) -> Tuple[List[str], Path, str]:
     with _retained_execution_lease(run_root / "meta" / f"agent_{idx:03d}"):
-        return _read_retained_execution(run_root, idx, workspace, prompt)
+        return _read_retained_execution(
+            run_root, idx, workspace, prompt,
+            expected_role=expected_role,
+            allow_external_shutdown=allow_external_shutdown,
+        )
 
 
 def _prepare_retained_execution(
     *, run_root: Path, idx: int, workspace: Path, prompt: str,
-    fingerprint: str, real_codex_home: Path,
+    fingerprint: str, real_codex_home: Path, expected_role: str = AGENT_ROLE_CANDIDATE,
+    allow_external_shutdown: bool = False,
 ) -> Tuple[List[str], Path]:
     with _retained_execution_lease(run_root / "meta" / f"agent_{idx:03d}"):
-        command, home, current = _read_retained_execution(run_root, idx, workspace, prompt)
+        command, home, current = _read_retained_execution(
+            run_root, idx, workspace, prompt,
+            expected_role=expected_role,
+            allow_external_shutdown=allow_external_shutdown,
+        )
         if current != fingerprint:
             raise ValueError("The retained execution changed after recovery was requested")
         archive = run_root / "retry_history" / f"agent_{idx:03d}" / _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         archive.mkdir(parents=True)
-        for name in ("status.json", "command.json", "execution_recovery.json", "final_message.md"):
+        for name in ("status.json", "command.json", "execution_recovery.json", "final_message.md", "execution_stop", "stdout.log", "stderr.log"):
             path = home.parent / name
             if path.exists():
                 shutil.copy2(path, archive / name)
+        recovery_path = home.parent / "execution_recovery.json"
+        recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+        unsubmitted = configuration_failed_before_input(home.parent, recovery)
         copy_codex_support_entries(real_codex_home, home)
+        if allow_external_shutdown:
+            stop_path = home.parent / "execution_stop"
+            stop_path.unlink(missing_ok=True)
+            recovery.update(
+                stage="continuation_ready",
+                error=None,
+                next_check_at=None,
+                input_origin=RECOVERY_ORIGIN,
+                recoveries=int(recovery.get("recoveries") or 0) + 1,
+            )
+            from .plugin.lifecycle import write_json_atomic
+            write_json_atomic(recovery_path, recovery)
+        elif unsubmitted:
+            recovery.update(stage="ready", error=None, next_check_at=None)
+            from .plugin.lifecycle import write_json_atomic
+            write_json_atomic(recovery_path, recovery)
     return command, home
 
 
@@ -5092,6 +5214,15 @@ def _prepare_additional_agent(
     agent_meta_dir = meta_root / f"agent_{idx:03d}"
     agent_codex_home = agent_meta_dir / "codex_home"
     preparation_timings: Dict[str, float] = {}
+
+    if retry and agent_role == AGENT_ROLE_CANDIDATE:
+        original_prompt = (run_root / "prompt.txt").read_text(encoding="utf-8")
+        _, _, fingerprint = retained_execution_preparation(run_root, idx, agent_workspace, original_prompt)
+        return _prepare_retained_execution(
+            run_root=run_root, idx=idx, workspace=agent_workspace,
+            prompt=original_prompt,
+            fingerprint=fingerprint, real_codex_home=real_codex_home,
+        )
 
     def measured(name: str, began: float) -> None:
         preparation_timings[name] = time.monotonic() - began
@@ -5205,6 +5336,7 @@ def run_additional_agents(
     synthesis_error: Optional[str] = None,
     retained_startup_fingerprint: Optional[str] = None,
     retained_execution_fingerprints: Optional[Dict[int, str]] = None,
+    external_shutdown_recovery: bool = False,
     synthesis_preparation_fingerprints: Optional[Dict[int, str]] = None,
 ) -> List[AgentResult]:
     agent_role = normalize_agent_role(agent_role)
@@ -5225,6 +5357,12 @@ def run_additional_agents(
     retries = set(retry_indices or set())
     retained_executions = dict(retained_execution_fingerprints or {})
     synthesis_preparations = dict(synthesis_preparation_fingerprints or {})
+    if retries and agent_role == AGENT_ROLE_CANDIDATE and not retained_executions and not retained_startup_fingerprint:
+        for idx in retries:
+            agent_workspace = agent_execution_workspace(workspace, workspaces_root, idx,
+                getattr(args, "workspace_mode", "isolated"))
+            _, _, fingerprint = retained_execution_preparation(run_root, idx, agent_workspace, prompt)
+            retained_executions[idx] = fingerprint
     if synthesis_preparations and (
         set(synthesis_preparations) != set(indices) or retries != set(indices)
         or agent_role != AGENT_ROLE_SYNTHESIS or retained_executions or retained_startup_fingerprint
@@ -5235,9 +5373,14 @@ def run_additional_agents(
             raise ValueError("Synthesis preparation changed before dispatch")
     if retained_executions and (
         retained_startup_fingerprint or set(retained_executions) != set(indices)
-        or retries != set(indices) or agent_role != AGENT_ROLE_CANDIDATE
+        or retries != set(indices)
     ):
         raise ValueError("Retained execution recovery must cover exactly the requested candidate retries")
+    if external_shutdown_recovery and (
+        not retained_executions or not all(isinstance(value, str) and len(value) == 64
+                                           for value in retained_executions.values())
+    ):
+        raise ValueError("External shutdown recovery requires retained execution fingerprints")
     if retained_startup_fingerprint and (
         len(indices) != 1 or retries != set(indices) or not resume_session_id
         or agent_role != AGENT_ROLE_CANDIDATE or getattr(args, "workspace_mode", "isolated") != "source"
@@ -5265,7 +5408,11 @@ def run_additional_agents(
     for idx, expected in retained_executions.items():
         agent_workspace = agent_execution_workspace(workspace, workspaces_root, idx,
             getattr(args, "workspace_mode", "isolated"))
-        command, home, current = retained_execution_preparation(run_root, idx, agent_workspace, prompt)
+        command, home, current = retained_execution_preparation(
+            run_root, idx, agent_workspace, prompt,
+            expected_role=agent_role,
+            allow_external_shutdown=external_shutdown_recovery,
+        )
         if current != expected:
             raise ValueError("The retained execution changed before recovery dispatch")
         command_by_agent[idx], codex_home_by_agent[idx] = command, home
@@ -5277,7 +5424,8 @@ def run_additional_agents(
             agent_workspace = agent_execution_workspace(workspace, workspaces_root, idx,
                 getattr(args, "workspace_mode", "isolated"))
             return _prepare_retained_execution(run_root=run_root, idx=idx, workspace=agent_workspace,
-                prompt=prompt, fingerprint=retained_executions[idx], real_codex_home=real_codex_home)
+                prompt=prompt, fingerprint=retained_executions[idx], real_codex_home=real_codex_home,
+                expected_role=agent_role, allow_external_shutdown=external_shutdown_recovery)
         if retained_startup_fingerprint:
             return _prepare_retained_resume(
                 run_root=run_root, idx=idx, workspace=workspace,
@@ -5691,10 +5839,18 @@ def run_synthesis_refresh(
     targeted_retry = (
         synthesis_indices is not None and retry_synthesis_indices is not None
     )
+    retained_executions = {}
+    if targeted_retry and not synthesis_preparation_fingerprints:
+        for idx in retry_synthesis_indices:
+            agent_workspace = agent_execution_workspace(workspace, run_root / "workspaces", idx,
+                getattr(args, "workspace_mode", "isolated"))
+            _, _, fingerprint = retained_execution_preparation(run_root, idx, agent_workspace, prompt,
+                expected_role=AGENT_ROLE_SYNTHESIS)
+            retained_executions[idx] = fingerprint
     excluded = set(recommendation_excluded_indices or set())
     if not targeted_retry:
         excluded.update(set(existing_synthesis) - set(indices))
-    if not sources or not indices:
+    if (not sources and not retained_executions) or not indices:
         refresh_run_result_files(
             run_root=run_root,
             workspace=workspace,
@@ -5725,11 +5881,10 @@ def run_synthesis_refresh(
     for idx, expected in (synthesis_preparation_fingerprints or {}).items():
         if failed_synthesis_preparation_fingerprint(run_root, idx, prompt) != expected:
             raise ValueError("Synthesis preparation changed before its context was refreshed")
-    context_path, instructions = create_synthesis_context(
-        run_root,
-        prompt,
-        sources,
-    )
+    if retained_executions:
+        context_path, instructions = run_root / "synthesis_context.md", None
+    else:
+        context_path, instructions = create_synthesis_context(run_root, prompt, sources)
     if progress_callback is not None:
         settings = effective_synthesis_codex_settings(args)
         progress_callback(
@@ -5769,6 +5924,7 @@ def run_synthesis_refresh(
             cancel_event=cancel_event,
             agent_cancel_events=agent_cancel_events,
             agent_role=AGENT_ROLE_SYNTHESIS,
+            retained_execution_fingerprints=retained_executions,
             developer_instructions=instructions,
             recommendation_excluded_indices=excluded,
             synthesis_source_agents=[result.idx for result in sources],

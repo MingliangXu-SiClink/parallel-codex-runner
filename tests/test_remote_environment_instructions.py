@@ -1,5 +1,7 @@
 import json
+import hashlib
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -29,12 +31,6 @@ def test_preparation_injects_remote_access_and_identity_into_codex_transport(
         workspace, run_root / "workspaces", idx, mode,
     )
     meta = run_root / "meta" / f"agent_{idx:03d}"
-    if retry:
-        (meta / "codex_home").mkdir(parents=True)
-        if mode == "isolated":
-            agent_workspace.mkdir(parents=True)
-            (agent_workspace / "previous.txt").touch()
-
     def prepare_home(source, destination, current_workspace, session, **kwargs):
         assert current_workspace == agent_workspace
         assert session == resume
@@ -49,15 +45,16 @@ def test_preparation_injects_remote_access_and_identity_into_codex_transport(
         "Usage: codex exec --config --json --output-last-message "
         "--dangerously-bypass-approvals-and-sandbox"
     )
-    command, _ = app._prepare_additional_agent(
+    preparation = dict(
         args=args, idx=idx, run_root=run_root, workspace=workspace,
         workspaces_root=run_root / "workspaces", meta_root=run_root / "meta",
         help_text=help_text, real_codex_home=tmp_path / "real-home",
-        effective_effort=None, resume_session_id=resume, retry=retry,
+        effective_effort=None, resume_session_id=resume, retry=False,
         progress_callback=None, agent_role=role,
         developer_instructions="Review candidate results." if role == "synthesis" else None,
         instruction_resolver=app._AgentDeveloperInstructionResolver(), initial=True,
     )
+    command, home = app._prepare_additional_agent(**preparation)
     server_command, params, _, session = parse_exec_command(command)
     overrides = [item for item in server_command if item.startswith("developer_instructions=")]
     if transport == "exec":
@@ -67,6 +64,31 @@ def test_preparation_injects_remote_access_and_identity_into_codex_transport(
         assert not overrides
         instructions = json.loads((meta / "developer_instructions.json").read_text())
         assert existing not in instructions
+    if retry:
+        (agent_workspace / "previous.txt").write_text("completed work")
+        (run_root / "prompt.txt").write_text("remote task")
+        recorded = {"idx": idx, "role": role, "cwd": str(agent_workspace), "codex_home": str(home),
+                    "command": command, "additional_developer_instructions": instructions}
+        status = {**recorded, "workspace_dir": str(agent_workspace), "status": "failed"}
+        identity = hashlib.sha256(json.dumps([command, str(agent_workspace), str(home), "remote task", instructions],
+                                            ensure_ascii=False).encode()).hexdigest()
+        receipt = {"version": 1, "identity": identity, "stage": "blocked", "thread_id": resume,
+                   "turn_id": "original-turn", "client_message_id": "original-input", "native_pid": 999999999,
+                   "error": {"message": "workspace routing discovery timed out", "codexErrorInfo": "other"}}
+        for name, value in (("command.json", recorded), ("status.json", status),
+                            ("developer_instructions.json", instructions), ("execution_recovery.json", receipt)):
+            (meta / name).write_text(json.dumps(value))
+        (meta / "execution_recovery.lock").touch()
+        sessions = home / "sessions"
+        sessions.mkdir()
+        rollout = sessions / "rollout.jsonl"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": resume}}) + "\n")
+        with sqlite3.connect(home / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+            db.execute("INSERT INTO threads VALUES (?, ?)", (resume, str(rollout)))
+        preparation["retry"] = True
+        assert app._prepare_additional_agent(**preparation) == (command, home)
+        assert (agent_workspace / "previous.txt").read_text() == "completed work"
     assert "Every candidate and synthesis Agent may use SSH" in instructions
     assert f".pcr/{run_root.name}/agent_{idx:03d}" not in instructions
     assert "The user's remote project structure takes precedence" in instructions
@@ -87,8 +109,6 @@ def test_preparation_injects_remote_access_and_identity_into_codex_transport(
     assert params["sandbox"] == "danger-full-access"
     assert params["approvalPolicy"] == "never"
     assert (workspace / "input.txt").read_text() == "user data\n"
-    if retry and mode == "isolated":
-        assert not (agent_workspace / "previous.txt").exists()
 
 
 def test_execution_identity_is_stable_but_does_not_impose_remote_paths(tmp_path):

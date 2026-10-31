@@ -8,6 +8,7 @@ import logging
 import os
 import plistlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3360,6 +3361,64 @@ class RemoteControllerTests(unittest.TestCase):
                 ],
             )
 
+    def test_run_transcript_page_reads_once_and_keeps_physical_agent_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = FakeRunManager()
+            events = [{"event_id": index, "type": "agent_line", "idx": agent,
+                       "text": f"agent_message:answer-{agent}-{index}"}
+                      for index, agent in enumerate([2, 1, 2, 8])]
+            events.append({"event_id": 4, "type": "agent_tokens", "idx": 1, "reasoning_tokens": 10})
+            manager.get_events = mock.Mock(return_value={"run_id": "run-1", "cursor": 0,
+                "next_cursor": 5, "total": 5, "has_more": False, "events": events})
+            manager.get_agent = mock.Mock(side_effect=AssertionError("Transcript reads must not load Agent metadata"))
+            manager.rewrite_agent_visible_texts = mock.Mock(side_effect=lambda run, agent, texts:
+                [f"agent-{agent}:{text}" for text in texts])
+            controller = RemoteController(state_dir=Path(tmp), manager=manager)
+            result = controller.dispatch(RemoteRequest(action="runs.events",
+                body={"run_id": "run-1", "transcript_items_only": True}))
+            manager.get_events.assert_called_once()
+            manager.get_agent.assert_not_called()
+            self.assertNotIn("events", result)
+            self.assertEqual(result["next_cursor"], 5)
+            self.assertFalse(result["has_more"])
+            self.assertEqual({branch["agent"]: [item["text"] for item in branch["items"]]
+                for branch in result["agents"]}, {2: ["agent-2:answer-2-0", "agent-2:answer-2-2"],
+                                                1: ["agent-1:answer-1-1"], 8: ["agent-8:answer-8-3"]})
+            raw = controller.dispatch(RemoteRequest(action="runs.events", body={"run_id": "run-1"}))
+            self.assertEqual(raw["events"], events)
+
+    def test_run_transcript_noise_page_still_advances_every_agents_shared_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = FakeRunManager()
+            manager.get_events = mock.Mock(return_value={"run_id": "run-1", "cursor": 5,
+                "next_cursor": 9, "total": 12, "has_more": True,
+                "events": [{"event_id": 5, "type": "agent_tokens", "idx": 1}]})
+            controller = RemoteController(state_dir=Path(tmp), manager=manager)
+            result = controller.dispatch(RemoteRequest(action="runs.events",
+                body={"run_id": "run-1", "cursor": 5, "transcript_items_only": True}))
+            self.assertEqual(result["agents"], [])
+            self.assertEqual(result["next_cursor"], 9)
+            self.assertTrue(result["has_more"])
+
+    def test_run_conversation_page_uses_canonical_ordinals_without_agent_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = FakeRunManager()
+            manager.get_events = mock.Mock(return_value={"run_id": "run-1", "cursor": 12,
+                "next_cursor": 23, "total": 23, "has_more": False,
+                "events": [{"event_id": 22, "type": "agent_line", "idx": 2,
+                            "text": "agent_message:new visible answer"}]})
+            manager.get_agent = mock.Mock(side_effect=AssertionError("Slow metadata must remain independent"))
+            controller = RemoteController(state_dir=Path(tmp), manager=manager)
+            result = controller.dispatch(RemoteRequest(action="runs.events", body={
+                "run_id": "run-1", "agent": 2, "cursor": 12,
+                "transcript_items_only": True, "conversation_items_only": True}))
+            self.assertEqual(manager.get_events.call_args.kwargs["transcript_kinds"],
+                             {"output", "warning", "error"})
+            self.assertEqual(manager.get_events.call_args.kwargs["agent"], 2)
+            self.assertEqual(result["next_cursor"], 23)
+            self.assertEqual(result["agents"][0]["items"][0]["event_id"], 22)
+            manager.get_agent.assert_not_called()
+
     def test_agent_page_resolves_visible_paths_once_not_for_every_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = FakeRunManager()
@@ -4580,6 +4639,40 @@ class RemoteControllerTests(unittest.TestCase):
                 controller._ensure_run_start_context(str(workspace), workspace_id)
 
 class PcrdIpcTests(unittest.TestCase):
+    def test_navigation_burst_is_accepted_before_listener_is_rescheduled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RemoteController(state_dir=Path(tmp), manager=FakeRunManager())
+            server = PcrdServer(Path(tmp) / "pcrd.sock", controller)
+            connections = []
+            thread = None
+            try:
+                # A workspace starts independent body, history and metadata reads.
+                # Hold accept, not the handlers, to reproduce a brief GIL/OS pause.
+                for index in range(16):
+                    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    connections.append(connection)
+                    connection.settimeout(1)
+                    connection.connect(str(server.socket_path))
+                    request = RemoteRequest(action="system.capabilities", request_id=f"burst-{index}").to_mapping()
+                    request["auth_token"] = server.auth_token if index else "invalid"
+                    connection.sendall(encode_message(request))
+                thread = server.start_thread()
+                for index, connection in enumerate(connections):
+                    with connection.makefile("rb") as stream:
+                        response = decode_message(stream.readline())
+                    self.assertEqual(response["request_id"], f"burst-{index}")
+                    self.assertEqual(response["ok"], bool(index))
+                    if not index:
+                        self.assertEqual(response["error"]["code"], "unauthorized")
+            finally:
+                for connection in connections:
+                    connection.close()
+                if thread is not None:
+                    server.shutdown()
+                    thread.join(timeout=3)
+                server.server_close()
+                controller.close()
+
     def test_server_preserves_small_responses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             controller = RemoteController(
@@ -4748,6 +4841,7 @@ class LaunchAgentTests(unittest.TestCase):
             self.assertEqual(payload["Label"], LAUNCH_AGENT_LABEL)
             self.assertIn("parallel_codex_runner_core.remote.daemon", payload["ProgramArguments"])
             self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(payload["ProcessType"], "Interactive")
             service_path = payload["EnvironmentVariables"]["PATH"].split(os.pathsep)
             self.assertIn("/opt/homebrew/bin", service_path)
             self.assertIn("/Applications/ChatGPT.app/Contents/Resources", service_path)
@@ -4761,6 +4855,10 @@ class LaunchAgentTests(unittest.TestCase):
             )
             self.assertTrue(destination.is_file())
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            with destination.open("rb") as stream:
+                installed = plistlib.load(stream)
+            self.assertEqual(installed["ProcessType"], "Interactive")
+            self.assertEqual(installed["ProgramArguments"], payload["ProgramArguments"])
 
 
 class SystemdUserServiceTests(unittest.TestCase):

@@ -303,7 +303,7 @@ def pcr_stop_run(
 
 @mcp.tool(annotations=RUN_CODE)
 def pcr_retry_agent(run_id: str, agent: int) -> Dict[str, Any]:
-    """Rerun one failed, killed, cancelled, or interrupted Agent from a fresh copy."""
+    """Resume one failed Agent in its original session and workspace; never start over."""
     return get_manager().retry_agent(run_id=run_id, agent=agent)
 
 

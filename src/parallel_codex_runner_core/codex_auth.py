@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,13 +35,37 @@ def _claims(token: str) -> dict[str, Any]:
         return {}
 
 
+def _config_stamp(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
+
+@lru_cache(maxsize=32)
+def _config_supports_file_auth(path: Path, stamp: tuple[int, int, int, int, int]) -> bool:
+    # Cache only this policy decision, never credentials or the full config.
+    # Large project trust lists otherwise get reparsed on every auth check.
+    with path.open("r", encoding="utf-8") as source:
+        if _config_stamp(os.fstat(source.fileno())) != stamp:
+            raise OSError("Codex configuration changed before reading")
+        config = tomllib.loads(source.read())
+        if _config_stamp(os.fstat(source.fileno())) != stamp:
+            raise OSError("Codex configuration changed while reading")
+    return (config.get("cli_auth_credentials_store", "file") == "file"
+        and config.get("model_provider") in (None, "openai")
+        and not config.get("profile") and not config.get("model_providers", {}).get("openai"))
+
+
 def supports_file_auth(home: Path) -> bool:
     try:
-        path = home / "config.toml"
-        config = tomllib.loads(path.read_text()) if path.exists() else {}
-        return (config.get("cli_auth_credentials_store", "file") == "file"
-            and config.get("model_provider") in (None, "openai")
-            and not config.get("profile") and not config.get("model_providers", {}).get("openai")
+        path = (home / "config.toml").absolute()
+        try:
+            stamp = _config_stamp(path.stat())
+        except FileNotFoundError:
+            supported = True
+        else:
+            supported = _config_supports_file_auth(path, stamp)
+            if _config_stamp(path.stat()) != stamp:
+                return False
+        return (supported
             and not any(os.environ.get(key) for key in AUTH_ENV)
             and not any(path.exists() for path in (Path("/etc/codex/config.toml"), home / "managed_config.toml",
                                                    home / ".codex/config.toml")))
@@ -72,7 +97,10 @@ def file_auth(home: Path, *, check_config: bool = True) -> FileAuth | None:
             return None
         value = json.loads(raw)
         tokens = value.get("tokens") or {}
-        if value.get("auth_mode") != "chatgpt":
+        # Native Codex also accepts older token stores without auth_mode.
+        # Infer ChatGPT only from the validated token identity below, never
+        # over an explicit provider or a conflicting API key.
+        if value.get("auth_mode") not in (None, "chatgpt") or value.get("OPENAI_API_KEY"):
             return None
         account, access = tokens.get("account_id"), tokens.get("access_token")
         claims = _claims(tokens.get("id_token") or "")

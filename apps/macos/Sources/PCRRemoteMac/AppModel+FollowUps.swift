@@ -628,9 +628,10 @@ extension AppModel {
     func enqueueFollowUp(_ value: String) async -> Bool {
         guard let run = activeRun,
               let workspaceID = selectedWorkspaceID else { return false }
+        guard let queuedSettings = settingsWithConcreteModelsForNewPrompt(settings) else { return false }
         queueIssue = nil
         if followUpQueue.isEmpty { followUpRunID = run.runId }
-        var queuedItem = QueuedFollowUp(prompt: value, settings: settings)
+        var queuedItem = QueuedFollowUp(prompt: value, settings: queuedSettings)
         queuedItem.daemonAcknowledged = false
         followUpQueue.append(queuedItem)
         let submittedItems = followUpQueue
@@ -1028,7 +1029,7 @@ extension AppModel {
         )
     }
 
-    private func cancelFollowUpCountdown() {
+    func cancelFollowUpCountdown() {
         followUpTask?.cancel()
         followUpTask = nil
         daemonFollowUpMonitorToken = nil

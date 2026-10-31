@@ -204,10 +204,10 @@ if ! rg -U -n 'agentTab[\s\S]{0,4200}accessibilityAddTraits\(selected \? \.isSel
     exit 1
 fi
 
-if ! rg -U -n 'func selectAgent[\s\S]{0,5000}maxPages: 1,[\s\S]{0,180}initialEventLimit: 100[\s\S]{0,2800}commitVisibleAgentSelection\(agent, keepPending: false, selectedWhileWorking: run.isWorking\)[\s\S]{0,1000}Task \{ \[weak self\][\s\S]{0,1400}loadAgentDetail\(agent, maxPages: 20\)' \
-      "$ROOT/Sources/PCRRemoteMac/AppModel+RunControls.swift" >/dev/null \
-    || ! rg -U -n 'func selectAgent[\s\S]{0,1800}errorMessage = nil[\s\S]{0,160}pendingAgentSelection = agent' \
-      "$ROOT/Sources/PCRRemoteMac/AppModel+RunControls.swift" >/dev/null \
+AGENT_NAVIGATION=$(sed -n '/    func selectAgent(/,/    private func commitVisibleAgentSelection(/p' \
+    "$ROOT/Sources/PCRRemoteMac/AppModel+RunControls.swift")
+if ! printf '%s\n' "$AGENT_NAVIGATION" | rg -U -q 'maxPages: 1,[\s\S]*initialEventLimit: 100[\s\S]*commitVisibleAgentSelection\(agent, keepPending: false, selectedWhileWorking: run.isWorking\)[\s\S]*Task \{ \[weak self\][\s\S]*loadAgentDetail\(agent, maxPages: 20\)' \
+    || ! printf '%s\n' "$AGENT_NAVIGATION" | rg -U -q 'errorMessage = nil[\s\S]*pendingAgentSelection = agent' \
     || rg -U -n 'selectionEnabled:[^\n]*[\s\S]{0,80}!isRunOperationInProgress' \
       "$ROOT/Sources/PCRRemoteMac/AppModel+Presentation.swift" >/dev/null; then
   printf '%s\n' \
@@ -446,7 +446,7 @@ if ! rg -U -n 'let requestedMachineID = forceDirectoryRefresh[\s\S]{0,320}should
   exit 1
 fi
 
-if ! rg -U -n 'private struct WorkspaceNavigationSidebar[\s\S]{0,2200}dynamicTypeSize\(\.large\)' \
+if ! rg -U -n 'struct WorkspaceNavigationSidebar[\s\S]{0,2200}dynamicTypeSize\(\.large\)' \
     "$ROOT/Sources/PCRRemoteMac/ContentView.swift" >/dev/null; then
   printf '%s\n' \
     "Display zoom must keep the sidebar on a stable Dynamic Type category." >&2

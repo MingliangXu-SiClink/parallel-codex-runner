@@ -11,6 +11,27 @@ import org.junit.Test
 
 class TranscriptFormatterTest {
     @Test
+    fun longIdenticalFinalAnswerComparisonRetainsItsCompleteBody() {
+        val text = (1..2_000).joinToString("\n") { index ->
+            "Result $index has complete evidence, commands and a retained [artifact](<file:///tmp/result-$index.txt>)."
+        }
+        val equalCopy = String(text.toCharArray())
+        val start = System.nanoTime()
+        repeat(20) {
+            assertTrue(MobileTranscriptFormatter.equivalentAssistantPresentation(text, equalCopy))
+        }
+        println("Identical final-answer comparison: ${(System.nanoTime() - start) / 1_000_000.0} ms, ${text.length} characters, 20 passes")
+        val blocks = MobileTranscriptFormatter.visibleBlocks("", MobileAgentTranscript(
+            blocks = listOf(MobileTranscriptBlock("original", MobileTranscriptKind.OUTPUT, text)),
+            finalMessage = equalCopy,
+        ))
+        assertEquals(1, blocks.size)
+        assertEquals("original", blocks.single().id)
+        assertEquals(text, blocks.single().text)
+        assertTrue(blocks.single().isFinalAnswer)
+    }
+
+    @Test
     fun formatsPromptReasoningCommandAndAnswerInOrder() {
         val events = buildJsonArray {
             add(

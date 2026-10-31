@@ -35,12 +35,19 @@ enum ExecutionStage: String, CaseIterable {
             machineID: model.currentMachineContextID, model: displayedSettings(in: model)[keyPath: self.model]))
     }
 
+    @MainActor func modelSelection(in model: AppModel) -> String {
+        resolvedCodexModel(current: displayedSettings(in: model)[keyPath: self.model], options: options(in: model))
+    }
+
+    @MainActor func modelChoices(in model: AppModel) -> [CodexOption] {
+        codexModelChoices(dynamic: model.codexModelCatalog,
+            current: displayedSettings(in: model)[keyPath: self.model], effective: modelSelection(in: model))
+    }
+
     @MainActor func modelTitle(in model: AppModel) -> String {
-        let selection = displayedSettings(in: model)[keyPath: self.model]
-        let options = options(in: model)
-        let value = selection.isEmpty ? options?.effectiveModel ?? options?.configuredModel ?? "" : selection
+        let value = modelSelection(in: model)
         let label = model.codexModelCatalog?.first(where: { $0.value == value })?.label ?? value
-        return label.isEmpty ? model.appLanguage.text("Codex 默认", "Codex default") : codexModelDisplayName(label)
+        return label.isEmpty ? model.appLanguage.text("选择模型", "Select model") : codexModelDisplayName(label)
     }
 }
 
@@ -81,6 +88,7 @@ extension AppModel {
             guard (stage == .candidates ? 1...effectiveMaximumAgentCount : 0...effectiveMaximumAgentCount).contains(value) else { return false }
             settings[keyPath: stage.count] = value
         case .model(let value):
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
             if stage == .candidates { await updatePrimaryModel(value) }
             else { await updateSynthesisModel(value) }
             return true
@@ -333,7 +341,6 @@ private struct ExecutionStageView: View {
     private var settings: RunSettings { stage.displayedSettings(in: model) }
     private var options: CodexModelOptions? { stage.options(in: model) }
     private var locked: Bool { stage.isLocked(in: model) }
-    private var modelSelection: String { settings[keyPath: stage.model] }
     private var modelTitle: String {
         stage.modelTitle(in: model)
     }
@@ -363,9 +370,6 @@ private struct ExecutionStageView: View {
                     Text(modelTitle).appScaledSystemFont(size: 15, weight: .semibold)
                         .foregroundStyle(locked ? Color.secondary : .primary)
                         .fixedSize(horizontal: false, vertical: true)
-                    if modelSelection.isEmpty, options?.effectiveModel?.isEmpty == false {
-                        Text(language.text("默认", "Default")).appScaledSystemFont(size: 10).foregroundStyle(.secondary)
-                    }
                     Image(systemName: "chevron.down").appScaledSystemFont(size: 9, weight: .medium).foregroundStyle(.tertiary)
                         .opacity(locked ? 0 : 1)
                 }
@@ -430,6 +434,8 @@ private struct ExecutionStageView: View {
         let context = ExecutionEditContext(model)
         return ExecutionOptionMenu(title: "\(stage.title(language)) · \(label)",
             identifier: "configuration.\(stage.rawValue).\(field.rawValue)",
+            error: field == .model ? model.modelOptionsError : nil,
+            retry: field == .model ? { Task { await model.reloadModelOptions() } } : nil,
             choices: choices(for: field), selection: selection(for: field), select: { value in
             let edit: ExecutionConfigurationEdit
             switch field {
@@ -444,7 +450,7 @@ private struct ExecutionStageView: View {
             content().padding(.horizontal, 5).frame(minHeight: 24 * textSize.scale).contentShape(Rectangle())
         }
         .id(context)
-        .disabled(locked || model.isRunOperationInProgress)
+        .disabled(locked || model.isRunOperationInProgress || (choices(for: field).isEmpty && model.modelOptionsError == nil))
         .accessibilityLabel("\(stage.title(language)) · \(label)")
         .accessibilityValue(value(for: field))
         .accessibilityHint(scope)
@@ -454,7 +460,7 @@ private struct ExecutionStageView: View {
 
     private func value(for field: ExecutionField) -> String {
         switch field {
-        case .model: modelSelection.isEmpty ? "\(language.text("Codex 默认", "Codex default")) · \(modelTitle)" : modelTitle
+        case .model: modelTitle
         case .effort: effortTitle
         case .fast: settings[keyPath: stage.fast].title(language: language)
         }
@@ -462,7 +468,7 @@ private struct ExecutionStageView: View {
 
     private func selection(for field: ExecutionField) -> String {
         switch field {
-        case .model: modelSelection
+        case .model: stage.modelSelection(in: model)
         case .effort: settings[keyPath: stage.effort]
         case .fast: settings[keyPath: stage.fast].rawValue
         }
@@ -471,10 +477,7 @@ private struct ExecutionStageView: View {
     private func choices(for field: ExecutionField) -> [CodexOption] {
         switch field {
         case .model:
-            return codexOptionChoices(dynamic: model.codexModelCatalog, current: modelSelection,
-                fallbackLabel: language.text("Codex 默认", "Codex default")).map {
-                CodexOption(label: $0.value.isEmpty ? $0.label : codexModelDisplayName($0.label), value: $0.value, selected: $0.selected)
-            }
+            return stage.modelChoices(in: model)
         case .effort:
             return codexEffortChoices(dynamic: options?.efforts, current: settings[keyPath: stage.effort],
                                       effective: options?.effectiveEffort, language: language)
@@ -487,6 +490,8 @@ private struct ExecutionStageView: View {
 struct ExecutionOptionMenu<Content: View>: View {
     let title: String
     var identifier = ""
+    var error: String? = nil
+    var retry: (() -> Void)? = nil
     let choices: [CodexOption]
     let selection: String
     let select: (String) -> Void
@@ -496,15 +501,18 @@ struct ExecutionOptionMenu<Content: View>: View {
         // Keep SwiftUI's complete, wrapping label; native Menu truncates custom labels.
         label().accessibilityHidden(true)
             .overlay(ExecutionOptionPopUp(title: title, identifier: identifier,
-                choices: choices, selection: selection, select: select))
+                error: error, retry: retry, choices: choices, selection: selection, select: select))
     }
 }
 
 private struct ExecutionOptionPopUp: NSViewRepresentable {
     @Environment(\.appTextSize) private var textSize
+    @Environment(\.appLanguage) private var language
     @Environment(\.isEnabled) private var enabled
     let title: String
     let identifier: String
+    let error: String?
+    let retry: (() -> Void)?
     let choices: [CodexOption]
     let selection: String
     let select: (String) -> Void
@@ -530,13 +538,28 @@ private struct ExecutionOptionPopUp: NSViewRepresentable {
 
     func updateNSView(_ button: NSPopUpButton, context: Context) {
         context.coordinator.parent = self
-        if button.itemArray.map(\.title) != choices.map(\.label)
+        let status = language.text("模型列表加载失败", "Model list unavailable")
+        let reload = language.text("重新加载模型", "Reload models")
+        let extraTitles = error == nil ? [] : ["", status] + (retry == nil ? [] : [reload])
+        if button.itemArray.map(\.title) != choices.map(\.label) + extraTitles
             || button.itemArray.compactMap({ $0.representedObject as? String }) != choices.map(\.value) {
             button.removeAllItems()
             for option in choices {
                 let item = NSMenuItem(title: option.label, action: nil, keyEquivalent: "")
                 item.representedObject = option.value
                 button.menu?.addItem(item)
+            }
+            if let error {
+                button.menu?.addItem(.separator())
+                let item = NSMenuItem(title: status, action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                item.toolTip = error
+                button.menu?.addItem(item)
+                if retry != nil {
+                    let retryItem = NSMenuItem(title: reload, action: nil, keyEquivalent: "")
+                    retryItem.tag = 1
+                    button.menu?.addItem(retryItem)
+                }
             }
         }
         button.selectItem(at: choices.firstIndex { $0.value == selection } ?? -1)
@@ -558,7 +581,13 @@ private struct ExecutionOptionPopUp: NSViewRepresentable {
         init(_ parent: ExecutionOptionPopUp) { self.parent = parent }
 
         @objc func selected(_ button: NSPopUpButton) {
-            guard parent.enabled, let value = button.selectedItem?.representedObject as? String,
+            guard parent.enabled else { return }
+            if button.selectedItem?.tag == 1, button.selectedItem?.representedObject == nil {
+                button.selectItem(at: parent.choices.firstIndex { $0.value == parent.selection } ?? -1)
+                parent.retry?()
+                return
+            }
+            guard let value = button.selectedItem?.representedObject as? String,
                   parent.choices.contains(where: { $0.value == value }) else { return }
             parent.select(value)
         }

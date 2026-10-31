@@ -5,6 +5,71 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct TranscriptPresentationCacheTests {
+    @Test func longPlainConversationFormattingPreservesEveryParagraph() {
+        let text = (0..<4000).map { "Paragraph \($0): the result remains in the original workspace." }
+            .joined(separator: "\n\n")
+        let start = ContinuousClock.now
+        for _ in 0..<20 {
+            #expect(TranscriptFormatter.assistantPresentationText(text) == text)
+            #expect(TranscriptFormatter.reasoningPresentationText(text) == text)
+            #expect(TranscriptFormatter.markdownPresentationText(text) == text)
+        }
+        print("Plain conversation formatting 20 passes: \(start.duration(to: .now)), bytes=\(text.utf8.count)")
+    }
+
+    @Test func readinessChecksDoNotBuildAnUnneededTranscript() throws {
+        let model = try model()
+        defer { model.stopWindowObservation() }
+        model.selectedAgent = 1
+        let generation = model.presentationProjectionSequence
+        #expect(!model.isSelectedWorkspaceContextLoading)
+        #expect(model.presentationProjectionSequence == generation)
+        model.workspaceContextLoadingID = model.selectedWorkspaceID
+        model.pendingPromptSubmission = pending(model)
+        #expect(!model.isSelectedWorkspaceContextLoading)
+        #expect(model.presentationProjectionSequence == generation)
+        model.pendingPromptSubmission = nil
+        #expect(!model.isSelectedWorkspaceContextLoading)
+        #expect(model.presentationProjectionSequence > generation)
+        #expect(model.selectedTranscriptBlocks.contains { $0.text == "Candidate 1" })
+    }
+
+    @Test func readinessOnlyConsultsTheBodyWhenItCouldBlock() {
+        for hydrating in [false, true] {
+            for composing in [false, true] {
+                for pending in [false, true] {
+                    for hasContent in [false, true] {
+                        var reads = 0
+                        func content() -> Bool { reads += 1; return hasContent }
+                        let loading = workspaceSurfaceNeedsBlockingLoading(hydrating: hydrating,
+                            composingNewConversation: composing, hasRenderableContent: content(),
+                            hasPendingSubmission: pending)
+                        #expect(loading == (hydrating && !composing && !pending && !hasContent))
+                        #expect(reads == (hydrating && !composing && !pending ? 1 : 0))
+                    }
+                }
+            }
+        }
+    }
+
+    @Test func repeatedLongFinalAnswersRetainTheirOriginalIdentity() {
+        let text = "Final answer\n\n" + String(repeating: "A concrete result with Unicode: \u{4e2d}\u{6587}.\n", count: 4000)
+        let blocks = (0..<40).flatMap { index in [
+            TranscriptBlock(id: "user-\(index)", kind: .user, text: "Question \(index)"),
+            TranscriptBlock(id: "stream-\(index)", kind: .output, text: text),
+            TranscriptBlock(id: "final-\(index)", kind: .output, text: text, isFinalAnswer: true)] }
+        let start = ContinuousClock.now
+        let projected = TranscriptFormatter.coalescedVisibleConversation(blocks)
+        print("Long identical final mirrors: \(start.duration(to: .now)), bytes=\(text.utf8.count * 80)")
+        #expect(projected.count == 80)
+        for index in 0..<40 {
+            #expect(projected[index * 2].kind == .user)
+            #expect(projected[index * 2 + 1].id == "stream-\(index)")
+            #expect(projected[index * 2 + 1].text == text)
+            #expect(projected[index * 2 + 1].isFinalAnswer)
+        }
+    }
+
     @Test func activeBranchBodiesSurviveHistoryPressureAndReleaseTheirReservation() {
         var cache = TranscriptPresentationCache(maximumCost: 32 * 1024 * 1024)
         let keys = (0..<32).map {

@@ -47,7 +47,7 @@ internal fun relayDelivery(envelope: JsonObject): RelayDelivery? {
     )
 }
 
-class RelayTransport(
+open class RelayTransport(
     private val api: RelayApi,
     private val crypto: EnvelopeCrypto,
     private val secureStore: SecureStore,
@@ -61,7 +61,7 @@ class RelayTransport(
     @Volatile private var connectedSocket: WebSocket? = null
     @Volatile private var connecting: CompletableDeferred<Unit>? = null
 
-    suspend fun command(
+    open suspend fun command(
         target: RelayDevice,
         action: String,
         body: JsonObject = JsonObject(emptyMap()),

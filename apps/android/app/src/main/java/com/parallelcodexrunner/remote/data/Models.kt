@@ -417,6 +417,7 @@ data class ResumeHistoryEntry(
     val text: String,
     val id: String = "",
     @SerialName("turn_id") val turnId: String = "",
+    @SerialName("input_origin") val inputOrigin: String = "",
 )
 
 @Serializable

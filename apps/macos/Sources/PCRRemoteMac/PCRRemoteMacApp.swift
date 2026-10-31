@@ -76,10 +76,9 @@ final class ParallelCodexAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
 @MainActor
-enum ParallelCodexEntryPoint {
-    static func main() async {
+public enum ParallelCodexEntryPoint {
+    public static func main() async {
         if AppLaunchMode.isUISmokeTest,
            ProcessInfo.processInfo.environment["PCR_INTERACTIVE_QA_AUTHORIZED"] != "1" {
             fputs("Interactive QA is disabled without fresh user approval.\n", stderr)

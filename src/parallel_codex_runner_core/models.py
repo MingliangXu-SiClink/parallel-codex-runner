@@ -147,6 +147,7 @@ class CodexHistoryEntry:
     text: str
     id: str = ""
     turn_id: str = ""
+    input_origin: str = ""
 
 
 @dataclass

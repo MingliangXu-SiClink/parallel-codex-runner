@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..work_operations import operation_for_event, operation_from_payload, wait_deadline
+from ..work_operations import (
+    operation_for_event, operation_from_payload, strip_shell_command_wrapper, wait_deadline,
+)
 
 
 TRANSCRIPT_SCHEMA_VERSION = 1
@@ -141,7 +142,7 @@ def _transcript_item(event: object) -> dict[str, Any] | None:
             result = _base_item(
                 event_id,
                 kind="command",
-                text=_strip_shell_wrapper(command_text),
+                text=strip_shell_command_wrapper(command_text),
             )
             result["status"] = _command_status(event_item)
             operation_id = _clean_text(event_item.get("id"))
@@ -471,20 +472,6 @@ def _display_text(kind: str, value: str) -> str:
         else:
             lines.append(line)
     return "\n".join(lines)
-
-
-def _strip_shell_wrapper(command: str) -> str:
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return command
-    if (
-        len(parts) == 3
-        and parts[0].rsplit("/", 1)[-1] in {"bash", "dash", "ksh", "sh", "zsh"}
-        and parts[1] in {"-c", "-lc"}
-    ):
-        return parts[2]
-    return command
 
 
 def _clean_text(value: object) -> str:

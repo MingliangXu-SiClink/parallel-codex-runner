@@ -7,6 +7,40 @@ import Testing
 @MainActor
 struct TranscriptScrollPublicationTests {
     @Test
+    func contextReplacementMeasuresHistoryOnlyAtItsFinalReadingWidth() async throws {
+        let fixture = Fixture()
+        defer { fixture.close() }
+        await fixture.settle()
+        let block = TranscriptBlock(id: UUID().uuidString, kind: .output,
+            text: "New conversation \(UUID().uuidString). " + String(repeating: "Full history stays readable. ", count: 80))
+        func key(availableWidth: CGFloat) -> String {
+            transcriptLayoutMetricKey(.init(kind: block.kind.rawValue, text: block.text,
+                statusPresent: false, activityType: nil, isHistorical: false, isFinalAnswer: false,
+                textSize: AppTextSize.standard.rawValue,
+                maximumBodyWidth: TranscriptCollectionItem.layoutReferenceWidth(for: block, availableWidth: availableWidth)))
+        }
+        let width = fixture.scrollView.contentSize.width
+        let provisionalKey = key(availableWidth: width - 2 * ParallelCodexVisualStyle.Layout.transcriptInset - 4)
+        #expect(TranscriptLayoutMetricsStore.shared.metrics(forKey: provisionalKey) == nil)
+        fixture.context = "new-history"
+        fixture.items = [
+            .message(.init(id: "q1", kind: .user, text: "Earlier question")),
+            .message(block),
+            .message(.init(id: "q2", kind: .user, text: "Current question"))
+        ]
+        fixture.coordinator.update(parent: fixture.parent())
+        await fixture.settle()
+        let flow = try #require(fixture.collectionView.collectionViewLayout as? NSCollectionViewFlowLayout)
+        #expect(flow.sectionInset.left == 44)
+        let finalKey = key(availableWidth: width - flow.sectionInset.left - flow.sectionInset.right - 4)
+        #expect(TranscriptLayoutMetricsStore.shared.metrics(forKey: finalKey) != nil)
+        #expect(TranscriptLayoutMetricsStore.shared.metrics(forKey: provisionalKey) == nil,
+                "Attaching a replacement must not typeset every history row at a throwaway width.")
+        #expect(fixture.collectionView.numberOfItems(inSection: 0) == fixture.items.count)
+        try fixture.expectVisibleFramesMatchLayout()
+    }
+
+    @Test
     func trackingAndMomentumKeepOneCoherentSnapshotThenCommitOnlyTheLatest() async throws {
         let fixture = Fixture()
         defer { fixture.close() }

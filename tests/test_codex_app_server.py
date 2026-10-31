@@ -67,6 +67,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
         process.stdin.drain = AsyncMock()
         process.wait = AsyncMock(return_value=0)
         process.returncode = None
+        process.pid = 12345
         return process
 
     def requests(self, process):
@@ -108,6 +109,13 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
                 started = [json.loads(line) for line in events.getvalue().splitlines()
                            if json.loads(line)["type"] == "turn.started"]
                 self.assertEqual(started, [{"type": "turn.started", "turn_id": "turn"}])
+                phases = [json.loads(line) for line in events.getvalue().splitlines()
+                          if json.loads(line)["type"] == "pcr.phase"]
+                self.assertEqual(phases[0]["phase"], "initializing")
+                self.assertEqual(phases[-1]["phase"], "submitting")
+                self.assertTrue(all(item["native_pid"] == process.pid and item["emitted_at"] > 0 for item in phases))
+                self.assertEqual([item["elapsed_seconds"] for item in phases],
+                                 sorted(item["elapsed_seconds"] for item in phases))
 
     async def test_pending_resume_remains_cancellable_and_never_submits_the_question(self):
         process = self.process()

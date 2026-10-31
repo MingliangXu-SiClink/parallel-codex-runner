@@ -504,7 +504,7 @@ private final class WindowConfigurationView: NSView {
     }
 }
 
-private struct WorkspaceNavigationSidebar: View {
+struct WorkspaceNavigationSidebar: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var workspacePendingRemoval: RemoteWorkspace?
@@ -514,6 +514,17 @@ private struct WorkspaceNavigationSidebar: View {
     @State private var searchFocusRestoration: ConversationSearchFocus?
     @State private var machinePickerPresented = false
     @FocusState private var searchFieldFocused: Bool
+    @AppStorage(WorkspaceSidebarOrder.defaultsKey) private var workspaceOrderData = Data()
+    @StateObject private var workspaceReorder = WorkspaceSidebarReorder()
+    @State private var workspaceRowFrames: [String: CGRect] = [:]
+    @Namespace private var workspaceCoordinates
+
+    init(workspacePendingRemoval: Binding<RemoteWorkspace?>, searchRequestSequence: Int,
+         reorder: WorkspaceSidebarReorder = WorkspaceSidebarReorder()) {
+        _workspacePendingRemoval = workspacePendingRemoval
+        self.searchRequestSequence = searchRequestSequence
+        _workspaceReorder = StateObject(wrappedValue: reorder)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -544,10 +555,13 @@ private struct WorkspaceNavigationSidebar: View {
         .onChange(of: model.selectedWorkspaceID) { _ in
             searchText = ""
         }
+        .onChange(of: model.workspaces.map(\.workspaceId)) { _ in rememberNewWorkspaces() }
+        .onChange(of: model.currentMachineContextID) { _ in rememberNewWorkspaces() }
         .onChange(of: searchRequestSequence) { _ in
             if searchRequestSequence > 0 { openSearch() }
         }
         .onAppear {
+            rememberNewWorkspaces()
             if searchRequestSequence > 0 { openSearch() }
         }
         .onExitCommand {
@@ -770,12 +784,19 @@ private struct WorkspaceNavigationSidebar: View {
             }
             .padding(.horizontal, 8)
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 4) {
                     workspaceRows
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
                 .padding(.bottom, 12)
+                .coordinateSpace(name: workspaceCoordinates)
+                .onPreferenceChange(WorkspaceSidebarFrames.self) { workspaceRowFrames = $0 }
+                .onDrop(of: [WorkspaceSidebarDrag.type], delegate:
+                    WorkspaceSidebarDrop(reorder: workspaceReorder, commit: moveWorkspace))
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.12),
+                           value: workspaceReorder.session?.displayedIDs)
+                .onDisappear { workspaceReorder.cancel() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -806,13 +827,10 @@ private struct WorkspaceNavigationSidebar: View {
                 title: model.appLanguage.text("暂无工作区", "No workspaces")
             )
         } else {
-            ForEach(model.workspaces, id: \.workspaceId) { workspace in
+            let workspaces = displayedWorkspaces
+            ForEach(Array(workspaces.enumerated()), id: \.element.workspaceId) { index, workspace in
                 Button {
-                    if workspace.available || model.workspaceDirectoryIsCached {
-                        Task { await model.selectWorkspace(workspace.workspaceId) }
-                    } else {
-                        workspacePendingRemoval = workspace
-                    }
+                    selectWorkspace(workspace)
                 } label: {
                     WorkspaceSidebarRow(
                         workspace: workspace,
@@ -830,7 +848,48 @@ private struct WorkspaceNavigationSidebar: View {
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("sidebar.workspace.\(workspace.workspaceId)")
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: WorkspaceSidebarFrames.self, value:
+                        [workspace.workspaceId: geometry.frame(in: .named(workspaceCoordinates))])
+                })
+                .overlay {
+                    WorkspaceSidebarDragSource(
+                        payload: WorkspaceSidebarDrag(machine: model.currentMachineContextID, workspace: workspace.workspaceId),
+                        begin: {
+                            workspaceReorder.begin(source: workspace.workspaceId,
+                                ids: orderedWorkspaces.map(\.workspaceId), frames: workspaceRowFrames)
+                        }, end: { workspaceReorder.cancel() }, click: { selectWorkspace(workspace) })
+                        .accessibilityHidden(true)
+                }
+                .opacity(workspaceReorder.session?.inside == true
+                         && workspaceReorder.session?.source == workspace.workspaceId ? 0 : 1)
                 .contextMenu {
+                    Button {
+                        moveWorkspace(workspace.workspaceId, relativeTo: workspaces[0].workspaceId, after: false)
+                    } label: {
+                        Label(model.appLanguage.text("移到最上方", "Move to Top"), systemImage: "arrow.up.to.line")
+                    }
+                    .disabled(index == 0)
+                    Button {
+                        moveWorkspace(workspace.workspaceId, relativeTo: workspaces[index - 1].workspaceId, after: false)
+                    } label: {
+                        Label(model.appLanguage.text("上移", "Move Up"), systemImage: "arrow.up")
+                    }
+                    .disabled(index == 0)
+                    Button {
+                        moveWorkspace(workspace.workspaceId, relativeTo: workspaces[index + 1].workspaceId, after: true)
+                    } label: {
+                        Label(model.appLanguage.text("下移", "Move Down"), systemImage: "arrow.down")
+                    }
+                    .disabled(index == workspaces.count - 1)
+                    Button {
+                        moveWorkspace(workspace.workspaceId, relativeTo: workspaces[workspaces.count - 1].workspaceId, after: true)
+                    } label: {
+                        Label(model.appLanguage.text("移到最下方", "Move to Bottom"), systemImage: "arrow.down.to.line")
+                    }
+                    .disabled(index == workspaces.count - 1)
+                    Divider()
                     Button(
                         model.appLanguage.text("移除工作区", "Remove Workspace"),
                         role: .destructive
@@ -840,6 +899,42 @@ private struct WorkspaceNavigationSidebar: View {
                 }
             }
         }
+    }
+
+    private var orderedWorkspaces: [RemoteWorkspace] {
+        let byID = Dictionary(uniqueKeysWithValues: model.workspaces.map { ($0.workspaceId, $0) })
+        return WorkspaceSidebarOrder(data: workspaceOrderData)
+            .orderedIDs(model.workspaces.map(\.workspaceId), machine: model.currentMachineContextID)
+            .compactMap { byID[$0] }
+    }
+
+    private var displayedWorkspaces: [RemoteWorkspace] {
+        let ordered = orderedWorkspaces
+        guard let ids = workspaceReorder.session?.displayedIDs else { return ordered }
+        let byID = Dictionary(uniqueKeysWithValues: ordered.map { ($0.workspaceId, $0) })
+        return ids.compactMap { byID[$0] }
+    }
+
+    private func selectWorkspace(_ workspace: RemoteWorkspace) {
+        if workspace.available || model.workspaceDirectoryIsCached {
+            Task { await model.selectWorkspace(workspace.workspaceId) }
+        } else {
+            workspacePendingRemoval = workspace
+        }
+    }
+
+    private func moveWorkspace(_ source: String, relativeTo target: String, after: Bool) {
+        var order = WorkspaceSidebarOrder(data: workspaceOrderData)
+        order.move(source, relativeTo: target, after: after,
+                   available: model.workspaces.map(\.workspaceId), machine: model.currentMachineContextID)
+        workspaceOrderData = order.data
+    }
+
+    private func rememberNewWorkspaces() {
+        var order = WorkspaceSidebarOrder(data: workspaceOrderData)
+        let previous = order
+        order.includeNewWorkspaces(model.workspaces.map(\.workspaceId), machine: model.currentMachineContextID)
+        if order != previous { workspaceOrderData = order.data }
     }
 
     private var activeMachineHelp: String {
@@ -1546,11 +1641,10 @@ private struct SidebarSettingsFooter: View {
                 SidebarCodexUsage()
             }
             .padding(.horizontal, 8)
-            if let errorMessage = model.connectionErrorMessage {
+            if let errorMessage = model.connectionErrorMessage ?? model.statusRefreshErrorMessage {
                 Text(errorMessage)
                     .appScaledSystemFont(size: 10)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
                     .padding(.horizontal, 18)
             }
         }
@@ -1596,6 +1690,10 @@ private struct SidebarSettingsFooter: View {
                 Image(systemName: "wifi.exclamationmark")
                     .appScaledSystemFont(size: 11)
                     .foregroundStyle(Color.orange)
+            } else if model.statusRefreshErrorMessage != nil {
+                Image(systemName: "exclamationmark.circle")
+                    .appScaledSystemFont(size: 11)
+                    .foregroundStyle(Color.orange)
             }
         }
         .padding(.horizontal, 10)
@@ -1605,6 +1703,7 @@ private struct SidebarSettingsFooter: View {
 
     private var settingsHelp: String {
         model.connectionErrorMessage
+            ?? model.statusRefreshErrorMessage
             ?? model.appLanguage.text("应用、设备与连接设置", "App, computer and connection settings")
     }
 }

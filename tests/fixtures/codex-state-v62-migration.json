@@ -1,0 +1,9 @@
+{
+  "version": 62,
+  "description": "threads attached parent",
+  "checksum": "dab8b7c8390f9c764d5d64733da39fa0b79ad4f67931fa15263c1129143c1717bc252930b1a5668ad119c50844950304",
+  "statements": [
+    "ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT",
+    "CREATE INDEX idx_threads_attached_parent ON threads(attached_thread_parent_id)\n    WHERE attached_thread_parent_id IS NOT NULL"
+  ]
+}

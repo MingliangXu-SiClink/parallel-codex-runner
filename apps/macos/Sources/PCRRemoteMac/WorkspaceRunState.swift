@@ -1,16 +1,17 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 func workspaceSurfaceNeedsBlockingLoading(
     hydrating: Bool,
     composingNewConversation: Bool,
-    hasRenderableContent: Bool,
+    hasRenderableContent: @autoclosure () -> Bool,
     hasPendingSubmission: Bool
 ) -> Bool {
     hydrating
         && !composingNewConversation
-        && !hasRenderableContent
         && !hasPendingSubmission
+        && !hasRenderableContent()
 }
 
 func runViewCacheNeedsHydration(
@@ -51,6 +52,7 @@ struct WorkspaceRunViewSnapshot: Codable, Equatable, Sendable {
     var conversationTitle: String? = nil
     var conversationUpdatedAt: Int? = nil
     var historyLoaded: Bool? = nil
+    var historyProjectionVersion: Int? = 1
 
     func mergingVisible(_ visible: Self, for key: WorkspaceRunViewKey) -> Self {
         var merged = validated(for: key)
@@ -91,12 +93,17 @@ struct WorkspaceRunViewSnapshot: Codable, Equatable, Sendable {
     }
 
     func validated(for key: WorkspaceRunViewKey) -> Self {
+        var result = self
+        if historyProjectionVersion != 1 {
+            // Keep the cached conversation on screen while fetching provenance
+            // from the source once. Old complete caches are not authoritative.
+            result.historyLoaded = false
+            result.historyProjectionVersion = 1
+        }
         guard !key.runID.hasPrefix("resume-session:") else {
-            var result = self
             result.transcripts = [:]
             return result
         }
-        var result = self
         result.transcripts = transcripts.reduce(into: [:]) { values, entry in
             let (agent, transcript) = entry
             guard transcript.sourceRunID == key.runID,
@@ -143,26 +150,71 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
     private let capacity: Int
     private let maximumBytes: Int64
     private let lock = NSLock()
-    private let encoder: JSONEncoder
+    private let writerLock = NSLock()
+    private let encodeRecord: @Sendable (WorkspaceRunViewCacheRecord) throws -> Data
     private let decoder: JSONDecoder
     private var removedWorkspaces: [String: Date] = [:]
     private var removedMachines: [String: Date] = [:]
+    private var removedAllAt: Date?
+    private struct FileRevision: Codable, Equatable {
+        let inode: UInt64
+        let size: Int
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+    }
+    private struct RecordIdentity: Decodable {
+        let schemaVersion: Int
+        let key: WorkspaceRunViewKey
+    }
+    private struct CatalogEntry: Codable, Equatable {
+        let key: WorkspaceRunViewKey
+        let revision: FileRevision
+    }
+    private struct Catalog: Codable, Equatable {
+        var schemaVersion = 1
+        var entries: [String: CatalogEntry]
+    }
+    private final class DecodedRecord {
+        let revision: FileRevision
+        let record: WorkspaceRunViewCacheRecord
+        init(_ record: WorkspaceRunViewCacheRecord, revision: FileRevision) {
+            self.record = record
+            self.revision = revision
+        }
+    }
+    private let decodedRecords = NSCache<NSURL, DecodedRecord>()
+    private var accessDates: [URL: Date] = [:]
+    private var decodeCount = 0
+    private var identityDecodeCount = 0
+    private var catalog: Catalog?
+    private var persistedCatalog: Catalog?
+
+    var diskDecodeCount: Int { lock.withLock { decodeCount } }
+    var diskIdentityDecodeCount: Int { lock.withLock { identityDecodeCount } }
 
     init(
         directory: URL,
         capacity: Int = 64,
-        maximumBytes: Int64 = 256 * 1024 * 1024
+        maximumBytes: Int64 = 256 * 1024 * 1024,
+        encodeRecord: @escaping @Sendable (WorkspaceRunViewCacheRecord) throws -> Data = WorkspaceRunDiskCache.encode
     ) {
         self.directory = directory
         self.capacity = max(1, capacity)
         self.maximumBytes = max(1, maximumBytes)
-        encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .millisecondsSince1970
+        decodedRecords.countLimit = 8
+        decodedRecords.totalCostLimit = 32 * 1024 * 1024
+        self.encodeRecord = encodeRecord
         decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .millisecondsSince1970
         // Server snapshots use snake_case while older cache records may mix
         // camelCase outer fields with snake_case generated conversation fields.
         decoder.keyDecodingStrategy = .convertFromSnakeCase
+    }
+
+    static func encode(_ record: WorkspaceRunViewCacheRecord) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        return try encoder.encode(record)
     }
 
     static func standard(windowID: UUID? = nil) -> WorkspaceRunDiskCache {
@@ -186,10 +238,9 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
             guard let record = readRecordUnlocked(file, expectedKey: key) else {
                 return nil
             }
-            try? FileManager.default.setAttributes(
-                [.modificationDate: Date()],
-                ofItemAtPath: file.path
-            )
+            // Recency is not a content revision. Touching mtime here made
+            // every subsequent navigation decode the same history again.
+            accessDates[file] = Date()
             return record
         }
     }
@@ -204,57 +255,76 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
     func records(machineID: String?, workspaceIDs: Set<String>) -> [WorkspaceRunViewCacheRecord] {
         let resolvedMachineID = MachineContextKey.normalizeMachineID(machineID)
         return lock.withLock {
-            cacheFilesUnlocked()
-                .compactMap { readRecordUnlocked($0, expectedKey: nil) }
-                .filter {
-                    $0.key.machineID == resolvedMachineID
-                        && workspaceIDs.contains($0.key.workspaceID)
+            let files = cacheFilesUnlocked()
+            loadCatalogUnlocked()
+            let names = Set(files.map(\.lastPathComponent))
+            let retainedIdentities = catalog?.entries.filter { names.contains($0.key) } ?? [:]
+            catalog?.entries = retainedIdentities
+            let records = files
+                .compactMap { file -> WorkspaceRunViewCacheRecord? in
+                    guard let key = readIdentityUnlocked(file),
+                          key.machineID == resolvedMachineID,
+                          workspaceIDs.contains(key.workspaceID) else { return nil }
+                    return readRecordUnlocked(file, expectedKey: key)
                 }
                 .sorted { $0.updatedAt > $1.updatedAt }
+            persistCatalogUnlocked()
+            return records
         }
     }
 
     @discardableResult
     func put(_ record: WorkspaceRunViewCacheRecord) -> Bool {
-        lock.withLock {
+        writerLock.withLock {
             do {
-                let workspaceRemoval = removedWorkspaces[
-                    removalWorkspaceKey(
-                        machineID: record.key.machineID,
-                        workspaceID: record.key.workspaceID
-                    )
-                ]
-                let machineRemoval = removedMachines[record.key.machineID]
-                if workspaceRemoval.map({ record.updatedAt <= $0 }) == true
-                    || machineRemoval.map({ record.updatedAt <= $0 }) == true {
-                    return false
-                }
-                try FileManager.default.createDirectory(
-                    at: directory,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
                 let target = fileURL(for: record.key)
-                var retained = record
-                if let current = readRecordUnlocked(target, expectedKey: record.key) {
-                    if current.updatedAt > record.updatedAt { return true }
-                    // A fast answer-only repaint is not a replacement for the
-                    // persisted conversation, even before memory is hydrated.
-                    retained.snapshot = current.snapshot.mergingVisible(record.snapshot, for: record.key)
+                while true {
+                    let baseline = lock.withLock { () -> (Bool, WorkspaceRunViewCacheRecord?, FileRevision?) in
+                        guard !wasRemovedUnlocked(record) else { return (false, nil, nil) }
+                        let current = readRecordUnlocked(target, expectedKey: record.key)
+                        return (true, current, revisionUnlocked(target))
+                    }
+                    guard baseline.0 else { return false }
+                    if let current = baseline.1, current.updatedAt > record.updatedAt { return true }
+                    var retained = record
+                    if let current = baseline.1 {
+                        retained.snapshot = current.snapshot.mergingVisible(record.snapshot, for: record.key)
+                    }
+                    // Encoding a large immutable snapshot must not hold the
+                    // read lock. Publish only against the baseline we merged.
+                    let data = try encodeRecord(retained)
+                    try FileManager.default.createDirectory(at: directory,
+                        withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                    let staging = directory.appendingPathComponent(".\(UUID().uuidString).pcrconversation-write")
+                    defer { try? FileManager.default.removeItem(at: staging) }
+                    try data.write(to: staging, options: [.withoutOverwriting, .completeFileProtection])
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staging.path)
+                    let preparedRevision = revisionUnlocked(staging)
+                    let published = try lock.withLock { () throws -> Bool? in
+                        guard !wasRemovedUnlocked(record) else { return false }
+                        guard revisionUnlocked(target) == baseline.2 else { return nil }
+                        guard rename(staging.path, target.path) == 0 else {
+                            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                        }
+                        rememberUnlocked(retained, file: target, expectedRevision: preparedRevision)
+                        pruneUnlocked(protectedURL: target)
+                        persistCatalogUnlocked()
+                        return true
+                    }
+                    if let published { return published }
                 }
-                let data = try encoder.encode(retained)
-                try data.write(to: target, options: [.atomic, .completeFileProtection])
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: 0o600, .modificationDate: Date()],
-                    ofItemAtPath: target.path
-                )
-                pruneUnlocked(protectedURL: target)
-                return true
             } catch {
                 // A cache write must never block the live pcrd conversation.
                 return false
             }
         }
+    }
+
+    private func wasRemovedUnlocked(_ record: WorkspaceRunViewCacheRecord) -> Bool {
+        let workspaceRemoval = removedWorkspaces[removalWorkspaceKey(
+            machineID: record.key.machineID, workspaceID: record.key.workspaceID)]
+        return [removedAllAt, workspaceRemoval, removedMachines[record.key.machineID]]
+            .contains { $0.map { record.updatedAt <= $0 } == true }
     }
 
     func removeWorkspace(machineID: String?, workspaceID: String) {
@@ -288,7 +358,13 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
 
     func removeAll() {
         lock.withLock {
+            removedAllAt = Date()
+            decodedRecords.removeAllObjects()
+            accessDates.removeAll()
+            catalog = Catalog(entries: [:])
+            persistedCatalog = nil
             cacheFilesUnlocked().forEach { try? FileManager.default.removeItem(at: $0) }
+            try? FileManager.default.removeItem(at: catalogURL)
         }
     }
 
@@ -297,31 +373,119 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
     ) {
         cacheFilesUnlocked().forEach { file in
             guard let record = readRecordUnlocked(file, expectedKey: nil) else { return }
-            if predicate(record) { try? FileManager.default.removeItem(at: file) }
+            if predicate(record) {
+                try? FileManager.default.removeItem(at: file)
+                accessDates.removeValue(forKey: file)
+                catalog?.entries.removeValue(forKey: file.lastPathComponent)
+            }
         }
+        persistCatalogUnlocked()
     }
 
     private func removalWorkspaceKey(machineID: String, workspaceID: String) -> String {
         machineID + "\u{1f}" + workspaceID
     }
 
+    private func readIdentityUnlocked(_ file: URL) -> WorkspaceRunViewKey? {
+        guard let revision = revisionUnlocked(file) else { return nil }
+        if let cached = decodedRecords.object(forKey: file as NSURL), cached.revision == revision {
+            return cached.record.key
+        }
+        loadCatalogUnlocked()
+        if let entry = catalog?.entries[file.lastPathComponent], entry.revision == revision,
+           fileURL(for: entry.key).standardizedFileURL == file.standardizedFileURL { return entry.key }
+        // Even decoding only the key parses the whole JSON document. Keep a
+        // rebuildable identity catalog so cold navigation never scans unrelated
+        // transcript bodies unless their on-disk generation has changed.
+        identityDecodeCount += 1
+        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe),
+              let identity = try? decoder.decode(RecordIdentity.self, from: data),
+              identity.schemaVersion == Self.schemaVersion,
+              fileURL(for: identity.key).standardizedFileURL == file.standardizedFileURL,
+              revisionUnlocked(file) == revision else {
+            catalog?.entries.removeValue(forKey: file.lastPathComponent)
+            return nil
+        }
+        catalog?.entries[file.lastPathComponent] = CatalogEntry(key: identity.key, revision: revision)
+        return identity.key
+    }
+
     private func readRecordUnlocked(
         _ file: URL,
         expectedKey: WorkspaceRunViewKey?
     ) -> WorkspaceRunViewCacheRecord? {
-        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        guard let revision = revisionUnlocked(file) else {
+            decodedRecords.removeObject(forKey: file as NSURL)
+            return nil
+        }
+        // An atomic cache write replaces the inode. Reuse only these exact
+        // bytes. External writes and deletions remain visible before merging.
+        if let cached = decodedRecords.object(forKey: file as NSURL), cached.revision == revision,
+           expectedKey == nil || cached.record.key == expectedKey {
+            return cached.record
+        }
         do {
             let data = try Data(contentsOf: file, options: .mappedIfSafe)
+            decodeCount += 1
             let record = try decoder.decode(WorkspaceRunViewCacheRecord.self, from: data)
             guard record.schemaVersion == Self.schemaVersion,
+                  fileURL(for: record.key).standardizedFileURL == file.standardizedFileURL,
                   expectedKey == nil || record.key == expectedKey else {
                 throw CocoaError(.fileReadCorruptFile)
             }
+            guard revisionUnlocked(file) == revision else { return nil }
+            rememberUnlocked(record, file: file, expectedRevision: revision)
             return record
         } catch {
-            try? FileManager.default.removeItem(at: file)
+            decodedRecords.removeObject(forKey: file as NSURL)
+            if revisionUnlocked(file) == revision {
+                try? FileManager.default.removeItem(at: file)
+                catalog?.entries.removeValue(forKey: file.lastPathComponent)
+            }
             return nil
         }
+    }
+
+    private func revisionUnlocked(_ file: URL) -> FileRevision? {
+        var attributes = stat()
+        guard lstat(file.path, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else { return nil }
+        return FileRevision(inode: UInt64(attributes.st_ino), size: Int(attributes.st_size),
+            modifiedSeconds: Int64(attributes.st_mtimespec.tv_sec),
+            modifiedNanoseconds: Int64(attributes.st_mtimespec.tv_nsec))
+    }
+
+    private func rememberUnlocked(_ record: WorkspaceRunViewCacheRecord, file: URL, expectedRevision: FileRevision?) {
+        guard let revision = revisionUnlocked(file), revision == expectedRevision else { return }
+        decodedRecords.setObject(DecodedRecord(record, revision: revision), forKey: file as NSURL, cost: revision.size)
+        loadCatalogUnlocked()
+        catalog?.entries[file.lastPathComponent] = CatalogEntry(key: record.key, revision: revision)
+    }
+
+    private var catalogURL: URL { directory.appendingPathComponent("runs.pcrcacheindex") }
+
+    private func loadCatalogUnlocked() {
+        guard catalog == nil else { return }
+        if let data = try? Data(contentsOf: catalogURL),
+           let saved = try? decoder.decode(Catalog.self, from: data), saved.schemaVersion == 1 {
+            catalog = saved
+            persistedCatalog = saved
+        } else {
+            catalog = Catalog(entries: [:])
+        }
+    }
+
+    private func persistCatalogUnlocked() {
+        guard let catalog, catalog != persistedCatalog,
+              FileManager.default.fileExists(atPath: directory.path) else { return }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        guard let data = try? encoder.encode(catalog) else { return }
+        do {
+            try data.write(to: catalogURL, options: [.atomic, .completeFileProtection])
+            persistedCatalog = catalog
+        } catch { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: catalogURL.path)
     }
 
     private func fileURL(for key: WorkspaceRunViewKey) -> URL {
@@ -348,10 +512,12 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
             ])
             return (
                 url,
-                values?.contentModificationDate ?? .distantPast,
+                max(accessDates[url] ?? .distantPast, values?.contentModificationDate ?? .distantPast),
                 Int64(values?.fileSize ?? 0)
             )
         }.sorted { $0.1 > $1.1 }
+        let existingFiles = Set(files.map { $0.0 })
+        accessDates = accessDates.filter { existingFiles.contains($0.key) }
 
         var retained = 0
         var retainedBytes: Int64 = 0
@@ -363,6 +529,7 @@ final class WorkspaceRunDiskCache: @unchecked Sendable {
                 retainedBytes += size
             } else {
                 try? FileManager.default.removeItem(at: url)
+                catalog?.entries.removeValue(forKey: url.lastPathComponent)
             }
         }
     }
@@ -531,7 +698,7 @@ final class WorkspaceRunViewStateStore: @unchecked Sendable {
                           self?.isPersistenceCurrent(key: key, token: token) == true else {
                         return
                     }
-                    await ClientBlockingIO.cache { [weak self] in
+                    await ClientBlockingIO.cacheWrite { [weak self] in
                         guard self?.isPersistenceCurrent(key: key, token: token) == true else { return }
                         diskCache.put(record)
                     }
@@ -570,7 +737,7 @@ final class WorkspaceRunViewStateStore: @unchecked Sendable {
         // another workspace is visible. Commit before retiring the outbox.
         put(snapshot, runSummary: summary, for: key)
         let record = WorkspaceRunViewCacheRecord(key: key, runSummary: summary, snapshot: snapshot)
-        guard await ClientBlockingIO.cache({ [self] in
+        guard await ClientBlockingIO.cacheWrite({ [self] in
             // A newer answer may arrive while this write waits for the I/O
             // queue. Persist that page before consuming its durable receipt.
             let latest = warmRecord(for: key) ?? record
@@ -724,7 +891,7 @@ final class WorkspaceRunViewStateStore: @unchecked Sendable {
         }
         if let diskCache {
             Task(priority: .utility) {
-                await ClientBlockingIO.cache {
+                await ClientBlockingIO.cacheWrite {
                     diskCache.removeWorkspace(
                         machineID: resolvedMachineID,
                         workspaceID: workspaceID
@@ -748,7 +915,7 @@ final class WorkspaceRunViewStateStore: @unchecked Sendable {
         }
         if let diskCache {
             Task(priority: .utility) {
-                await ClientBlockingIO.cache { diskCache.removeMachine(resolvedMachineID) }
+                await ClientBlockingIO.cacheWrite { diskCache.removeMachine(resolvedMachineID) }
             }
         }
     }

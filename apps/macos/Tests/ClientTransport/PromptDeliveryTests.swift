@@ -8,6 +8,220 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct PromptDeliveryTests {
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PCR_ISOLATED_PROVIDER_PROBE"] != nil))
+    func isolatedProviderSubmissionReachesNativeConversation() async throws {
+        let root = URL(fileURLWithPath: try #require(ProcessInfo.processInfo.environment["PCR_ISOLATED_PROVIDER_PROBE"]))
+            .resolvingSymlinksInPath()
+        #expect(try String(contentsOf: root.appendingPathComponent("scope"), encoding: .utf8)
+            == "isolated-synthetic-provider-no-production")
+        let client = PcrdClient(socketURL: root.appendingPathComponent("s"), tokenURL: root.appendingPathComponent("t"))
+        let listing: WorkspaceList = try await client.call("workspaces.list", body: EmptyBody())
+        let workspace = try #require(listing.workspaces.first)
+        let workspaceURL = URL(fileURLWithPath: workspace.path).resolvingSymlinksInPath()
+        let expectedURL = root.appendingPathComponent("workspace").resolvingSymlinksInPath()
+        try #require(listing.workspaces.count == 1 && workspaceURL.path == expectedURL.path,
+            "The native probe may only send to its own isolated workspace: \(workspaceURL.path) / \(expectedURL.path)")
+        let directory = root.appendingPathComponent("client")
+        let store = DesktopStateStore(windowID: UUID(), directory: directory)
+        let model = AppModel(client: client, windowID: UUID(), desktopStateStore: store,
+            runViewStateStore: WorkspaceRunViewStateStore(diskCache: WorkspaceRunDiskCache(directory: directory.appendingPathComponent("cache"))))
+        defer {
+            let diagnostic: [String: Any] = [
+                "machine": model.currentMachineContextID,
+                "workspace": model.selectedWorkspaceID ?? "",
+                "visible": model.activeRun.flatMap { try? JSONEncoder().encode($0) }
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
+                "summaries": model.runSummariesByContext.values.compactMap {
+                    (try? JSONEncoder().encode($0)).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+                },
+                "polling": model.runPollingTasks.keys.map { $0.runID },
+                "error": model.errorMessage ?? "",
+                "warning": model.liveConversationWarning ?? ""
+            ]
+            try? JSONSerialization.data(withJSONObject: diagnostic, options: [.prettyPrinted, .sortedKeys])
+                .write(to: root.appendingPathComponent("client-state.json"))
+            model.stopWindowObservation()
+            model.cancelDeferredPromptProcessing()
+            _ = store.flushPendingWrites()
+            _ = model.runViewStateStore.flushPendingWrites(timeout: 3)
+        }
+        // Match normal startup: bind the daemon's actual local machine identity
+        // before submission, so its first health refresh is not a navigation.
+        await model.refresh(reportErrors: false)
+        await model.selectWorkspace(workspace.workspaceId)
+        try #require(model.daemonOnline && model.selectedWorkspaceID == workspace.workspaceId)
+        model.settings.agents = 1
+        model.settings.synthesisAgents = 0
+        let verifyQueue = ProcessInfo.processInfo.environment["PCR_ISOLATED_PROVIDER_QUEUE_PROBE"] == "1"
+        model.settings.followUpDelay = verifyQueue ? 2 : 0
+        model.settings.model = "gpt-6.1-sol"
+        model.settings.effort = "max"
+        model.settings.syncBack = true
+        model.settings.keepWorkspaces = true
+        model.settings.runsDirectory = root.appendingPathComponent("runs").path
+        model.rememberCurrentSettings()
+        try await waitUntil { model.dirtySettingsFieldsByWorkspace.isEmpty }
+        model.systemCapabilitiesByMachine[model.currentMachineContextID] = try await client.call("system.capabilities", body: EmptyBody())
+        _ = model.preparePromptHistoryContext()
+        let surface = NativeHandoffSurface(model: model)
+        defer { surface.close() }
+        var queuedItemID: String?
+        var queuedSourceRunID: String?
+        var queueDeadline: Task<(Int, ContinuousClock.Instant), Error>?
+        defer { queueDeadline?.cancel() }
+        var measurements: [[String: Any]] = []
+        for kind in ["new", "followup"] {
+            try #require(model.settings.agents == 1 && model.settings.synthesisAgents == 0)
+            let previous = model.activeRun?.runId
+            let answer = "PCR_READY_\(kind.uppercased())"
+            model.updatePrompt("Isolated transport test. Do not use tools, inspect files, or contact other services. Reply with only this text:\n\(answer)")
+            try #require(model.promptSubmissionPlan.isAvailable,
+                "The probe must enter the real permitted submission path: \(model.promptSubmissionPlan)")
+            let began = ContinuousClock.now
+            await model.submitPrompt()
+            if verifyQueue && kind == "followup" {
+                try await waitUntil {
+                    model.activeRun?.runId != previous && model.activeRun?.isWorking == true
+                        && model.pendingPromptSubmission == nil
+                }
+                queuedSourceRunID = try #require(model.activeRun?.runId)
+                try #require(model.settings.followUpDelay == 2)
+                model.updatePrompt("Isolated queue test. Do not use tools or inspect files. Reply with only PCR_READY_QUEUED")
+                try #require(model.promptSubmissionPlan == .enqueue)
+                await model.submitPrompt()
+                let itemID = try #require(model.composerQueuedMessages.first?.id.uuidString.lowercased())
+                try #require(model.composerQueuedMessages.first?.settings?.followUpDelay == 2)
+                queuedItemID = itemID
+                queueDeadline = Task {
+                    let expires = ContinuousClock.now + .seconds(90)
+                    while ContinuousClock.now < expires {
+                        let response: RemoteFollowUpQueueResponse = try await client.call("followups.get",
+                            body: FollowUpQueueGetBody(workspaceId: workspace.workspaceId))
+                        if let queue = response.queue, let deadline = queue.deadlineEpochMs {
+                            #expect(queue.items.map(\.id).contains(itemID))
+                            #expect(queue.state == "countdown")
+                            let wallNow = Date().timeIntervalSince1970
+                            let eligibility = ContinuousClock.now + .seconds(Double(deadline) / 1_000 - wallNow)
+                            return (deadline, eligibility)
+                        }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    throw CancellationError()
+                }
+            }
+            try await waitUntil(timeout: .seconds(90)) {
+                surface.update()
+                guard let run = model.activeRun, run.runId != previous,
+                      model.transcripts[1]?.sourceRunID == run.runId else { return false }
+                return model.selectedTranscriptBlocks.contains { $0.kind == .output && $0.text.contains(answer) }
+                    && surface.texts.contains {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) == answer
+                    }
+            }
+            let elapsed = began.duration(to: .now)
+            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            let run = try #require(model.activeRun)
+            measurements.append(["kind": kind, "seconds": seconds, "run": run.runId,
+                "under10s": elapsed < .seconds(10)])
+            try JSONSerialization.data(withJSONObject: measurements, options: [.prettyPrinted, .sortedKeys])
+                .write(to: root.appendingPathComponent("measurements.json"))
+            print("Isolated real-provider submit to native output, \(kind): \(seconds) s")
+            #expect(elapsed < .seconds(10))
+            #expect(!surface.window.isVisible && !surface.window.isKeyWindow)
+            try await waitUntil(timeout: .seconds(90)) { model.activeRun?.isWorking == false }
+        }
+        if let queueDeadline, let queuedItemID, let queuedSourceRunID {
+            // Use the server's original deadline, not the later observation or
+            // dispatch time. The predecessor finishes naturally through PCR.
+            let (deadline, eligibility) = try await queueDeadline.value
+            try await waitUntil(timeout: .seconds(90)) {
+                surface.update()
+                guard let run = model.activeRun, run.runId != queuedSourceRunID,
+                      model.transcripts[1]?.sourceRunID == run.runId else { return false }
+                return model.selectedTranscriptBlocks.contains { $0.kind == .output && $0.text.contains("PCR_READY_QUEUED") }
+                    && surface.texts.contains {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) == "PCR_READY_QUEUED"
+                    }
+            }
+            let elapsed = eligibility.duration(to: .now)
+            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            let run = try #require(model.activeRun)
+            let response: RemoteFollowUpQueueResponse = try await client.call("followups.get",
+                body: FollowUpQueueGetBody(workspaceId: workspace.workspaceId))
+            #expect(response.queue?.lastCompletedItemId == queuedItemID)
+            measurements.append(["kind": "queued", "seconds": seconds, "run": run.runId,
+                "sourceRun": queuedSourceRunID, "itemID": queuedItemID,
+                "originalDeadlineEpochMs": deadline, "under10s": elapsed < .seconds(10)])
+            try JSONSerialization.data(withJSONObject: measurements, options: [.prettyPrinted, .sortedKeys])
+                .write(to: root.appendingPathComponent("measurements.json"))
+            print("Isolated real-provider original queue deadline to native output: \(seconds) s")
+            #expect(elapsed >= .zero && elapsed < .seconds(10))
+            try await waitUntil(timeout: .seconds(90)) { model.activeRun?.isWorking == false }
+        }
+        try surface.framePNG().write(to: root.appendingPathComponent("native-render.png"))
+    }
+
+    @Test(arguments: [false, true])
+    func submissionPaintsTheOriginalMessagesResponseWithinTenSeconds(followUp: Bool) async throws {
+        let fixture = try Fixture(mode: .accepted, fragmentReplies: true)
+        defer { fixture.close() }
+        if followUp { try fixture.installCompletedConversation() }
+        let answer = "Native response tied to the accepted performance-test message"
+        await fixture.replies.showDestinationAnswer(answer)
+        await fixture.replies.allowOpening()
+        let surface = NativeHandoffSurface(model: fixture.model)
+        defer { surface.close() }
+        fixture.model.updatePrompt(followUp ? "Performance-test follow-up" : "Performance-test question")
+        let began = ContinuousClock.now
+        await fixture.model.submitPrompt()
+        try await waitUntil(timeout: .seconds(10)) {
+            surface.update()
+            return fixture.model.activeRun?.runId == "accepted" && surface.texts.contains(answer)
+        }
+        let elapsed = began.duration(to: .now)
+        #expect(elapsed < .seconds(10))
+        #expect(await fixture.replies.createdCommands.count == 1)
+        #expect(await fixture.replies.allStartsWereDurable)
+        #expect(!surface.window.isVisible)
+        print("Submit to native answer, followUp=\(followUp): \(elapsed); loopback provider, not a real-provider SLA")
+    }
+
+    @Test func queuedFollowupPaintsItsOwnResponseWithinTenSeconds() async throws {
+        let fixture = try Fixture(mode: .accepted, fragmentReplies: true)
+        defer { fixture.close() }
+        try fixture.installCompletedConversation(finalized: false)
+        fixture.model.settings.followUpDelay = 0
+        await fixture.replies.enableOrderedDelivery()
+        await fixture.replies.holdAcceptance()
+        fixture.model.updatePrompt("Preceding isolated request")
+        await fixture.model.submitPrompt()
+        try await waitUntil { await fixture.replies.createdCommands.count == 1 }
+        let first = try #require(fixture.model.pendingPromptSubmission)
+        fixture.model.updatePrompt("Queued isolated follow-up")
+        let began = ContinuousClock.now
+        await fixture.model.submitPrompt()
+        let queued = try #require(fixture.model.visibleDeferredPrompts.first)
+        let answer = "Response for the queued original message, not its predecessor"
+        await fixture.replies.showDestinationAnswer(answer)
+        let surface = NativeHandoffSurface(model: fixture.model)
+        defer { surface.close() }
+        await fixture.replies.releaseAcceptance()
+        try await waitUntil { fixture.model.promptOutboxByWorkspace.isEmpty
+            && fixture.model.acceptedPromptResultsByWorkspace.isEmpty }
+        try await fixture.replies.completeOrderedRun("ordered-1")
+        try await waitUntil(timeout: .seconds(10)) {
+            surface.update()
+            return fixture.model.activeRun?.runId == "ordered-2" && surface.texts.contains(answer)
+        }
+        let elapsed = began.duration(to: .now)
+        #expect(elapsed < .seconds(10))
+        #expect(await fixture.replies.startCommands == [first.commandID,
+            "\(queued.item.id.uuidString.lowercased())-attempt-0"])
+        #expect(await fixture.replies.allStartsWereDurable)
+        #expect(!surface.window.isVisible)
+        print("Queued submit to native answer: \(elapsed); loopback predecessor/provider, includes queue residence")
+    }
+
     @Test func workspaceReentryKeepsTheUnacceptedFollowupBeforeAnyNetworkRead() async throws {
         let fixture = try Fixture(mode: .accepted)
         defer { fixture.close() }
@@ -724,7 +938,7 @@ struct PromptDeliveryTests {
         let gate = DispatchGroup()
         let entered = DispatchGroup()
         gate.enter(); entered.enter()
-        let blocker = Task { await ClientBlockingIO.cache { entered.leave(); gate.wait() } }
+        let blocker = Task { await ClientBlockingIO.cacheWrite { entered.leave(); gate.wait() } }
         var released = false
         defer { if !released { gate.leave() } }
         func cacheWasEntered() -> Bool { entered.wait(timeout: .now()) == .success }
@@ -2466,8 +2680,9 @@ struct PromptDeliveryTests {
                 return try encode(["ok": true, "body": destination])
             }
             if action == "runs.agent", let answer = destinationAnswer,
-               let body = payload["body"] as? [String: Any], body["run_id"] as? String == "accepted" {
-                return try encode(["ok": true, "body": ["run_id": "accepted", "agent": 1, "name": "Agent 1",
+               let body = payload["body"] as? [String: Any], let id = body["run_id"] as? String,
+               id == "accepted" || (orderedDelivery && id == "ordered-2" && knownRuns[id] != nil) {
+                return try encode(["ok": true, "body": ["run_id": id, "agent": 1, "name": "Agent 1",
                     "status": "success", "reasoning_token_counts": [:], "rejected": false, "recommended": false,
                     "finalized": false, "final_message": "", "stdout_tail": "", "stderr_tail": "",
                     "final_message_page": ["cursor": 0, "next_cursor": answer.utf8.count, "has_more": false,
@@ -2558,6 +2773,8 @@ struct PromptDeliveryTests {
                 """.utf8))]
             model.selectedWorkspaceID = "workspace"
             model.selectedConversationID = "delivery-conversation"
+            model.settings.model = "gpt-6.1-sol"
+            model.settings.synthesisModel = "gpt-6-astra"
             _ = model.preparePromptHistoryContext()
             model.daemonOnline = true
         }
@@ -2603,6 +2820,8 @@ struct PromptDeliveryTests {
             model.workspaceConversations = [.init(id: "delivery-conversation", title: "Conversation", runs: [run], resumeSession: nil)]
             model.selectedAgent = 2
             model.settings = settings
+            model.settings.model = "gpt-6.1-sol"
+            model.settings.synthesisModel = "gpt-6-astra"
             model.resumeHistory = [ResumeHistoryEntry(category: "user", text: original.prompt, id: "earlier-real-user"),
                 ResumeHistoryEntry(category: "output", text: "An earlier real answer.", id: "earlier-real-answer")]
             model.transcripts[2] = AgentTranscript(sourceRunID: run.runId, sourceAgent: 2,

@@ -191,6 +191,7 @@ struct PcrdClient: Sendable {
         timeoutSeconds: Int = 30,
         commandID: String? = nil,
         priority: TaskPriority? = nil,
+        readDemand: ClientReadDemand? = nil,
         response: Response.Type = Response.self
     ) async throws -> Response where Body: Encodable & Sendable, Response: Decodable & Sendable {
         try await call(
@@ -201,6 +202,7 @@ struct PcrdClient: Sendable {
             timeoutSeconds: timeoutSeconds,
             commandID: commandID,
             priority: priority,
+            readDemand: readDemand,
             response: response
         )
     }
@@ -213,6 +215,7 @@ struct PcrdClient: Sendable {
         timeoutSeconds: Int = 30,
         commandID: String? = nil,
         priority: TaskPriority? = nil,
+        readDemand: ClientReadDemand? = nil,
         response: Response.Type = Response.self
     ) async throws -> Response where Body: Encodable & Sendable, Response: Decodable & Sendable {
         if case .relay(let machine) = target {
@@ -237,7 +240,10 @@ struct PcrdClient: Sendable {
                 timeoutSeconds: min(15 * 60, effectiveTimeout + 30),
                 commandID: stableCommandID,
                 priority: priority,
+                readDemand: readDemand,
                 observationAction: action,
+                liveContent: action == "runs.events" || action == "runs.agent"
+                    && (body as? GetAgentBody)?.includeEvents != false,
                 response: response
             )
         }
@@ -248,6 +254,7 @@ struct PcrdClient: Sendable {
             timeoutSeconds: timeoutSeconds,
             commandID: commandID,
             priority: priority,
+            readDemand: readDemand,
             response: response
         )
     }
@@ -263,16 +270,20 @@ struct PcrdClient: Sendable {
         timeoutSeconds: Int = 30,
         commandID: String? = nil,
         priority: TaskPriority? = nil,
+        readDemand: ClientReadDemand? = nil,
         observationAction: String? = nil,
+        liveContent: Bool? = nil,
         response: Response.Type = Response.self
     ) async throws -> Response where Body: Encodable & Sendable, Response: Decodable & Sendable {
         let socketURL = socketURL
         let tokenURL = tokenURL
-        let effectiveTimeout = max(timeoutSeconds, minimumTimeout(for: action))
+        let effectiveTimeout = max(timeoutSeconds, minimumTimeout(for: observationAction ?? action))
         return try await ClientBlockingIO.transport(
             priority: priority ?? Task.currentPriority,
             isObservation: Self.observationActions.contains(observationAction ?? action),
-            isLiveContent: ["runs.agent", "runs.events"].contains(observationAction ?? action)
+            isLiveContent: liveContent ?? (action == "runs.events" || action == "runs.agent"
+                && (body as? GetAgentBody)?.includeEvents != false),
+            demand: readDemand
         ) {
             guard let tokenData = try? Data(contentsOf: tokenURL),
                   let rawToken = String(data: tokenData, encoding: .utf8) else {
@@ -300,7 +311,7 @@ struct PcrdClient: Sendable {
             var lastTransportError: Error?
             // Answer delivery owns reconciliation. A missing reply must first
             // read the original question's receipt, not immediately resend it.
-            let attempts = (observationAction ?? action) == "runs.answer_question" ? 1 : 2
+            let attempts = ["runs.answer_question", "system.ping"].contains(observationAction ?? action) ? 1 : 2
             for attempt in 0..<attempts {
                 do {
                     let responseData = try sendUnixRequest(
@@ -442,6 +453,8 @@ struct PcrdClient: Sendable {
 
     private func minimumTimeout(for action: String) -> Int {
         switch action {
+        case "system.ping":
+            return 3
         case "runs.start",
              "runs.continue",
              "runs.accept_agent",
@@ -466,7 +479,7 @@ struct PcrdClient: Sendable {
     // Only known reads share the observation budget. Automatic user commands
     // can inherit utility priority; relay wrappers must use their inner action.
     private static let observationActions: Set<String> = [
-        "system.health", "system.capabilities", "commands.get",
+        "system.ping", "system.health", "system.capabilities", "commands.get",
         "filesystem.roots", "filesystem.list", "filesystem.inspect",
         "workspaces.list", "workspaces.settings.get", "workspace.file.read",
         "workspace.item.resolve", "settings.defaults.get", "devices.list",

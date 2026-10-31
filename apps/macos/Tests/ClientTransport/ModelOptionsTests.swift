@@ -127,6 +127,101 @@ struct ModelOptionsTests {
         #expect(cache.models(for: "mac")?.count == 3)
     }
 
+    @Test func committedCapabilitiesRestoreBeforeFetchingAndFailuresNeverReplaceThem() async throws {
+        let name = "PCR.ModelOptionsTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let context = CodexModelOptionsContext(machineID: "mac", model: "gpt-6.1-sol")
+        var value = Self.options
+        value.catalogContext = "account-a"
+        value.catalogRevision = 1
+        value.catalogRefreshing = true
+        let saved = value
+        _ = try await CodexModelOptionsCache(defaults: defaults).refresh(context: context) { saved }
+        let restored = CodexModelOptionsCache(defaults: defaults)
+        #expect(restored.models(for: "mac")?.count == 3)
+        #expect(restored.options(for: context)?.efforts.count == 3)
+        #expect(restored.options(for: context)?.catalogRefreshing != true)
+        let before = defaults.data(forKey: "parallel-codex.model-options.v1")
+        do { _ = try await restored.refresh(context: context) { throw PcrdClientError.connection("offline") } }
+        catch {}
+        var empty = saved
+        empty.models = []
+        let emptyResult = empty
+        do {
+            _ = try await restored.refresh(context: context) { emptyResult }
+            Issue.record("An empty discovery must not erase committed capabilities")
+        } catch {}
+        #expect(defaults.data(forKey: "parallel-codex.model-options.v1") == before)
+        #expect(CodexModelOptionsCache(defaults: defaults).models(for: "mac")?.count == 3)
+    }
+
+    @Test func aLateOlderCatalogCannotReplaceANewerSuccessfulCatalog() async throws {
+        let cache = CodexModelOptionsCache()
+        let first = CodexModelOptionsContext(machineID: "mac", model: "first")
+        let second = CodexModelOptionsContext(machineID: "mac", model: "second")
+        cache.selectScope("account-a", machineID: "mac")
+        var old = Self.options
+        old.catalogContext = "account-a"
+        old.catalogRevision = 1
+        var new = old
+        new.catalogRevision = 2
+        new.models = [CodexOption(label: "new-model", value: "new-model", selected: false)]
+        let oldValue = old, newValue = new
+        async let delayed = cache.refresh(context: first) {
+            try await Task.sleep(for: .milliseconds(60))
+            return oldValue
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        _ = try await cache.refresh(context: second) { newValue }
+        _ = try await delayed
+        #expect(cache.models(for: "mac")?.map(\.value) == ["new-model"])
+        #expect(cache.options(for: first)?.models.map(\.value) == ["new-model"])
+        #expect(cache.options(for: first)?.efforts.count == 3)
+    }
+
+    @Test func changingAccountsDoesNotJoinOrPublishAnOldAccountsRequest() async throws {
+        let cache = CodexModelOptionsCache()
+        let context = CodexModelOptionsContext(machineID: "mac", model: "gpt-6.1-sol")
+        cache.selectScope("account-a", machineID: "mac")
+        var old = Self.options
+        old.catalogContext = "account-a"
+        let oldValue = old
+        let pending = Task {
+            try await cache.refresh(context: context) {
+                try await Task.sleep(for: .milliseconds(60))
+                return oldValue
+            }
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        cache.selectScope("account-b", machineID: "mac")
+        #expect(cache.models(for: "mac") == nil)
+        var new = Self.options
+        new.catalogContext = "account-b"
+        new.models = [CodexOption(label: "account-b-model", value: "account-b-model", selected: true)]
+        let newValue = new
+        _ = try await cache.refresh(context: context) { newValue }
+        do { _ = try await pending.value; Issue.record("Old account response must be fenced") }
+        catch is CancellationError {} catch { Issue.record("Unexpected error: \(error)") }
+        #expect(cache.models(for: "mac")?.map(\.value) == ["account-b-model"])
+    }
+
+    @Test func separateWindowsPreserveEachOthersCommittedMachineCatalogs() async throws {
+        let name = "PCR.ModelOptionsWindows.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let first = CodexModelOptionsCache(defaults: defaults)
+        let second = CodexModelOptionsCache(defaults: defaults)
+        var value = Self.options
+        value.catalogContext = "account-a"
+        let saved = value
+        _ = try await first.refresh(context: .init(machineID: "mac-a", model: "first")) { saved }
+        _ = try await second.refresh(context: .init(machineID: "mac-b", model: "second")) { saved }
+        let restored = CodexModelOptionsCache(defaults: defaults)
+        #expect(restored.models(for: "mac-a")?.count == 3)
+        #expect(restored.models(for: "mac-b")?.count == 3)
+    }
+
     @Test func simultaneousPrimaryAndSynthesisRequestsShareDiscovery() async throws {
         let cache = CodexModelOptionsCache()
         let context = CodexModelOptionsContext(machineID: "mac", model: "")
@@ -171,6 +266,85 @@ struct ModelOptionsTests {
             .contains { $0.value == "future-model" })
         #expect(codexEffortChoices(dynamic: Self.options.efforts, current: "future-effort", effective: "high", language: .chinese)
             .contains { $0.value == "future-effort" && $0.label == "future-effort" })
+    }
+
+    @Test func modelMenusContainOnlyConcreteIDsAndSelectTheEffectiveLegacyModel() {
+        let choices = codexModelChoices(dynamic: Self.options.models + [Self.options.models[1]],
+                                       current: "", effective: "gpt-6.1-sol")
+        #expect(choices.map(\.value) == ["gpt-6.1-sol", "future-model"])
+        #expect(choices.first?.label == "GPT-6.1 Sol")
+        #expect(choices.filter(\.selected).map(\.value) == ["gpt-6.1-sol"])
+        #expect(resolvedCodexModel(current: "", options: Self.options) == "gpt-6.1-sol")
+        #expect(resolvedCodexModel(current: "custom", options: Self.options) == "custom")
+        #expect(resolvedCodexModel(current: "", options: nil).isEmpty)
+    }
+
+    @Test func catalogFailurePreservesExplicitModelWithoutInventingDefaultOrOtherModels() {
+        let choices = codexModelChoices(dynamic: nil, current: "private-model", effective: "")
+        #expect(choices.map(\.value) == ["private-model"])
+        #expect(choices.first?.selected == true)
+        #expect(codexModelChoices(dynamic: nil, current: "", effective: "").isEmpty)
+        #expect(codexModelChoices(dynamic: [CodexOption(label: "Default", value: " ", selected: true)],
+                                 current: "", effective: "").isEmpty)
+        // Effort still has a meaningful automatic mode; model selection does not.
+        #expect(codexEffortChoices(dynamic: Self.options.efforts, current: "", effective: "high", language: .english)
+            .filter { $0.value.isEmpty }.count == 1)
+    }
+
+    @Test func emptyModelEditsCannotRestoreAnImplicitDefault() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let before = fixture.model.settings
+        let defaults = fixture.model.defaultSettings
+        for value in ["", " \n "] {
+            await fixture.model.updatePrimaryModel(value)
+            await fixture.model.updateSynthesisModel(value)
+            await fixture.model.updateDefaultPrimaryModel(value)
+            await fixture.model.updateDefaultSynthesisModel(value)
+            for stage in ExecutionStage.allCases {
+                #expect(!(await fixture.model.editExecutionConfiguration(.model(value), stage: stage,
+                    context: ExecutionEditContext(fixture.model))))
+            }
+        }
+        #expect(fixture.model.settings == before)
+        #expect(fixture.model.defaultSettings == defaults)
+    }
+
+    @Test func newRequestsPinResolvedModelsWithoutRewritingOldSettingsOrAcceptedMessages() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        var legacy = RunSettings()
+        legacy.synthesisAgents = 2
+        let context = CodexModelOptionsContext(machineID: fixture.model.currentMachineContextID, model: "")
+        let options = Self.options
+        _ = try await fixture.model.modelOptionsCache.refresh(context: context) { options }
+        let snapshot = try #require(fixture.model.settingsWithConcreteModelsForNewPrompt(legacy))
+        let body = fixture.model.makeRunStartBody(workspaceID: "qa", prompt: "new prompt", settings: snapshot, confirmLargeRun: false)
+        #expect(body.model == "gpt-6.1-sol" && body.synthesisModel == "gpt-6.1-sol")
+        #expect(legacy.model.isEmpty && legacy.synthesisModel.isEmpty)
+        let changed = CodexModelOptions(configuredModel: "new-default", configuredEffort: nil,
+            configuredServiceTier: nil, effectiveModel: "new-default", effectiveEffort: nil,
+            effectiveFast: nil,
+            models: [CodexOption(label: "new-default", value: "new-default", selected: true)], efforts: [])
+        _ = try await fixture.model.modelOptionsCache.refresh(context: context) { changed }
+        #expect(snapshot.model == "gpt-6.1-sol" && snapshot.synthesisModel == "gpt-6.1-sol")
+        let continued = fixture.model.makeRunContinueBody(runID: "qa", agent: 1, prompt: "new prompt", settings: snapshot, confirmLargeRun: false)
+        #expect(continued.model == body.model && continued.synthesisModel == body.synthesisModel)
+        #expect(fixture.model.promptOutboxByWorkspace.isEmpty)
+    }
+
+    @Test func unresolvedNewModelsDoNotFallBackOrReplaceAnExplicitChoice() throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        var settings = RunSettings()
+        #expect(fixture.model.settingsWithConcreteModelsForNewPrompt(settings) == nil)
+        settings.model = "unlisted-explicit-candidate"
+        settings.synthesisAgents = 0
+        #expect(fixture.model.settingsWithConcreteModelsForNewPrompt(settings)?.model == settings.model)
+        settings.synthesisAgents = 1
+        #expect(fixture.model.settingsWithConcreteModelsForNewPrompt(settings) == nil)
+        settings.synthesisModel = "unlisted-explicit-synthesis"
+        #expect(fixture.model.settingsWithConcreteModelsForNewPrompt(settings) == settings)
     }
 
     private actor RequestCounter {

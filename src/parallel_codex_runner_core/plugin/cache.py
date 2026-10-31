@@ -30,13 +30,16 @@ class LruCache(Generic[K, V]):
         self._values.clear()
 
 
-def file_fingerprint(path: str | Path | None) -> tuple[str, int, int]:
+def file_fingerprint(path: str | Path | None) -> tuple[str, int, int, int, int, int]:
     if not path:
-        return "", 0, 0
+        return "", 0, 0, 0, 0, 0
     value = Path(path).expanduser()
     try:
         stat = value.stat()
     except OSError:
-        return str(value), 0, 0
-    return str(value.resolve()), stat.st_mtime_ns, stat.st_size
+        return str(value), 0, 0, 0, 0, 0
+    # A restored timestamp and equal byte count do not identify the same file.
+    # This in-memory key must be as strict as the native-history disk cache.
+    return (str(value.resolve()), stat.st_dev, stat.st_ino,
+            stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
 

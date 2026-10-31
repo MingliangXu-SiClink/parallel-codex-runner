@@ -23,6 +23,10 @@ struct HealthResponse: Decodable, Sendable {
     let link: RelayLinkInfo?
 }
 
+struct ReachabilityResponse: Decodable, Sendable {
+    let status: String
+}
+
 struct RelayLinkInfo: Decodable, Equatable, Sendable {
     let state: String
     let since: String?
@@ -49,6 +53,9 @@ struct SystemCapabilities: Decodable, Equatable, Sendable {
     let actions: [String]
     var commandReceiptStoreId: String? = nil
     var supportsFollowUpEnqueueReconciliation: Bool? = nil
+    var supportsRunTranscriptPages: Bool? = nil
+    var supportsRunConversationPages: Bool? = nil
+    var modelCatalogContext: String? = nil
 
     var compatible: Bool {
         let minimum = minimumClientProtocolVersion ?? clientProtocolVersion

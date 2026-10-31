@@ -53,6 +53,31 @@ class PromptReceiptTests(unittest.TestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
 
+    def test_restart_preserves_in_doubt_stop_without_replaying_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = CommandJournal(root)
+            request = RemoteRequest(action="runs.kill_agent", client_id="mac-app",
+                                    command_id="original-stop", body={"run_id": "pcr-source", "agent": 10})
+            stopped = []
+
+            def interrupted_stop():
+                stopped.append(10)
+                raise KeyboardInterrupt("fixture manager exits after the worker stopped")
+
+            with self.assertRaises(KeyboardInterrupt):
+                journal.execute(request, interrupted_stop)
+            path = root / f"{journal._key(request)}.json"
+            before = path.read_bytes()
+            reopened = CommandJournal(root)
+            self.assertEqual(reopened.pending_requests(), [])
+            self.assertEqual(reopened.lookup(request), {"status": "in_doubt"})
+            with self.assertRaises(CommandJournalError) as error:
+                reopened.execute(request, lambda: self.fail("stop was replayed"))
+            self.assertEqual(error.exception.code, "command_in_doubt")
+            self.assertEqual(stopped, [10])
+            self.assertEqual(path.read_bytes(), before)
+
     def test_accepted_run_recovers_a_failed_receipt_without_starting_again(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

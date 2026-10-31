@@ -104,7 +104,8 @@ extension AppModel {
         }
         let hasForeignProjection = selectedConversation != nil && scopedDeferredConversation == nil
         let conversationID = navigation?.conversationID ?? (hasForeignProjection ? nil : selectedConversationID)
-        let queuedSettings = hasForeignProjection ? backgroundSettings(for: workspace, machineID: currentMachineContextID) : settings
+        let unresolvedSettings = hasForeignProjection ? backgroundSettings(for: workspace, machineID: currentMachineContextID) : settings
+        guard let queuedSettings = settingsWithConcreteModelsForNewPrompt(unresolvedSettings) else { return }
         let destination = deferredPromptDestination()
         let key = machineWorkspaceContextKey(workspaceID: workspace.workspaceId)
         let predecessor = promptOutboxByWorkspace[key] ?? acceptedPromptResultsByWorkspace[key]?.submission
@@ -146,6 +147,10 @@ extension AppModel {
                     guard let self, let head = self.deferredPromptsByWorkspace[key]?.first,
                           !head.item.isPaused else { return }
                     await self.processDeferredPrompt(key: key)
+                    guard let current = self.deferredPromptsByWorkspace[key]?.first else { return }
+                    // A durable rebind or consumed head is progress, not a wait.
+                    // Recheck the new head's stop, retry and countdown gates now.
+                    if current != head { continue }
                     do { try await Task.sleep(for: .seconds(2)) } catch { return }
                 }
             }

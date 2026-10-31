@@ -2,27 +2,39 @@ import Foundation
 
 @MainActor
 extension AppModel {
+    func refreshModelCatalogScope(target: PcrdRequestTarget) async {
+        guard systemCapabilitiesByMachine[target.machineID]?.modelCatalogContext != nil else { return }
+        _ = try? await verifiedSystemCapabilities(forceRefresh: true, target: target)
+    }
+
     func loadPrimaryModelOptions() async {
         let target = client.currentTarget()
         let context = primaryModelOptionsContext
         loadingPrimaryModelOptionsContexts.insert(context)
         defer { loadingPrimaryModelOptionsContexts.remove(context) }
         do {
-            _ = try await modelOptionsCache.refresh(context: context) { [client] in
-                try await client.call(
-                    target: target, "codex.model_options",
-                    body: ModelOptionsBody(
-                        model: context.model.isEmpty ? nil : context.model,
-                        effort: nil
+            await refreshModelCatalogScope(target: target)
+            repeat {
+                let options = try await modelOptionsCache.refresh(context: context) { [client] in
+                    try await client.call(
+                        target: target, "codex.model_options",
+                        body: ModelOptionsBody(
+                            model: context.model.isEmpty ? nil : context.model,
+                            effort: nil
+                        )
                     )
-                )
-            }
-            guard primaryModelOptionsContext == context else { return }
-            modelOptionsRevision &+= 1
-            setModelOptionsError("Primary", error: nil)
+                }
+                guard primaryModelOptionsContext == context else { return }
+                modelOptionsRevision &+= 1
+                setModelOptionsError("Primary", error: nil)
+                if options.catalogRefreshing != true { return }
+                try await Task.sleep(for: .seconds(1))
+            } while !Task.isCancelled
+        } catch is CancellationError {
+            return
         } catch {
             guard primaryModelOptionsContext == context else { return }
-            setModelOptionsError("Primary", error: error)
+            setModelOptionsError("Primary", error: codexModelCatalog == nil ? error : nil)
         }
     }
 
@@ -30,21 +42,28 @@ extension AppModel {
         let target = client.currentTarget()
         let context = synthesisModelOptionsContext
         do {
-            _ = try await modelOptionsCache.refresh(context: context) { [client] in
-                try await client.call(
-                    target: target, "codex.model_options",
-                    body: ModelOptionsBody(
-                        model: context.model.isEmpty ? nil : context.model,
-                        effort: nil
+            await refreshModelCatalogScope(target: target)
+            repeat {
+                let options = try await modelOptionsCache.refresh(context: context) { [client] in
+                    try await client.call(
+                        target: target, "codex.model_options",
+                        body: ModelOptionsBody(
+                            model: context.model.isEmpty ? nil : context.model,
+                            effort: nil
+                        )
                     )
-                )
-            }
-            guard synthesisModelOptionsContext == context else { return }
-            modelOptionsRevision &+= 1
-            setModelOptionsError("Synthesis", error: nil)
+                }
+                guard synthesisModelOptionsContext == context else { return }
+                modelOptionsRevision &+= 1
+                setModelOptionsError("Synthesis", error: nil)
+                if options.catalogRefreshing != true { return }
+                try await Task.sleep(for: .seconds(1))
+            } while !Task.isCancelled
+        } catch is CancellationError {
+            return
         } catch {
             guard synthesisModelOptionsContext == context else { return }
-            setModelOptionsError("Synthesis", error: error)
+            setModelOptionsError("Synthesis", error: codexModelCatalog == nil ? error : nil)
         }
     }
 

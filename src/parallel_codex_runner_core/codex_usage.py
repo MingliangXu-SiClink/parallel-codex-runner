@@ -15,13 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib
-
 from .codex_cli import codex_process_environment, resolve_codex_executable
-from .codex_auth import file_auth
+from .codex_auth import file_auth, supports_file_auth
 
 
 class UsageReadError(RuntimeError):
@@ -253,17 +248,10 @@ class CodexUsageReader:
     @staticmethod
     def _has_persistent_identity(home: Path) -> bool:
         try:
-            config_path = home / "config.toml"
-            config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
             # A leftover auth.json does not identify a keyring/auto account.
             # Codex's absent setting defaults to file; ambiguous overrides stay
             # memory-only until a live read, rather than restoring another user.
-            if (config.get("cli_auth_credentials_store", "file") != "file"
-                    or config.get("model_provider") not in (None, "openai")
-                    or config.get("profile") or config.get("model_providers", {}).get("openai")
-                    or any(os.environ.get(name) for name in CodexUsageReader._AUTH_ENVIRONMENT)
-                    or any(path.exists() for path in (Path("/etc/codex/config.toml"),
-                               home / "managed_config.toml", home / ".codex/config.toml"))):
+            if not supports_file_auth(home):
                 return False
             auth = json.loads((home / "auth.json").read_bytes())
             tokens = auth.get("tokens") if isinstance(auth, dict) else None

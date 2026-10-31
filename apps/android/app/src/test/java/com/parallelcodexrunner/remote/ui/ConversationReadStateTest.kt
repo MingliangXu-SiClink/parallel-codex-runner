@@ -4,16 +4,258 @@ import com.parallelcodexrunner.remote.data.RemoteCommandException
 import java.io.IOException
 import java.nio.file.Files
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import org.junit.Assert.*
 import org.junit.Test
 
 class ConversationReadStateTest {
+    @Test fun liveAgentBacklogPagesDoNotWaitForTheAgentToFinishOrAnotherPollInterval() {
+        val pending = MobileAgentTranscript(cursor = 100, hasMore = true, finalMessageHasMore = false)
+        assertTrue(shouldReadNextAgentPage(pending, true, 1, 4))
+        assertTrue(shouldReadNextAgentPage(pending.copy(hasMore = false, finalMessageHasMore = true), true, 3, 4))
+        assertFalse(shouldReadNextAgentPage(pending, true, 4, 4))
+        assertFalse(shouldReadNextAgentPage(pending, false, 1, 4))
+        assertFalse(shouldReadNextAgentPage(pending.copy(hasMore = false), true, 1, 4))
+        assertFalse(shouldReadNextAgentPage(pending, true, 1, 0))
+    }
+
     private val key = WorkspaceRunKey("mac", "workspace", "run")
+
+    @Test fun focusedTranscriptCanAdvanceWhileMetadataAndOtherWorkspaceReadsArePending() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val metadataStarted = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val background = launch {
+                reads.read(key, ConversationReadTarget.Metadata) {
+                    metadataStarted.complete(Unit)
+                    release.await()
+                }
+            }
+            metadataStarted.await()
+            var cursor = 42
+            withTimeout(1_000) {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(2), pageLimit = 20) {
+                    cursor += 1
+                }
+                reads.readShared(owner, key, ConversationReadTarget.History) { Unit }
+            }
+            assertEquals(43, cursor)
+            assertEquals(ConversationReadPhase.LOADING, reads[key].metadata.phase)
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[2]?.phase)
+            assertEquals(ConversationReadPhase.READY, reads[key].history.phase)
+            release.complete(Unit)
+            background.join()
+        } finally { owner.cancel() }
+    }
+
+    @Test fun returningToHistoryJoinsItsOriginalPagesAndDoesNotBlockCurrentOutput() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val firstPage = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var issuedIdentities = 0
+            val pages = mutableListOf<Int>()
+            val initial = launch {
+                reads.readShared(owner, key, ConversationReadTarget.History) {
+                    issuedIdentities += 1
+                    pages += 0
+                    firstPage.complete(Unit)
+                    release.await()
+                    pages += 100
+                }
+            }
+            firstPage.await()
+            val requestId = reads[key].history.requestId
+            val returning = launch {
+                reads.readShared(owner, key, ConversationReadTarget.History) {
+                    issuedIdentities += 1
+                    fail("Returning navigation must not invalidate the original history pages")
+                }
+            }
+            yield()
+            initial.cancelAndJoin()
+            withTimeout(1_000) {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { Unit }
+                reads.readShared(owner, key.copy(workspaceId = "other"), ConversationReadTarget.History) { Unit }
+            }
+            assertEquals(requestId, reads[key].history.requestId)
+            assertEquals(ConversationReadPhase.LOADING, reads[key].history.phase)
+            release.complete(Unit)
+            returning.join()
+            assertEquals(1, issuedIdentities)
+            assertEquals(listOf(0, 100), pages)
+            assertEquals(ConversationReadPhase.READY, reads[key].history.phase)
+        } finally { owner.cancel() }
+    }
+
+    @Test fun removedReaderCannotBorrowItsReplacementsPageBudgetOrReleaseItsSlot() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val oldStarted = CompletableDeferred<Unit>()
+            val newStarted = CompletableDeferred<Unit>()
+            val releaseOld = CompletableDeferred<Unit>()
+            val releaseNew = CompletableDeferred<Unit>()
+            val old = launch {
+                runCatching {
+                    reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 4) { limit ->
+                        withContext(NonCancellable) {
+                            oldStarted.complete(Unit)
+                            releaseOld.await()
+                            assertEquals(4, limit())
+                        }
+                    }
+                }
+            }
+            oldStarted.await()
+            reads.removeWhere { it == key }
+            val replacement = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 20) { limit ->
+                    newStarted.complete(Unit)
+                    releaseNew.await()
+                    assertEquals(20, limit())
+                }
+            }
+            newStarted.await()
+            val replacementId = reads[key].agents[1]!!.requestId
+            releaseOld.complete(Unit)
+            old.join()
+            assertEquals(replacementId, reads[key].agents[1]!!.requestId)
+            assertEquals(ConversationReadPhase.LOADING, reads[key].agents[1]!!.phase)
+            val joined = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 4) {
+                    fail("Late completion must not evict the replacement")
+                }
+            }
+            yield()
+            releaseNew.complete(Unit)
+            replacement.join()
+            joined.join()
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[1]!!.phase)
+        } finally { owner.cancel() }
+    }
+
+    @Test fun selectingAnAgentPromotesTheExistingPollWithoutRestartingItsCursor() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var cursor = 80
+            var requests = 0
+            val poll = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 4) { limit ->
+                    requests += 1
+                    assertEquals(4, limit())
+                    cursor += 1
+                    started.complete(Unit)
+                    release.await()
+                    assertEquals(20, limit())
+                    repeat(limit() - 1) { cursor += 1 }
+                }
+            }
+            started.await()
+            val selection = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 20) {
+                    fail("Selection must join the original request")
+                }
+            }
+            yield()
+            val lowerPriority = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1), pageLimit = 4) {
+                    fail("A later poll must neither restart nor demote selection")
+                }
+            }
+            yield()
+            release.complete(Unit)
+            poll.join()
+            selection.join()
+            lowerPriority.join()
+            assertEquals(100, cursor)
+            assertEquals(1, requests)
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[1]?.phase)
+        } finally { owner.cancel() }
+    }
+
+    @Test fun navigationAndPollingShareAReadWithoutBlockingOtherAgents() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var requests = 0
+            val navigation = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1)) {
+                    requests += 1
+                    started.complete(Unit)
+                    release.await()
+                }
+            }
+            started.await()
+            val polling = launch {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { requests += 1 }
+            }
+            yield()
+            navigation.cancelAndJoin()
+            withTimeout(1_000) {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(2)) { requests += 1 }
+                reads.readShared(owner, key.copy(workspaceId = "other"), ConversationReadTarget.Agent(1)) {
+                    requests += 1
+                }
+            }
+            assertEquals(3, requests)
+            assertEquals(ConversationReadPhase.LOADING, reads[key].agents[1]?.phase)
+            release.complete(Unit)
+            polling.join()
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[1]?.phase)
+            reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { requests += 1 }
+            assertEquals(4, requests)
+        } finally {
+            owner.cancel()
+        }
+    }
+
+    @Test fun removedAndFailedSharedReadsCanBeRetried() = runBlocking {
+        val owner = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val reads = ConversationReadStateStore()
+            val started = CompletableDeferred<Unit>()
+            val old = launch {
+                runCatching {
+                    reads.readShared(owner, key, ConversationReadTarget.Agent(1)) {
+                        started.complete(Unit)
+                        awaitCancellation()
+                    }
+                }
+            }
+            started.await()
+            reads.removeWhere { it == key }
+            reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { Unit }
+            old.join()
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[1]?.phase)
+            runCatching {
+                reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { throw IOException("offline") }
+            }
+            assertEquals(ConversationReadPhase.FAILED, reads[key].agents[1]?.phase)
+            reads.readShared(owner, key, ConversationReadTarget.Agent(1)) { Unit }
+            assertEquals(ConversationReadPhase.READY, reads[key].agents[1]?.phase)
+        } finally {
+            owner.cancel()
+        }
+    }
 
     private fun state(reads: Map<String, ConversationReadState> = emptyMap()) = MainUiState(
         selectedMacId = key.macId, selectedWorkspaceId = key.workspaceId,

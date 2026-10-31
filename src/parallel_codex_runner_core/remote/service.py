@@ -63,7 +63,10 @@ def launch_agent_payload(
         "WorkingDirectory": str(state_dir),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
-        "ProcessType": "Background",
+        # The macOS UI synchronously depends on this Unix-socket service.
+        # Background throttles its CPU and disk I/O; Adaptive requires XPC
+        # transactions, which this transport does not use.
+        "ProcessType": "Interactive",
         "ThrottleInterval": 5,
         "EnvironmentVariables": {
             "PATH": service_environment_path(home),

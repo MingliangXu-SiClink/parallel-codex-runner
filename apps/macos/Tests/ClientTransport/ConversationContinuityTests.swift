@@ -7,9 +7,46 @@ private func awaitNavigationFixtureRelease(_ gate: DispatchSemaphore) -> Bool {
     gate.wait(timeout: .now() + 5) == .success
 }
 
+private func consumeAvailableSignals(_ semaphore: DispatchSemaphore) -> Int {
+    var count = 0
+    while semaphore.wait(timeout: .now()) == .success { count += 1 }
+    return count
+}
+
 @Suite(.serialized)
 @MainActor
 struct ConversationContinuityTests {
+    @Test func provenRecoveryInputsStayAuditableButNeverBecomeUserBubbles() throws {
+        let text = "Continue the unfinished task from its saved progress, without restarting completed work."
+        let control = ResumeHistoryEntry(category: "user", text: text, id: "native-control",
+            turnId: "native-turn", inputOrigin: "pcr_recovery")
+        let human = ResumeHistoryEntry(category: "user", text: text, id: "native-human", turnId: "human-turn")
+        let answer = ResumeHistoryEntry(category: "output", text: "Preserved output", id: "answer")
+        let raw = [control, human, answer]
+        let blocks = TranscriptFormatter.blocks(history: raw, prompt: "", transcript: AgentTranscript())
+        #expect(blocks.map(\.id) == [human.id, answer.id])
+        #expect(blocks[0].text == text)
+        var legacy = control
+        legacy.inputOrigin = nil
+        let corrected = mergeConversationHistory(current: [legacy, human, answer], authoritative: raw)
+        #expect(corrected == raw)
+        #expect(mergeConversationHistory(current: raw, authoritative: [legacy, human, answer]) == raw)
+        #expect(mergeConversationHistory(current: [legacy, human, answer], authoritative: [control]) == raw)
+        let encoded = try JSONEncoder().encode(raw)
+        #expect(try JSONDecoder().decode([ResumeHistoryEntry].self, from: encoded) == raw)
+    }
+
+    @Test func oldHistoryCacheRefreshesProvenanceWithoutLosingTheConversation() throws {
+        let data = Data("""
+        {"transcripts":{},"conversationHistory":[{"category":"user","text":"Original question","id":"q","turnId":"t"}],"historyLoaded":true}
+        """.utf8)
+        let old = try JSONDecoder().decode(WorkspaceRunViewSnapshot.self, from: data)
+        let current = old.validated(for: WorkspaceRunViewKey(machineID: "m", workspaceID: "w", runID: "r"))
+        #expect(current.historyLoaded == false)
+        #expect(current.conversationHistory == old.conversationHistory)
+        #expect(current.historyProjectionVersion == 1)
+    }
+
     private func workspace() throws -> RemoteWorkspace {
         try JSONDecoder().decode(RemoteWorkspace.self, from: Data("""
         {"workspaceId":"continuity","name":"Continuity QA","path":"/continuity","lastRunId":"a",
@@ -281,6 +318,284 @@ struct ConversationContinuityTests {
     @Test func legacyQueueWithoutConversationIDRequiresAKnownRun() {
         #expect(queue(conversation: nil).belongsToConversation(ownerIDs: ["conversation-a"], runIDs: ["a"]))
         #expect(!queue(runID: "unknown", conversation: nil).belongsToConversation(ownerIDs: ["conversation-a"], runIDs: ["a"]))
+    }
+
+    @Test func repeatedCachePersistenceDoesNotDecodeItsOwnUnchangedHistory() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-reuse-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = WorkspaceRunDiskCache(directory: directory)
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        var snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: String(repeating: "Original history. ", count: 20_000))],
+            historyLoaded: true)
+        for index in 0..<12 {
+            snapshot.conversationTitle = "Update \(index)"
+            #expect(cache.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        }
+        #expect(cache.diskDecodeCount == 0)
+        #expect(cache.record(for: key)?.snapshot == snapshot)
+        #expect(WorkspaceRunDiskCache(directory: directory).record(for: key)?.snapshot == snapshot)
+    }
+
+    @Test func navigatingAnUnchangedCacheDoesNotInvalidateDecodedBytes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-navigation-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = WorkspaceRunDiskCache(directory: directory)
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        let snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: String(repeating: "Original history. ", count: 20_000))],
+            historyLoaded: true)
+        #expect(cache.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        for _ in 0..<12 {
+            #expect(cache.record(for: key)?.snapshot == snapshot)
+        }
+        #expect(cache.diskDecodeCount == 0)
+        let peer = WorkspaceRunDiskCache(directory: directory)
+        var changed = snapshot
+        changed.conversationTitle = "Published by another cache owner"
+        #expect(peer.put(.init(key: key, runSummary: nil, snapshot: changed)))
+        #expect(cache.record(for: key)?.snapshot == changed)
+        #expect(cache.diskDecodeCount == 1)
+    }
+
+    @Test func coldHydrationDoesNotWaitForAnotherConversationToEncode() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-lanes-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "readable", runID: "a")
+        let snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Complete original history")], historyLoaded: true)
+        #expect(WorkspaceRunDiskCache(directory: directory).put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
+        let disk = WorkspaceRunDiskCache(directory: directory, encodeRecord: { record in
+            entered.signal()
+            #expect(awaitNavigationFixtureRelease(gate))
+            return try WorkspaceRunDiskCache.encode(record)
+        })
+        let writer = Task.detached {
+            await ClientBlockingIO.cacheWrite {
+                disk.put(.init(key: .init(machineID: "mac", workspaceID: "writing", runID: "b"),
+                    runSummary: nil, snapshot: snapshot))
+            }
+        }
+        defer { gate.signal() }
+        #expect(awaitNavigationFixtureRelease(entered))
+        let started = ContinuousClock.now
+        let restored = await WorkspaceRunViewStateStore(diskCache: disk).hydrate(for: key)
+        let elapsed = started.duration(to: .now)
+        #expect(restored?.snapshot == snapshot)
+        #expect(elapsed < .seconds(1))
+        print("Cold hydration while another cache encode is held: \(elapsed)")
+        gate.signal()
+        #expect(await writer.value)
+    }
+
+    @Test func cacheEncodeRebasesAnAtomicReplacementBeforePublishing() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-rebase-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        let original = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Original", id: "original")], historyLoaded: true)
+        let peer = WorkspaceRunDiskCache(directory: directory)
+        #expect(peer.put(.init(key: key, runSummary: nil, snapshot: original)))
+        var peerSnapshot = original
+        peerSnapshot.conversationHistory.append(.init(category: "output", text: "Peer answer", id: "peer"))
+        peerSnapshot.conversationHistory.append(.init(category: "user", text: "Later question", id: "question"))
+        let peerRecord = WorkspaceRunViewCacheRecord(key: key, runSummary: nil, snapshot: peerSnapshot)
+        var pending = original
+        pending.conversationTitle = "Local selection"
+        let pendingRecord = WorkspaceRunViewCacheRecord(key: key, runSummary: nil, snapshot: pending)
+        let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
+        let disk = WorkspaceRunDiskCache(directory: directory, encodeRecord: { record in
+            if !record.snapshot.conversationHistory.contains(where: { $0.id == "peer" }) {
+                entered.signal()
+                #expect(awaitNavigationFixtureRelease(gate))
+            }
+            return try WorkspaceRunDiskCache.encode(record)
+        })
+        let writer = Task.detached { disk.put(pendingRecord) }
+        defer { gate.signal() }
+        #expect(awaitNavigationFixtureRelease(entered))
+        #expect(peer.put(peerRecord))
+        gate.signal()
+        #expect(await writer.value)
+        let restored = try #require(WorkspaceRunDiskCache(directory: directory).record(for: key))
+        #expect(restored.snapshot.conversationHistory == peerSnapshot.conversationHistory)
+        #expect(restored.snapshot.conversationTitle == "Local selection")
+    }
+
+    @Test func readingDuringEncodingDoesNotMakeTheWriterEncodeAgain() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-touch-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        let original = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Original")], historyLoaded: true)
+        #expect(WorkspaceRunDiskCache(directory: directory).put(.init(key: key, runSummary: nil, snapshot: original)))
+        let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
+        let calls = DispatchSemaphore(value: 0)
+        let disk = WorkspaceRunDiskCache(directory: directory, encodeRecord: { record in
+            calls.signal()
+            entered.signal()
+            #expect(awaitNavigationFixtureRelease(gate))
+            return try WorkspaceRunDiskCache.encode(record)
+        })
+        var changed = original
+        changed.conversationTitle = "New title"
+        let record = WorkspaceRunViewCacheRecord(key: key, runSummary: nil, snapshot: changed)
+        let writer = Task.detached { disk.put(record) }
+        defer { gate.signal() }
+        #expect(awaitNavigationFixtureRelease(entered))
+        for _ in 0..<10 { #expect(disk.record(for: key)?.snapshot == original) }
+        gate.signal()
+        // A spare permit prevents a regressed re-encode from hanging the test.
+        gate.signal()
+        #expect(await writer.value)
+        #expect(consumeAvailableSignals(calls) == 1)
+        #expect(WorkspaceRunDiskCache(directory: directory).record(for: key)?.snapshot == changed)
+    }
+
+    @Test func cacheRemovalDuringEncodingCannotResurrectRemovedRecords() async throws {
+        for removal in ["workspace", "machine", "all"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-remove-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+            let snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:], conversationHistory: [])
+            let record = WorkspaceRunViewCacheRecord(key: key, runSummary: nil, snapshot: snapshot)
+            let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
+            let disk = WorkspaceRunDiskCache(directory: directory, encodeRecord: { record in
+                entered.signal()
+                #expect(awaitNavigationFixtureRelease(gate))
+                return try WorkspaceRunDiskCache.encode(record)
+            })
+            let writer = Task.detached { disk.put(record) }
+            defer { gate.signal() }
+            #expect(awaitNavigationFixtureRelease(entered))
+            switch removal {
+            case "workspace": disk.removeWorkspace(machineID: "mac", workspaceID: "continuity")
+            case "machine": disk.removeMachine("mac")
+            default: disk.removeAll()
+            }
+            gate.signal()
+            #expect(await writer.value == false)
+            #expect(disk.record(for: key) == nil)
+        }
+    }
+
+    @Test func failedCacheEncodingPreservesTheLastDurableConversation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-failure-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        let snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Must survive")], historyLoaded: true)
+        let peer = WorkspaceRunDiskCache(directory: directory)
+        #expect(peer.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        let disk = WorkspaceRunDiskCache(directory: directory, encodeRecord: { _ in throw CocoaError(.fileWriteUnknown) })
+        var changed = snapshot
+        changed.conversationTitle = "Not durable"
+        #expect(!disk.put(.init(key: key, runSummary: nil, snapshot: changed)))
+        #expect(disk.record(for: key)?.snapshot == snapshot)
+    }
+
+    @Test func workspaceDiscoveryDoesNotDecodeUnrelatedConversationBodies() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-discovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let writer = WorkspaceRunDiskCache(directory: directory)
+        let history = (0..<10_000).map {
+            ResumeHistoryEntry(category: "output", text: "Original answer \($0). " + String(repeating: "history ", count: 20),
+                id: "history-\($0)")
+        }
+        let snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: history, historyLoaded: true)
+        for workspace in 0..<64 {
+            let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "workspace-\(workspace)", runID: "a")
+            #expect(writer.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        }
+        let reader = WorkspaceRunDiskCache(directory: directory)
+        let began = ContinuousClock.now
+        let records = reader.records(machineID: "mac", workspaceID: "workspace-0")
+        let elapsed = began.duration(to: .now)
+        print("Cold workspace cache discovery across 64 records: \(elapsed), decoded bodies=\(reader.diskDecodeCount)")
+        #expect(records.count == 1)
+        #expect(records.first?.snapshot == snapshot)
+        #expect(reader.diskDecodeCount == 1)
+        #expect(reader.diskIdentityDecodeCount == 0)
+        #expect(elapsed < .seconds(1))
+        let index = directory.appendingPathComponent("runs.pcrcacheindex")
+        let indexRevision = try FileManager.default.attributesOfItem(atPath: index.path)
+        #expect(reader.records(machineID: "other-machine", workspaceID: "workspace-0").isEmpty)
+        #expect(reader.records(machineID: "mac", workspaceID: "workspace-1").first?.snapshot == snapshot)
+        #expect(reader.diskDecodeCount == 2)
+        #expect(reader.diskIdentityDecodeCount == 0)
+        let afterReads = try FileManager.default.attributesOfItem(atPath: index.path)
+        #expect(indexRevision[.systemFileNumber] as? NSNumber == afterReads[.systemFileNumber] as? NSNumber)
+        #expect(indexRevision[.modificationDate] as? Date == afterReads[.modificationDate] as? Date)
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("runs.pcrcacheindex"))
+        let legacy = WorkspaceRunDiskCache(directory: directory)
+        let legacyBegan = ContinuousClock.now
+        #expect(legacy.records(machineID: "mac", workspaceID: "workspace-0").first?.snapshot == snapshot)
+        print("Legacy discovery without catalog: \(legacyBegan.duration(to: .now)), identity parses=\(legacy.diskIdentityDecodeCount)")
+        #expect(legacy.diskIdentityDecodeCount == 64)
+        let repaired = WorkspaceRunDiskCache(directory: directory)
+        #expect(repaired.records(machineID: "mac", workspaceID: "workspace-1").first?.snapshot == snapshot)
+        #expect(repaired.diskIdentityDecodeCount == 0)
+    }
+
+    @Test func cacheCatalogRepairsCorruptionAndAnInterruptedOrExternalWrite() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-catalog-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = WorkspaceRunDiskCache(directory: directory)
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        var snapshot = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Original history")], historyLoaded: true)
+        #expect(cache.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        let index = directory.appendingPathComponent("runs.pcrcacheindex")
+        let oldIndex = try Data(contentsOf: index)
+        let peer = WorkspaceRunDiskCache(directory: directory)
+        snapshot.conversationHistory.append(.init(category: "output", text: "New original answer"))
+        #expect(peer.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        // Simulate termination after record publication but before index publication.
+        try oldIndex.write(to: index, options: .atomic)
+        let cold = WorkspaceRunDiskCache(directory: directory)
+        #expect(cold.records(machineID: "mac", workspaceID: "continuity").first?.snapshot == snapshot)
+        #expect(cold.diskIdentityDecodeCount == 1)
+        #expect(cache.records(machineID: "mac", workspaceID: "continuity").first?.snapshot == snapshot)
+        try Data("broken".utf8).write(to: index)
+        let damaged = WorkspaceRunDiskCache(directory: directory)
+        #expect(damaged.records(machineID: "mac", workspaceID: "continuity").first?.snapshot == snapshot)
+        #expect(damaged.diskIdentityDecodeCount == 1)
+        #expect(damaged.records(machineID: "different", workspaceID: "continuity").isEmpty)
+        damaged.removeWorkspace(machineID: "mac", workspaceID: "continuity")
+        #expect(WorkspaceRunDiskCache(directory: directory).records(machineID: "mac", workspaceID: "continuity").isEmpty)
+        #expect(damaged.put(.init(key: key, runSummary: nil, snapshot: snapshot)))
+        damaged.removeAll()
+        #expect(!FileManager.default.fileExists(atPath: index.path))
+        #expect(WorkspaceRunDiskCache(directory: directory).records(machineID: "mac", workspaceID: "continuity").isEmpty)
+    }
+
+    @Test func reusedCacheRecordsObserveExternalReplacementCorruptionAndRemoval() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcr-cache-replacement-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = WorkspaceRunDiskCache(directory: directory)
+        let second = WorkspaceRunDiskCache(directory: directory)
+        let key = WorkspaceRunViewKey(machineID: "mac", workspaceID: "continuity", runID: "a")
+        let original = WorkspaceRunViewSnapshot(selectedAgent: 1, transcripts: [:],
+            conversationHistory: [.init(category: "output", text: "Original history")], historyLoaded: true)
+        #expect(first.put(.init(key: key, runSummary: nil, snapshot: original)))
+        var changed = original
+        changed.conversationHistory.append(.init(category: "output", text: "Another writer's new answer"))
+        #expect(second.put(.init(key: key, runSummary: nil, snapshot: changed)))
+        #expect(first.records(machineID: "mac", workspaceID: "continuity").first?.snapshot == changed)
+        #expect(first.record(for: key)?.snapshot == changed)
+        let file = try #require(FileManager.default.contentsOfDirectory(at: directory,
+            includingPropertiesForKeys: nil).first { $0.pathExtension == "pcrconversation" })
+        let data = try Data(contentsOf: file)
+        let timestamp = try #require(FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date)
+        // Same size and mtime must not disguise an atomic replacement.
+        try Data(repeating: 0, count: data.count).write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.modificationDate: timestamp], ofItemAtPath: file.path)
+        #expect(first.record(for: key) == nil)
+        #expect(first.put(.init(key: key, runSummary: nil, snapshot: original)))
+        second.removeAll()
+        #expect(first.record(for: key) == nil)
     }
 
     @Test func diskHydrationDoesNotReplaceNewerMemoryOrDropAnUnwrittenTurn() async throws {

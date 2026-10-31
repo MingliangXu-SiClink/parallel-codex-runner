@@ -312,6 +312,7 @@ extension AppModel {
     }
 
     func updateDefaultPrimaryModel(_ model: String) async {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let changed = defaultSettings.model != model
         defaultSettings.model = model
         if changed {
@@ -324,6 +325,7 @@ extension AppModel {
     }
 
     func updateDefaultSynthesisModel(_ model: String) async {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let changed = defaultSettings.synthesisModel != model
         defaultSettings.synthesisModel = model
         if changed {
@@ -369,32 +371,38 @@ extension AppModel {
         let requestID = defaultPrimaryOptionsRequestID
         let requestedModel = defaultSettings.model
         let requestedEffort = defaultSettings.effort
+        let context = CodexModelOptionsContext(machineID: machineID, model: requestedModel)
+        defaultPrimaryModelOptions = modelOptionsCache.options(for: context)
         do {
-            let options: CodexModelOptions = try await client.call(
-                target: target,
-                "codex.model_options",
-                body: ModelOptionsBody(
-                    model: requestedModel.isEmpty ? nil : requestedModel,
-                    effort: requestedEffort.isEmpty ? nil : requestedEffort
-                )
-            )
-            guard isCurrentMachine(machineID),
-                  requestID == defaultPrimaryOptionsRequestID,
-                  defaultSettings.model == requestedModel,
-                  defaultSettings.effort == requestedEffort else { return }
-            defaultPrimaryModelOptions = options
-            setDefaultModelOptionsError("Primary", error: nil)
-            if !defaultSettings.effort.isEmpty,
-               !options.efforts.contains(where: { $0.value == defaultSettings.effort }) {
-                defaultSettings.effort = ""
-                defaultSettingsNeedsSave = true
-                scheduleDefaultConversationSettingsSave()
-            }
+            await refreshModelCatalogScope(target: target)
+            guard isCurrentMachine(machineID), requestID == defaultPrimaryOptionsRequestID else { return }
+            defaultPrimaryModelOptions = modelOptionsCache.options(for: context)
+            repeat {
+                let options = try await modelOptionsCache.refresh(context: context) { [client] in
+                    try await client.call(
+                        target: target, "codex.model_options",
+                        body: ModelOptionsBody(
+                            model: requestedModel.isEmpty ? nil : requestedModel,
+                            effort: requestedEffort.isEmpty ? nil : requestedEffort
+                        )
+                    )
+                }
+                guard isCurrentMachine(machineID),
+                      requestID == defaultPrimaryOptionsRequestID,
+                      defaultSettings.model == requestedModel,
+                      defaultSettings.effort == requestedEffort else { return }
+                defaultPrimaryModelOptions = options
+                setDefaultModelOptionsError("Primary", error: nil)
+                if options.catalogRefreshing != true { return }
+                try await Task.sleep(for: .seconds(1))
+            } while !Task.isCancelled
+        } catch is CancellationError {
+            return
         } catch {
             guard isCurrentMachine(machineID),
                   requestID == defaultPrimaryOptionsRequestID else { return }
-            defaultPrimaryModelOptions = nil
-            setDefaultModelOptionsError("Primary", error: error)
+            defaultPrimaryModelOptions = modelOptionsCache.options(for: context)
+            setDefaultModelOptionsError("Primary", error: defaultPrimaryModelOptions == nil ? error : nil)
         }
     }
 
@@ -405,34 +413,38 @@ extension AppModel {
         let requestID = defaultSynthesisOptionsRequestID
         let requestedModel = defaultSettings.synthesisModel
         let requestedEffort = defaultSettings.synthesisEffort
+        let context = CodexModelOptionsContext(machineID: machineID, model: requestedModel)
+        defaultSynthesisModelOptions = modelOptionsCache.options(for: context)
         do {
-            let options: CodexModelOptions = try await client.call(
-                target: target,
-                "codex.model_options",
-                body: ModelOptionsBody(
-                    model: requestedModel.isEmpty ? nil : requestedModel,
-                    effort: requestedEffort.isEmpty ? nil : requestedEffort
-                )
-            )
-            guard isCurrentMachine(machineID),
-                  requestID == defaultSynthesisOptionsRequestID,
-                  defaultSettings.synthesisModel == requestedModel,
-                  defaultSettings.synthesisEffort == requestedEffort else { return }
-            defaultSynthesisModelOptions = options
-            setDefaultModelOptionsError("Synthesis", error: nil)
-            if !defaultSettings.synthesisEffort.isEmpty,
-               !options.efforts.contains(where: {
-                   $0.value == defaultSettings.synthesisEffort
-               }) {
-                defaultSettings.synthesisEffort = ""
-                defaultSettingsNeedsSave = true
-                scheduleDefaultConversationSettingsSave()
-            }
+            await refreshModelCatalogScope(target: target)
+            guard isCurrentMachine(machineID), requestID == defaultSynthesisOptionsRequestID else { return }
+            defaultSynthesisModelOptions = modelOptionsCache.options(for: context)
+            repeat {
+                let options = try await modelOptionsCache.refresh(context: context) { [client] in
+                    try await client.call(
+                        target: target, "codex.model_options",
+                        body: ModelOptionsBody(
+                            model: requestedModel.isEmpty ? nil : requestedModel,
+                            effort: requestedEffort.isEmpty ? nil : requestedEffort
+                        )
+                    )
+                }
+                guard isCurrentMachine(machineID),
+                      requestID == defaultSynthesisOptionsRequestID,
+                      defaultSettings.synthesisModel == requestedModel,
+                      defaultSettings.synthesisEffort == requestedEffort else { return }
+                defaultSynthesisModelOptions = options
+                setDefaultModelOptionsError("Synthesis", error: nil)
+                if options.catalogRefreshing != true { return }
+                try await Task.sleep(for: .seconds(1))
+            } while !Task.isCancelled
+        } catch is CancellationError {
+            return
         } catch {
             guard isCurrentMachine(machineID),
                   requestID == defaultSynthesisOptionsRequestID else { return }
-            defaultSynthesisModelOptions = nil
-            setDefaultModelOptionsError("Synthesis", error: error)
+            defaultSynthesisModelOptions = modelOptionsCache.options(for: context)
+            setDefaultModelOptionsError("Synthesis", error: defaultSynthesisModelOptions == nil ? error : nil)
         }
     }
 }

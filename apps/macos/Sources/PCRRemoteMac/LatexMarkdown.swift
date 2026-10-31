@@ -229,6 +229,8 @@ enum LatexMarkdownExtractor {
             )
             return "\n\n\(token)\n\n"
         }
+        // Ordinary conversation lines need no delimiter scan or Character array.
+        guard line.contains("$") || line.contains("\\") else { return line }
         let characters = Array(line)
         var output = ""
         var index = 0
@@ -319,7 +321,8 @@ enum LatexMarkdownExtractor {
         at index: Int,
         in characters: [Character]
     ) -> Delimiter? {
-        guard !isEscaped(index, in: characters) else { return nil }
+        guard characters[index] == "$" || characters[index] == "\\",
+              !isEscaped(index, in: characters) else { return nil }
         if matches(["$", "$"], at: index, in: characters) {
             return Delimiter(open: ["$", "$"], close: ["$", "$"], display: true)
         }
@@ -357,7 +360,10 @@ enum LatexMarkdownExtractor {
         in characters: [Character]
     ) -> Bool {
         guard index + value.count <= characters.count else { return false }
-        return Array(characters[index..<(index + value.count)]) == value
+        for offset in value.indices where characters[index + offset] != value[offset] {
+            return false
+        }
+        return true
     }
 
     private static func repeatedCount(

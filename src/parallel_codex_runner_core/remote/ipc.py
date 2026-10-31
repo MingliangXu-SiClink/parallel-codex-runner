@@ -105,6 +105,9 @@ class _PcrdRequestHandler(socketserver.StreamRequestHandler):
 class _ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = False
+    # Darwin refuses Unix connects when the default five-slot backlog fills,
+    # even with a healthy listener. Keep short navigation bursts in the kernel.
+    request_queue_size = 128
 
 
 class PcrdServer(_ThreadingUnixServer):

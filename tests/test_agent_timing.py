@@ -9,6 +9,34 @@ from parallel_codex_runner_core.plugin_runtime import ManagedRun, PluginRunManag
 
 
 class AgentTimingTests(unittest.TestCase):
+    def test_cold_summary_replay_is_bounded_resumable_and_not_reported_as_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PluginRunManager(Path(tmp), detached_workers=False)
+            run = ManagedRun(run_id="pcr-20260918T100000Z-12345678", prompt="QA",
+                             workspace=tmp, config={}, status="running",
+                             agent_statuses={1: "running", 2: "queued"})
+            for _ in range(2_100):
+                manager._events.append(run.run_id, {"type": "agent_status", "idx": 2, "status": "queued"})
+            manager._events.append(run.run_id, {"type": "agent_started", "idx": 1,
+                                                "timestamp": "2026-09-18T10:00:00Z"})
+            run.event_count = manager._events.count(run.run_id)
+            with mock.patch.object(manager._events, "read", wraps=manager._events.read) as read:
+                first = manager._run_summary_locked(run)
+                self.assertEqual(read.call_count, 1)
+                self.assertIsNone(first["agents"][0]["started_at"])
+                self.assertIsNone(first["agents"][0]["activity"])
+                cursor = manager._progress_cache.get(run.run_id).cursor
+                self.assertGreater(cursor, 0)
+                self.assertLess(cursor, run.event_count)
+                for _ in range(5):
+                    read.reset_mock()
+                    final = manager._run_summary_locked(run)
+                    self.assertLessEqual(read.call_count, 1)
+                    if final["agents"][0]["started_at"] is not None:
+                        break
+                self.assertEqual(final["agents"][0]["started_at"], "2026-09-18T10:00:00Z")
+                self.assertEqual(manager._progress_cache.get(run.run_id).cursor, run.event_count)
+
     def test_synthesis_refresh_clears_the_previous_attempt_before_copying(self):
         projection = RunProgressProjection()
         for idx in (1, 2):

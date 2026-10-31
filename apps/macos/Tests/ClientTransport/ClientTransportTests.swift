@@ -46,18 +46,23 @@ struct ClientTransportTests {
         try #require(bound == 0 && Darwin.listen(listener, 1) == 0)
         let server = Task {
             try await ClientBlockingIO.transport(priority: .utility, isObservation: false) {
-                var pending = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
-                guard Darwin.poll(&pending, 1, 5_000) > 0 else { return false }
-                let socket = Darwin.accept(listener, nil, nil)
-                guard socket >= 0 else { return false }
-                defer { Darwin.close(socket) }
-                var byte: UInt8 = 0
-                guard Darwin.read(socket, &byte, 1) == 1 else { return false }
-                Darwin.shutdown(socket, SHUT_RDWR)
+                // The read transport retries once. Close both accepted peers;
+                // an unaccepted retry only tests the socket timeout instead.
+                for _ in 0..<2 {
+                    var pending = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+                    guard Darwin.poll(&pending, 1, 5_000) > 0 else { return false }
+                    let socket = Darwin.accept(listener, nil, nil)
+                    guard socket >= 0 else { return false }
+                    defer { Darwin.close(socket) }
+                    var byte: UInt8 = 0
+                    guard Darwin.read(socket, &byte, 1) == 1 else { return false }
+                    Darwin.shutdown(socket, SHUT_RDWR)
+                }
                 return true
             }
         }
         struct Body: Encodable, Sendable { let padding: String }
+        let began = ContinuousClock.now
         do {
             let _: TransportReply = try await PcrdClient(socketURL: socketURL, tokenURL: tokenURL)
                 .callLocal("codex.model_options", body: Body(padding: String(repeating: "x", count: 2 * 1_024 * 1_024)))
@@ -69,6 +74,7 @@ struct ClientTransportTests {
             }
         }
         #expect(try await server.value)
+        #expect(began.duration(to: .now) < .seconds(1))
     }
 
     @Test @MainActor

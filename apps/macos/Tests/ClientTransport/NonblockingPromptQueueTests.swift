@@ -9,6 +9,33 @@ import Testing
 struct NonblockingPromptQueueTests {
     typealias Fixture = PromptDeliveryTests.Fixture
 
+    @Test func resolvedQueueDestinationDoesNotWaitForAnotherPollingInterval() async throws {
+        let fixture = try Fixture(mode: .accepted)
+        defer { fixture.close() }
+        try fixture.installCompletedConversation(finalized: false, runID: "accepted")
+        let source = try #require(fixture.model.activeRun)
+        await fixture.replies.registerRun(source)
+        await fixture.replies.holdAcceptance()
+        var settings = fixture.model.settings
+        settings.followUpDelay = 0
+        let queued = PersistedDeferredPrompt(item: QueuedFollowUp(prompt: "Resolve and deliver once", settings: settings),
+            machineID: "local", workspaceID: "workspace", workspacePath: "/qa",
+            conversationID: "delivery-conversation", destination: .workspace)
+        #expect(await fixture.store.appendDeferredPrompt(queued) != nil)
+        fixture.model.deferredPromptsByWorkspace = fixture.store.loadSnapshot().deferredPromptsByWorkspace
+        let began = ContinuousClock.now
+        fixture.model.ensureDeferredPromptProcessing()
+        try await wait(timeout: .seconds(1)) { await fixture.replies.startCommands.count == 1 }
+        let elapsed = began.duration(to: .now)
+        #expect(elapsed < .seconds(1))
+        #expect(await fixture.replies.startCommands == ["\(queued.item.id.uuidString.lowercased())-attempt-0"])
+        #expect(await fixture.replies.allStartsWereDurable)
+        let body = try #require(JSONSerialization.jsonObject(with: await fixture.replies.startBodies[0]) as? [String: Any])
+        #expect(body["run_id"] as? String == "accepted" && body["agent"] as? Int == 7)
+        print("Resolved deferred destination to original command: \(elapsed)")
+        await fixture.replies.releaseAcceptance()
+    }
+
     @Test func slowAcceptanceQueuesRepeatedTextAndDrainsInOrderOffscreen() async throws {
         let fixture = try Fixture(mode: .accepted, fragmentReplies: true)
         defer { fixture.close() }
@@ -230,6 +257,8 @@ struct NonblockingPromptQueueTests {
         fixture.model.selectedWorkspaceID = "other"
         var settings = RunSettings()
         settings.agents = 2
+        settings.model = "other-candidate-model"
+        settings.synthesisModel = "other-synthesis-model"
         fixture.model.settingsByWorkspace[MachineContextKey.workspace(machineID: "local", workspaceID: "other")] = settings
         fixture.model.settings.agents = 9
         fixture.model.updatePrompt("This belongs only to the newly chosen workspace")
@@ -238,6 +267,8 @@ struct NonblockingPromptQueueTests {
         #expect(queued.workspaceID == "other" && queued.workspacePath == "/other")
         #expect(queued.destination == .workspace && queued.originRunID == nil)
         #expect(queued.item.settings?.agents == 2)
+        #expect(queued.item.settings?.model == "other-candidate-model")
+        #expect(queued.item.settings?.synthesisModel == "other-synthesis-model")
         #expect(await fixture.replies.startCommands.isEmpty)
     }
 
@@ -449,8 +480,11 @@ struct NonblockingPromptQueueTests {
         model.workspaces = fixture.model.workspaces
         model.selectedWorkspaceID = "workspace"
         model.selectedConversationID = nil
+        model.settings.model = "gpt-6.1-sol"
+        model.settings.synthesisModel = "gpt-6-astra"
         model.updatePrompt("Identical text in two independent drafts")
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         writes.async { gate.wait() }
         let saving = Task { await model.submitPrompt() }
         let key = MachineContextKey.workspace(machineID: "local", workspaceID: "workspace")

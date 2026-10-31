@@ -6,13 +6,15 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from parallel_codex_runner_core.app import stream_to_log
 from parallel_codex_runner_core.models import AgentState
 from parallel_codex_runner_core.plugin_runtime import PluginRunManager, PluginRunError
 from parallel_codex_runner_core.remote.transcript import transcript_items
 from parallel_codex_runner_core.work_operations import WorkOperationTracker, classify_command
+from parallel_codex_runner_core.work_operations import strip_shell_command_wrapper
+from parallel_codex_runner_core.plugin.events import EventLog
 
 
 def command(identifier="item_0", status="in_progress", output=None, code=None):
@@ -25,6 +27,51 @@ def command(identifier="item_0", status="in_progress", output=None, code=None):
 
 
 class WorkOperationTests(unittest.TestCase):
+    def test_command_display_preserves_large_scripts_without_shell_tokenization(self):
+        text = "/bin/zsh -lc 'python -c " + "x" * (1024 * 1024) + "'"
+        payload = command()
+        payload["item"]["command"] = text
+        event = {"type": "agent_line", "event_id": 4, "text": json.dumps(payload)}
+        with patch("shlex.split", side_effect=AssertionError("unbounded display parsing")):
+            self.assertEqual(strip_shell_command_wrapper(text), text)
+            item = transcript_items([event])[0]
+            self.assertEqual(item["text"], text)
+            self.assertEqual(item["operation_id"], "item_0")
+            self.assertEqual(item["status"], "running")
+            with tempfile.TemporaryDirectory() as directory:
+                log = EventLog(Path(directory))
+                log.append("fixture", event)
+                cursor, fragments = 0, []
+                while True:
+                    page = log.read("fixture", cursor=cursor, limit=100)
+                    fragments.extend(transcript_items(page["events"]))
+                    if not page["has_more"]:
+                        break
+                    self.assertGreater(page["next_cursor"], cursor)
+                    cursor = page["next_cursor"]
+                self.assertEqual("".join(item["text"] for item in fragments), text)
+
+    def test_small_command_wrappers_keep_their_existing_display(self):
+        for source, expected in [
+            ("/bin/zsh -lc 'cat a'", "cat a"),
+            ("dash -c 'echo two words'", "echo two words"),
+            ("/bin/bash -lc 'echo \"hello\"'", 'echo "hello"'),
+            ("zsh -c 'unterminated", "zsh -c 'unterminated"),
+            ("echo 'two words'", "echo 'two words'"),
+            ("sh -c 'echo a' extra", "sh -c 'echo a' extra"),
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(strip_shell_command_wrapper(source), expected)
+
+    def test_large_or_dynamic_commands_do_not_enter_shell_tokenization(self):
+        for text in ("python -c '" + "x" * 100_000 + "'", "cat a\ncat b", "cat $HOME/a", "cat `pwd`/a"):
+            with self.subTest(length=len(text)), patch(
+                "parallel_codex_runner_core.work_operations.shlex.split",
+                side_effect=AssertionError("display classification must stay bounded"),
+            ):
+                kind, paths, query = classify_command(text)
+                self.assertEqual((kind.value, paths, query), ("command", [], None))
+
     def test_conservative_classification(self):
         for text, kind, paths in [
             ("cat 'a b.tex'", "file_read", ["a b.tex"]),

@@ -134,15 +134,7 @@ internal fun MainViewModel.applyDaemonFollowUpQueue(
             }?.takeIf { items.isNotEmpty() && visiblePending.isEmpty() },
         )
     }
-    if (remote?.runId == state.value.visibleRunId &&
-        remote?.selectionSource in setOf("manual", "automatic") &&
-        isTerminalRunStatus(state.value.runStatus) && state.value.finalizedAgent == null &&
-        state.value.pendingAgentSelection == null
-    ) {
-        remote?.selectedAgent?.takeIf { it != state.value.selectedAgent }?.let {
-            selectAgent(it, userInitiated = false)
-        }
-    }
+    // Queue source is execution state, not a request to change the reader's tab.
 }
 
 internal suspend fun MainViewModel.refreshDaemonFollowUpQueue(

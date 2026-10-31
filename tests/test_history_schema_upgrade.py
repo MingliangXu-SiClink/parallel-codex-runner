@@ -21,13 +21,20 @@ def native_state(path, migration=61):
                 db.execute(sql)
         # Preserve SQLite's empty sequence table left by an earlier migration.
         db.executescript("CREATE TABLE sequence_bootstrap(id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE sequence_bootstrap;")
-        for kind, _, table, sql in contract["schema"]:
-            if sql and kind in {"index", "view", "trigger"} and table not in omitted:
+        for kind, name, table, sql in contract["schema"]:
+            if (sql and kind in {"index", "view", "trigger"} and table not in omitted
+                    and not (migration < 59 and name == "idx_thread_attachments_identity_thread")):
                 db.execute(sql)
         for version, description, success, checksum in contract["migrations"]:
             if version <= migration:
                 db.execute("INSERT INTO _sqlx_migrations VALUES (?,?,'2026-10-16',?,?,0)",
                            (version, description, success, bytes.fromhex(checksum)))
+        if migration >= 62:
+            upgrade = json.loads((Path(__file__).parent / "fixtures/codex-state-v62-migration.json").read_text())
+            for statement in upgrade["statements"]:
+                db.execute(statement)
+            db.execute("INSERT INTO _sqlx_migrations VALUES (?,?,'2026-10-28',1,?,0)",
+                       (upgrade["version"], upgrade["description"], bytes.fromhex(upgrade["checksum"])))
         for thread in ("selected", "unrelated"):
             db.execute("""INSERT INTO threads (id,rollout_path,created_at,updated_at,source,
                 model_provider,cwd,title,sandbox_policy,approval_mode) VALUES (?,?,1,1,'cli','test',?,'fixture','{}','never')""",
@@ -38,11 +45,13 @@ def native_state(path, migration=61):
             if migration >= 61:
                 db.execute("INSERT INTO thread_read_receipts VALUES (?,?,?,?)",
                            (thread, f"turn-{thread}", "revision", f"last-{thread}"))
+        if migration >= 62:
+            db.execute("UPDATE threads SET attached_thread_parent_id='unrelated' WHERE id='selected'")
         db.commit()
     return path
 
 
-@pytest.mark.parametrize("migration", [59, 60, 61])
+@pytest.mark.parametrize("migration", [58, 59, 60, 61, 62])
 def test_reviewed_native_schemas_copy_only_selected_thread_dependencies(tmp_path, migration):
     source = native_state(tmp_path / "state.sqlite", migration)
     original = source.read_bytes()
@@ -59,17 +68,56 @@ def test_reviewed_native_schemas_copy_only_selected_thread_dependencies(tmp_path
             assert db.execute("SELECT thread_id,record FROM guardian_review_feedback").fetchall() == [("selected", b"selected-review")]
         if migration >= 61:
             assert db.execute("SELECT * FROM thread_read_receipts").fetchall() == [("selected", "turn-selected", "revision", "last-selected")]
+        if migration >= 62:
+            assert db.execute("SELECT attached_thread_parent_id FROM threads").fetchall() == [("unrelated",)]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     assert b"unrelated-review" not in target.read_bytes()
     assert source.read_bytes() == original
 
 
+@pytest.mark.parametrize("migration", [7, 8])
+def test_fresh_cli_and_desktop_projection_histories_keep_only_the_selected_thread(tmp_path, migration):
+    contract = json.loads((Path(__file__).parent / "fixtures/codex-projection-v8.json").read_text())
+    source = tmp_path / "projection.sqlite"
+    with closing(sqlite3.connect(source)) as db:
+        for kind, name, _, sql in contract["schema"]:
+            if not sql:
+                continue
+            if kind == "table" and name == "thread_turns" and migration == 7:
+                sql = sql.replace(", root_turn_id TEXT,", ",")
+            db.execute(sql)
+        for version, description, success, checksum in contract["migrations"]:
+            if version <= migration:
+                db.execute("INSERT INTO _sqlx_migrations VALUES (?,?,'2026-10-28',?,?,0)",
+                           (version, description, success, bytes.fromhex(checksum)))
+        for thread in ("selected", "unrelated"):
+            db.execute("INSERT INTO thread_turns (thread_id,turn_id,rollout_ordinal,status) VALUES (?,?,1,'completed')",
+                       (thread, f"turn-{thread}"))
+        db.commit()
+    original = source.read_bytes()
+    target = tmp_path / "private.sqlite"
+    bound = scoped_database_bytes(source, "projection", ("selected",))
+    assert copy_scoped_database(source, target, "projection", ("selected",)) == bound
+    with closing(sqlite3.connect(source)) as before, closing(sqlite3.connect(target)) as db:
+        assert db.execute("SELECT thread_id,turn_id FROM thread_turns").fetchall() == [("selected", "turn-selected")]
+        assert db.execute("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name").fetchall() == before.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name").fetchall()
+        assert db.execute("SELECT * FROM _sqlx_migrations").fetchall() == before.execute("SELECT * FROM _sqlx_migrations").fetchall()
+    assert source.read_bytes() == original
+    with closing(sqlite3.connect(source)) as db:
+        db.execute("UPDATE _sqlx_migrations SET checksum=X'00' WHERE version=?", (migration,))
+        db.commit()
+    with pytest.raises(HistorySchemaCompatibilityError):
+        copy_scoped_database(source, target, "projection", ("selected",))
+
+
 @pytest.mark.parametrize("change", ["checksum", "column", "trigger", "table"])
-def test_future_or_changed_native_schema_stays_fail_closed_and_atomic(tmp_path, change):
-    source = native_state(tmp_path / "state.sqlite")
+@pytest.mark.parametrize("migration", [61, 62])
+def test_future_or_changed_native_schema_stays_fail_closed_and_atomic(tmp_path, change, migration):
+    source = native_state(tmp_path / "state.sqlite", migration)
     with closing(sqlite3.connect(source)) as db:
         db.execute({
-            "checksum": "UPDATE _sqlx_migrations SET checksum=X'00' WHERE version=61",
+            "checksum": f"UPDATE _sqlx_migrations SET checksum=X'00' WHERE version={migration}",
             "column": "ALTER TABLE thread_read_receipts ADD COLUMN new_policy TEXT",
             "trigger": "CREATE TRIGGER changed AFTER INSERT ON thread_read_receipts BEGIN SELECT 1; END",
             "table": "CREATE TABLE unknown (private TEXT)",

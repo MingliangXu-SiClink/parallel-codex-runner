@@ -167,6 +167,43 @@ struct AgentPreloadTests {
     }
 
     @Test
+    func confirmingABrowsedAgentPreservesTheOriginalQueueDeadline() async throws {
+        let fixture = try Fixture(modernSelection: true)
+        defer { fixture.close() }
+        let model = fixture.model
+        let itemID = UUID().uuidString.lowercased()
+        let deadline = Int(Date().timeIntervalSince1970 * 1000) + 50_000
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "workspace_id": fixture.workspaceID, "run_id": fixture.runID,
+            "items": [["id": itemID, "prompt": "Keep the original queued message",
+                       "settings": JSONSerialization.jsonObject(with: encoder.encode(model.settings)),
+                       "attempt": 0, "paused": false]],
+            "selected_agent": 1, "state": "countdown", "deadline_epoch_ms": deadline,
+            "generation": 1, "selection_source": "manual",
+        ])
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        model.applyDaemonFollowUpQueue(try decoder.decode(RemoteFollowUpQueue.self, from: payload),
+            workspaceID: fixture.workspaceID, machineID: model.currentMachineContextID, revision: 1)
+        try await fixture.replies.installQueue(payload)
+        await fixture.replies.holdSelection(2)
+        await model.selectAgent(2)
+        try await waitUntil { await fixture.replies.selectionRequests == [2] }
+        #expect(model.selectedAgent == 2)
+        #expect(model.followUpQueue.first?.id.uuidString.lowercased() == itemID)
+        await fixture.replies.releaseSelection()
+        try await waitUntil { model.continuationSelectionTasks.isEmpty }
+        #expect(!model.continuationSelectionNeedsConfirmation)
+        #expect(await fixture.replies.queueReplacementRequests == 0)
+        #expect(model.daemonFollowUpSnapshot?.deadlineEpochMs == deadline)
+        #expect(model.daemonFollowUpSnapshot?.selectedAgent == 2)
+        #expect(model.followUpQueue.first?.id.uuidString.lowercased() == itemID)
+        #expect(await fixture.replies.continuationRequests.isEmpty)
+    }
+
+    @Test
     func returningToTheConfirmedAgentWhileAnotherChoiceIsInFlightStillConfirmsTheLastClick() async throws {
         let fixture = try Fixture(modernSelection: true)
         defer { fixture.close() }
@@ -655,6 +692,9 @@ struct AgentPreloadTests {
         try await waitUntil { await fixture.replies.answerRequests.filter { $0 == 3 }.count >= 2 }
         try await waitUntil { fixture.model.transcripts[3]?.cursor == 2 }
         #expect(await fixture.replies.requests.contains(3))
+        // Work and answer cursors are independent. The work reader can reach
+        // EOF before its remaining final-message pages have arrived.
+        try await waitUntil { fixture.model.transcripts[3]?.finalMessageHasMore == false }
         #expect(fixture.model.transcripts[3]?.finalMessage == "Candidate 3")
         #expect(fixture.model.transcripts[3]?.finalMessageHasMore == false)
         await fixture.replies.releaseAnswer()
@@ -711,6 +751,7 @@ struct AgentPreloadTests {
         let first = Task { await fixture.model.selectAgent(3, manageFollowUpQueue: false) }
         try await waitUntil { await fixture.replies.answerRequests == [3] }
         await fixture.model.selectAgent(4, manageFollowUpQueue: false)
+        let began = ContinuousClock.now
         let returning = Task { await fixture.model.selectAgent(3, manageFollowUpQueue: false) }
         try await waitUntil { await fixture.replies.answerRequests.filter { $0 == 3 }.count == 2 }
         #expect(fixture.model.selectedAgent == 3)
@@ -720,7 +761,11 @@ struct AgentPreloadTests {
         #expect(fixture.model.selectedAgent == 3)
         #expect(fixture.model.pendingAgentSelection == nil)
         #expect(fixture.model.transcripts[3]?.finalMessage == "Candidate 3")
+        let key = WorkspaceRunViewKey(machineID: fixture.model.currentMachineContextID,
+            workspaceID: fixture.workspaceID, runID: fixture.runID)
+        try await waitUntil { fixture.model.runViewStateStore.snapshot(for: key)?.historyLoaded == true }
         #expect(!fixture.model.isSelectedTimelineLoading)
+        #expect(began.duration(to: .now) < .seconds(1))
     }
 
     @Test
@@ -800,7 +845,11 @@ struct AgentPreloadTests {
         payload["eventCount"] = 4
         model.activeRun = try JSONDecoder().decode(RunSummary.self, from: JSONSerialization.data(withJSONObject: payload))
         await fixture.replies.advance()
-        try await waitUntil { model.transcripts[3]?.finalMessage == "Updated candidate 3" }
+        // Answer and work reads are independent: both must advance, without
+        // making the assertion depend on which response is published first.
+        try await waitUntil {
+            model.transcripts[3]?.finalMessage == "Updated candidate 3" && model.transcripts[3]?.cursor == 4
+        }
         #expect(model.transcripts[3]?.cursor == 4)
         #expect(model.transcripts[3]?.finalMessageHasMore == false)
         #expect(model.selectedAgent == 1)
@@ -845,6 +894,12 @@ struct AgentPreloadTests {
         var droppedSelectionReceipts = 0
         var continuationRequests: [Int] = []
         var continuationCommandIDs: [String] = []
+        var queuedPayload: [String: Any]?
+        var queueReplacementRequests = 0
+
+        func installQueue(_ data: Data) throws {
+            queuedPayload = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
 
         func holdSelection(_ agent: Int) { pausedSelection = agent }
         func rejectSelection() { rejectedSelection = true }
@@ -897,6 +952,18 @@ struct AgentPreloadTests {
         func reply(action: String, agent: Int, cursor: Int, finalCursor: Int, includeEvents: Bool,
                    conversationOnly: Bool,
                    workspaceID: String, commandID: String) async throws -> Data {
+            if action == "followups.replace" { queueReplacementRequests += 1 }
+            if action == "followups.get", let queue = queuedPayload {
+                return try JSONSerialization.data(withJSONObject: ["ok": true, "body": [
+                    "revision": selectionRevision, "queue": queue,
+                ]]) + Data([10])
+            }
+            if action == "runs.history" {
+                return try JSONSerialization.data(withJSONObject: ["ok": true, "body": [
+                    "workspace": "/qa", "cursor": cursor, "next_cursor": cursor,
+                    "has_more": false, "total_entries": 0, "entries": []
+                ]]) + Data([10])
+            }
             if action == "system.capabilities" {
                 return try JSONSerialization.data(withJSONObject: ["ok": true, "body": [
                     "daemon_version": "0.1.70", "command_receipt_store_id": "selection-fixture",
@@ -922,6 +989,14 @@ struct AgentPreloadTests {
                 if droppedSelectionReceipts > 0 {
                     droppedSelectionReceipts -= 1
                     return Data()
+                }
+                if var queue = queuedPayload {
+                    queue["selected_agent"] = agent
+                    queue["selection_source"] = "manual"
+                    queuedPayload = queue
+                    return try JSONSerialization.data(withJSONObject: ["ok": true, "body": [
+                        "revision": selectionRevision, "queue": queue,
+                    ]]) + Data([10])
                 }
                 return try JSONSerialization.data(withJSONObject: ["ok": true, "body": [
                     "revision": selectionRevision, "queue": ["workspace_id": workspaceID,
@@ -1075,6 +1150,8 @@ struct AgentPreloadTests {
             model.selectedWorkspaceID = workspaceID
             model.activeRun = run
             model.selectedAgent = 1
+            model.settings.model = "gpt-6.1-sol"
+            model.settings.synthesisModel = "gpt-6-astra"
             model.transcripts[1] = AgentTranscript(sourceRunID: runID, sourceAgent: 1,
                 cursor: 2, hasMore: false, finalMessage: "Candidate 1", finalMessageHasMore: false,
                 finalMessageReadStatus: "success")

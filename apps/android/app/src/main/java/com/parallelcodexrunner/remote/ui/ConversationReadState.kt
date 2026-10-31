@@ -3,7 +3,11 @@ package com.parallelcodexrunner.remote.ui
 import com.parallelcodexrunner.remote.data.RemoteCommandException
 import com.parallelcodexrunner.remote.data.isPermanentRemoteCommandRejection
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 
 enum class ConversationReadPhase { IDLE, LOADING, READY, FAILED }
 
@@ -68,8 +72,41 @@ internal class ConversationReadStateStore(
 ) {
     private var nextRequestId = 0L
     private val states = mutableMapOf<WorkspaceRunKey, ConversationReadState>()
+    private class SharedRead(var pageLimit: Int, val task: Deferred<Unit>)
+    private val sharedReads = mutableMapOf<Pair<WorkspaceRunKey, ConversationReadTarget>, SharedRead>()
 
     operator fun get(key: WorkspaceRunKey): ConversationReadState = states[key] ?: ConversationReadState()
+
+    // Owned by the ViewModel, not a navigation waiter. Polling and selection
+    // must not invalidate each other's cursor while reading the same Agent.
+    suspend fun readShared(
+        scope: CoroutineScope,
+        key: WorkspaceRunKey,
+        target: ConversationReadTarget,
+        pageLimit: Int = 1,
+        block: suspend (() -> Int) -> Unit,
+    ) {
+        val identity = key to target
+        val request = sharedReads[identity] ?: run {
+            lateinit var shared: SharedRead
+            lateinit var created: Deferred<Unit>
+            created = scope.async(start = CoroutineStart.LAZY) {
+                try {
+                    read(key, target) {
+                        block { shared.pageLimit }
+                    }
+                } finally {
+                    if (sharedReads[identity]?.task === created) sharedReads.remove(identity)
+                }
+            }
+            shared = SharedRead(pageLimit.coerceAtLeast(1), created)
+            shared.also { sharedReads[identity] = it }
+        }
+        // A foreground waiter can promote an existing four-page poll without
+        // starting a competing reader or resetting its cursor.
+        request.pageLimit = maxOf(request.pageLimit, pageLimit)
+        request.task.await()
+    }
 
     suspend fun <T> read(
         key: WorkspaceRunKey,
@@ -104,6 +141,8 @@ internal class ConversationReadStateStore(
     }
 
     fun removeWhere(predicate: (WorkspaceRunKey) -> Boolean) {
+        val obsolete = sharedReads.keys.filter { predicate(it.first) }
+        obsolete.forEach { sharedReads.remove(it)?.task?.cancel() }
         states.keys.removeAll(predicate)
         onChange(states.mapKeys { it.key.encoded })
     }

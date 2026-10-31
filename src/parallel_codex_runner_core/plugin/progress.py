@@ -35,9 +35,15 @@ class RunProgressProjection:
     candidate_generation: int = 0
     synthesis_generations: dict[int, int] = field(default_factory=dict)
 
-    def refresh(self, events: EventLog, run_id: str, event_count: int) -> None:
+    def refresh(
+        self, events: EventLog, run_id: str, event_count: int, *, max_pages: int | None = None,
+    ) -> None:
+        pages = 0
         while self.cursor < event_count:
+            if max_pages is not None and pages >= max_pages:
+                break
             page = events.read(run_id, cursor=self.cursor, limit=1000)
+            pages += 1
             for event in page["events"]:
                 self.apply(event)
             next_cursor = page["next_cursor"]

@@ -149,7 +149,7 @@ class FileBackedCandidateCoordinator(LiveCandidateCoordinator):
                 write_json_atomic(
                     self.path,
                     {
-                        "accepting": bool(payload.get("accepting")),
+                        **payload,
                         "requests": [],
                     },
                 )
@@ -163,12 +163,12 @@ class FileBackedCandidateCoordinator(LiveCandidateCoordinator):
             if requests:
                 write_json_atomic(
                     self.path,
-                    {"accepting": True, "requests": []},
+                    {**payload, "accepting": True, "requests": []},
                 )
             else:
                 write_json_atomic(
                     self.path,
-                    {"accepting": False, "requests": []},
+                    {**payload, "accepting": False, "requests": []},
                 )
         if requests:
             self._prepare_signals(requests)
@@ -319,7 +319,10 @@ def _manager_operation(
     # Import before any task can edit PCR, then keep this process's module objects.
     from ..plugin_runtime import PluginRunManager
 
-    manager = PluginRunManager(state_dir, detached_workers=False)
+    # The daemon owns global maintenance. A result operation must not start
+    # unrelated answer delivery or cleanup while its receipt is pending.
+    manager = PluginRunManager(state_dir, detached_workers=False, run_maintenance=False,
+                               reconcile_run_id=run.run_id)
     try:
         if operation == "finalize":
             return manager._accept_agent(
@@ -371,6 +374,7 @@ def _execute_request(
     fingerprint = request.get("retained_startup_fingerprint")
     execution_fingerprints = request.get("retained_execution_fingerprints")
     synthesis_preparations = request.get("synthesis_preparation_fingerprints")
+    external_shutdown_recovery = bool(request.get("external_shutdown_recovery"))
     if synthesis_preparations is not None and (
         operation != "retry" or fingerprint is not None or execution_fingerprints is not None
         or agent_role != AGENT_ROLE_SYNTHESIS or bool(request.get("refresh_synthesis"))
@@ -381,14 +385,17 @@ def _execute_request(
     ):
         raise RuntimeError("Synthesis preparation recovery must match the exact unsubmitted synthesis slots")
     if execution_fingerprints is not None and (
-        operation != "retry" or fingerprint is not None or agent_role != "candidate"
+        operation != "retry" or fingerprint is not None
+        or any(run.agent_roles.get(idx) != agent_role for idx in indices)
         or not isinstance(execution_fingerprints, dict)
         or set(execution_fingerprints) != {str(idx) for idx in indices}
         or retry_indices != set(indices) or not indices
         or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
                for value in execution_fingerprints.values())
     ):
-        raise RuntimeError("Retained execution recovery must match the exact candidate retry request")
+        raise RuntimeError("Retained execution recovery must match the exact retry request")
+    if external_shutdown_recovery and execution_fingerprints is None:
+        raise RuntimeError("External shutdown recovery requires retained execution bindings")
     if fingerprint is not None and (
         operation != "retry" or not isinstance(fingerprint, str) or len(fingerprint) != 64
         or len(indices) != 1 or retry_indices != set(indices)
@@ -521,22 +528,60 @@ def _execute_request(
                         if int(value) > 0
                     }
                     if agent_role == AGENT_ROLE_SYNTHESIS:
-                        run_synthesis_refresh(
-                            args=args,
-                            prompt=run.prompt,
-                            run_root=Path(run.run_root),
-                            workspace=artifacts.workspace(run),
-                            recorded_results=recorded_results,
-                            resume_session_id=run.config.get("resume_session_id"),
-                            progress_callback=report,
-                            cancel_event=cancel,
-                            agent_cancel_events=agent_signals,
-                            synthesis_indices=selected,
-                            retry_synthesis_indices=retry_indices,
-                            recommendation_excluded_indices=rejected,
-                            synthesis_preparation_fingerprints=({int(idx): value for idx, value in synthesis_preparations.items()}
-                                if synthesis_preparations is not None else None),
-                        )
+                        if execution_fingerprints is not None:
+                            report({
+                                "type": "synthesis_started",
+                                "indices": selected,
+                                "source_agents": [result.idx for result in recorded_results
+                                                   if result.role == "candidate" and result.status == "success"],
+                                "refresh": True,
+                            })
+                            results = run_additional_agents(
+                                args=args,
+                                prompt=run.prompt,
+                                agent_indices=selected,
+                                run_root=Path(run.run_root),
+                                workspace=artifacts.workspace(run),
+                                resume_session_id=run.config.get("resume_session_id"),
+                                retry_indices=retry_indices,
+                                progress_callback=report,
+                                cancel_event=cancel,
+                                agent_cancel_events=agent_signals,
+                                agent_role=agent_role,
+                                recommendation_excluded_indices=rejected,
+                                synthesis_source_agents=[result.idx for result in recorded_results
+                                                         if result.role == "candidate" and result.status == "success"],
+                                synthesis_requested_agents=int(run.config.get("synthesis_agents") or 0),
+                                synthesis_status="completed",
+                                retained_execution_fingerprints={int(idx): value for idx, value in execution_fingerprints.items()},
+                                external_shutdown_recovery=external_shutdown_recovery,
+                            )
+                            report({
+                                "type": "synthesis_finished",
+                                "indices": selected,
+                                "source_agents": [result.idx for result in recorded_results
+                                                   if result.role == "candidate" and result.status == "success"],
+                                "success": sum(result.status == "success" for result in results),
+                                "cancelled": cancel.is_set(),
+                                "refresh": True,
+                            })
+                        else:
+                            run_synthesis_refresh(
+                                args=args,
+                                prompt=run.prompt,
+                                run_root=Path(run.run_root),
+                                workspace=artifacts.workspace(run),
+                                recorded_results=recorded_results,
+                                resume_session_id=run.config.get("resume_session_id"),
+                                progress_callback=report,
+                                cancel_event=cancel,
+                                agent_cancel_events=agent_signals,
+                                synthesis_indices=selected,
+                                retry_synthesis_indices=retry_indices,
+                                recommendation_excluded_indices=rejected,
+                                synthesis_preparation_fingerprints=({int(idx): value for idx, value in synthesis_preparations.items()}
+                                    if synthesis_preparations is not None else None),
+                            )
                     else:
                         run_additional_agents(
                             args=args,
@@ -555,6 +600,7 @@ def _execute_request(
                             retained_startup_fingerprint=request.get("retained_startup_fingerprint"),
                             retained_execution_fingerprints=({int(idx): value for idx, value in execution_fingerprints.items()}
                                 if execution_fingerprints is not None else None),
+                            external_shutdown_recovery=external_shutdown_recovery,
                         )
                         if refresh_synthesis and not cancel.is_set():
                             recorded_results = []

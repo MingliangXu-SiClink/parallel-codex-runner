@@ -8,6 +8,34 @@ import org.junit.Test
 
 class MarkdownTranscriptTest {
     @Test
+    fun prewarmingSkipsEntriesThatCannotBeCachedWithoutChangingTheTranscript() {
+        val oversized = "x".repeat(300_001)
+        val contents = listOf("earlier", "", oversized, "latest")
+
+        assertEquals(listOf("earlier", "latest"), markdownPrewarmContents(contents))
+        assertEquals(oversized, contents[2])
+    }
+
+    @Test
+    fun prewarmingKeepsTheRecentSuffixWithinBothCacheBudgets() {
+        val contents = listOf("older", "one", "two", "three")
+
+        assertEquals(listOf("two", "three"), markdownPrewarmContents(contents, maxEntries = 2))
+        assertEquals(listOf("two", "three"), markdownPrewarmContents(contents, maxCharacters = 8))
+        assertEquals(listOf("three"), markdownPrewarmContents(contents, maxCharacters = 7))
+        assertEquals(emptyList<String>(), markdownPrewarmContents(contents, maxCharacters = 0))
+        assertEquals(emptyList<String>(), markdownPrewarmContents(contents, maxEntries = 0))
+    }
+
+    @Test
+    fun repeatedMessagesConsumeOnePrewarmSlotButRemainInTheConversation() {
+        val contents = listOf("same", "other", "same")
+
+        assertEquals(listOf("other", "same"), markdownPrewarmContents(contents, maxEntries = 2))
+        assertEquals(3, contents.size)
+    }
+
+    @Test
     fun compactTablesFitBeforeTheyBecomeScrollable() {
         assertEquals(
             360.dp,

@@ -2,6 +2,24 @@ import Foundation
 
 @MainActor
 extension AppModel {
+    private func readSystemHealth(target: PcrdRequestTarget) async throws -> HealthResponse {
+        if let reading = healthReadTasks[target.machineID] { return try await reading.value }
+        let client = client
+        let reading = Task {
+            try await client.call(target: target, "system.health", body: EmptyBody(),
+                priority: .utility, response: HealthResponse.self)
+        }
+        healthReadTasks[target.machineID] = reading
+        defer { healthReadTasks.removeValue(forKey: target.machineID) }
+        return try await reading.value
+    }
+
+    private func confirmReachability(target: PcrdRequestTarget) async throws {
+        let reply: ReachabilityResponse = try await client.call(target: target, "system.ping",
+            body: EmptyBody(), timeoutSeconds: 3, priority: .userInitiated)
+        guard reply.status == "ok" else { throw PcrdClientError.invalidResponse }
+    }
+
     func refresh(
         reportErrors: Bool = true,
         forceMachineDirectoryRefresh: Bool = false
@@ -14,6 +32,7 @@ extension AppModel {
             }
         }
         var requestMachineID = currentMachineContextID
+        var reachableTarget: PcrdRequestTarget?
         do {
             try await prepareMachineTarget(
                 forceDirectoryRefresh: forceMachineDirectoryRefresh
@@ -29,11 +48,18 @@ extension AppModel {
                     "The connected server does not support system.health."
                 )
             }
-            let health: HealthResponse = try await client.call(
-                target: target,
-                "system.health",
-                body: EmptyBody()
-            )
+            if capabilities.supports("system.ping") {
+                try await confirmReachability(target: target)
+                guard isCurrentMachine(target.machineID), requestID == refreshRequestID else { return }
+                reachableTarget = target
+                daemonOnline = true
+                connectionLoading = false
+                connectionErrorMessage = nil
+                statusText = "Connected"
+                relayBootstrapRetryAfter = .distantPast
+                resumePendingPromptSubmissions()
+            }
+            let health = try await readSystemHealth(target: target)
             guard isCurrentMachine(target.machineID),
                   requestID == refreshRequestID else { return }
             appliedRefreshRequestID = requestID
@@ -41,6 +67,7 @@ extension AppModel {
             if daemonOnline != nextDaemonOnline { daemonOnline = nextDaemonOnline }
             if connectionLoading { connectionLoading = false }
             if connectionErrorMessage != nil { connectionErrorMessage = nil }
+            statusRefreshErrorMessage = nil
             let nextStatusText = nextDaemonOnline ? "Connected" : health.status
             if statusText != nextStatusText { statusText = nextStatusText }
             let previousWorkspaceID = selectedWorkspaceID
@@ -117,6 +144,19 @@ extension AppModel {
         } catch {
             guard requestID == refreshRequestID,
                   isCurrentMachine(requestMachineID) else { return }
+            if let target = reachableTarget,
+               (try? await confirmReachability(target: target)) != nil {
+                guard requestID == refreshRequestID, isCurrentMachine(requestMachineID) else { return }
+                appliedRefreshRequestID = requestID
+                daemonOnline = true
+                connectionLoading = false
+                connectionErrorMessage = nil
+                statusText = "Connected"
+                statusRefreshErrorMessage = appLanguage.text("状态刷新失败：", "Status refresh failed: ")
+                    + appLanguage.userMessage(for: error)
+                return
+            }
+            guard requestID == refreshRequestID, isCurrentMachine(requestMachineID) else { return }
             appliedRefreshRequestID = requestID
             if daemonOnline { daemonOnline = false }
             if connectionLoading { connectionLoading = false }
@@ -128,7 +168,8 @@ extension AppModel {
                 systemCapabilities = nil
             }
             let message = appLanguage.userMessage(for: error)
-            if reportErrors, connectionErrorMessage != message {
+            statusRefreshErrorMessage = nil
+            if connectionErrorMessage != message {
                 connectionErrorMessage = message
             }
         }
@@ -602,6 +643,9 @@ extension AppModel {
             )
         }
         systemCapabilitiesByMachine[target.machineID] = capabilities
+        if modelOptionsCache.selectScope(capabilities.modelCatalogContext, machineID: target.machineID) {
+            modelOptionsRevision &+= 1
+        }
         if isCurrentMachine(target.machineID) { systemCapabilities = capabilities }
         return capabilities
     }

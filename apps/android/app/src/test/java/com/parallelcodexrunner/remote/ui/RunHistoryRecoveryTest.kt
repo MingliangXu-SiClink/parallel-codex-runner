@@ -17,6 +17,24 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RunHistoryRecoveryTest {
+    @Test fun recoveryOnlyPagesAdvanceAndKeepOriginalIdsWithoutShowingControlBubbles() = runBlocking {
+        val text = "Continue the unfinished task from its saved progress, without restarting completed work."
+        val cursors = mutableListOf<Int>()
+        val raw = readCompleteResumeHistory { cursor ->
+            cursors += cursor
+            if (cursor == 0) ResumeHistoryPage(0, 6, true, (0..5).map {
+                ResumeHistoryEntry("user", text, "recovery-$it", inputOrigin = "pcr_recovery")
+            }) else ResumeHistoryPage(6, 7, false, listOf(ResumeHistoryEntry("user", text, "human")))
+        }
+        assertEquals(listOf(0, 6), cursors)
+        assertEquals(7, raw.size)
+        assertEquals(listOf("human"), MobileTranscriptFormatter.visibleBlocks(raw, "", MobileAgentTranscript()).map { it.id })
+        val old = raw.map { it.copy(inputOrigin = "") }
+        assertEquals(raw, mergeConversationHistory(old, raw))
+        assertEquals(raw, mergeConversationHistory(raw, old))
+        assertEquals(raw, mergeConversationHistory(old, raw.take(6)))
+    }
+
     private val key = WorkspaceRunKey("mac", "workspace", "old-run")
     private val conversation = ConversationRecord(
         conversationId = "conversation", workspaceId = key.workspaceId,

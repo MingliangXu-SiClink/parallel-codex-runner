@@ -173,18 +173,18 @@ MainActor.assumeIsolated {
     )
     NativeMultilineEditorCommitRegistry.shared.unregister(nativeEditorCommitProbe)
 }
-let localizedModelChoices = codexOptionChoices(
+let localizedModelChoices = codexModelChoices(
     dynamic: [
         CodexOption(label: "default (gpt-5.6-sol)", value: "", selected: true),
         CodexOption(label: "gpt-5.6-luna", value: "gpt-5.6-luna", selected: false),
     ],
     current: "",
-    fallbackLabel: localizedDefaultModelLabel("gpt-5.6-sol", language: .chinese)
+    effective: "gpt-5.6-sol"
 )
 require(
-    localizedModelChoices.first?.label == "默认（gpt-5.6-sol）"
-        && localizedModelChoices.filter { $0.value.isEmpty }.count == 1,
-    "A server-provided English default option overrides the localized model label"
+    localizedModelChoices.allSatisfy { !$0.value.isEmpty }
+        && localizedModelChoices.contains { $0.value == "gpt-5.6-sol" && $0.selected },
+    "Model menus must select a concrete model and never expose an implicit default"
 )
 require(
     localizedAutomaticCodexLabel("auto (fast)", language: .chinese) == "自动（开启）",

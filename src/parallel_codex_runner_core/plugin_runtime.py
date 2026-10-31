@@ -36,6 +36,7 @@ from .app import (
     promote_best_codex_session_to_workspace,
     retained_resume_preparation,
     retained_execution_preparation,
+    configuration_failed_before_input,
     agent_execution_workspace,
     run_additional_agents,
     run_once,
@@ -124,11 +125,12 @@ from .plugin.state import (
     utc_now as _utc_now,
 )
 from .run_statuses import TERMINAL_AGENT_STATUSES
-from .visible_paths import WorkspacePathMapping, rewrite_workspace_references
+from .visible_paths import WorkspacePathMapping, WorkspaceReferenceState, rewrite_workspace_references
 
 
 ACTIVE_RUN_STATES = {"preparing", "running", "stopping"}
 FINAL_RUN_STATES = {"finalized", "discarded"}
+REPLAY_ONLY_PROGRESS_EVENTS = frozenset({"agent_line", "agent_tokens", "agent_phase", "run_phase"})
 MAX_EVENT_PAGE = 250
 DEFAULT_EVENT_PAGE_BYTES = 512 * 1024
 MAX_EVENT_PAGE_BYTES = 640 * 1024
@@ -145,7 +147,7 @@ MAX_STORAGE_SUMMARY_RUNS = 100
 UNMANAGED_STORAGE_CACHE_SECONDS = 30.0
 CANDIDATE_CLEANUP_RETRY_SECONDS = 60.0
 RUN_ID_PATTERN = re.compile(r"^pcr-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
-RESUME_CACHE_SIZE = 8
+RESUME_CACHE_SIZE = 32
 RESUME_COMPLETE_CACHE_SECONDS = 30.0
 RESUME_INCOMPLETE_CACHE_SECONDS = 2.0
 
@@ -332,6 +334,7 @@ def _history_payloads(
     entries: Sequence[Any],
     *,
     path_mappings: Sequence[WorkspacePathMapping] = (),
+    reference_state: WorkspaceReferenceState | None = None,
 ) -> list[Dict[str, Any]]:
     """Split only protocol-sized history entries on UTF-8 boundaries."""
     payloads: list[Dict[str, Any]] = []
@@ -342,10 +345,12 @@ def _history_payloads(
             payload.pop("id", None)
         if not str(payload.get("turn_id") or "").strip():
             payload.pop("turn_id", None)
+        if not payload.get("input_origin"):
+            payload.pop("input_origin", None)
         text = str(payload.get("text") or "")
         category = str(payload.get("category") or "").strip().casefold()
         if category in {"output", "assistant", "agent_message"}:
-            text = rewrite_workspace_references(text, path_mappings)
+            text = rewrite_workspace_references(text, path_mappings, state=reference_state)
             payload["text"] = text
         encoded = text.encode("utf-8")
         if len(encoded) <= MAX_HISTORY_ENTRY_TEXT_BYTES:
@@ -370,6 +375,37 @@ def _history_payloads(
             payloads.append(fragment)
             start = end
     return payloads
+
+
+class _HistorySnapshot:
+    def __init__(self, entries: Sequence[Any]) -> None:
+        self.entries = tuple(entries)
+        self._lock = threading.Lock()
+        self._projections: LruCache[tuple[Any, ...], tuple[list[Dict[str, Any]], int, WorkspaceReferenceState]] = LruCache(2)
+
+    def project(self, legacy_prompt: str, conversation_only: bool,
+                mappings: Sequence[WorkspacePathMapping]) -> tuple[list[Dict[str, Any]], int]:
+        key = legacy_prompt, conversation_only, tuple(mappings)
+        # Pagination shares a rendered snapshot, not a new full-history rewrite
+        # for each 100 entries. Only readers of this same history wait here.
+        with self._lock:
+            cached = self._projections.get(key)
+            if cached is not None and cached[2].is_current():
+                return cached[0], cached[1]
+            history = self.entries
+            if legacy_prompt:
+                normalized = " ".join(legacy_prompt.split())
+                for index in range(len(history) - 1, -1, -1):
+                    if history[index].category == "user" and " ".join(history[index].text.split()) == normalized:
+                        history = history[:index]
+                        break
+            source_count = len(history)
+            if conversation_only:
+                history = tuple(entry for entry in history if entry.category in {"user", "output"})
+            state = WorkspaceReferenceState()
+            payloads = _history_payloads(history, path_mappings=mappings, reference_state=state)
+            self._projections.put(key, (payloads, source_count, state))
+            return payloads, source_count
 
 
 def _validated_agent_count(value: int, name: str, *, allow_zero: bool = False) -> int:
@@ -508,6 +544,7 @@ class PluginRunManager:
         enforce_storage_quota: bool = True,
         retain_history: bool = False,
         run_maintenance: bool = True,
+        reconcile_run_id: str | None = None,
     ) -> None:
         self.state_dir = (state_dir or default_plugin_state_dir()).expanduser().resolve()
         self.events_dir = self.state_dir / "events"
@@ -517,6 +554,7 @@ class PluginRunManager:
         self._state_store = JsonStateStore(self.state_dir)
         self._events = EventLog(self.events_dir)
         self._progress_cache: LruCache[str, RunProgressProjection] = LruCache(256)
+        self._progress_reading: set[str] = set()
         self._artifacts = ArtifactStore()
         self._live_diffs = LiveDiffSnapshots()
         self._model_catalog: CodexModelCacheManager | None = None
@@ -528,8 +566,13 @@ class PluginRunManager:
         self._lock = threading.RLock()
         self._runs: Dict[str, ManagedRun] = {}
         self._contexts: Dict[str, _RunContext] = {}
+        self._event_read_locks: dict[str, threading.Lock] = {}
+        self._event_dirty_runs: set[str] = set()
         self._worker_processes: Dict[str, Any] = {}
-        self._resume_cache: LruCache[tuple[Any, ...], tuple[Any, list[Any]]] = (
+        self._resume_cache: LruCache[tuple[Any, ...], tuple[Any, _HistorySnapshot]] = (
+            LruCache(RESUME_CACHE_SIZE)
+        )
+        self._resume_session_cache: LruCache[tuple[Any, ...], tuple[Any, float, list[Any]]] = (
             LruCache(RESUME_CACHE_SIZE)
         )
         self._resume_condition = threading.Condition(threading.RLock())
@@ -546,14 +589,7 @@ class PluginRunManager:
         self._run_operations: Dict[str, str] = {}
         self._async_answer_dispatching: set[str] = set()
         self._async_answer_retry_after: dict[str, float] = {}
-        # Reads (health, runs.list, turns.get) previously re-parsed runs.json
-        # on every call while holding self._lock, serializing all concurrent
-        # clients. Cache the file's (mtime_ns, size) so we only re-parse when
-        # the file actually changed. This is safe across processes: any writer
-        # (worker or peer manager) does an atomic os.replace which always
-        # changes mtime. Unlike a time-based throttle, a stale cache is
-        # impossible because a write always produces a new file stamp.
-        self._state_file_stamp: tuple[int, int] | None = None  # (mtime_ns, size)
+        self._state_file_stamp: tuple[int, int, int, int] | None = None
         self._closed = False
         self._cleanup_stop = threading.Event()
         self._cleanup_thread: threading.Thread | None = None
@@ -578,7 +614,7 @@ class PluginRunManager:
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self._harden_path(self.state_dir, 0o700)
         self._harden_path(self.events_dir, 0o700)
-        self._load_state()
+        self._load_state(reconcile_run_id=reconcile_run_id)
         if run_maintenance:
             self._run_maintenance_locked()
 
@@ -602,9 +638,9 @@ class PluginRunManager:
                 f"{reason}; the invalid state could not be preserved: {exc}"
             )
 
-    def _load_state(self) -> None:
+    def _load_state(self, *, reconcile_run_id: str | None = None) -> None:
         try:
-            payload = self._state_store.load_payload()
+            payload, stamp = self._state_store.load_snapshot()
         except FileNotFoundError:
             return
         except OSError as exc:
@@ -634,6 +670,7 @@ class PluginRunManager:
                 "Plugin state does not contain a run list"
             )
             return
+        self._state_file_stamp = stamp
         # Version 4 only introduced additive fields. Rewrite it as the stable
         # version-3 envelope so already-running version-3 workers do not reject
         # the shared state after pcrd itself has been upgraded.
@@ -645,6 +682,8 @@ class PluginRunManager:
             if not RUN_ID_PATTERN.fullmatch(run.run_id):
                 continue
             self._runs[run.run_id] = run
+            if reconcile_run_id is not None and run.run_id != reconcile_run_id:
+                continue
             if run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid:
                 if self._refresh_events_locked(run, save=False):
                     changed = True
@@ -670,11 +709,21 @@ class PluginRunManager:
         deleted_run_ids: set[str] | None = None,
     ) -> None:
         deleted = deleted_run_ids or set()
+        started = time.monotonic()
         with self._state_store.locked():
+            acquired = time.monotonic()
             try:
-                payload = self._state_store.load_payload()
-            except (OSError, ValueError):
-                payload = None
+                current_stamp = self._state_store.stamp(self.state_path.stat())
+            except OSError:
+                current_stamp = None
+            payload = None
+            # Recheck after acquiring the writer lock: a peer may publish while
+            # we wait. Our exact loaded/published generation needs no re-parse.
+            if current_stamp is None or current_stamp != self._state_file_stamp:
+                try:
+                    payload = self._state_store.load_payload()
+                except (OSError, ValueError):
+                    pass
             if isinstance(payload, dict) and isinstance(payload.get("runs"), list):
                 for value in payload["runs"]:
                     if not isinstance(value, dict):
@@ -693,15 +742,18 @@ class PluginRunManager:
                 for run in self._runs.values():
                     run.expires_at = ""
             self._state_store.write_runs(self._runs)
+            # Capture our own publication before releasing the writer lock.
+            # A peer's later replacement must trigger a new read, not be stamped
+            # as if it were the in-memory state that we just wrote.
+            self._state_file_stamp = self._state_store.stamp(self.state_path.stat())
+            self._event_dirty_runs.clear()
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow state publication: writer_wait=%.3fs merge_encode_sync=%.3fs runs=%d",
+                acquired - started, finished - acquired, len(self._runs),
+            )
         self._harden_path(self.state_path, 0o600)
-        # Record the stamp of the file we just wrote so the in-memory state
-        # (already current) is not overwritten by a redundant re-parse on the
-        # next read. A peer process's stale stamp still differs and re-loads.
-        try:
-            st = self.state_path.stat()
-            self._state_file_stamp = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            self._state_file_stamp = None
 
     def _create_context(
         self,
@@ -743,35 +795,20 @@ class PluginRunManager:
         self._refresh_events_locked(run, save=False)
 
     def _sync_state_from_disk_locked(self, *, force: bool = False) -> None:
-        # Check mtime+size of runs.json before acquiring the cross-process lock
-        # and re-parsing JSON. Any writer (worker or peer manager instance) does
-        # an atomic os.replace which always updates the mtime. This avoids
-        # redundant JSON parsing on rapid read bursts while remaining correct
-        # across multiple processes sharing the same state_dir — unlike a pure
-        # time-based throttle, a stale cache is impossible because a write always
-        # changes the file stamp.
         state_path = self._state_store.path
         try:
-            st = state_path.stat()
-            current_stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+            current_stamp = self._state_store.stamp(state_path.stat())
         except OSError:
             current_stamp = None
         if not force and current_stamp is not None and current_stamp == self._state_file_stamp:
             return
         try:
-            with self._state_store.locked():
-                payload = self._state_store.load_payload()
-                # Re-stat after acquiring the lock so we capture the stamp of
-                # the file we actually read, not a newer concurrent write.
-                try:
-                    st2 = state_path.stat()
-                    self._state_file_stamp = (st2.st_mtime_ns, st2.st_size)
-                except OSError:
-                    self._state_file_stamp = None
+            payload, stamp = self._state_store.load_snapshot()
         except (OSError, ValueError):
             return
         if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
             return
+        self._state_file_stamp = stamp
         disk_run_ids: set[str] = set()
         for value in payload["runs"]:
             if not isinstance(value, dict):
@@ -789,17 +826,96 @@ class PluginRunManager:
             if not self._worker_active_locked(run):
                 self._runs.pop(run_id, None)
 
-    def _require_run_locked(self, run_id: str) -> ManagedRun:
+    def _require_run_locked(self, run_id: str, *, refresh_events: bool = True) -> ManagedRun:
         self._sync_state_from_disk_locked()
         run = self._runs.get(run_id)
         if run is None:
             raise PluginRunError(f"Unknown PCR run: {run_id}")
-        changed = self._refresh_events_locked(run, save=False)
+        # Event replay is already durable in the log. A reader must not rewrite
+        # the entire shared checkpoint just to observe the owner's progress.
+        changed = run_id in self._event_dirty_runs and (
+            refresh_events or run.status not in ACTIVE_RUN_STATES
+        )
+        if refresh_events:
+            changed = self._refresh_events_locked(run, save=False) or changed
+        else:
+            changed = self._revalidate_unchanged_synthesis_locked(run) or changed
         if self._uses_persistent_worker(run):
             changed = self._detect_worker_failure_locked(run) or changed
         if changed:
             self._save_state_locked()
         return run
+
+    def _reconcile_read_events(self, run_id: str, *, max_pages: int | None = None) -> bool:
+        """Read a fixed tail outside the manager lock; commit contiguous pages only."""
+        with self._lock:
+            read_lock = self._event_read_locks.setdefault(run_id, threading.Lock())
+        # A duplicate observer may wait for this run, never for another workspace.
+        with read_lock:
+            end_cursor = None
+            pages = 0
+            while True:
+                with self._lock:
+                    self._sync_state_from_disk_locked()
+                    run = self._runs.get(run_id)
+                    if run is None:
+                        return False
+                    cursor = run.event_count
+                    if end_cursor is not None and cursor >= end_cursor:
+                        return True
+                page = self._events.read(run_id, cursor=cursor, limit=1000,
+                                         end_cursor=end_cursor)
+                if end_cursor is None:
+                    end_cursor = page["total"]
+                with self._lock:
+                    self._sync_state_from_disk_locked()
+                    current = self._runs.get(run_id)
+                    # A command or peer worker already incorporated this page.
+                    # Never publish an old owner/result snapshot over its state.
+                    if current is not run or current.event_count != cursor:
+                        continue
+                    for payload in page["events"]:
+                        self._apply_progress_locked(current, payload)
+                        if str(payload.get("type") or "") not in REPLAY_ONLY_PROGRESS_EVENTS:
+                            self._event_dirty_runs.add(run_id)
+                    current.event_count = page["next_cursor"]
+                    complete = current.event_count >= end_cursor
+                pages += 1
+                if complete:
+                    return True
+                if page["next_cursor"] <= cursor or (max_pages is not None and pages >= max_pages):
+                    return False
+
+    def _refresh_read_progress(self, run_id: str) -> None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run_id in self._progress_reading:
+                return
+            needed = any(status not in TERMINAL_AGENT_STATUSES
+                         or (run.results.get(idx) or {}).get("seconds") is None
+                         for idx, status in run.agent_statuses.items())
+            projection = self._progress_cache.get(run_id)
+            if projection is None:
+                if not needed:
+                    return
+                projection = RunProgressProjection()
+                self._progress_cache.put(run_id, projection)
+            cursor, count = projection.cursor, run.event_count
+            if cursor >= count:
+                return
+            updated = deepcopy(projection)
+            self._progress_reading.add(run_id)
+        try:
+            # Activity/timing is shared by all Agents. Concurrent readers must
+            # not replay the same cold page or wait on it to show conversation.
+            updated.refresh(self._events, run_id, count, max_pages=1)
+            with self._lock:
+                if (run_id in self._runs and self._progress_cache.get(run_id) is projection
+                    and projection.cursor == cursor):
+                    self._progress_cache.put(run_id, updated)
+        finally:
+            with self._lock:
+                self._progress_reading.discard(run_id)
 
     def _active_context_thread_locked(
         self,
@@ -920,6 +1036,11 @@ class PluginRunManager:
         return True
 
     def _detect_worker_failure_locked(self, run: ManagedRun) -> bool:
+        if (run.worker_state == "stopped" and run.worker_pid is None
+            and not run.worker_operation and run.status in FINAL_RUN_STATES):
+            # An already reconciled, finalized owner cannot emit another tail.
+            # Do not reopen every historical log on each live status request.
+            return False
         if not self._uses_persistent_worker(run):
             if run.status not in ACTIVE_RUN_STATES or self._worker_alive_locked(run):
                 return False
@@ -1324,7 +1445,10 @@ class PluginRunManager:
             run.worker_state = "stopped"
             run.worker_operation = ""
             run.worker_operation_id = ""
-        run.updated_at = str(payload.get("timestamp") or _utc_now())
+        # Display-only replay must not outvote a peer's newer business state
+        # when the shared checkpoint is merged. Activity keeps its event time.
+        if kind not in REPLAY_ONLY_PROGRESS_EVENTS:
+            run.updated_at = str(payload.get("timestamp") or _utc_now())
 
     def _refresh_events_locked(
         self,
@@ -1334,18 +1458,19 @@ class PluginRunManager:
     ) -> bool:
         changed = False
         durable_changed = False
+        end_cursor = None
         while True:
             page = self._events.read(
                 run.run_id,
                 cursor=run.event_count,
                 limit=1000,
+                end_cursor=end_cursor,
             )
+            if end_cursor is None:
+                end_cursor = page["total"]
             for payload in page["events"]:
                 self._apply_progress_locked(run, payload)
-                if str(payload.get("type") or "") not in {
-                    "agent_line",
-                    "agent_tokens",
-                }:
+                if str(payload.get("type") or "") not in REPLAY_ONLY_PROGRESS_EVENTS:
                     durable_changed = True
             if page["next_cursor"] != run.event_count:
                 changed = True
@@ -1367,7 +1492,7 @@ class PluginRunManager:
         if progress is None:
             progress = RunProgressProjection()
             self._progress_cache.put(run.run_id, progress)
-        progress.refresh(self._events, run.run_id, run.event_count)
+        progress.refresh(self._events, run.run_id, run.event_count, max_pages=1)
         sources = {idx: result_fingerprint(value) for idx, value in run.results.items()
             if value.get("status") == "success"
             and normalize_agent_role(value.get("role", run.agent_roles.get(idx))) == AGENT_ROLE_CANDIDATE}
@@ -1393,7 +1518,9 @@ class PluginRunManager:
         run_id: str,
         payload: Dict[str, Any],
     ) -> None:
-        save = str(payload.get("type") or "") not in {"agent_line", "agent_tokens"}
+        # Timings/activity are rebuilt from this run's event log. Publishing a
+        # phase must not rewrite every archived run on the execution path.
+        save = str(payload.get("type") or "") not in REPLAY_ONLY_PROGRESS_EVENTS
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
@@ -1535,13 +1662,19 @@ class PluginRunManager:
     def _next_worker_deadline(self) -> str:
         return utc_deadline(self.run_ttl_seconds) if self.run_ttl_seconds > 0 else ""
 
-    def _run_maintenance_locked(self) -> None:
+    def _run_maintenance_locked(self, run_ids: Sequence[str] | None = None,
+                                *, refresh_events: bool = True) -> None:
         now = time.time()
         retain_history = self.retains_history
-        changed = False
+        dirty = self._event_dirty_runs.intersection(run_ids) if run_ids is not None else self._event_dirty_runs
+        changed = any(refresh_events or self._runs[run_id].status not in ACTIVE_RUN_STATES
+                      for run_id in dirty if run_id in self._runs)
         removable: list[str] = []
-        for run in list(self._runs.values()):
-            if run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid:
+        runs = list(self._runs.values()) if run_ids is None else [
+            self._runs[run_id] for run_id in run_ids if run_id in self._runs
+        ]
+        for run in runs:
+            if refresh_events and (run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid):
                 if self._refresh_events_locked(run, save=False):
                     changed = True
             if self._detect_worker_failure_locked(run):
@@ -2285,7 +2418,6 @@ class PluginRunManager:
             if self._closed:
                 raise PluginRunError("PCR plugin runtime is shutting down")
             self._sync_state_from_disk_locked()
-            self._run_maintenance_locked()
 
         storage = self.estimate(
             str(source),
@@ -2536,10 +2668,25 @@ class PluginRunManager:
         matches.sort(key=lambda item: (item.created_at, item.run_id))
         return matches[-1], len(matches)
 
+    def _progress_projection_locked(
+        self, run: ManagedRun, *, needed: bool, refresh: bool,
+    ) -> RunProgressProjection | None:
+        projection = self._progress_cache.get(run.run_id)
+        if projection is None and needed:
+            projection = RunProgressProjection()
+            self._progress_cache.put(run.run_id, projection)
+        if projection is None:
+            return None
+        if refresh:
+            projection.refresh(self._events, run.run_id, run.event_count, max_pages=1)
+        # Keep the replay cursor, but do not present historical activity as live.
+        return projection if projection.cursor >= run.event_count else None
+
     def _agent_summary_locked(
         self,
         run: ManagedRun,
         idx: int,
+        *, refresh_progress: bool = True, include_questions: bool = True,
     ) -> Dict[str, Any]:
         result = run.results.get(idx) or {}
         token_value = result.get("reasoning_tokens", run.agent_tokens.get(idx))
@@ -2552,7 +2699,9 @@ class PluginRunManager:
             or "unknown"
         )
         workspace_available = self._agent_workspace_available_locked(run, idx)
-        retry_workspace_available = self._workspaces_root_available_locked(run)
+        retry_workspace_available = workspace_available and bool(run.run_root) and (
+            Path(run.run_root) / "meta" / f"agent_{idx:03d}" / "execution_recovery.json"
+        ).is_file()
         worker_available = (
             not self._uses_persistent_worker(run)
             or self._worker_available_locked(run)
@@ -2561,6 +2710,11 @@ class PluginRunManager:
         candidate_mutations_available = (
             not self._worker_active_locked(run)
             or self._live_candidate_stage_accepting_locked(run)
+        )
+        retry_available = candidate_mutations_available and (
+            not self._worker_active_locked(run)
+            or (normalize_agent_role(result.get("role", run.agent_roles.get(idx))) == AGENT_ROLE_CANDIDATE
+                and bool(read_json(worker_candidate_requests_path(self.state_dir, run.run_id)).get("retained_retry")))
         )
         run_open = run.finalized_agent is None and run.status not in FINAL_RUN_STATES
         can_accept = (
@@ -2583,16 +2737,13 @@ class PluginRunManager:
             and bool(promoted_session)
             and Path(run.workspace).expanduser().is_dir()
         )
-        timing = self._progress_cache.get(run.run_id)
         # Completed results already carry the authoritative measured duration.
         # Only running or incomplete summaries need the event-derived clock.
-        if timing is None and (
-            status not in TERMINAL_AGENT_STATUSES or result.get("seconds") is None
-        ):
-            timing = RunProgressProjection()
-            self._progress_cache.put(run.run_id, timing)
-        if timing is not None:
-            timing.refresh(self._events, run.run_id, run.event_count)
+        timing = self._progress_projection_locked(
+            run,
+            needed=status not in TERMINAL_AGENT_STATUSES or result.get("seconds") is None,
+            refresh=refresh_progress,
+        )
         started_at = timing.started.get(idx) if timing is not None else None
         finished_at = timing.finished.get(idx) if timing is not None else None
         if status in {"queued", "copying", "starting", "resuming", "submitting"}:
@@ -2600,7 +2751,7 @@ class PluginRunManager:
         activity = timing.activities[idx].snapshot() if timing is not None and idx in timing.activities else None
         if activity is not None and status in TERMINAL_AGENT_STATUSES:
             activity.update(state="finished", wait_until=None, active_operation_count=0)
-        questions = self._questions_if_present(run, idx)
+        questions = self._questions_if_present(run, idx) if include_questions else None
         return {
             "agent": idx,
             "pending_question_count": questions.pending_count() if questions is not None and not self._question_stopped_locked(run, idx) else 0,
@@ -2632,11 +2783,11 @@ class PluginRunManager:
             "idle_expiry_recovery": idle_expiry_recovery,
             "can_retry": (
                 status
-                in {"failed", "error", "killed", "cancelled", "interrupted"}
+                in {"failed", "error", "interrupted"}
                 and run_open
                 and retry_workspace_available
                 and worker_available
-                and candidate_mutations_available
+                and retry_available
             ),
         }
 
@@ -2730,7 +2881,7 @@ class PluginRunManager:
         texts: Sequence[str],
     ) -> list[str]:
         with self._lock:
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             mapping = self._accepted_workspace_mapping_locked(run, agent=int(agent))
         mappings = (mapping,) if mapping is not None else ()
         return [rewrite_workspace_references(text, mappings) for text in texts]
@@ -2759,7 +2910,8 @@ class PluginRunManager:
         with locked_synthesis_config(path):
             return path.is_file() and not bool(read_json(path).get("locked"))
 
-    def _run_summary_locked(self, run: ManagedRun) -> Dict[str, Any]:
+    def _run_summary_locked(self, run: ManagedRun, *, refresh_progress: bool = True,
+                            include_questions: bool = True) -> Dict[str, Any]:
         indices = sorted(
             set(run.agent_statuses)
             | set(run.results)
@@ -2792,7 +2944,18 @@ class PluginRunManager:
             or str(promotion.get("session_id") or "").strip()
             or run.run_id
         )
-        agents = [self._agent_summary_locked(run, idx) for idx in indices]
+        timing = self._progress_projection_locked(
+            run,
+            needed=any(
+                str((run.results.get(idx) or {}).get("status") or run.agent_statuses.get(idx))
+                not in TERMINAL_AGENT_STATUSES
+                or (run.results.get(idx) or {}).get("seconds") is None
+                for idx in indices
+            ),
+            refresh=refresh_progress,
+        )
+        agents = [self._agent_summary_locked(run, idx, refresh_progress=False,
+                                             include_questions=include_questions) for idx in indices]
         eligible = {agent["agent"] for agent in agents if agent.get("can_continue")}
         continuation = select_best_result(
             [candidate for candidate in self._recommendation_candidates_locked(run)
@@ -2800,7 +2963,6 @@ class PluginRunManager:
             "reasoning_tokens",
             warn_missing_tokens=False,
         )
-        timing = self._progress_cache.get(run.run_id)
         return {
             "run_id": run.run_id,
             "status": run.status,
@@ -2882,9 +3044,23 @@ class PluginRunManager:
         event_limit: int = 50,
         event_max_bytes: int = DEFAULT_EVENT_PAGE_BYTES,
     ) -> Dict[str, Any]:
+        started = time.monotonic()
+        self._reconcile_read_events(run_id)
+        reconciled = time.monotonic()
+        self._refresh_read_progress(run_id)
+        projected = time.monotonic()
         with self._lock:
-            run = self._require_run_locked(run_id)
-            result = self._run_summary_locked(run)
+            run = self._require_run_locked(run_id, refresh_events=False)
+            result = self._run_summary_locked(run, refresh_progress=False, include_questions=False)
+        summarized = time.monotonic()
+        self._populate_question_metadata(run_id, result["agents"])
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow run read: reconcile=%.3fs activity=%.3fs summary=%.3fs questions=%.3fs run=%s",
+                reconciled - started, projected - reconciled, summarized - projected,
+                finished - summarized, run_id,
+            )
         if include_events:
             result["event_page"] = self.get_events(
                 run_id,
@@ -2906,7 +3082,6 @@ class PluginRunManager:
         boundary = _parse_run_cursor(cursor) if cursor else None
         with self._lock:
             self._sync_state_from_disk_locked()
-            self._run_maintenance_locked()
             values = sorted(
                 self._runs.values(),
                 key=lambda run: (run.created_at, run.run_id),
@@ -2922,53 +3097,71 @@ class PluginRunManager:
                     for run in values
                     if (run.created_at, run.run_id) < boundary
                 ]
-            summaries: list[Dict[str, Any]] = []
-            serialized_bytes = 2
-            oversized_run = False
-            for run in values:
-                if len(summaries) >= limit:
-                    break
-                summary = self._run_summary_locked(run)
-                encoded_size = len(
-                    json.dumps(
-                        summary,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-                separator = 1 if summaries else 0
-                if summaries and serialized_bytes + separator + encoded_size > max_bytes:
-                    break
-                if not summaries and serialized_bytes + encoded_size > max_bytes:
-                    oversized_run = True
-                summaries.append(summary)
-                serialized_bytes += separator + encoded_size
-            has_more = len(summaries) < len(values)
-            next_cursor = ""
-            if has_more and summaries:
-                last = summaries[-1]
-                next_cursor = _run_cursor(
-                    str(last.get("created_at") or ""),
-                    str(last.get("run_id") or ""),
-                )
-            return {
-                "runs": summaries,
-                "total": total,
-                "cursor": cursor,
-                "next_cursor": next_cursor,
-                "has_more": has_more,
-                "serialized_bytes": serialized_bytes,
-                "byte_limit": max_bytes,
-                "oversized_run": oversized_run,
-            }
+            # Listing a page is not a request to replay every other workspace.
+            remaining = len(values)
+            page_ids = [run.run_id for run in values[:limit]]
+        for run_id in page_ids:
+            self._reconcile_read_events(run_id)
+            self._refresh_read_progress(run_id)
+        with self._lock:
+            self._run_maintenance_locked(page_ids, refresh_events=False)
+            # Expiry can remove a page; retain the next untouched records so a
+            # caller never receives has_more with an empty continuation cursor.
+            values = [self._runs[run.run_id] for run in values if run.run_id in self._runs]
+            removed = remaining - len(values)
+            total -= removed
+            remaining -= removed
+            candidates = [self._run_summary_locked(run, refresh_progress=False, include_questions=False)
+                          for run in values[:limit]]
+        summaries: list[Dict[str, Any]] = []
+        serialized_bytes = 2
+        oversized_run = False
+        for summary in candidates:
+            self._populate_question_metadata(summary["run_id"], summary["agents"])
+            encoded_size = len(json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            separator = 1 if summaries else 0
+            if summaries and serialized_bytes + separator + encoded_size > max_bytes:
+                break
+            if not summaries and serialized_bytes + encoded_size > max_bytes:
+                oversized_run = True
+            summaries.append(summary)
+            serialized_bytes += separator + encoded_size
+        has_more = len(summaries) < remaining
+        next_cursor = ""
+        if has_more and summaries:
+            last = summaries[-1]
+            next_cursor = _run_cursor(str(last.get("created_at") or ""), str(last.get("run_id") or ""))
+        return {
+            "runs": summaries,
+            "total": total,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "serialized_bytes": serialized_bytes,
+            "byte_limit": max_bytes,
+            "oversized_run": oversized_run,
+        }
 
     def get_run_overviews(self, run_ids: Sequence[str]) -> Dict[str, Any]:
+        started = time.monotonic()
         normalized = tuple(dict.fromkeys(str(run_id).strip() for run_id in run_ids))
         normalized = tuple(run_id for run_id in normalized if run_id)
         with self._lock:
             self._sync_state_from_disk_locked()
-            self._run_maintenance_locked()
-            return {
+        synced = time.monotonic()
+        for run_id in normalized:
+            run_started, cpu_started = time.monotonic(), time.thread_time()
+            self._reconcile_read_events(run_id)
+            elapsed = time.monotonic() - run_started
+            if elapsed >= 1:
+                logging.getLogger(__name__).warning(
+                    "Slow overview event reconciliation: wall=%.3fs thread_cpu=%.3fs run=%s",
+                    elapsed, time.thread_time() - cpu_started, run_id,
+                )
+        reconciled = time.monotonic()
+        with self._lock:
+            self._run_maintenance_locked(normalized, refresh_events=False)
+            result = {
                 "runs": [
                     self._run_overview_locked(self._runs[run_id])
                     for run_id in normalized
@@ -2976,20 +3169,41 @@ class PluginRunManager:
                 ],
                 "requested": len(normalized),
             }
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow overview read: sync=%.3fs events=%.3fs maintenance=%.3fs runs=%d",
+                synced - started, reconciled - synced, finished - reconciled, len(normalized),
+            )
+        return result
 
     def completion_snapshot(self) -> list[Dict[str, Any]]:
         """Return the lightweight lifecycle state used by background notifiers."""
 
         with self._lock:
             self._sync_state_from_disk_locked()
-            self._run_maintenance_locked()
+            run_ids = list(self._runs)
+        # Use the existing lifecycle monitor, yielding the manager between runs.
+        # Command admission still reconciles its own target before mutation.
+        pending_reconciliation: set[str] = set()
+        for run_id in run_ids:
+            with self._lock:
+                run = self._runs.get(run_id)
+                needs_events = run is not None and (
+                    run.status in ACTIVE_RUN_STATES | {"finalizing"} or run.worker_pid)
+            if needs_events and not self._reconcile_read_events(run_id, max_pages=1):
+                pending_reconciliation.add(run_id)
+                continue
+            with self._lock:
+                self._run_maintenance_locked([run_id], refresh_events=False)
+        with self._lock:
             records: list[Dict[str, Any]] = []
             for run in self._runs.values():
                 statuses = [
                     str(status or "").strip().lower()
                     for status in run.agent_statuses.values()
                 ]
-                working = (
+                working = run.run_id in pending_reconciliation or (
                     self._worker_active_locked(run)
                     and run.worker_operation not in {"finalize", "discard"}
                 ) or run.status in {
@@ -3008,7 +3222,7 @@ class PluginRunManager:
                         "worker_operation": run.worker_operation,
                         "updated_at": run.updated_at,
                         "working": working,
-                        "all_agents_terminal": bool(statuses)
+                        "all_agents_terminal": run.run_id not in pending_reconciliation and bool(statuses)
                         and all(
                             status in TERMINAL_AGENT_STATUSES
                             for status in statuses
@@ -3030,7 +3244,9 @@ class PluginRunManager:
         limit = min(max(1, int(limit)), MAX_EVENT_PAGE)
         max_bytes = min(max(4 * 1024, int(max_bytes)), MAX_EVENT_PAGE_BYTES)
         with self._lock:
-            self._require_run_locked(run_id)
+            self._sync_state_from_disk_locked()
+            if run_id not in self._runs:
+                raise PluginRunError(f"Unknown PCR run: {run_id}")
         try:
             return self._events.read(
                 run_id,
@@ -3062,7 +3278,7 @@ class PluginRunManager:
             if type(total) is not int or total < 0 or not isinstance(identity, str) or not identity:
                 raise PluginRunError("The operation output reference is invalid.")
             with self._lock:
-                run = self._require_run_locked(run_id)
+                run = self._require_run_locked(run_id, refresh_events=False)
                 if agent not in run.agent_statuses and agent not in run.results:
                     raise PluginRunError("The operation Agent is unavailable.")
                 path = self._agent_meta_file(run, agent, operation_output_name(identity))
@@ -3087,7 +3303,7 @@ class PluginRunManager:
         availability = "available"
         if "pcr_log_offset" in event:
             with self._lock:
-                run = self._require_run_locked(run_id)
+                run = self._require_run_locked(run_id, refresh_events=False)
                 if agent not in run.agent_statuses and agent not in run.results:
                     raise PluginRunError("The operation Agent is unavailable.")
                 stream = event.get("stream")
@@ -3178,7 +3394,8 @@ class PluginRunManager:
             raise PluginRunError("Agent question directory was replaced by a symbolic link")
         return QuestionStore(directory)
 
-    def _questions_if_present(self, run: ManagedRun, agent: int) -> QuestionStore | None:
+    def _questions_if_present(self, run: ManagedRun, agent: int, *,
+                              import_output: bool = True) -> QuestionStore | None:
         if not run.run_root:
             return None
         directory = Path(run.run_root) / "meta" / f"agent_{agent:03d}"
@@ -3195,9 +3412,44 @@ class PluginRunManager:
             if not existing:
                 return None
             raise
+        if not import_output:
+            return store
         if run.config.get("supports_agent_questions") is True:
             store.import_async_output(store.directory / "stdout.log")
         return store if store.path.exists() or store.async_path.exists() else None
+
+    def _populate_question_metadata(self, run_id: str, agents: Sequence[Dict[str, Any]], *,
+                                    include_requests: bool = False) -> None:
+        # Importing legacy questions and opening SQLite can wait on an owner.
+        # Keep that per-Agent I/O out of the lock shared by every workspace.
+        for summary in agents:
+            agent = int(summary["agent"])
+            with self._lock:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise PluginRunError(f"Unknown PCR run: {run_id}")
+                root = run.run_root
+                store = self._questions_if_present(run, agent, import_output=False)
+                import_output = run.config.get("supports_agent_questions") is True
+            pending = blocking = 0
+            requests = []
+            if store is not None:
+                if import_output:
+                    store.import_async_output(store.directory / "stdout.log")
+                pending, blocking = store.pending_count(), store.blocking_count()
+                if include_requests:
+                    requests = store.snapshot()
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is None or current.run_root != root:
+                    raise PluginRunError("The original Agent changed while reading questions")
+                stopped = self._question_stopped_locked(current, agent)
+                summary["pending_question_count"] = 0 if stopped else pending
+                summary["blocking_question_count"] = 0 if stopped else blocking
+                if include_requests:
+                    summary["input_requests"] = [
+                        self._question_snapshot_locked(current, agent, record) for record in requests
+                    ]
 
     def _question_stopped_locked(self, run: ManagedRun, agent: int) -> bool:
         return (run.finalized_agent is not None or run.finalizing_agent is not None
@@ -3303,11 +3555,18 @@ class PluginRunManager:
                 self._save_state_locked()
 
     def get_question(self, run_id: str, agent: int, request_id: str) -> Dict[str, Any]:
+        self._reconcile_read_events(run_id)
         with self._lock:
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             if agent not in run.agent_statuses and agent not in run.results:
                 raise PluginRunError(f"AGENT-{agent:03d} does not belong to {run_id}")
-            record = self._question_store(run, agent).get(request_id)
+            root = run.run_root
+            store = self._question_store(run, agent)
+        record = store.get(request_id)
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run.run_root != root:
+                raise PluginRunError("The original Agent changed while reading its answer receipt")
             return {"run_id": run_id, "agent": agent, "request": self._question_snapshot_locked(run, agent, record)}
 
     def answer_question(self, run_id: str, agent: int, request_id: str,
@@ -3344,18 +3603,20 @@ class PluginRunManager:
         transcript_kinds: set[str] | None = None,
     ) -> Dict[str, Any]:
         agent = int(agent)
+        started = time.monotonic()
+        self._reconcile_read_events(run_id)
+        reconciled = time.monotonic()
+        self._refresh_read_progress(run_id)
+        projected = time.monotonic()
         with self._lock:
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             if agent not in run.agent_statuses and agent not in run.results:
                 raise PluginRunError(
                     f"AGENT-{agent:03d} does not belong to {run_id}"
                 )
             result_data = dict(run.results.get(agent) or {})
-            response = self._agent_summary_locked(run, agent)
+            response = self._agent_summary_locked(run, agent, refresh_progress=False, include_questions=False)
             response["run_id"] = run_id
-            questions = self._questions_if_present(run, agent)
-            response["input_requests"] = [self._question_snapshot_locked(run, agent, record)
-                for record in questions.snapshot()] if questions is not None else []
             response["stdout_tail"] = result_data.get("stdout_tail") or ""
             response["stderr_tail"] = result_data.get("stderr_tail") or ""
             response["workspace_dir"] = None
@@ -3401,6 +3662,9 @@ class PluginRunManager:
                     artifact_errors.append(
                         "The saved Agent output could not be verified."
                     )
+        summarized = time.monotonic()
+        self._populate_question_metadata(run_id, [response], include_requests=True)
+        questioned = time.monotonic()
         if include_final_message:
             final_message = ""
             if final_message_path is not None and final_message_path.is_file():
@@ -3428,6 +3692,7 @@ class PluginRunManager:
                 ),
             )
         response["artifact_error"] = " ".join(dict.fromkeys(artifact_errors)) or None
+        artifacts_read = time.monotonic()
         if include_events:
             response["event_page"] = self.get_events(
                 run_id,
@@ -3437,6 +3702,7 @@ class PluginRunManager:
                 max_bytes=event_max_bytes,
                 transcript_kinds=transcript_kinds,
             )
+        events_read = time.monotonic()
         if include_diff:
             if response["artifact_error"]:
                 response["diff"] = None
@@ -3456,6 +3722,15 @@ class PluginRunManager:
                 except (OSError, PluginRunError) as exc:
                     response["diff"] = None
                     response["diff_error"] = str(exc)
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow Agent read: reconcile=%.3fs activity=%.3fs summary=%.3fs questions=%.3fs "
+                "artifacts=%.3fs events=%.3fs diff=%.3fs run=%s agent=%d cursor=%d",
+                reconciled - started, projected - reconciled, summarized - projected,
+                questioned - summarized, artifacts_read - questioned, events_read - artifacts_read,
+                finished - events_read, run_id, agent, cursor,
+            )
         return response
 
     def get_diff(
@@ -3470,16 +3745,17 @@ class PluginRunManager:
         agent = int(agent)
         cursor = max(0, int(cursor))
         limit = min(max(1, int(limit)), MAX_DIFF_PAGE_CHARS)
+        self._reconcile_read_events(run_id)
         with self._lock:
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             if agent not in run.agent_statuses and agent not in run.results:
                 raise PluginRunError(
                     f"AGENT-{agent:03d} does not belong to {run_id}"
                 )
             result_data = dict(run.results.get(agent) or {})
             live = not result_data or run.agent_statuses.get(agent) in {"pending", "running", "starting"}
-            captured = deepcopy(run) if live or snapshot_id else None
-        if captured is not None:
+            captured = deepcopy(run)
+        if live or snapshot_id:
             try:
                 identifier, data = self._live_diffs.read(
                     (run_id, agent, full_context), snapshot_id,
@@ -3492,17 +3768,15 @@ class PluginRunManager:
                     "next_cursor": next_cursor, "has_more": next_cursor < len(data),
                     "total_chars": len(data), "cursor_unit": "utf8_bytes", "full_context": full_context,
                     "snapshot_id": identifier, "live": True, "text": text}
-        with self._lock:
-            run = self._require_run_locked(run_id)
-            try:
-                path = self._artifacts.persist_diff(
-                    run,
-                    agent,
-                    result_data.get("workspace_dir"),
-                    full_context=full_context,
-                )
-            except ArtifactError as exc:
-                raise PluginRunError(str(exc)) from exc
+        try:
+            path = self._artifacts.persist_diff(
+                captured,
+                agent,
+                result_data.get("workspace_dir"),
+                full_context=full_context,
+            )
+        except ArtifactError as exc:
+            raise PluginRunError(str(exc)) from exc
         total = path.stat().st_size
         cursor = min(cursor, total)
         with path.open("rb") as handle:
@@ -3538,8 +3812,9 @@ class PluginRunManager:
         }
 
     def get_file_preview(self, run_id: str, agent: int, path: str, **page: Any) -> Dict[str, Any]:
+        self._reconcile_read_events(run_id)
         with self._lock:
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             if agent not in run.agent_statuses and agent not in run.results:
                 raise PluginRunError(f"AGENT-{agent:03d} does not belong to {run_id}")
             result = dict(run.results.get(agent) or {})
@@ -3789,8 +4064,9 @@ class PluginRunManager:
                                 break
                         time.sleep(0.05)
                 with self._lock:
-                    run = self._require_run_locked(run_id)
-                    self._save_state_locked()
+                    # Reconciliation persists any new lifecycle transition.
+                    # Reading an already committed receipt is not another write.
+                    self._require_run_locked(run_id)
                 if not bool(response.get("ok")):
                     raise PluginRunError(
                         str(response.get("error") or "Persistent PCR worker operation failed")
@@ -3813,13 +4089,15 @@ class PluginRunManager:
         agent_role: str = AGENT_ROLE_CANDIDATE,
         retained_startup_fingerprint: str | None = None,
         retained_execution_fingerprints: dict[int, str] | None = None,
+        external_shutdown_recovery: bool = False,
         synthesis_preparation_fingerprints: dict[int, str] | None = None,
+        refresh_completed_synthesis: bool = True,
     ) -> Dict[str, Any]:
         agent_role = normalize_agent_role(agent_role)
         operation = "retry" if retry_indices else "more"
         run_root = self._validated_run_root(run)
         worker_active = self._worker_active_locked(run)
-        fresh_owner = bool(retained_execution_fingerprints or synthesis_preparation_fingerprints)
+        fresh_owner = bool(retained_execution_fingerprints or synthesis_preparation_fingerprints) and self._detached_workers and run.worker_pid is None
         if synthesis_preparation_fingerprints and (
             not self._detached_workers or worker_active or run.worker_pid is not None
             or run.worker_state != "stopped" or set(synthesis_preparation_fingerprints) != set(indices)
@@ -3830,13 +4108,15 @@ class PluginRunManager:
         ):
             raise PluginRunError("Synthesis preparation dispatch requires a retired owner and exact unsubmitted slots")
         if retained_execution_fingerprints and (
-            not self._detached_workers or worker_active or run.worker_pid is not None
-            or run.worker_state != "stopped" or set(retained_execution_fingerprints) != set(indices)
-            or retry_indices != set(indices) or agent_role != AGENT_ROLE_CANDIDATE
+            (fresh_owner and run.worker_state != "stopped")
+            or set(retained_execution_fingerprints) != set(indices)
+            or retry_indices != set(indices)
             or (self.control_dir / run.run_id / "stop").exists()
             or any((self.control_dir / run.run_id / f"kill-agent-{idx:03d}").exists() for idx in indices)
         ):
-            raise PluginRunError("Retained execution dispatch requires a retired owner and exact candidate bindings")
+            raise PluginRunError("Retained execution dispatch requires an available owner and exact Agent bindings")
+        if external_shutdown_recovery and not retained_execution_fingerprints:
+            raise PluginRunError("External shutdown recovery requires retained execution bindings")
         live_candidate_stage = bool(
             worker_active
             and self._detached_workers
@@ -3849,12 +4129,19 @@ class PluginRunManager:
             raise PluginRunError(
                 f"PCR run {run.run_id} is still active; wait or stop it first"
             )
+        if live_candidate_stage and agent_role != AGENT_ROLE_CANDIDATE:
+            raise PluginRunError("Synthesis retry must wait for the active candidate batch to finish")
+        if live_candidate_stage and retained_execution_fingerprints and not read_json(
+            worker_candidate_requests_path(self.state_dir, run.run_id)
+        ).get("retained_retry"):
+            raise PluginRunError("This active worker does not support in-place retry; wait for the batch to finish. No Agent was restarted.")
         if self._detached_workers and not (retained_startup_fingerprint or fresh_owner):
             self._require_persistent_worker_locked(run)
         refresh_synthesis = bool(
             not live_candidate_stage
             and agent_role == AGENT_ROLE_CANDIDATE
             and int(run.config.get("synthesis_agents") or 0) > 0
+            and (not retry_indices or refresh_completed_synthesis)
         )
         context: _RunContext | None = None
         args: argparse.Namespace | None = None
@@ -4005,6 +4292,10 @@ class PluginRunManager:
                     "agent_role": agent_role,
                     "refresh_synthesis": refresh_synthesis,
                 }
+                if retained_execution_fingerprints:
+                    request["retained_execution_fingerprints"] = {
+                        str(idx): value for idx, value in retained_execution_fingerprints.items()
+                    }
                 if retained_startup_fingerprint:
                     if run.worker_operation != operation or run.worker_state != "busy":
                         raise PluginRunError("The retained startup operation changed before dispatch")
@@ -4019,6 +4310,8 @@ class PluginRunManager:
                     key = "retained_execution_fingerprints" if retained_execution_fingerprints else "synthesis_preparation_fingerprints"
                     request[key] = {str(idx): value for idx, value in (
                         retained_execution_fingerprints or synthesis_preparation_fingerprints).items()}
+                    if external_shutdown_recovery:
+                        request["external_shutdown_recovery"] = True
                     process, _operation_id = spawn_worker(
                         self.state_dir, run.run_id, operation, request,
                         operation_id=run.worker_operation_id,
@@ -4060,7 +4353,7 @@ class PluginRunManager:
                 progress = lambda payload: self._record_progress(  # noqa: E731
                     run.run_id, payload
                 )
-                if agent_role == AGENT_ROLE_SYNTHESIS:
+                if agent_role == AGENT_ROLE_SYNTHESIS and not retained_execution_fingerprints:
                     recorded_results = []
                     for value in run.results.values():
                         try:
@@ -4090,6 +4383,8 @@ class PluginRunManager:
                         workspace=self._workspace_for_run(run),
                         resume_session_id=run.config.get("resume_session_id"),
                         retry_indices=retry_indices,
+                        agent_role=agent_role,
+                        retained_execution_fingerprints=retained_execution_fingerprints,
                         progress_callback=progress,
                         cancel_event=context.cancel_event,
                         agent_cancel_events=context.agent_cancel_events,
@@ -4546,6 +4841,173 @@ class PluginRunManager:
                 response["recovery_operation_id"] = run.worker_operation_id
                 return response
 
+    def recover_configuration_failures(self, run_id: str, agents: Sequence[int]) -> Dict[str, Any]:
+        """Start the original prepared synthesis input that never reached Codex."""
+        indices = list(agents)
+        if not indices or any(type(idx) is not int or idx <= 0 for idx in indices) or len(set(indices)) != len(indices):
+            raise PluginRunError("Recovery requires distinct positive synthesis indices")
+        with self._run_operation_guard(run_id, "recover pre-input configuration failures"):
+            with self._lock:
+                run = self._require_run_locked(run_id)
+                self._refresh_events_locked(run, save=False)
+                control = self.control_dir / run_id
+                if (not self._detached_workers or run.status != "completed" or run.worker_state != "stopped"
+                    or run.worker_pid is not None or run.worker_operation or run.finalized_agent is not None
+                    or run.finalizing_agent is not None or run.workspaces_deleted or run.codex_homes_deleted
+                    or (control / "stop").exists() or self._finalization_journal_path(run).exists()
+                    or any(other.workspace == run.workspace and other.created_at > run.created_at for other in self._runs.values())):
+                    raise PluginRunError("Configuration recovery requires the latest completed run with a retired owner")
+                checkpoint = read_json(self.state_dir / "workers" / f"{run_id}.json")
+                pid = checkpoint.get("pid")
+                if (checkpoint.get("run_id") != run_id or checkpoint.get("protocol") != WORKER_PROTOCOL_VERSION
+                    or checkpoint.get("alive") is not False or checkpoint.get("active") is not False
+                    or checkpoint.get("stop_reason") != "shutdown" or checkpoint.get("operation")
+                    or checkpoint.get("operation_id") or type(pid) is not int or pid <= 0 or pid_is_alive(pid)
+                    or any((self.state_dir / "workers" / "requests").glob(f"{run_id}-*.json"))):
+                    raise PluginRunError("The original owner has not durably exited")
+                root = self._validated_run_root(run)
+                fingerprints = {}
+                for idx in indices:
+                    result = run.results.get(idx) or {}
+                    meta = root / "meta" / f"agent_{idx:03d}"
+                    if (result.get("role") != AGENT_ROLE_SYNTHESIS or result.get("status") != "failed"
+                        or idx in run.rejected_agents or idx in run.stale_synthesis_agents
+                        or (control / f"kill-agent-{idx:03d}").exists()
+                        or not configuration_failed_before_input(meta, read_json(meta / "execution_recovery.json"))):
+                        raise PluginRunError(f"AGENT-{idx:03d} is not a pre-input configuration failure")
+                    workspace = agent_execution_workspace(self._workspace_for_run(run), root / "workspaces", idx,
+                        str(run.config.get("workspace_mode") or "isolated"))
+                    command, home, fingerprint = retained_execution_preparation(root, idx, workspace, run.prompt,
+                        expected_role=AGENT_ROLE_SYNTHESIS)
+                    if result.get("command") != command or result.get("codex_home") != str(home) or result.get("workspace_dir") != str(workspace):
+                        raise PluginRunError("Original configuration failure identity changed")
+                    fingerprints[idx] = fingerprint
+                self._append_event_locked(run, {"type": "configuration_recovery_requested", "indices": indices})
+                response = self._start_additional_batch(run, indices, set(indices), agent_role=AGENT_ROLE_SYNTHESIS,
+                    retained_execution_fingerprints=fingerprints)
+                response["recovery_operation_id"] = run.worker_operation_id
+                return response
+
+    def resume_external_shutdown_agents(
+        self, run_id: str, agents: Sequence[int],
+    ) -> Dict[str, Any]:
+        """Resume accepted Agents stopped by a verified external shutdown."""
+        indices = list(agents)
+        if (not indices or any(type(idx) is not int or idx <= 0 for idx in indices)
+            or len(set(indices)) != len(indices)):
+            raise PluginRunError("External shutdown recovery requires distinct positive Agent indices")
+        with self._run_operation_guard(run_id, "resume externally shutdown Agents"):
+            with self._lock:
+                run = self._require_run_locked(run_id)
+                self._refresh_events_locked(run, save=False)
+                control = self.control_dir / run_id
+                if (
+                    not self._detached_workers or run.status != "cancelled"
+                    or run.completion_reason != "cancelled" or run.worker_state != "stopped"
+                    or run.worker_pid is not None or run.worker_operation
+                    or run.finalized_agent is not None or run.finalizing_agent is not None
+                    or run.workspaces_deleted or run.codex_homes_deleted
+                    or self._finalization_journal_path(run).exists()
+                    or any(other.workspace == run.workspace and other.created_at > run.created_at
+                           for other in self._runs.values())
+                ):
+                    raise PluginRunError("External shutdown recovery requires the original latest idle run")
+                checkpoint = read_json(self.state_dir / "workers" / f"{run_id}.json")
+                old_pid = checkpoint.get("pid")
+                if (checkpoint.get("run_id") != run_id or checkpoint.get("protocol") != WORKER_PROTOCOL_VERSION
+                    or checkpoint.get("alive") is not False or checkpoint.get("active") is not False
+                    or checkpoint.get("stop_reason") != "shutdown" or checkpoint.get("exit_code") != 130
+                    or type(old_pid) is not int or old_pid <= 0 or pid_is_alive(old_pid)
+                    or checkpoint.get("operation") or checkpoint.get("operation_id")
+                    or any((self.state_dir / "workers" / "requests").glob(f"{run_id}-*.json"))):
+                    raise PluginRunError("External shutdown owner has not durably exited")
+                # SIGTERM writes both signals from the retiring worker. A user
+                # stop is written by the controller and also has a durable event.
+                for name in ("stop", "shutdown"):
+                    path = control / name
+                    if not path.is_file() or path.read_text(encoding="utf-8").strip() != str(old_pid):
+                        raise PluginRunError("Stop signals do not belong to the retired shutdown owner")
+                saw_cancelled_finish = False
+                saw_shutdown = False
+                saw_user_stop = False
+                try:
+                    with self._events.event_path(run_id).open(encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                event = json.loads(line)
+                            except (TypeError, ValueError):
+                                continue
+                            kind = event.get("type")
+                            if kind in {"run_stop_requested", "agent_stop_requested"}:
+                                saw_user_stop = True
+                            if kind in {"run_finished", "batch_finished"} and event.get("cancelled") is True:
+                                saw_cancelled_finish = True
+                            if (kind == "plugin_worker_stopped" and event.get("reason") == "shutdown"
+                                and event.get("pid") == old_pid):
+                                saw_shutdown = True
+                except OSError as exc:
+                    raise PluginRunError(f"Cannot verify external shutdown evidence: {exc}") from exc
+                if not saw_cancelled_finish or not saw_shutdown or saw_user_stop:
+                    raise PluginRunError("The run does not contain exclusive external shutdown evidence")
+
+                run_root = self._validated_run_root(run)
+                roles = set()
+                fingerprints: Dict[int, str] = {}
+                for idx in indices:
+                    result = run.results.get(idx) or {}
+                    role = normalize_agent_role(result.get("role", run.agent_roles.get(idx)))
+                    status = str(result.get("status") or run.agent_statuses.get(idx) or "")
+                    if role not in {AGENT_ROLE_CANDIDATE, AGENT_ROLE_SYNTHESIS} or status != "cancelled":
+                        raise PluginRunError(f"AGENT-{idx:03d} is not an externally cancelled retained Agent")
+                    if idx in run.rejected_agents or (control / f"kill-agent-{idx:03d}").exists():
+                        raise PluginRunError(f"AGENT-{idx:03d} has an explicit stop or rejection and cannot be revived")
+                    meta = run_root / "meta" / f"agent_{idx:03d}"
+                    stop = meta / "execution_stop"
+                    if not stop.is_file() or stop.read_text(encoding="utf-8").strip() != "cancelled":
+                        raise PluginRunError(f"AGENT-{idx:03d} is missing the external cancellation receipt")
+                    roles.add(role)
+                    workspace = agent_execution_workspace(
+                        self._workspace_for_run(run), run_root / "workspaces", idx,
+                        str(run.config.get("workspace_mode") or "isolated"),
+                    )
+                    try:
+                        command, home, fingerprint = retained_execution_preparation(
+                            run_root, idx, workspace, run.prompt,
+                            expected_role=role, allow_external_shutdown=True,
+                        )
+                    except (OSError, ValueError, TypeError) as exc:
+                        raise PluginRunError(
+                            f"AGENT-{idx:03d} cannot resume its retained execution: {exc}"
+                        ) from exc
+                    if (result.get("command") != command
+                        or result.get("workspace_dir") != str(workspace)
+                        or result.get("codex_home") != str(home)):
+                        raise PluginRunError(f"AGENT-{idx:03d} identity does not match its retained receipt")
+                    fingerprints[idx] = fingerprint
+
+                if len(roles) != 1:
+                    raise PluginRunError("External shutdown recovery must target one Agent role at a time")
+                if (control / "stop").read_text(encoding="utf-8").strip() != str(old_pid) or any(
+                    (control / f"kill-agent-{idx:03d}").exists() for idx in indices
+                ):
+                    raise PluginRunError("The user stopped an Agent during recovery preflight")
+                role = next(iter(roles))
+                # This run-level signal is the retired supervisor's shutdown
+                # latch. User stop was ruled out from the durable event log above.
+                FileSignal(control / "stop").clear()
+                self._append_event_locked(run, {
+                    "type": "external_shutdown_recovery_requested",
+                    "indices": indices,
+                    "role": role,
+                })
+                response = self._start_additional_batch(
+                    run, indices, set(indices), agent_role=role,
+                    retained_execution_fingerprints=fingerprints,
+                    external_shutdown_recovery=True,
+                )
+                response["recovery_operation_id"] = run.worker_operation_id
+                return response
+
     def _retry_agent(
         self, run_id: str, agent: int, *, refresh_startup_runtime: bool = False,
     ) -> Dict[str, Any]:
@@ -4577,23 +5039,21 @@ class PluginRunManager:
             retained_executions = None
             if refresh_startup_runtime:
                 fingerprint = self._retire_failed_startup_worker_locked(run, agent)
-            elif role == AGENT_ROLE_CANDIDATE and status in {"failed", "error", "interrupted"} and run.run_root:
+            else:
                 root = self._validated_run_root(run)
                 receipt_path = root / "meta" / f"agent_{agent:03d}" / "execution_recovery.json"
                 receipt = read_json(receipt_path)
                 pid = receipt.get("native_pid")
                 if type(pid) is int and pid > 0 and pid_is_alive(pid):
                     raise PluginRunError(f"AGENT-{agent:03d} still has a native execution owner; retry would duplicate its input")
-                if receipt_path.exists() and receipt.get("stage") != "ready":
-                    workspace = agent_execution_workspace(self._workspace_for_run(run), root / "workspaces", agent,
-                        str(run.config.get("workspace_mode") or "isolated"))
-                    try:
-                        _, _, retained = retained_execution_preparation(root, agent, workspace, run.prompt)
-                    except (OSError, ValueError, TypeError) as exc:
-                        # An accepted task is never silently converted into a
-                        # fresh workspace/full-prompt retry when resume is unsafe.
-                        raise PluginRunError(f"AGENT-{agent:03d} retained execution cannot safely resume: {exc}") from exc
-                    retained_executions = {agent: retained}
+                workspace = agent_execution_workspace(self._workspace_for_run(run), root / "workspaces", agent,
+                    str(run.config.get("workspace_mode") or "isolated"))
+                try:
+                    _, _, retained = retained_execution_preparation(root, agent, workspace, run.prompt,
+                        expected_role=role)
+                except (OSError, ValueError, TypeError) as exc:
+                    raise PluginRunError(f"AGENT-{agent:03d} cannot resume its original session and workspace; no new task was started: {exc}") from exc
+                retained_executions = {agent: retained}
             return self._start_additional_batch(
                 run,
                 [agent],
@@ -4601,6 +5061,7 @@ class PluginRunManager:
                 agent_role=role,
                 retained_startup_fingerprint=fingerprint,
                 retained_execution_fingerprints=retained_executions,
+                refresh_completed_synthesis=False,
             )
 
     def _retire_failed_startup_worker_locked(self, run: ManagedRun, agent: int) -> str:
@@ -5779,22 +6240,18 @@ class PluginRunManager:
             sessions_stamp = sessions_root.stat().st_mtime_ns
         except OSError:
             sessions_stamp = 0
-        key = (
+        cache_key = (
             "sessions",
             str(source),
             bool(include_non_interactive),
-            file_fingerprint(codex_home / "state_5.sqlite"),
-            sessions_stamp,
         )
+        stamp = file_fingerprint(codex_home / "state_5.sqlite"), sessions_stamp
+        key = (*cache_key, stamp)
         with self._resume_condition:
             while True:
-                cached = self._resume_cache.get(key)
-                if cached is not None:
-                    expires_at = cached[0]
-                    if not isinstance(expires_at, (int, float)) or (
-                        float(expires_at) > time.monotonic()
-                    ):
-                        return list(cached[1])
+                cached = self._resume_session_cache.get(cache_key)
+                if cached is not None and cached[0] == stamp and cached[1] > time.monotonic():
+                    return list(cached[2])
                 if key not in self._resume_inflight:
                     self._resume_inflight.add(key)
                     break
@@ -5812,9 +6269,11 @@ class PluginRunManager:
                 else RESUME_INCOMPLETE_CACHE_SECONDS
             )
             with self._resume_condition:
-                self._resume_cache.put(
-                    key,
-                    (time.monotonic() + ttl, sessions),
+                # Registry generations replace their own entry. Frequent native
+                # registry writes must not evict expensive conversation bodies.
+                self._resume_session_cache.put(
+                    cache_key,
+                    (stamp, time.monotonic() + ttl, sessions),
                 )
             return list(sessions)
         finally:
@@ -5871,8 +6330,7 @@ class PluginRunManager:
         conversation_items_only: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
-            self._sync_state_from_disk_locked()
-            run = self._require_run_locked(run_id)
+            run = self._require_run_locked(run_id, refresh_events=False)
             workspace = run.workspace
             session_id = str(run.config.get("resume_session_id") or "").strip()
             raw_line_count = run.config.get("resume_rollout_line_count")
@@ -5979,34 +6437,16 @@ class PluginRunManager:
                         f"Cannot load Codex history for {session_id}: {exc}"
                     ) from exc
                 with self._resume_condition:
-                    self._resume_cache.put(cache_key, (session, list(history)))
+                    snapshot = _HistorySnapshot(history)
+                    self._resume_cache.put(cache_key, (session, snapshot))
             finally:
                 with self._resume_condition:
                     self._resume_inflight.discard(cache_key)
                     self._resume_condition.notify_all()
         else:
-            _cached_session, history = cached
-        if legacy_current_prompt:
-            normalized_prompt = " ".join(legacy_current_prompt.split())
-            matching_turns = [
-                index
-                for index, entry in enumerate(history)
-                if entry.category == "user"
-                and " ".join(entry.text.split()) == normalized_prompt
-            ]
-            if matching_turns:
-                history = history[: matching_turns[-1]]
-        source_entry_count = len(history)
-        if conversation_items_only:
-            history = [
-                entry
-                for entry in history
-                if entry.category in {"user", "output"}
-            ]
-        history_payloads = _history_payloads(
-            history,
-            path_mappings=path_mappings,
-        )
+            _cached_session, snapshot = cached
+        history_payloads, source_entry_count = snapshot.project(
+            legacy_current_prompt, conversation_items_only, path_mappings)
         cursor = min(cursor, len(history_payloads))
         entries: list[Dict[str, Any]] = []
         serialized_bytes = 2
@@ -6027,7 +6467,7 @@ class PluginRunManager:
                 # larger than this page budget, so one unusually long message can
                 # still be delivered rather than trapping clients in a retry loop.
                 oversized_entry = True
-            entries.append(payload)
+            entries.append(dict(payload))
             serialized_bytes += separator + encoded_size
         next_cursor = cursor + len(entries)
         return {
@@ -6090,6 +6530,14 @@ class PluginRunManager:
                 result[key] += 1
         return {**result, "observed_at": time.time()}
 
+    def model_catalog_context(self) -> str:
+        # Capability reads must not wait on run operations or native discovery.
+        home = get_codex_home()
+        current = self._model_catalog
+        if current is not None and current.real_codex_home == home:
+            return current.context_key()
+        return CodexModelCacheManager("codex", home, copy_codex_support_entries).context_key()
+
     def model_options(
         self,
         model: Optional[str] = None,
@@ -6105,15 +6553,22 @@ class PluginRunManager:
             catalog = self._model_catalog
         # Other Codex installations also write the shared home. Read the
         # execution CLI's own snapshot so their menus cannot replace ours.
+        context = catalog.context_key()
         snapshot = catalog.catalog_path()
+        refreshing = catalog.catalog_refreshing
         if snapshot is None:
             raise PluginRunError("Codex model options are temporarily unavailable. Please try again later.")
         registry = CodexModelRegistry.load(home, model_cache_path=snapshot)
+        if context != catalog.context_key():
+            raise PluginRunError("Codex model context changed during discovery. Please try again.")
         if not registry.models:
             raise PluginRunError("Codex model options are temporarily unavailable. Please try again later.")
         selected_model = str(model or "")
         selected_effort = str(effort or "")
         return {
+            "catalog_context": context,
+            "catalog_refreshing": refreshing,
+            "catalog_revision": registry.catalog_revision,
             "configured_model": registry.configured_model,
             "configured_effort": registry.configured_effort,
             "configured_service_tier": registry.configured_service_tier,
@@ -6129,7 +6584,7 @@ class PluginRunManager:
                     "value": value,
                     "selected": value == selected_model,
                 }
-                for label, value in registry.model_options(model)
+                for label, value in registry.model_options(None)
             ],
             "efforts": [
                 {
@@ -6144,7 +6599,6 @@ class PluginRunManager:
     def health(self) -> Dict[str, Any]:
         with self._lock:
             self._sync_state_from_disk_locked()
-            self._run_maintenance_locked()
             active_runs = [
                 run.run_id
                 for run in self._runs.values()

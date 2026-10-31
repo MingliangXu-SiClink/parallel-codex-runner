@@ -426,6 +426,7 @@ struct ConversationTimelineView: NSViewRepresentable {
                 )
             }
             if (contextChanged && !candidateChanged) || presentationChanged {
+                itemMeasurements.removeAll(keepingCapacity: true)
                 if (contextChanged && !oldContext.isEmpty) || presentationChanged {
                     isRestoring = true
                     renderedItems = parent.items
@@ -437,7 +438,6 @@ struct ConversationTimelineView: NSViewRepresentable {
                 scrollView?.backgroundColor = canvas
                 collectionView?.backgroundColors = [canvas]
                 scrollView?.contentView.needsDisplay = true
-                itemMeasurements.removeAll(keepingCapacity: true)
             } else if itemsChanged, !changesOnlyFixedAgentSwitch {
                 trimInactiveMeasurements(retaining: parent.items)
             }
@@ -568,11 +568,17 @@ struct ConversationTimelineView: NSViewRepresentable {
                 previous.onLiveResizeEnded = nil
             }
             let replacement = ConversationTimelineView.makeCollectionView(coordinator: self)
-            replacement.frame = NSRect(origin: .zero, size: scrollView.contentView.bounds.size)
-            scrollView.documentView = replacement
+            // Attaching a document immediately asks AppKit to size every row.
+            // Set its final reading-column width before exposing the data source.
+            replacement.dataSource = nil
+            replacement.delegate = nil
             collectionView = replacement
-            lastGeometryCommit = nil
+            replacement.frame = NSRect(origin: .zero, size: scrollView.contentView.bounds.size)
             _ = updateSectionInsets(for: replacement.bounds.width)
+            replacement.dataSource = self
+            replacement.delegate = self
+            scrollView.documentView = replacement
+            lastGeometryCommit = nil
         }
 
         func scrollToHistoryQuestion(id: String) {

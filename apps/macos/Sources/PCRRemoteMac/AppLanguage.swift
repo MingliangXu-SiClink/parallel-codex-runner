@@ -188,15 +188,24 @@ enum AppLanguage: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    func localized(_ key: String) -> String {
+    func localized(_ key: String, in bundle: Bundle = .main) -> String {
         let baseBundles: [Bundle]
 #if SWIFT_PACKAGE
-        baseBundles = [.main, .module]
+        if bundle.bundleURL.pathExtension == "app" {
+            // SwiftPM's generated accessor also embeds a build-machine path.
+            // Installed apps must resolve resources inside their signed bundle.
+            let packaged = bundle.url(forResource: "ParallelCodexMac_PCRRemoteMac", withExtension: "bundle")
+                .flatMap { Bundle(url: $0) }
+            baseBundles = [bundle] + [packaged].compactMap { $0 }
+        } else {
+            baseBundles = [bundle, .module]
+        }
 #else
-        baseBundles = [.main]
+        baseBundles = [bundle]
 #endif
         for baseBundle in baseBundles {
-            guard let path = baseBundle.path(forResource: rawValue, ofType: "lproj"),
+            let localization = baseBundle.localizations.first { $0.caseInsensitiveCompare(rawValue) == .orderedSame } ?? rawValue
+            guard let path = baseBundle.path(forResource: localization, ofType: "lproj"),
                   let languageBundle = Bundle(path: path) else { continue }
             return languageBundle.localizedString(forKey: key, value: key, table: nil)
         }

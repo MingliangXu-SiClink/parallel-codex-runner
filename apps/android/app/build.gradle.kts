@@ -96,8 +96,8 @@ android {
         applicationId = "com.parallelcodexrunner.remote"
         minSdk = 28
         targetSdk = 37
-        versionCode = 270
-        versionName = "0.1.269"
+        versionCode = 278
+        versionName = "0.1.277"
 
         buildConfigField("String", "DEFAULT_RELAY_URL", quoted(configured("PCR_RELAY_URL")))
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

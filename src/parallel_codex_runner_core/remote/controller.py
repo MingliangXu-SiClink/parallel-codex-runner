@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 import platform
+import logging
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
@@ -114,6 +116,7 @@ class RemoteController:
 
     READ_ONLY_ACTIONS = frozenset(
         {
+            "system.ping",
             "system.health",
             "system.capabilities",
             "commands.get",
@@ -176,6 +179,8 @@ class RemoteController:
             "runs.kill_agent",
             "runs.answer_question",
             "runs.retry_agent",
+            "runs.resume_external_shutdown",
+            "runs.recover_configuration_failures",
             "runs.reject_agent",
             "runs.add_agents",
             "runs.update_synthesis",
@@ -292,6 +297,7 @@ class RemoteController:
         # path so switching workspaces still forces a fresh sync.
         self._conversation_runs_stamps: dict[tuple[str, str], tuple[int, int] | None] = {}
         self._actions: dict[str, Callable[[RemoteRequest], dict[str, Any]]] = {
+            "system.ping": lambda _request: {"status": "ok"},
             "system.health": self._health,
             "system.capabilities": self._capabilities,
             "commands.get": self._command_receipt,
@@ -334,6 +340,8 @@ class RemoteController:
             "runs.stop": self._runs_stop,
             "runs.kill_agent": self._runs_kill_agent,
             "runs.retry_agent": self._runs_retry_agent,
+            "runs.resume_external_shutdown": self._runs_resume_external_shutdown,
+            "runs.recover_configuration_failures": self._runs_recover_configuration_failures,
             "runs.reject_agent": self._runs_reject_agent,
             "runs.add_agents": self._runs_add_agents,
             "runs.update_synthesis": self._runs_update_synthesis,
@@ -831,22 +839,34 @@ class RemoteController:
             admission.release()
 
     def _health(self, _request: RemoteRequest) -> dict[str, Any]:
+        started = time.monotonic()
         pcr = self.manager.health()
+        manager_finished = time.monotonic()
         delivery = self.prompt_delivery_status() if self.prompt_delivery_status else {}
         with self._prompt_lock:
             admission_count = sum(admission.locked() for admission in list(self._prompt_admissions.values()))
         if delivery.get("pending_count") or delivery.get("active_count") or admission_count:
             pcr = {**pcr, "active_operation": pcr.get("active_operation") or "prompt_delivery"}
-        return {
+        registry = self._workspace_registry_payload()
+        registry_finished = time.monotonic()
+        result = {
             "status": "ok",
             "pcr": pcr,
             "prompt_delivery": delivery,
             "prompt_admission_count": admission_count,
-            "workspace_registry": self._workspace_registry_payload(),
+            "workspace_registry": registry,
             "devices": self.devices.list(),
             "relay": self.relay.status(),
             "link": self.relay_link_status.load(),
         }
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow health read: manager=%.3fs registry=%.3fs other=%.3fs",
+                manager_finished - started, registry_finished - manager_finished,
+                finished - registry_finished,
+            )
+        return result
 
     def _command_receipt(self, request: RemoteRequest) -> dict[str, Any]:
         original = RemoteRequest.from_mapping({
@@ -880,7 +900,9 @@ class RemoteController:
         return bool(callable(checker) and checker(run_id, agent))
 
     def _capabilities(self, _request: RemoteRequest) -> dict[str, Any]:
+        catalog_context = getattr(self.manager, "model_catalog_context", None)
         return {
+            **({"model_catalog_context": catalog_context()} if callable(catalog_context) else {}),
             "daemon_name": "pcrd",
             "daemon_version": _daemon_version(),
             "protocol_version": PROTOCOL_VERSION,
@@ -909,6 +931,8 @@ class RemoteController:
                 platform.system().lower() == "darwin"
             ),
             "supports_transcript_items": True,
+            "supports_run_transcript_pages": True,
+            "supports_run_conversation_pages": True,
             "supports_work_operations": True,
             "supports_agent_questions": True,
             "supports_async_agent_questions": True,
@@ -1096,7 +1120,9 @@ class RemoteController:
         )
 
     def _workspace_registry_payload(self) -> dict[str, Any]:
+        started = time.monotonic()
         payload = self.registry.list()
+        registry_finished = time.monotonic()
         records = payload.get("workspaces")
         if not isinstance(records, list):
             return payload
@@ -1115,12 +1141,14 @@ class RemoteController:
                 run_id = str(value.get("run_id") or "").strip()
                 if run_id in run_ids:
                     run_summaries[run_id] = value
+        runs_finished = time.monotonic()
         paths = tuple(
             str(record.get("path") or "")
             for record in records
             if isinstance(record, dict) and record.get("path")
         )
         settings_by_path = self.workspace_config.load_many(paths)
+        settings_finished = time.monotonic()
         enriched: list[dict[str, Any]] = []
         for raw_record in records:
             if not isinstance(raw_record, dict):
@@ -1150,6 +1178,13 @@ class RemoteController:
                 )
             )
             enriched.append(record)
+        finished = time.monotonic()
+        if finished - started >= 1:
+            logging.getLogger(__name__).warning(
+                "Slow workspace read: registry=%.3fs runs=%.3fs settings=%.3fs projection=%.3fs",
+                registry_finished - started, runs_finished - registry_finished,
+                settings_finished - runs_finished, finished - settings_finished,
+            )
         return {**payload, "workspaces": enriched}
 
     @staticmethod
@@ -2121,8 +2156,10 @@ class RemoteController:
     def _runs_events(self, request: RemoteRequest) -> dict[str, Any]:
         body = request.body
         raw_agent = body.get("agent")
-        return self.manager.get_events(
-            self._text(body, "run_id"),
+        run_id = self._text(body, "run_id")
+        conversation_only = self._boolean(body, "conversation_items_only", default=False)
+        page = self.manager.get_events(
+            run_id,
             cursor=self._integer(body, "cursor", default=0, minimum=0),
             limit=self._integer(body, "limit", default=100, minimum=1),
             max_bytes=self._integer(
@@ -2136,7 +2173,30 @@ class RemoteController:
                 if raw_agent is not None
                 else None
             ),
+            **({"transcript_kinds": {"output", "warning", "error"}} if conversation_only else {}),
         )
+        if not self._boolean(body, "transcript_items_only", default=False):
+            return page
+        # One run cursor serves every Agent. Background readers must not scan
+        # the same interleaved log once per Agent and once per presentation mode.
+        branches: dict[int, list[dict[str, Any]]] = {}
+        for event in page.get("events", []):
+            agent = event.get("idx")
+            if type(agent) is int and agent > 0:
+                branches.setdefault(agent, []).append(event)
+        agents = []
+        for agent, events in branches.items():
+            projected = transcript_page({**page, "events": events})
+            outputs = [item for item in projected["items"] if item.get("kind") == "output"]
+            if outputs:
+                texts = self.manager.rewrite_agent_visible_texts(
+                    run_id, agent, [str(item.get("text") or "") for item in outputs])
+                for item, text in zip(outputs, texts, strict=True):
+                    item["text"] = text
+            if projected["items"]:
+                agents.append({"agent": agent, "items": projected["items"]})
+        return {**{key: value for key, value in page.items() if key != "events"},
+                "schema_version": TRANSCRIPT_SCHEMA_VERSION, "agents": agents}
 
     def _runs_history(self, request: RemoteRequest) -> dict[str, Any]:
         return self.manager.run_history(
@@ -2306,6 +2366,24 @@ class RemoteController:
             self._integer(body, "agent", minimum=1),
             **options,
         )
+
+    def _runs_resume_external_shutdown(self, request: RemoteRequest) -> dict[str, Any]:
+        body = request.body
+        raw_agents = body.get("agents")
+        if not isinstance(raw_agents, list) or not raw_agents:
+            raise RemoteControllerError("invalid_argument", "agents must be a non-empty list")
+        agents = [self._integer({"agent": value}, "agent", minimum=1) for value in raw_agents]
+        return self.manager.resume_external_shutdown_agents(
+            self._text(body, "run_id"), agents,
+        )
+
+    def _runs_recover_configuration_failures(self, request: RemoteRequest) -> dict[str, Any]:
+        body = request.body
+        raw_agents = body.get("agents")
+        if not isinstance(raw_agents, list) or not raw_agents:
+            raise RemoteControllerError("invalid_argument", "agents must be a non-empty list")
+        agents = [self._integer({"agent": value}, "agent", minimum=1) for value in raw_agents]
+        return self.manager.recover_configuration_failures(self._text(body, "run_id"), agents)
 
     def _runs_reject_agent(self, request: RemoteRequest) -> dict[str, Any]:
         body = request.body

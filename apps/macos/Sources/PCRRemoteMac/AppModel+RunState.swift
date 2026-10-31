@@ -215,7 +215,9 @@ extension AppModel {
             let key = WorkspaceRunViewKey(machineID: target.machineID,
                 workspaceID: workspaceID, runID: runID)
             let current = currentReadRun(key, fallback: activeRun?.runId == runID ? activeRun! : run)
-            if run.isOlderProjection(than: current) { return }
+            // A background reader may already know completion while the view
+            // still shows working. Publish that newer state, not the late reply.
+            if run.isOlderProjection(than: current) { run = current }
         }
         // Readers can advance while turns.get is in flight. Compare and select
         // against the current projection, not the snapshot from before await.
