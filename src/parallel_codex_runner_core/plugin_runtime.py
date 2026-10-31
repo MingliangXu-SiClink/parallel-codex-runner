@@ -57,10 +57,14 @@ from .models import (
     AGENT_ROLE_CANDIDATE,
     AGENT_ROLE_SYNTHESIS,
     AgentResult,
+    AgentSpec,
     DEFAULT_FOLLOW_UP_DELAY_SECONDS,
     DEFAULT_NUM_AGENTS,
     DEFAULT_SUBAGENTS_LIMIT,
+    agent_spec_by_index,
+    expand_agent_specs,
     normalize_agent_role,
+    normalize_agent_specs,
 )
 from .paths import choose_run_base, is_relative_to
 from .synthesis import (
@@ -2385,11 +2389,24 @@ class PluginRunManager:
         turn_index: int = 0,
         submission_command: Optional[Dict[str, str]] = None,
         supports_agent_questions: bool = False,
+        agent_specs: Optional[list] = None,
     ) -> Dict[str, Any]:
         prompt = prompt.strip()
         if not prompt:
             raise PluginRunError("Prompt must not be empty")
         source = self._resolve_workspace(workspace)
+
+        # Parse multi-model agent specs if provided; overrides num_agents/model/effort/fast
+        parsed_specs = normalize_agent_specs(agent_specs)
+        if parsed_specs:
+            num_agents = sum(s.count for s in parsed_specs)
+            # Use defaults from the first spec if run-level model/effort not given
+            first = parsed_specs[0]
+            if model is None and first.model is not None:
+                model = None  # keep None; per-agent model is in specs
+            if effort is None and first.effort is not None:
+                effort = None  # keep None; per-agent effort is in specs
+
         _validated_agent_count(num_agents, "num_agents")
         if max_parallel is not None and max_parallel <= 0:
             raise PluginRunError("max_parallel must be greater than zero")
@@ -2482,6 +2499,12 @@ class PluginRunManager:
             "keep_workspaces": bool(keep_workspaces),
             "run_base": str(storage["run_base"]),
         }
+        if parsed_specs:
+            expanded = expand_agent_specs(parsed_specs)
+            config["agent_specs"] = [
+                {"idx": idx, **s.to_dict()}
+                for idx, s in enumerate(expanded, start=1)
+            ]
         if submission_command is not None:
             config["submission_command"] = dict(submission_command)
         if supports_agent_questions:
@@ -4392,6 +4415,11 @@ class PluginRunManager:
                             set(run.rejected_agents)
                             | set(run.stale_synthesis_agents)
                         ),
+                        agent_specs={
+                            int(spec["idx"]): spec
+                            for spec in (run.config.get("agent_specs") or [])
+                            if isinstance(spec, dict) and "idx" in spec
+                        } or None,
                     )
                     if refresh_synthesis and not context.cancel_event.is_set():
                         recorded_results = []

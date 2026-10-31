@@ -5186,6 +5186,27 @@ def agent_role_execution_args(
     return stage_args
 
 
+def agent_spec_execution_args(
+    args: argparse.Namespace,
+    agent_specs: dict[int, dict[str, Any]] | None,
+    idx: int,
+) -> argparse.Namespace:
+    """Return args with per-agent model/effort/fast overridden if a spec exists."""
+    if not agent_specs:
+        return args
+    spec = agent_specs.get(idx)
+    if spec is None:
+        return args
+    override = argparse.Namespace(**vars(args))
+    if spec.get("model") is not None:
+        override.model = spec["model"]
+    if spec.get("effort") is not None:
+        override.effort = spec["effort"]
+    if spec.get("fast") is not None:
+        override.fast = spec["fast"]
+    return override
+
+
 def _prepare_additional_agent(
     *,
     args: argparse.Namespace,
@@ -5338,6 +5359,7 @@ def run_additional_agents(
     retained_execution_fingerprints: Optional[Dict[int, str]] = None,
     external_shutdown_recovery: bool = False,
     synthesis_preparation_fingerprints: Optional[Dict[int, str]] = None,
+    agent_specs: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> List[AgentResult]:
     agent_role = normalize_agent_role(agent_role)
     execution_args = agent_role_execution_args(args, agent_role)
@@ -5433,7 +5455,7 @@ def run_additional_agents(
                 fingerprint=retained_startup_fingerprint, real_codex_home=real_codex_home,
             )
         return _prepare_additional_agent(
-            args=execution_args,
+            args=agent_spec_execution_args(execution_args, agent_specs, idx),
             idx=idx,
             run_root=run_root,
             workspace=workspace,

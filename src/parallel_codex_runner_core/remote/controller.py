@@ -1906,6 +1906,7 @@ class RemoteController:
                 default=DEFAULT_SUBAGENTS_LIMIT,
                 minimum=1,
             ),
+            agent_specs=body.get("agent_specs"),
         )
         run_id = str(result.get("run_id") or "")
         if run_id:

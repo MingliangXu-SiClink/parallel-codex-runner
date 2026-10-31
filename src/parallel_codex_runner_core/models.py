@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 import time
 
 from .work_operations import WorkOperationTracker
@@ -21,6 +21,77 @@ def normalize_agent_role(value: object) -> str:
         if str(value or "").strip().lower() == AGENT_ROLE_SYNTHESIS
         else AGENT_ROLE_CANDIDATE
     )
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    """Per-agent model configuration for multi-model candidate runs."""
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    fast: Optional[bool] = None
+    count: int = 1
+
+    def with_defaults(self, default_model: Optional[str], default_effort: Optional[str], default_fast: Optional[bool]) -> "AgentSpec":
+        """Return a copy with any None fields filled from run-level defaults."""
+        return AgentSpec(
+            model=self.model if self.model is not None else default_model,
+            effort=self.effort if self.effort is not None else default_effort,
+            fast=self.fast if self.fast is not None else default_fast,
+            count=self.count,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"count": self.count}
+        if self.model is not None:
+            d["model"] = self.model
+        if self.effort is not None:
+            d["effort"] = self.effort
+        if self.fast is not None:
+            d["fast"] = self.fast
+        return d
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "AgentSpec | None":
+        if not isinstance(value, Mapping):
+            return None
+        count = value.get("count", 1)
+        try:
+            count = max(1, int(count))
+        except (TypeError, ValueError):
+            count = 1
+        model = str(value["model"]).strip() or None if "model" in value and value["model"] else None
+        effort = str(value["effort"]).strip().lower() or None if "effort" in value and value["effort"] else None
+        fast = value.get("fast")
+        if not isinstance(fast, bool):
+            fast = None
+        return cls(model=model, effort=effort, fast=fast, count=count)
+
+
+def normalize_agent_specs(raw: object) -> list[AgentSpec]:
+    """Parse agent_specs from API input. Returns [] if invalid or absent."""
+    if not isinstance(raw, list) or not raw:
+        return []
+    specs = []
+    for item in raw:
+        spec = AgentSpec.from_mapping(item)
+        if spec is None:
+            return []  # any invalid item invalidates the whole list
+        specs.append(spec)
+    return specs
+
+
+def expand_agent_specs(specs: list[AgentSpec]) -> list[AgentSpec]:
+    """Expand specs into one entry per agent (count=1 each), in order."""
+    return [
+        AgentSpec(model=s.model, effort=s.effort, fast=s.fast, count=1)
+        for s in specs
+        for _ in range(s.count)
+    ]
+
+
+def agent_spec_by_index(specs: list[AgentSpec]) -> Dict[int, AgentSpec]:
+    """Map 1-based agent index to its AgentSpec (after expansion)."""
+    return {idx: spec for idx, spec in enumerate(expand_agent_specs(specs), start=1)}
 
 
 @dataclass
