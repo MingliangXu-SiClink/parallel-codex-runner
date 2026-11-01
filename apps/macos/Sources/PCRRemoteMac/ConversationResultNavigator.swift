@@ -297,7 +297,7 @@ struct ConversationAgentSwitchBar: View {
     }
 
     private func agentMarkerSymbol(_ agent: RunAgentSummary) -> String? {
-        if (agent.pendingQuestionCount ?? 0) > 0 { return "questionmark.bubble.fill" }
+        if !agent.isTerminal && (agent.pendingQuestionCount ?? 0) > 0 { return "questionmark.bubble.fill" }
         if state.finalizedAgent == agent.agent { return "checkmark.seal.fill" }
         if state.recommendedAgent == agent.agent || agent.recommended { return "star.fill" }
         if agent.rejected { return "nosign" }
@@ -305,7 +305,7 @@ struct ConversationAgentSwitchBar: View {
     }
 
     private func agentMarkerColor(_ agent: RunAgentSummary) -> Color {
-        if (agent.pendingQuestionCount ?? 0) > 0 { return accentColor }
+        if !agent.isTerminal && (agent.pendingQuestionCount ?? 0) > 0 { return accentColor }
         if state.finalizedAgent == agent.agent { return .green }
         if state.recommendedAgent == agent.agent || agent.recommended { return .orange }
         return .secondary
@@ -323,7 +323,7 @@ struct ConversationAgentSwitchBar: View {
 
     private func agentHelp(_ agent: RunAgentSummary) -> String {
         var parts = [agent.name, navigatorStatus(agent)]
-        if (agent.pendingQuestionCount ?? 0) > 0 { parts.append(language.text("有问题待回答", "Has unanswered questions")) }
+        if !agent.isTerminal && (agent.pendingQuestionCount ?? 0) > 0 { parts.append(language.text("有问题待回答", "Has unanswered questions")) }
         let activity = AgentActivityPresentation.detail(agent, language: language, live: state.executionConfirmed)
         if !activity.isEmpty { parts.append(activity) }
         if agent.isSuccessful,
@@ -346,7 +346,7 @@ struct ConversationAgentSwitchBar: View {
 
     private func agentAccessibilityLabel(_ agent: RunAgentSummary) -> String {
         var parts = [displayName(agent), navigatorStatus(agent)]
-        if (agent.pendingQuestionCount ?? 0) > 0 { parts.append(language.text("有问题待回答", "Has unanswered questions")) }
+        if !agent.isTerminal && (agent.pendingQuestionCount ?? 0) > 0 { parts.append(language.text("有问题待回答", "Has unanswered questions")) }
         if agent.isSuccessful,
            agent.workspaceAvailable == false,
            state.finalizedAgent != agent.agent {
