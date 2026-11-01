@@ -191,9 +191,21 @@ struct ComposerExecutionConfigurationSummary: View {
                     Text(stage.title(model.appLanguage))
                     Text("\(settings[keyPath: stage.count])").monospacedDigit()
                         .foregroundStyle(ParallelCodexVisualStyle.primaryText)
-                    Text(stage.modelTitle(in: model))
-                        .foregroundStyle(ParallelCodexVisualStyle.primaryText)
-                        .accessibilityIdentifier("configuration.summary.\(stage.rawValue).model")
+                    if stage == .candidates && !settings.agentSpecs.isEmpty {
+                        // Multi-model mode: show each spec's model name separated by "/"
+                        let names = settings.agentSpecs.map { spec -> String in
+                            let value = spec.model.isEmpty ? "" :
+                                model.codexModelCatalog?.first(where: { $0.value == spec.model })?.label ?? spec.model
+                            return value.isEmpty ? model.appLanguage.text("未选", "—") : codexModelDisplayName(value)
+                        }
+                        Text(names.joined(separator: " / "))
+                            .foregroundStyle(ParallelCodexVisualStyle.primaryText)
+                            .accessibilityIdentifier("configuration.summary.\(stage.rawValue).model")
+                    } else {
+                        Text(stage.modelTitle(in: model))
+                            .foregroundStyle(ParallelCodexVisualStyle.primaryText)
+                            .accessibilityIdentifier("configuration.summary.\(stage.rawValue).model")
+                    }
                 }
             }
         }
@@ -578,6 +590,7 @@ private struct ExecutionStageView: View {
 }
 
 private struct AgentSpecRow: View {
+    @EnvironmentObject private var appModel: AppModel
     @Environment(\.appTextSize) private var textSize
     @Environment(\.appLanguage) private var language
     let spec: AgentSpecEntry
@@ -587,42 +600,104 @@ private struct AgentSpecRow: View {
     let update: (AgentSpecEntry) -> Void
     let remove: () -> Void
 
+    private var specOptions: CodexModelOptions? {
+        guard !spec.model.isEmpty else { return nil }
+        return appModel.modelOptionsCache.options(for: CodexModelOptionsContext(
+            machineID: appModel.currentMachineContextID, model: spec.model))
+    }
+
+    private var effortTitle: String {
+        executionEffortTitle(selection: spec.effort, effective: specOptions?.effectiveEffort, language: language)
+    }
+
+    private var effortChoices: [CodexOption] {
+        codexEffortChoices(dynamic: specOptions?.efforts, current: spec.effort,
+                           effective: specOptions?.effectiveEffort, language: language)
+    }
+
+    private var fastTitle: String {
+        let mode = spec.fast
+        return "Fast \(mode == .automatic ? language.text("自动", "Auto") : mode.title(language: language))"
+    }
+
     var body: some View {
-        HStack(spacing: 5 * textSize.scale) {
-            ExecutionOptionMenu(
-                title: language.text("候选模型", "Candidate model"),
-                identifier: "configuration.spec.\(spec.id).model",
-                choices: choices,
-                selection: spec.model,
-                select: { value in var s = spec; s.model = value; update(s) }
-            ) {
-                HStack(spacing: 4 * textSize.scale) {
-                    Text(displayTitle)
-                        .appScaledSystemFont(size: 13, weight: .semibold)
-                        .foregroundStyle(spec.model.isEmpty ? .secondary : .primary)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.down")
-                        .appScaledSystemFont(size: 9, weight: .medium)
-                        .foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5 * textSize.scale) {
+                ExecutionOptionMenu(
+                    title: language.text("候选模型", "Candidate model"),
+                    identifier: "configuration.spec.\(spec.id).model",
+                    choices: choices,
+                    selection: spec.model,
+                    select: { value in var s = spec; s.model = value; update(s) }
+                ) {
+                    HStack(spacing: 4 * textSize.scale) {
+                        Text(displayTitle)
+                            .appScaledSystemFont(size: 13, weight: .semibold)
+                            .foregroundStyle(spec.model.isEmpty ? .secondary : .primary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .appScaledSystemFont(size: 9, weight: .medium)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 5)
+                    .frame(minHeight: 22 * textSize.scale)
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 5)
-                .frame(minHeight: 22 * textSize.scale)
-                .contentShape(Rectangle())
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Text("×").foregroundStyle(.secondary)
-                .appScaledSystemFont(size: 11)
-            ExecutionCountEditor(
-                title: language.text("候选模型", "Candidate model"),
-                value: spec.count, range: range,
-                commit: { count in var s = spec; s.count = count; update(s) }
-            )
-            Button(action: remove) {
-                Image(systemName: "minus.circle")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("×").foregroundStyle(.secondary)
                     .appScaledSystemFont(size: 11)
-                    .foregroundStyle(.secondary)
+                ExecutionCountEditor(
+                    title: language.text("候选模型", "Candidate model"),
+                    value: spec.count, range: range,
+                    commit: { count in var s = spec; s.count = count; update(s) }
+                )
+                Button(action: remove) {
+                    Image(systemName: "minus.circle")
+                        .appScaledSystemFont(size: 11)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
+            // Effort + Fast controls, matching the layout of singleModelBody's attributes row
+            HStack(spacing: 0) {
+                ExecutionOptionMenu(
+                    title: language.text("候选模型", "Candidate model") + " · " + language.text("推理强度", "Reasoning effort"),
+                    identifier: "configuration.spec.\(spec.id).effort",
+                    choices: effortChoices,
+                    selection: spec.effort,
+                    select: { value in var s = spec; s.effort = value; update(s) }
+                ) {
+                    Label(effortTitle, systemImage: "slider.horizontal.3")
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 5)
+                        .frame(minHeight: 20 * textSize.scale)
+                        .contentShape(Rectangle())
+                }
+                ExecutionOptionMenu(
+                    title: language.text("候选模型", "Candidate model") + " · Fast",
+                    identifier: "configuration.spec.\(spec.id).fast",
+                    choices: RunFastMode.allCases.map {
+                        CodexOption(label: $0.title(language: language), value: $0.rawValue, selected: false)
+                    },
+                    selection: spec.fast.rawValue,
+                    select: { value in
+                        guard let mode = RunFastMode(rawValue: value) else { return }
+                        var s = spec; s.fast = mode; update(s)
+                    }
+                ) {
+                    let mode = spec.fast
+                    Label(fastTitle,
+                          systemImage: mode == .off ? "bolt.slash" : mode == .on ? "bolt.fill" : "bolt.badge.clock")
+                        .foregroundStyle(mode == .on ? Color.orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 5)
+                        .frame(minHeight: 20 * textSize.scale)
+                        .contentShape(Rectangle())
+                }
+            }
+            .appScaledSystemFont(size: 11)
+            .foregroundStyle(.secondary)
+            .padding(.leading, 5)
         }
         .padding(.horizontal, 5)
     }
