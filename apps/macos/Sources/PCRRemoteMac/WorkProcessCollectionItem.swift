@@ -63,6 +63,18 @@ final class WorkProcessCollectionItem: NSCollectionViewItem {
             scroll.documentView = collection
             coordinator.attach(scrollView: scroll, collectionView: collection)
             self.coordinator = coordinator
+        } else if size.width > 1, let scroll = view as? NSScrollView,
+                  abs(scroll.frame.width - size.width) > 0.5 {
+            // On reconfigure the outer collection view may not have committed
+            // layout yet (e.g. inside a batch update), so itemWidth() returns 1.
+            // Always apply the caller-supplied size so the inner collection gets
+            // the correct width immediately instead of staying at 1px.
+            scroll.setFrameSize(size)
+            if let collection = scroll.documentView {
+                var frame = collection.frame
+                frame.size.width = scroll.contentSize.width
+                collection.frame = frame
+            }
         }
         coordinator?.update(parent: content)
     }

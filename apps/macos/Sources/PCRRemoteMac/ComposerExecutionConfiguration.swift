@@ -184,7 +184,12 @@ struct ComposerExecutionConfigurationSummary: View {
     }
 
     private var stages: some View {
-        HStack(spacing: 12 * textSize.scale) {
+        // Build a value→label dictionary once per render instead of a linear
+        // first(where:) scan per spec on every AppModel publish during streaming.
+        let catalogByValue: [String: String] = model.codexModelCatalog.map {
+            Dictionary(uniqueKeysWithValues: $0.map { ($0.value, $0.label) })
+        } ?? [:]
+        return HStack(spacing: 12 * textSize.scale) {
             ForEach(ExecutionStage.allCases, id: \.self) { stage in
                 let settings = stage.displayedSettings(in: model)
                 HStack(spacing: 5 * textSize.scale) {
@@ -194,9 +199,8 @@ struct ComposerExecutionConfigurationSummary: View {
                     if stage == .candidates && !settings.agentSpecs.isEmpty {
                         // Multi-model mode: show each spec's model name separated by "/"
                         let names = settings.agentSpecs.map { spec -> String in
-                            let value = spec.model.isEmpty ? "" :
-                                model.codexModelCatalog?.first(where: { $0.value == spec.model })?.label ?? spec.model
-                            return value.isEmpty ? model.appLanguage.text("未选", "—") : codexModelDisplayName(value)
+                            let label = spec.model.isEmpty ? "" : catalogByValue[spec.model] ?? spec.model
+                            return label.isEmpty ? model.appLanguage.text("未选", "—") : codexModelDisplayName(label)
                         }
                         Text(names.joined(separator: " / "))
                             .foregroundStyle(ParallelCodexVisualStyle.primaryText)
@@ -451,11 +455,15 @@ private struct ExecutionStageView: View {
             .frame(minHeight: 24 * textSize.scale)
 
             ForEach(Array(settings.agentSpecs.enumerated()), id: \.element.id) { _, spec in
+                let specOptions: CodexModelOptions? = spec.model.isEmpty ? nil :
+                    model.modelOptionsCache.options(for: CodexModelOptionsContext(
+                        machineID: model.currentMachineContextID, model: spec.model))
                 AgentSpecRow(
                     spec: spec,
                     choices: stage.modelChoices(in: model),
                     displayTitle: specModelTitle(spec.model),
                     range: 1...model.effectiveMaximumAgentCount,
+                    specOptions: specOptions,
                     update: { newSpec in
                         var specs = settings.agentSpecs
                         if let i = specs.firstIndex(where: { $0.id == spec.id }) { specs[i] = newSpec }
@@ -590,21 +598,18 @@ private struct ExecutionStageView: View {
 }
 
 private struct AgentSpecRow: View {
-    @EnvironmentObject private var appModel: AppModel
     @Environment(\.appTextSize) private var textSize
     @Environment(\.appLanguage) private var language
     let spec: AgentSpecEntry
     let choices: [CodexOption]
     let displayTitle: String
     let range: ClosedRange<Int>
+    // Pass options directly from the parent (which already has AppModel) so
+    // AgentSpecRow does not need its own @EnvironmentObject subscription that
+    // would re-render every row on every AppModel publish during streaming.
+    let specOptions: CodexModelOptions?
     let update: (AgentSpecEntry) -> Void
     let remove: () -> Void
-
-    private var specOptions: CodexModelOptions? {
-        guard !spec.model.isEmpty else { return nil }
-        return appModel.modelOptionsCache.options(for: CodexModelOptionsContext(
-            machineID: appModel.currentMachineContextID, model: spec.model))
-    }
 
     private var effortTitle: String {
         executionEffortTitle(selection: spec.effort, effective: specOptions?.effectiveEffort, language: language)
