@@ -165,8 +165,7 @@ enum MacOSUpdateInstaller {
             guard prepared.directoryURL.deletingLastPathComponent().standardizedFileURL == updatesRoot.standardizedFileURL,
                   requestURL.deletingLastPathComponent().standardizedFileURL == prepared.directoryURL.standardizedFileURL,
                   prepared.directoryURL.resolvingSymlinksInPath() == prepared.directoryURL.standardizedFileURL,
-                  let parent = NSRunningApplication(processIdentifier: request.parentProcessID),
-                  parent.bundleURL?.standardizedFileURL == target.standardizedFileURL else {
+                  NSRunningApplication(processIdentifier: request.parentProcessID)?.bundleURL?.standardizedFileURL == target.standardizedFileURL else {
                 throw MacOSUpdateVerificationError.invalidBundle
             }
             lockDescriptor = open(updatesRoot.appendingPathComponent("installer.lock").path,
@@ -189,19 +188,31 @@ enum MacOSUpdateInstaller {
                                            newBuild: prepared.update.buildNumber, state: "prepared")
             try journal?.save(to: journalURL)
             try writeResult(MacOSInstallResult(ready: true, installed: false, rolledBack: false, message: nil), to: readyURL)
+            // NSRunningApplication.isTerminated depends on AppKit KVO notifications
+            // being drained by an NSApplication run loop. The helper installs with a
+            // .prohibited activation policy and never starts NSApp.run(), so those
+            // notifications never fire and isTerminated stays false even after the
+            // parent exits — causing the helper to time out without installing or
+            // relaunching. Probe the parent process directly with kill(2) instead.
+            let parentPID = request.parentProcessID
             for _ in 0..<600 {
                 if FileManager.default.fileExists(atPath: requestURL.appendingPathExtension("cancel").path) {
                     throw MacOSUpdateVerificationError.verificationCommand("The update restart was cancelled. The current app has not been changed.")
                 }
-                if parent.isTerminated { break }
+                if kill(parentPID, 0) != 0 { break }
                 try await Task.sleep(for: .milliseconds(200))
             }
-            guard parent.isTerminated else {
+            guard kill(parentPID, 0) != 0 else {
                 throw MacOSUpdateVerificationError.verificationCommand("Parallel Codex did not quit. The current app has not been changed.")
             }
             parentExited = true
+            // Exclude the confirmed-dead parent and the helper itself: AppKit's
+            // runningApplications list may be stale without an active run loop and
+            // could still contain the parent entry we already verified is gone.
             guard NSWorkspace.shared.runningApplications.allSatisfy({
-                $0.bundleURL?.standardizedFileURL != target.standardizedFileURL
+                $0.processIdentifier == parentPID
+                    || $0.processIdentifier == ProcessInfo.processInfo.processIdentifier
+                    || $0.bundleURL?.standardizedFileURL != target.standardizedFileURL
             }) else {
                 throw MacOSUpdateVerificationError.verificationCommand("Another copy of Parallel Codex is running. Quit that copy, then retry the update.")
             }
@@ -209,7 +220,9 @@ enum MacOSUpdateInstaller {
             backupURL = neighbor
             try MacOSUpdateVerifier.verifyBundle(neighbor, update: prepared.update, currentAppURL: target)
             guard NSWorkspace.shared.runningApplications.allSatisfy({
-                $0.bundleURL?.standardizedFileURL != target.standardizedFileURL
+                $0.processIdentifier == parentPID
+                    || $0.processIdentifier == ProcessInfo.processInfo.processIdentifier
+                    || $0.bundleURL?.standardizedFileURL != target.standardizedFileURL
             }) else {
                 throw MacOSUpdateVerificationError.verificationCommand("Another copy of Parallel Codex is running. Quit that copy, then retry the update.")
             }

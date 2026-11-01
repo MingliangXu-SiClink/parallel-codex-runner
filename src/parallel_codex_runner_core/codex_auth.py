@@ -145,12 +145,37 @@ def install_for_start(source: Path, private_home: Path) -> FileAuth | None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def _is_auth_error(error: dict[str, Any]) -> bool:
+    """Return True for any error that indicates an authentication failure.
+
+    Codex uses two shapes for auth errors:
+      - String:  {"codexErrorInfo": "unauthorized"}  (legacy / PCR-generated)
+      - Dict:    {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}}
+                 {"codexErrorInfo": {"responseStreamConnectionFailed": {"httpStatusCode": 401}}}
+
+    The dict form is what the native Codex CLI emits for real 401 responses from
+    the model provider. Both shapes must be recognised so that a 401 received while
+    running against a custom provider (e.g. fox / code1.newcli.com) triggers the
+    same account-switch recovery path as the string form.
+    """
+    info = error.get("codexErrorInfo")
+    if isinstance(info, str):
+        return info in {"unauthorized", "unauthorizedError"}
+    if isinstance(info, dict):
+        kind = next(iter(info), "")
+        inner = info.get(kind)
+        if isinstance(inner, dict):
+            status = inner.get("httpStatusCode")
+            if isinstance(status, int) and status == 401:
+                return True
+        # dict key alone (no inner status) still matches legacy shape
+        return kind in {"unauthorized", "unauthorizedError"}
+    return False
+
+
 def changed_auth_for_block(state: dict[str, Any], private_home: Path) -> bool:
     error = state.get("error") or {}
-    info = error.get("codexErrorInfo")
-    if isinstance(info, dict):
-        info = next(iter(info), "")
-    if info not in {"unauthorized", "unauthorizedError"}:
+    if not _is_auth_error(error):
         return False
     current = file_auth(selected_home())
     previous = (state.get("auth") or {}).get("identity")

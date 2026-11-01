@@ -235,6 +235,34 @@ class FileAuthTests(unittest.TestCase):
         state["error"] = {"codexErrorInfo": "other", "message": "Please sign in"}
         self.assertFalse(changed_auth_for_block(state, self.private))
 
+    def test_dict_shape_401_triggers_auth_switch_same_as_string_unauthorized(self):
+        # Codex emits {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}}
+        # when the model provider returns a real HTTP 401. This must be treated the same
+        # as the legacy string form so that a mid-run account switch is not lost.
+        dict_401 = {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}}
+        stream_401 = {"codexErrorInfo": {"responseStreamConnectionFailed": {"httpStatusCode": 401}}}
+        string_unauth = {"codexErrorInfo": "unauthorized"}
+        non_auth_4xx = {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 403}}}
+        non_auth_5xx = {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 503}}}
+        other = {"codexErrorInfo": "other", "message": "Please sign in"}
+
+        from parallel_codex_runner_core.codex_auth import _is_auth_error
+        self.assertTrue(_is_auth_error(dict_401))
+        self.assertTrue(_is_auth_error(stream_401))
+        self.assertTrue(_is_auth_error(string_unauth))
+        self.assertFalse(_is_auth_error(non_auth_4xx))
+        self.assertFalse(_is_auth_error(non_auth_5xx))
+        self.assertFalse(_is_auth_error(other))
+
+        # changed_auth_for_block must also fire for the dict shape
+        state_dict = {"error": dict_401}
+        self.assertTrue(changed_auth_for_block(state_dict, self.private))
+        state_stream = {"error": stream_401}
+        self.assertTrue(changed_auth_for_block(state_stream, self.private))
+        # But not when there is no identity change
+        state_dict["auth"] = {"identity": file_auth(self.source).identity}
+        self.assertFalse(changed_auth_for_block(state_dict, self.private))
+
 
 class AccountPeer(NativePeer):
     def __init__(self, history, requests, source, account, *, rapid=False, stop=None, reject=False):

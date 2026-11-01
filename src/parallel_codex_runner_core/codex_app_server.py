@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from parallel_codex_runner_core.agent_questions import QuestionError, QuestionOwner, async_questions, async_reply
-from parallel_codex_runner_core.codex_auth import (SOURCE_ENV, FileAuth, changed_auth_for_block,
-    file_auth, install_for_start, selected_home, supports_file_auth)
+from parallel_codex_runner_core.codex_auth import (SOURCE_ENV, FileAuth, _is_auth_error,
+    changed_auth_for_block, file_auth, install_for_start, selected_home, supports_file_auth)
 from parallel_codex_runner_core.history_origins import RECOVERY_INPUT, RECOVERY_ORIGIN, RECOVERY_ID_PREFIX
 
 
@@ -925,7 +925,7 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
             desired = file_auth(source) if auth_enabled else None
             auth_continuation = (recovery is not None and code != 0 and desired is not None
                 and desired.identity != bound_auth.identity
-                and (adapter.error or {}).get("codexErrorInfo") == "unauthorized")
+                and _is_auth_error(adapter.error or {}))
             if recovery is None or code == 0 or (not transient_error(adapter.error) and not auth_continuation):
                 if auth_enabled and code == 0 and (auth_handoff_turn or desired is None or desired.identity != bound_auth.identity):
                     auth_status("completed_previous_account", file_auth(source))
