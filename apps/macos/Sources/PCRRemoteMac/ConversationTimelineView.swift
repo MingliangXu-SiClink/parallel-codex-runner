@@ -1,6 +1,18 @@
 import AppKit
 import SwiftUI
 
+/// Shared action holder written by the ConversationTimelineView coordinator so
+/// any UI outside the collection view (sticky agent-switch bar, toolbar prev/next
+/// buttons) can call prepareInlineControlMutation before changing the selected
+/// agent. Without this, the coordinator has no anchor to hold the switcher bar
+/// in place and the scroll position jumps when content heights differ.
+@MainActor
+final class AgentSwitchPrepareAction: ObservableObject {
+    private var action: ((String) -> Void)?
+    func register(_ closure: @escaping (String) -> Void) { action = closure }
+    func prepare(runID: String) { action?(runID) }
+}
+
 struct ConversationTimelineView: NSViewRepresentable {
     let language: AppLanguage
     let textSize: AppTextSize
@@ -19,6 +31,7 @@ struct ConversationTimelineView: NSViewRepresentable {
     let activateBlock: (TranscriptBlock) -> Void
     let selectAgent: (Int) -> Void
     let toggleResults: () -> Void
+    let agentSwitchPrepare: AgentSwitchPrepareAction
     var itemsRevision: UInt64? = nil
     var questionActions = AgentQuestionActions()
     var isWorkProcess = false
@@ -189,6 +202,12 @@ struct ConversationTimelineView: NSViewRepresentable {
                 self?.viewportHeightDidChange()
             }
             scrollMotion.onCompletion = { [weak self] in self?.recordScrollPosition() }
+            // Register the prepare-for-agent-switch closure so any UI outside
+            // the collection view (sticky bar, toolbar prev/next) can anchor the
+            // switcher before changing the selected agent.
+            parent.agentSwitchPrepare.register { [weak self] runID in
+                self?.prepareInlineControlMutation(id: "agent-switch:\(runID)")
+            }
             userScrollObserver = NotificationCenter.default.addObserver(
                 forName: NSScrollView.willStartLiveScrollNotification, object: scrollView, queue: .main
             ) { [weak self] _ in

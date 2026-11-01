@@ -6,6 +6,8 @@ final class WorkProcessCollectionItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("WorkProcessCollectionItem")
     private var coordinator: ConversationTimelineView.Coordinator?
     private var timeline: ConversationTimelineView?
+    // Work-process timelines never host an agent switcher; use a no-op holder.
+    private let agentSwitchPrepare = AgentSwitchPrepareAction()
 
     static func maximumHeight(textSize: AppTextSize) -> CGFloat { 360 * textSize.scale }
 
@@ -46,6 +48,7 @@ final class WorkProcessCollectionItem: NSCollectionViewItem {
             findNavigationRequest: parent.findNavigationRequest, memory: parent.memory,
             resultsInspectorVisible: false, openURL: parent.openURL,
             activateBlock: parent.activateBlock, selectAgent: { _ in }, toggleResults: {},
+            agentSwitchPrepare: agentSwitchPrepare,
             isWorkProcess: true, isNearBottom: .constant(false),
             inlineAgentSwitchPosition: .constant(.visible)
         )
@@ -75,6 +78,7 @@ final class WorkProcessCollectionItem: NSCollectionViewItem {
             findNavigationRequest: timeline.findNavigationRequest + 1, memory: timeline.memory,
             resultsInspectorVisible: false, openURL: timeline.openURL,
             activateBlock: timeline.activateBlock, selectAgent: { _ in }, toggleResults: {},
+            agentSwitchPrepare: agentSwitchPrepare,
             isWorkProcess: true, isNearBottom: .constant(false),
             inlineAgentSwitchPosition: .constant(.visible)
         )

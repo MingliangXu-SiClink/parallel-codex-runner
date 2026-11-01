@@ -4,6 +4,7 @@ struct WorkspaceWorkbench: View {
     var headerLeadingInset: CGFloat = 24
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var agentSwitchPrepare = AgentSwitchPrepareAction()
     @State private var discardConfirmation = false
     @State private var conversationFindPresented = false
     @State private var conversationFindCommandRequest = ConversationFindCommandRequest.idle
@@ -53,6 +54,7 @@ struct WorkspaceWorkbench: View {
             .clipped()
         }
         .background(ParallelCodexVisualStyle.canvas)
+        .environmentObject(agentSwitchPrepare)
         .onAppear { model.refreshExpandedWorkOperations() }
         .onChange(of: model.selectedTranscriptBlocks) { _ in
             model.refreshExpandedWorkOperations()
@@ -450,6 +452,7 @@ private struct LiveConversationWarning: View {
 
 private struct ConversationToolbar: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var agentSwitchPrepare: AgentSwitchPrepareAction
     let workspace: RemoteWorkspace
     @Binding var resultsInspectorVisible: Bool
     let discard: () -> Void
@@ -485,7 +488,10 @@ private struct ConversationToolbar: View {
         let title = delta < 0 ? model.appLanguage.text("上一个 Agent", "Previous Agent")
             : model.appLanguage.text("下一个 Agent", "Next Agent")
         return Button {
-            if let target { Task { await model.selectAgent(target) } }
+            if let target {
+                agentSwitchPrepare.prepare(runID: state.runID)
+                Task { await model.selectAgent(target) }
+            }
         } label: {
             Image(systemName: delta < 0 ? "chevron.left" : "chevron.right")
                 .appScaledSystemFont(size: 13)
@@ -604,6 +610,7 @@ struct AgentTranscriptView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appTextSize) private var appTextSize
+    @EnvironmentObject private var agentSwitchPrepare: AgentSwitchPrepareAction
     @State private var followsLatestByContext: [String: Bool] = [:]
     @State private var jumpToLatestRequest = 0
     @State private var findQuery = ""
@@ -760,6 +767,7 @@ struct AgentTranscriptView: View {
                     toggleResults: {
                         resultsInspectorVisible.toggle()
                     },
+                    agentSwitchPrepare: agentSwitchPrepare,
                     itemsRevision: model.conversationTimelineItemsProjectionGeneration,
                     questionActions: AgentQuestionActions.answering(
                         using: questionAnswers, target: linkTarget, workspaceID: workspace.workspaceId,
@@ -782,6 +790,7 @@ struct AgentTranscriptView: View {
                             resultsInspectorVisible: resultsInspectorVisible,
                             accessibilityHidden: false,
                             selectAgent: { agent in
+                                agentSwitchPrepare.prepare(runID: switchState.runID)
                                 Task { await model.selectAgent(agent) }
                             },
                             toggleResults: {
