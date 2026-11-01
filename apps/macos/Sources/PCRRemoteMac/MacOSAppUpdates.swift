@@ -365,7 +365,12 @@ extension AppModel {
                     currentBuildNumber: buildNumber
                 )
             )
-            let nextUpdate = response.available ? response.update : nil
+            // Guard against the server returning the current or an older build as
+            // "available". verifyBundle enforces the same condition but only after
+            // a full download; filter it here so we never show a banner or trigger
+            // a pointless download for a build that cannot be installed.
+            let nextUpdate = response.available && (response.update?.buildNumber ?? -1) > buildNumber
+                ? response.update : nil
             if let prepared = macOSPreparedUpdate {
                 macOSUpdateAvailable = prepared.update
             } else {
