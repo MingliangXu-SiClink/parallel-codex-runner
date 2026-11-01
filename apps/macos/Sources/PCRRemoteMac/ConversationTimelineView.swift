@@ -761,7 +761,15 @@ struct ConversationTimelineView: NSViewRepresentable {
                     synchronizeDocumentGeometry()
                     collectionView.layoutSubtreeIfNeeded()
                     if pendingInlineControlAnchor != nil {
-                        restorePendingInlineControlAnchor(finalPass: true, duringBatch: true)
+                        // reloadAll skips performBatchUpdates, so
+                        // collectionUpdateInFlight stays false. With finalPass
+                        // true that would finalize the anchor before AppKit has
+                        // measured the new rows, clamping the scroll to the top
+                        // when switching to a longer agent. Use finalPass false
+                        // so a deferred retry re-applies the anchor after row
+                        // heights are measured.
+                        restorePendingInlineControlAnchor(
+                            finalPass: !plan.reloadAll, duringBatch: true)
                     } else if isCandidateSwitch {
                         restore(snapshot: parent.memory.snapshot(for: activeContext))
                     }
