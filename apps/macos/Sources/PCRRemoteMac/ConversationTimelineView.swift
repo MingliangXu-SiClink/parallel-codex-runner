@@ -6,8 +6,12 @@ import SwiftUI
 /// buttons) can call prepareInlineControlMutation before changing the selected
 /// agent. Without this, the coordinator has no anchor to hold the switcher bar
 /// in place and the scroll position jumps when content heights differ.
+///
+/// Deliberately NOT ObservableObject: passing it through the view hierarchy as a
+/// plain let avoids SwiftUI environment subscription overhead that would re-render
+/// dependent views on every AppModel publish during scrolling.
 @MainActor
-final class AgentSwitchPrepareAction: ObservableObject {
+final class AgentSwitchPrepareAction {
     private var action: ((String) -> Void)?
     func register(_ closure: @escaping (String) -> Void) { action = closure }
     func prepare(runID: String) { action?(runID) }

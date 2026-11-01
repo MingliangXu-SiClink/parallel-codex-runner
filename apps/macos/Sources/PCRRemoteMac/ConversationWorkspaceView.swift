@@ -4,7 +4,7 @@ struct WorkspaceWorkbench: View {
     var headerLeadingInset: CGFloat = 24
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @StateObject private var agentSwitchPrepare = AgentSwitchPrepareAction()
+    @State private var agentSwitchPrepare = AgentSwitchPrepareAction()
     @State private var discardConfirmation = false
     @State private var conversationFindPresented = false
     @State private var conversationFindCommandRequest = ConversationFindCommandRequest.idle
@@ -16,6 +16,7 @@ struct WorkspaceWorkbench: View {
                 ConversationHeader(leadingInset: headerLeadingInset) {
                     if let workspace = model.selectedWorkspace {
                         ConversationToolbar(
+                            agentSwitchPrepare: agentSwitchPrepare,
                             workspace: workspace,
                             resultsInspectorVisible: $model.resultsInspectorVisible,
                             discard: { discardConfirmation = true },
@@ -54,7 +55,6 @@ struct WorkspaceWorkbench: View {
             .clipped()
         }
         .background(ParallelCodexVisualStyle.canvas)
-        .environmentObject(agentSwitchPrepare)
         .onAppear { model.refreshExpandedWorkOperations() }
         .onChange(of: model.selectedTranscriptBlocks) { _ in
             model.refreshExpandedWorkOperations()
@@ -193,6 +193,7 @@ struct WorkspaceWorkbench: View {
             AgentTranscriptView(
                 questionAnswers: model.questionAnswers,
                 workspace: workspace,
+                agentSwitchPrepare: agentSwitchPrepare,
                 resultsInspectorVisible: $model.resultsInspectorVisible,
                 findPresented: $conversationFindPresented,
                 findCommandRequest: conversationFindCommandRequest,
@@ -452,7 +453,7 @@ private struct LiveConversationWarning: View {
 
 private struct ConversationToolbar: View {
     @EnvironmentObject private var model: AppModel
-    @EnvironmentObject private var agentSwitchPrepare: AgentSwitchPrepareAction
+    let agentSwitchPrepare: AgentSwitchPrepareAction
     let workspace: RemoteWorkspace
     @Binding var resultsInspectorVisible: Bool
     let discard: () -> Void
@@ -610,7 +611,6 @@ struct AgentTranscriptView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appTextSize) private var appTextSize
-    @EnvironmentObject private var agentSwitchPrepare: AgentSwitchPrepareAction
     @State private var followsLatestByContext: [String: Bool] = [:]
     @State private var jumpToLatestRequest = 0
     @State private var findQuery = ""
@@ -620,6 +620,7 @@ struct AgentTranscriptView: View {
     @FocusState private var findFieldFocused: Bool
     @ObservedObject var questionAnswers: AgentAnswerOutbox
     let workspace: RemoteWorkspace
+    let agentSwitchPrepare: AgentSwitchPrepareAction
     @Binding var resultsInspectorVisible: Bool
     @Binding var findPresented: Bool
     let findCommandRequest: ConversationFindCommandRequest
