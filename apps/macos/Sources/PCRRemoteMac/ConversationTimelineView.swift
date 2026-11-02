@@ -596,7 +596,13 @@ struct ConversationTimelineView: NSViewRepresentable {
             replacement.dataSource = nil
             replacement.delegate = nil
             collectionView = replacement
-            replacement.frame = NSRect(origin: .zero, size: scrollView.contentView.bounds.size)
+            // Use scrollView.frame.size, not contentView.bounds.size. When the
+            // scroll view was just created (work process expand), contentView.bounds
+            // has not been laid out yet so its size is zero — this made itemWidth
+            // clamp to 1 and all work process rows render at 1px wide until the
+            // next window resize. The scroll view's own frame is always current.
+            let scrollFrame = scrollView.frame.size
+            replacement.frame = NSRect(origin: .zero, size: scrollFrame.width > 0 ? scrollFrame : scrollView.contentView.bounds.size)
             _ = updateSectionInsets(for: replacement.bounds.width)
             replacement.dataSource = self
             replacement.delegate = self

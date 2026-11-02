@@ -24,6 +24,9 @@ final class ParallelCodexAppDelegate: NSObject, NSApplicationDelegate {
     let windowModels = NSMapTable<NSWindow, AppModel>(keyOptions: .weakMemory, valueOptions: .weakMemory)
     var isQuitting = false
     var updateRestartInProgress = false
+    // Set by ParallelCodexMacApp.body so the delegate can open a window without
+    // needing direct access to SwiftUI's @Environment(\.openWindow).
+    var openNewWindow: (() -> Void)?
 
     func applicationShouldSaveSecureApplicationState(_ app: NSApplication) -> Bool {
         // AppKit's restoration snapshot can briefly paint an old transcript
@@ -36,6 +39,14 @@ final class ParallelCodexAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldRestoreSecureApplicationState(_ app: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        guard !hasVisibleWindows else { return true }
+        // All windows were closed. Open a new one so clicking the Dock icon
+        // brings the app back instead of doing nothing.
+        openNewWindow?()
+        return true
     }
 
     func applicationShouldTerminate(
@@ -166,6 +177,9 @@ struct ParallelCodexMacApp: App {
                     guard !restoredWindows, !AppLaunchMode.isUISmokeTest else { return }
                     restoredWindows = true
                     for id in ClientWindowCatalog.openWindowIDs { openWindow(id: "conversation-window", value: id) }
+                    // Give the delegate a closure to open a new window when the
+                    // Dock icon is clicked with all windows closed.
+                    appDelegate.openNewWindow = { openWindow(id: "conversation-window", value: UUID()) }
                 }
         }
         .windowStyle(.hiddenTitleBar)
