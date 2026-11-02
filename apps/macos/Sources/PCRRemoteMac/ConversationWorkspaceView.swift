@@ -5,6 +5,7 @@ struct WorkspaceWorkbench: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var agentSwitchPrepare = AgentSwitchPrepareAction()
+    @State private var jumpToLatestRequest = 0
     @State private var discardConfirmation = false
     @State private var conversationFindPresented = false
     @State private var conversationFindCommandRequest = ConversationFindCommandRequest.idle
@@ -144,9 +145,14 @@ struct WorkspaceWorkbench: View {
                 canStop: model.activeRun?.isWorking == true
                     && !model.isRunOperationInProgress
                     && !model.settingsPresented && !model.addAgentsPresented,
+                canJumpToLatest: model.selectedWorkspace != nil,
+                canStartNewConversation: model.selectedWorkspace != nil
+                    && !model.settingsPresented && !model.addAgentsPresented,
                 selectPreviousAgent: { Task { await model.selectAdjacentAgent(-1) } },
                 selectNextAgent: { Task { await model.selectAdjacentAgent(1) } },
-                stop: { Task { await model.stopCurrentRun() } }
+                stop: { Task { await model.stopCurrentRun() } },
+                jumpToLatest: { jumpToLatestRequest += 1 },
+                startNewConversation: { Task { await model.beginNewConversation() } }
             )
         )
     }
@@ -194,6 +200,7 @@ struct WorkspaceWorkbench: View {
                 questionAnswers: model.questionAnswers,
                 workspace: workspace,
                 agentSwitchPrepare: agentSwitchPrepare,
+                jumpToLatestRequest: $jumpToLatestRequest,
                 resultsInspectorVisible: $model.resultsInspectorVisible,
                 findPresented: $conversationFindPresented,
                 findCommandRequest: conversationFindCommandRequest,
@@ -612,7 +619,6 @@ struct AgentTranscriptView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appTextSize) private var appTextSize
     @State private var followsLatestByContext: [String: Bool] = [:]
-    @State private var jumpToLatestRequest = 0
     @State private var findQuery = ""
     @State private var findSelection = 0
     @State private var findNavigationRequest = 0
@@ -621,6 +627,7 @@ struct AgentTranscriptView: View {
     @ObservedObject var questionAnswers: AgentAnswerOutbox
     let workspace: RemoteWorkspace
     let agentSwitchPrepare: AgentSwitchPrepareAction
+    @Binding var jumpToLatestRequest: Int
     @Binding var resultsInspectorVisible: Bool
     @Binding var findPresented: Bool
     let findCommandRequest: ConversationFindCommandRequest
