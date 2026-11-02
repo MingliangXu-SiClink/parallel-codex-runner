@@ -222,7 +222,7 @@ struct ComposerQueueTests {
         model.followUpQueue[1].lastError = "The queue could not be updated."
         model.followUpQueue[2].daemonAcknowledged = false
         for size in AppTextSize.allCases {
-            let content = FollowUpQueueView().environmentObject(model)
+            let content = FollowUpQueueView().environmentObject(model).environmentObject(model.convState)
                 .environment(\.appLanguage, .chinese).environment(\.appTextSize, size)
                 .environment(\.colorScheme, .dark).frame(width: 620)
             let host = NSHostingView(rootView: content)

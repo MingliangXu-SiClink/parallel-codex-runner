@@ -21,7 +21,7 @@ struct ComposerOffscreenTests {
             try? FileManager.default.removeItem(at: directory)
         }
         model.promptDraftContext = "offscreen-conversation"
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(model))
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(model).environmentObject(model.convState))
         host.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
         host.layoutSubtreeIfNeeded()
         let editor = try #require(descendants(host).compactMap { $0 as? NSTextView }.first)
@@ -61,7 +61,7 @@ struct ComposerOffscreenTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let model = AppModel(windowID: UUID(), desktopStateStore: DesktopStateStore(directory: directory))
         defer { model.stopWindowObservation(); try? FileManager.default.removeItem(at: directory) }
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(model))
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(model).environmentObject(model.convState))
         host.frame = NSRect(x: 0, y: 0, width: 540, height: 400)
         host.layoutSubtreeIfNeeded()
         let editor = try #require(descendants(host).compactMap { $0 as? NSTextView }.first)

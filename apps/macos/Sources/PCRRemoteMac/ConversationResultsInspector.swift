@@ -13,6 +13,7 @@ enum ResultInspectorLayout {
 
 struct ConversationResultsInspector: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     let run: RunSummary?
     var close: (() -> Void)? = nil
 
@@ -35,7 +36,7 @@ struct ConversationResultsInspector: View {
                 .accessibilityLabel(model.appLanguage.text("结果信息", "Result information"))
             } else {
                 VStack(spacing: 12) {
-                    if model.pendingPromptSubmission != nil || model.isSelectedWorkspaceContextLoading {
+                    if convState.pendingPromptSubmission != nil || model.isSelectedWorkspaceContextLoading {
                         ProgressView()
                         Text(model.appLanguage.text("正在准备本轮结果", "Preparing this turn"))
                     } else {
@@ -70,7 +71,7 @@ struct ConversationResultsInspector: View {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(ParallelCodexIconButtonStyle())
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
                 .help(model.appLanguage.text("追加 Agent", "Add Agents"))
             }
             if let close {
@@ -95,7 +96,7 @@ struct ConversationResultsInspector: View {
                     .appScaledSystemFont(size: 15, weight: .medium)
                 Spacer(minLength: 8)
                 ConversationResultActions(run: run)
-                    .disabled(model.pendingAgentSelection != nil)
+                    .disabled(convState.pendingAgentSelection != nil)
             }
             Text(model.continuationSelectionContextText ?? ResultAgentContext.text(run: run, viewedAgent: agent.agent,
                                          isLatestTurn: model.isViewingLatestConversationTurn,

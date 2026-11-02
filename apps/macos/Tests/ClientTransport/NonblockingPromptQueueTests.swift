@@ -315,7 +315,7 @@ struct NonblockingPromptQueueTests {
         fixture.model.updatePrompt("第二条消息")
         await fixture.model.submitPrompt()
         fixture.model.updatePrompt("可以继续输入和排队发送")
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model)
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model).environmentObject(fixture.model.convState)
             .environment(\.appLanguage, .chinese).environment(\.appTextSize, .standard)
             .preferredColorScheme(.dark))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 420),

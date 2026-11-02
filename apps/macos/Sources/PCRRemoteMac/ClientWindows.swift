@@ -30,6 +30,7 @@ struct ClientWindowContent: View {
     var body: some View {
         ContentView()
             .environmentObject(model)
+            .environmentObject(model.convState)
             .environment(\.locale, model.appLanguage.locale)
             .environment(\.appLanguage, model.appLanguage)
             .environment(\.appAccentColor, model.appAccentColor)

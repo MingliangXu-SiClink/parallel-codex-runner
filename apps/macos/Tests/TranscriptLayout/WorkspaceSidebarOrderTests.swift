@@ -189,7 +189,7 @@ struct WorkspaceSidebarOrderTests {
         defaults.set(order.data, forKey: WorkspaceSidebarOrder.defaultsKey)
         let reorder = WorkspaceSidebarReorder()
         let root = WorkspaceNavigationSidebar(workspacePendingRemoval: .constant(nil), searchRequestSequence: 0, reorder: reorder)
-            .environmentObject(model).defaultAppStorage(defaults)
+            .environmentObject(model).environmentObject(model.convState).defaultAppStorage(defaults)
             .environment(\.appLanguage, .chinese).environment(\.colorScheme, dark ? .dark : .light)
             .transaction { $0.disablesAnimations = true }
             .frame(width: width, height: 650)

@@ -1257,6 +1257,7 @@ struct TranscriptScrollPublicationTests {
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in },
                 selectAgent: { [unowned self] in agentSelections.append($0) }, toggleResults: {},
+                agentSwitchPrepare: AgentSwitchPrepareAction(),
                 itemsRevision: itemsRevision,
                 isNearBottom: Binding(
                     get: { [unowned self] in liveValue ?? memory.snapshot(for: key)?.followsLatest ?? true },

@@ -3,6 +3,7 @@ import SwiftUI
 struct WorkspaceWorkbench: View {
     var headerLeadingInset: CGFloat = 24
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var agentSwitchPrepare = AgentSwitchPrepareAction()
     @State private var jumpToLatestRequest = 0
@@ -143,7 +144,7 @@ struct WorkspaceWorkbench: View {
                 canSwitchAgent: (model.activeRun?.agents.count ?? 0) > 1
                     && !model.settingsPresented && !model.addAgentsPresented,
                 canStop: model.activeRun?.isWorking == true
-                    && !model.isRunOperationInProgress
+                    && !convState.isRunOperationInProgress
                     && !model.settingsPresented && !model.addAgentsPresented,
                 canJumpToLatest: model.selectedWorkspace != nil,
                 canStartNewConversation: model.selectedWorkspace != nil
@@ -235,9 +236,9 @@ struct WorkspaceWorkbench: View {
     private var centersInitialComposer: Bool {
         model.isComposingNewConversation
             && model.activeRun == nil
-            && model.pendingPromptSubmission == nil
+            && convState.pendingPromptSubmission == nil
             && model.selectedTimelineItems.isEmpty
-            && model.followUpQueue.isEmpty
+            && convState.followUpQueue.isEmpty
             && !model.isSelectedWorkspaceContextLoading
     }
 
@@ -372,6 +373,7 @@ private struct ConversationTransientNotices: View {
 
 private struct ConversationOperationNotice: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     let message: String
 
     var body: some View {
@@ -415,6 +417,7 @@ private struct ConversationOperationNotice: View {
 
 private struct LiveConversationWarning: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     let message: String
 
     var body: some View {
@@ -460,6 +463,7 @@ private struct LiveConversationWarning: View {
 
 private struct ConversationToolbar: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     let agentSwitchPrepare: AgentSwitchPrepareAction
     let workspace: RemoteWorkspace
     @Binding var resultsInspectorVisible: Bool
@@ -543,7 +547,7 @@ private struct ConversationToolbar: View {
                     systemImage: "arrow.clockwise"
                 )
             }
-            .disabled(model.isRunOperationInProgress)
+            .disabled(convState.isRunOperationInProgress)
 
             if model.activeRun != nil {
                 Button {
@@ -567,7 +571,7 @@ private struct ConversationToolbar: View {
                         systemImage: "stop.fill"
                     )
                 }
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
             } else if let run = model.activeRun,
                       model.isViewingLatestWorkspaceRun,
                       run.finalizedAgent == nil,
@@ -579,7 +583,7 @@ private struct ConversationToolbar: View {
                         systemImage: "trash"
                     )
                 }
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
             }
             Divider()
             if let record = model.visibleDeletedConversation {
@@ -616,6 +620,7 @@ private struct ConversationToolbar: View {
 
 struct AgentTranscriptView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appTextSize) private var appTextSize
     @State private var followsLatestByContext: [String: Bool] = [:]
@@ -639,7 +644,7 @@ struct AgentTranscriptView: View {
 
     private var visibleConversationContextID: String {
         transcriptConversationContextID(
-            selectedConversationID: model.selectedConversationID,
+            selectedConversationID: convState.selectedConversationID,
             activeRunID: model.activeRun?.runId,
             workspaceLastRunID: workspace.lastRunId
         )
@@ -679,7 +684,7 @@ struct AgentTranscriptView: View {
 
     private var scrollContext: String {
         let agent = transcriptAgentContextID(
-            selectedAgent: model.selectedAgent,
+            selectedAgent: convState.selectedAgent,
             restoredAgent: restoredAgentContext
         )
         return transcriptScrollContextID(
@@ -734,9 +739,9 @@ struct AgentTranscriptView: View {
 
     var body: some View {
         let linkTarget = model.client.currentTarget()
-        let linkConversation = model.selectedConversationID
+        let linkConversation = convState.selectedConversationID
         if model.activeRun == nil,
-           model.pendingPromptSubmission == nil,
+           convState.pendingPromptSubmission == nil,
            model.selectedTimelineItems.isEmpty {
             EmptyWorkspaceRunView(
                 workspace: workspace,
@@ -875,7 +880,7 @@ struct AgentTranscriptView: View {
                 guard let request = model.conversationSearchNavigation,
                       request.machineID == model.currentMachineContextID,
                       request.workspaceID == model.selectedWorkspaceID,
-                      request.conversationID == model.selectedConversationID else { return }
+                      request.conversationID == convState.selectedConversationID else { return }
                 // Result navigation transfers attention from the sidebar to this
                 // conversation, not to the hosting view of the clicked result.
                 findFocusRestoration = ConversationSearchFocus(

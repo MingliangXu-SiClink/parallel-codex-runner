@@ -47,7 +47,7 @@ struct ComposerControlsTests {
                 fixture.model.appLanguage = language
                 for size in [AppTextSize.standard, .extraLarge] {
                     for width: CGFloat in [350, 560, 960] {
-                        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model)
+                        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                             .environment(\.appLanguage, language).environment(\.appTextSize, size)
                             .environment(\.colorScheme, .dark).frame(width: width))
                         let window = makeWindow(host: host, size: host.fittingSize, scheme: .dark)
@@ -99,7 +99,7 @@ struct ComposerControlsTests {
             let host = NSHostingView(rootView: VStack(spacing: 0) {
                 Spacer(minLength: 0)
                 PromptComposer()
-            }.environmentObject(fixture.model).environment(\.appLanguage, .chinese)
+            }.environmentObject(fixture.model).environmentObject(fixture.model.convState).environment(\.appLanguage, .chinese)
                 .environment(\.appTextSize, .standard).environment(\.colorScheme, scheme)
                 .background(ParallelCodexVisualStyle.canvas))
             let window = makeWindow(host: host, size: CGSize(width: 960, height: 320), scheme: scheme)
@@ -112,7 +112,7 @@ struct ComposerControlsTests {
             var presented = true
             let presentation = ExecutionConfigurationAnchor(isPresented: Binding(get: { presented }, set: { presented = $0 }),
                 preferredWidth: 368) { width in
-                ExecutionConfigurationPopover(width: width).environmentObject(fixture.model)
+                ExecutionConfigurationPopover(width: width).environmentObject(fixture.model).environmentObject(fixture.model.convState)
                     .environment(\.appLanguage, .chinese).environment(\.appTextSize, .standard)
                     .environment(\.colorScheme, scheme)
             }
@@ -127,7 +127,7 @@ struct ComposerControlsTests {
             #expect(container.convert(surface.frame, to: nil).minY > original.maxY)
             #expect(anchor.convert(anchor.bounds, to: nil) == original)
             #expect(window.childWindows?.isEmpty ?? true)
-            let content = NSHostingView(rootView: ComposerExecutionConfiguration().environmentObject(fixture.model)
+            let content = NSHostingView(rootView: ComposerExecutionConfiguration().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                 .environment(\.appTextSize, .standard).environment(\.appLanguage, .chinese))
             #expect(abs(surface.frame.height - content.fittingSize.height - 24) < 1)
             #expect(descendants(surface).compactMap { $0 as? NSPopUpButton }.count == 8)
@@ -153,7 +153,7 @@ struct ComposerControlsTests {
                                        ("stop", true, false), ("queue", true, true)] {
             try fixture.configure(running: running, draft: draft)
             for width: CGFloat in [560, 960] {
-                let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model)
+                let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                     .environment(\.appLanguage, .chinese).environment(\.colorScheme, .dark).frame(width: width))
                 let window = makeWindow(host: host, size: host.fittingSize, scheme: .dark)
                 defer { window.close() }
@@ -178,7 +178,7 @@ struct ComposerControlsTests {
         defer { fixture.close() }
         try fixture.configure(running: false, draft: false)
         for scheme in [ColorScheme.dark, .light] {
-            let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model)
+            let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                 .environment(\.appLanguage, .chinese).environment(\.colorScheme, scheme).frame(width: 560))
             let window = makeWindow(host: host, size: host.fittingSize, scheme: scheme)
             defer { window.close() }

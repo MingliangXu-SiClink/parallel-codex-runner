@@ -203,7 +203,7 @@ struct InlineQuestionTests {
                 contentIsLoading: false, jumpToLatestRequest: 0, findQuery: "", findMatch: nil,
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
-                isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
+                agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
         }
         let coordinator = ConversationTimelineView.Coordinator(parent: parent())
         let collection = ConversationTimelineView.makeCollectionView(coordinator: coordinator)
@@ -265,7 +265,7 @@ struct InlineQuestionTests {
                 contentIsLoading: false, jumpToLatestRequest: 0, findQuery: "", findMatch: nil,
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
-                isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
+                agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
         }
         let coordinator = ConversationTimelineView.Coordinator(parent: parent())
         let collection = ConversationTimelineView.makeCollectionView(coordinator: coordinator)

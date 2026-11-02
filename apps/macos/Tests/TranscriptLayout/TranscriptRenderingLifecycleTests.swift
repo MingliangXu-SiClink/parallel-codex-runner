@@ -105,7 +105,7 @@ struct TranscriptRenderingLifecycleTests {
                     findQuery: "", findMatch: nil, findNavigationRequest: 0, memory: p.memory,
                     resultsInspectorVisible: false, openURL: p.openURL, activateBlock: p.activateBlock,
                     selectAgent: p.selectAgent, toggleResults: p.toggleResults,
-                    isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
+                    agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
                 TextField("Unsent draft", text: .constant("Keep this draft."))
             })
         }
@@ -495,7 +495,7 @@ struct TranscriptRenderingLifecycleTests {
                 contentIsLoading: false, jumpToLatestRequest: 0, findQuery: "", findMatch: nil,
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
-                isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
+                agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
         }
 
         func update() {

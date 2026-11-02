@@ -34,6 +34,7 @@ enum MainWindowFrameStore {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.scenePhase) private var scenePhase
     @State private var workspacePendingRemoval: RemoteWorkspace?
     @State private var sidebarVisible = true
@@ -174,8 +175,8 @@ struct ContentView: View {
         .confirmationDialog(
             model.appLanguage.text("继续运行？", "Continue with this run?"),
             isPresented: Binding(
-                get: { model.storageConfirmationMessage != nil
-                    && model.pendingPromptSubmission?.status != .awaitingConfirmation },
+                get: { convState.storageConfirmationMessage != nil
+                    && convState.pendingPromptSubmission?.status != .awaitingConfirmation },
                 // SwiftUI sets this binding to false before invoking a dialog
                 // button. Cancelling here erased the pending prompt before the
                 // Continue action could confirm it.
@@ -190,7 +191,7 @@ struct ContentView: View {
                 model.cancelStorageUsage()
             }
         } message: {
-            Text(model.storageConfirmationMessage ?? "")
+            Text(convState.storageConfirmationMessage ?? "")
         }
         .task(id: scenePhase) {
             guard !AppLaunchMode.isUISmokeTest, scenePhase == .active else { return }
@@ -250,6 +251,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .environmentObject(model)
+            .environmentObject(model.convState)
             .environment(\.locale, model.appLanguage.locale)
             .environment(\.appLanguage, model.appLanguage)
             .environment(\.appTextSize, model.appTextSize)
@@ -273,10 +275,10 @@ struct ContentView: View {
             || model.machineSelectionInProgress
             || model.workspaceContextLoadingID != nil
             || model.remoteTurnTransitionInProgress
-            || model.isRunOperationInProgress
-            || model.pendingPromptSubmission != nil
+            || convState.isRunOperationInProgress
+            || convState.pendingPromptSubmission != nil
             || model.activeRun?.isWorking == true
-            || !model.followUpQueue.isEmpty
+            || !convState.followUpQueue.isEmpty
             || model.workspaces.contains(where: \.removalLooksActive)
         return .seconds(needsFrequentRefresh ? 5 : 15)
     }
@@ -1297,6 +1299,7 @@ private struct MachinePairingView: View {
 
 private struct WorkspaceConversationInlineList: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let searchText: String
@@ -1318,7 +1321,7 @@ private struct WorkspaceConversationInlineList: View {
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
-            } else if model.conversationIndexLoading && model.workspaceConversations.isEmpty {
+            } else if convState.conversationIndexLoading && convState.workspaceConversations.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.mini)
@@ -1357,7 +1360,7 @@ private struct WorkspaceConversationInlineList: View {
                         VStack(alignment: .leading, spacing: 2) {
                           WorkspaceConversationSidebarRow(
                             conversation: conversation,
-                            selected: model.selectedConversationID == conversation.id,
+                            selected: convState.selectedConversationID == conversation.id,
                             opening: model.openingConversationID == conversation.id,
                             pinned: isPinned(conversation),
                             showsUpdatedTime: duplicateConversationIDs.contains(conversation.id)
@@ -1368,7 +1371,7 @@ private struct WorkspaceConversationInlineList: View {
                                 .padding(.leading, 35).padding(.trailing, 10).padding(.bottom, 6)
                           }
                         }
-                        .parallelCodexSidebarRow(selected: model.selectedConversationID == conversation.id)
+                        .parallelCodexSidebarRow(selected: convState.selectedConversationID == conversation.id)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -1377,7 +1380,7 @@ private struct WorkspaceConversationInlineList: View {
                     .accessibilityLabel(conversationAccessibilityLabel(conversation))
                     .accessibilityHint(searchText.isEmpty ? "" : model.searchExcerpt(conversation, query: searchText) ?? "")
                     .accessibilityAddTraits(
-                        model.selectedConversationID == conversation.id ? .isSelected : []
+                        convState.selectedConversationID == conversation.id ? .isSelected : []
                     )
                     .contextMenu {
                         Button {
@@ -1476,7 +1479,7 @@ private struct WorkspaceConversationInlineList: View {
             return conversations
         }
         let collapsed = Array(conversations.prefix(collapsedConversationLimit))
-        guard let selectedID = model.selectedConversationID,
+        guard let selectedID = convState.selectedConversationID,
               conversations.contains(where: { $0.id == selectedID }),
               !collapsed.contains(where: { $0.id == selectedID }) else {
             return collapsed
@@ -1487,8 +1490,8 @@ private struct WorkspaceConversationInlineList: View {
     private var orderedConversations: [WorkspaceConversationSummary] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let filtered = query.isEmpty
-            ? model.workspaceConversations
-            : model.workspaceConversations.filter {
+            ? convState.workspaceConversations
+            : convState.workspaceConversations.filter {
                 model.searchExcerpt($0) != nil || model.workspaceConversationMatchesSearch($0, query: query)
             }
         return filtered.enumerated().sorted { left, right in
@@ -1502,7 +1505,7 @@ private struct WorkspaceConversationInlineList: View {
     private var collapsedConversationLimit: Int { 8 }
 
     private var duplicateConversationIDs: Set<String> {
-        let groups = Dictionary(grouping: model.workspaceConversations) {
+        let groups = Dictionary(grouping: convState.workspaceConversations) {
             $0.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
         return Set(groups.values.filter { $0.count > 1 }.flatMap { $0.map(\.id) })

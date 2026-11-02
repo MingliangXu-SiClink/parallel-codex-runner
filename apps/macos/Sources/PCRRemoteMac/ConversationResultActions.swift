@@ -4,6 +4,7 @@ import SwiftUI
 /// explicit. Selecting a branch alone never changes the original workspace.
 struct ConversationResultActions: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @State private var stopAndUseConfirmation = false
     @State private var recoveryConfirmation = false
     let run: RunSummary
@@ -78,7 +79,7 @@ struct ConversationResultActions: View {
             isLatestWorkspaceRun: model.isViewingLatestWorkspaceRun,
             syncBack: model.settings.syncBack,
             operation: nil,
-            hasPendingSubmission: model.pendingPromptSubmission != nil
+            hasPendingSubmission: convState.pendingPromptSubmission != nil
         ) {
         case .progress:
             Button(model.appLanguage.text("保存结果", "Save Result")) {}
@@ -95,14 +96,14 @@ struct ConversationResultActions: View {
             }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
         case .retryCleanup:
             Button(model.appLanguage.text("重试清理", "Retry Cleanup")) {
                 Task { await model.retryFinalizationCleanup() }
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
-            .disabled(model.isRunOperationInProgress)
+            .disabled(convState.isRunOperationInProgress)
         case .used:
             // The selected result header already carries the used badge.
             // Repeating the same state in the action lane makes a completed
@@ -131,13 +132,13 @@ struct ConversationResultActions: View {
             }
             .buttonStyle(.bordered)
             .help(model.appLanguage.text("将此 Agent 的修改保存到原工作区", "Save this Agent's changes to the original workspace"))
-            .disabled(model.isRunOperationInProgress)
+            .disabled(convState.isRunOperationInProgress)
         case .retryAgent:
             Button(model.appLanguage.text("重试 Agent", "Retry Agent")) {
                 Task { await model.retrySelectedAgent() }
             }
             .buttonStyle(.bordered)
-            .disabled(model.isRunOperationInProgress)
+            .disabled(convState.isRunOperationInProgress)
         case .stopAgent:
             EmptyView()
         case .none:
@@ -160,7 +161,7 @@ struct ConversationResultActions: View {
                     Label(model.appLanguage.text("仅停止 \(displayName(agent))", "Stop only \(displayName(agent))"),
                           systemImage: "stop.circle")
                 }
-                .disabled(model.isRunOperationInProgress || !model.daemonOnline)
+                .disabled(convState.isRunOperationInProgress || !model.daemonOnline)
                 Divider()
             }
             if (model.activeRun?.agents.count ?? 0) > 1 {
@@ -191,7 +192,7 @@ struct ConversationResultActions: View {
                         systemImage: "arrow.clockwise"
                     )
                 }
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
             }
 
             if model.isViewingLatestWorkspaceRun, run.finalizedAgent == nil {
@@ -206,7 +207,7 @@ struct ConversationResultActions: View {
                         systemImage: agent.rejected ? "arrow.uturn.backward" : "hand.thumbsdown"
                     )
                 }
-                .disabled(model.isRunOperationInProgress)
+                .disabled(convState.isRunOperationInProgress)
             }
         } label: {
             Image(systemName: "slider.horizontal.3")

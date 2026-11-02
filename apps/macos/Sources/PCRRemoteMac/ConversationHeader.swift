@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ConversationHeader<Actions: View>: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @State private var titleHovered = false
     var leadingInset: CGFloat = 24
     @ViewBuilder let actions: () -> Actions
@@ -37,7 +38,7 @@ struct ConversationHeader<Actions: View>: View {
                     && !running.isEmpty && running.allSatisfy(\.isObservedWaiting)
                     && model.daemonOnline && model.connectionErrorMessage == nil
                     && model.liveConversationWarning == nil && !model.machineSelectionInProgress
-                    && model.pendingPromptSubmission == nil
+                    && convState.pendingPromptSubmission == nil
                     && model.isViewingLatestConversationTurn
             } ?? false
             let status = allWaiting ? model.appLanguage.text("定时等待", "Waiting")
@@ -45,7 +46,7 @@ struct ConversationHeader<Actions: View>: View {
             let executionActive = ExecutionActivityState.isWorking(
                 run: model.activeRun,
                 isLatestTurn: model.isViewingLatestConversationTurn,
-                hasPendingSubmission: model.pendingPromptSubmission != nil,
+                hasPendingSubmission: convState.pendingPromptSubmission != nil,
                 connectionConfirmed: model.daemonOnline && model.connectionErrorMessage == nil
                     && model.liveConversationWarning == nil && !model.machineSelectionInProgress
             )
@@ -84,6 +85,7 @@ struct ConversationHeader<Actions: View>: View {
 
 struct ConversationRenameView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
     let request: ConversationRenameRequest

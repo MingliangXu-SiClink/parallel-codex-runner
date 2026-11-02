@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PromptComposer: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
 
     var body: some View {
         PromptComposerContent(draft: model.promptDraft)
@@ -48,6 +49,7 @@ struct ComposerActionButtonStyle: ButtonStyle {
 
 private struct PromptComposerContent: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @ObservedObject var draft: PromptDraftState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.appTextSize) private var appTextSize
@@ -160,15 +162,15 @@ private struct PromptComposerContent: View {
     private var activeComposer: some View {
         let queueContext = model.followUpQueueContext
         return VStack(alignment: .leading, spacing: ParallelCodexVisualStyle.Spacing.small) {
-            if let context = model.currentRunOperationContext(), let issue = model.runOperationIssues[context.key] {
+            if let context = model.currentRunOperationContext(), let issue = convState.runOperationIssues[context.key] {
                 HStack {
                     Text(issue.message).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
                     Spacer()
-                    Button { model.runOperationIssues.removeValue(forKey: context.key) } label: { Image(systemName: "xmark") }
+                    Button { convState.runOperationIssues.removeValue(forKey: context.key) } label: { Image(systemName: "xmark") }
                         .help(model.appLanguage.localized("Close"))
                 }.appScaledTextStyle(.caption)
             }
-            if let submission = model.pendingPromptSubmission,
+            if let submission = convState.pendingPromptSubmission,
                let presentation = promptSubmissionPresentation(
                    submission.presentationStatus.rawValue,
                    language: model.appLanguage,
@@ -282,7 +284,7 @@ private struct PromptComposerContent: View {
                         edit: { model.queueEditRequest = $0 },
                         manageQueue: { model.presentFollowUpQueue() }
                     )
-                    .id("\(model.currentMachineContextID):\(model.selectedWorkspaceID ?? ""): \(model.selectedConversationID ?? "")")
+                    .id("\(model.currentMachineContextID):\(model.selectedWorkspaceID ?? ""): \(convState.selectedConversationID ?? "")")
                     .padding(.horizontal, 14)
                     .padding(.bottom, -16)
                 }
@@ -389,7 +391,7 @@ private struct PromptComposerContent: View {
             } label: {
                 Label(model.appLanguage.text("运行设置", "Run Settings"), systemImage: "slider.horizontal.3")
             }
-            .disabled(model.isRunOperationInProgress)
+            .disabled(convState.isRunOperationInProgress)
             Divider()
             promptHistoryMenu
         } label: {
@@ -470,7 +472,7 @@ private struct PromptComposerContent: View {
     private var primaryActionHelp: String {
         if case .stop = composerAction.kind { return stopActionHelp }
         if composerAction.kind == .sending {
-            return model.pendingPromptSubmission?.status == .opening
+            return convState.pendingPromptSubmission?.status == .opening
                 ? model.appLanguage.text("正在打开", "Opening")
                 : model.appLanguage.text("正在发送", "Sending")
         }
@@ -489,8 +491,8 @@ private struct PromptComposerContent: View {
     }
 
     private var canStopRun: Bool {
-        model.daemonOnline && !model.isRunOperationInProgress
-            && model.pendingAgentSelection == nil
+        model.daemonOnline && !convState.isRunOperationInProgress
+            && convState.pendingAgentSelection == nil
             && !model.remoteTurnTransitionInProgress
     }
 

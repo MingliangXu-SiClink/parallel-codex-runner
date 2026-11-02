@@ -163,6 +163,7 @@ struct ParallelCodexMacApp: App {
         Window(AppIdentity.productName, id: "main") {
             ContentView()
                 .environmentObject(model)
+                .environmentObject(model.convState)
                 .environment(\.locale, model.appLanguage.locale)
                 .environment(\.appLanguage, model.appLanguage)
                 .environment(\.appAccentColor, model.appAccentColor)
@@ -207,6 +208,7 @@ struct ParallelCodexMacApp: App {
         Settings {
             SettingsRootView()
             .environmentObject(model)
+            .environmentObject(model.convState)
             .environment(\.locale, model.appLanguage.locale)
             .environment(\.appLanguage, model.appLanguage)
             .environment(\.appAccentColor, model.appAccentColor)

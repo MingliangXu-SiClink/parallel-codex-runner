@@ -27,7 +27,7 @@ struct ReviewPanelsTests {
         model.openTranscriptLink(file)
         await model.workspaceFileTask?.value
         let identity = try #require(model.workspaceDocument?.id)
-        let host = NSHostingView(rootView: WorkspaceWorkbench().environmentObject(model))
+        let host = NSHostingView(rootView: WorkspaceWorkbench().environmentObject(model).environmentObject(model.convState))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1600, height: 900),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -244,7 +244,7 @@ struct ReviewPanelsTests {
         model.selectedWorkspaceID = "review-layout"
         model.resultsInspectorVisible = true
         model.prompt = "Keep this draft and its editor while closing side panels."
-        let host = NSHostingView(rootView: WorkspaceWorkbench().environmentObject(model))
+        let host = NSHostingView(rootView: WorkspaceWorkbench().environmentObject(model).environmentObject(model.convState))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 741, height: 900),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

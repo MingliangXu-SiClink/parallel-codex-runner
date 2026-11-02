@@ -51,7 +51,7 @@ struct TranscriptLayoutTests {
         let model = AppModel(windowID: UUID())
         model.prompt = "A multiline prompt\nA second line"
         defer { model.stopWindowObservation() }
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(model))
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(model).environmentObject(model.convState))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2400, height: 400),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

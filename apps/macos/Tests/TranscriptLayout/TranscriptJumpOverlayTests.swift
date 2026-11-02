@@ -96,9 +96,11 @@ struct TranscriptJumpOverlayTests {
                 workspaceID: workspace.workspaceId, conversationID: "overlay-conversation", runID: run.runId, agentID: "1")
             model.transcriptScrollMemory.save(.init(offsetY: 280, followsLatest: false), for: context)
             host = NSHostingView(rootView: AgentTranscriptView(questionAnswers: model.questionAnswers, workspace: workspace,
+                agentSwitchPrepare: AgentSwitchPrepareAction(), jumpToLatestRequest: .constant(0),
                 resultsInspectorVisible: .constant(false), findPresented: .constant(false),
                 findCommandRequest: .idle, inlineAgentSwitchPosition: .constant(.missing))
-                .environmentObject(model).environment(\.appLanguage, .english).environment(\.appTextSize, size)
+                .environmentObject(model).environmentObject(model.convState)
+                .environment(\.appLanguage, .english).environment(\.appTextSize, size)
                 .preferredColorScheme(scheme))
             host.frame = NSRect(x: 0, y: 0, width: width, height: 520)
             window = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)

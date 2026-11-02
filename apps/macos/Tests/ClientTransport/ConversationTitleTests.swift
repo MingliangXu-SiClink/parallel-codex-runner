@@ -24,7 +24,7 @@ struct ConversationTitleTests {
         let action = NSView()
         let header = ConversationHeader(leadingInset: leadingInset) {
             HeaderActionProbe(view: action).frame(width: 32, height: 32)
-        }.environmentObject(model)
+        }.environmentObject(model).environmentObject(model.convState)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 52),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

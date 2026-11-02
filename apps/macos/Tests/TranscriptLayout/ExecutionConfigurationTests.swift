@@ -119,7 +119,7 @@ struct ExecutionConfigurationTests {
             #expect(stage.modelSelection(in: model) == "gpt-6-astra")
             #expect(stage.modelChoices(in: model).map(\.value) == ["gpt-6-astra", "gpt-6.1-sol"])
         }
-        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(model))
+        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(model).environmentObject(model.convState))
         let window = makeWindow(size: host.fittingSize, scheme: .dark)
         defer { window.close() }
         window.contentView = host
@@ -146,7 +146,7 @@ struct ExecutionConfigurationTests {
                 for scheme in [ColorScheme.dark, .light] {
                     for width: CGFloat in [260, 350, 960] {
                         var entrySize: CGSize?
-                        let host = NSHostingView(rootView: ComposerExecutionConfigurationSummary().environmentObject(model)
+                        let host = NSHostingView(rootView: ComposerExecutionConfigurationSummary().environmentObject(model).environmentObject(model.convState)
                             .environment(\.appTextSize, size).environment(\.appLanguage, language)
                             .background(GeometryReader { geometry in
                                 Color.clear.onAppear { entrySize = geometry.size }
@@ -175,7 +175,7 @@ struct ExecutionConfigurationTests {
                         window.close()
                     }
                     let host = NSHostingView(rootView: ExecutionConfigurationPopover()
-                        .environmentObject(model).environment(\.appTextSize, size)
+                        .environmentObject(model).environmentObject(model.convState).environment(\.appTextSize, size)
                         .environment(\.appLanguage, language).environment(\.colorScheme, scheme))
                     #expect(abs(host.fittingSize.width - 368 * size.scale) < 1)
                     #expect(host.fittingSize.height > 68 * size.scale && host.fittingSize.height < 248 * size.scale)
@@ -207,17 +207,17 @@ struct ExecutionConfigurationTests {
                     model.settings.model = "gpt-6.1-sol"
                     model.settings.synthesisModel = "gpt-6-astra"
                     let shortSummary = NSHostingView(rootView: ComposerExecutionConfigurationSummary()
-                        .environmentObject(model).environment(\.appTextSize, size).frame(width: 260)).fittingSize
+                        .environmentObject(model).environmentObject(model.convState).environment(\.appTextSize, size).frame(width: 260)).fittingSize
                     let shortPanel = NSHostingView(rootView: ExecutionConfigurationPopover()
-                        .environmentObject(model).environment(\.appTextSize, size)).fittingSize
+                        .environmentObject(model).environmentObject(model.convState).environment(\.appTextSize, size)).fittingSize
                     model.settings.model = longNames[0]
                     model.settings.synthesisModel = longNames[1]
                     let description = ComposerExecutionConfigurationSummary.description(in: model)
                     #expect(longNames.allSatisfy { description.contains($0) })
                     let cases: [(String, AnyView, CGFloat)] = [
-                        ("summary", AnyView(ComposerExecutionConfigurationSummary().environmentObject(model)
+                        ("summary", AnyView(ComposerExecutionConfigurationSummary().environmentObject(model).environmentObject(model.convState)
                             .frame(width: 260, alignment: .leading)), shortSummary.height),
-                        ("popover", AnyView(ExecutionConfigurationPopover().environmentObject(model)),
+                        ("popover", AnyView(ExecutionConfigurationPopover().environmentObject(model).environmentObject(model.convState)),
                          shortPanel.height + 30 * size.scale),
                     ]
                     for (name, view, minimumHeight) in cases {
@@ -260,7 +260,7 @@ struct ExecutionConfigurationTests {
         for language in [AppLanguage.chinese, .english] {
             fixture.model.appLanguage = language
             for size in [AppTextSize.standard, .extraLarge] {
-                let host = NSHostingView(rootView: ComposerExecutionConfigurationSummary().environmentObject(fixture.model)
+                let host = NSHostingView(rootView: ComposerExecutionConfigurationSummary().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                     .environment(\.appTextSize, size).environment(\.appLanguage, language)
                     .environment(\.colorScheme, .dark).frame(width: 260, alignment: .leading)
                     .background(ParallelCodexVisualStyle.canvas))
@@ -335,7 +335,7 @@ struct ExecutionConfigurationTests {
                     for locked in [false, true] {
                         model.activeRun = try run(locked: locked)
                         let host = NSHostingView(rootView: ExecutionConfigurationPopover()
-                            .environmentObject(model).environment(\.appTextSize, size)
+                            .environmentObject(model).environmentObject(model.convState).environment(\.appTextSize, size)
                             .environment(\.appLanguage, language).environment(\.colorScheme, scheme))
                         #expect(abs(host.fittingSize.width - 368 * size.scale) < 1)
                         #expect(host.fittingSize.height < 230 * size.scale)
@@ -416,7 +416,7 @@ struct ExecutionConfigurationTests {
             for size in AppTextSize.allCases {
                 for width: CGFloat in [350, 960] {
                     for scheme in [ColorScheme.dark, .light] {
-                        let content = ComposerExecutionConfiguration().environmentObject(model)
+                        let content = ComposerExecutionConfiguration().environmentObject(model).environmentObject(model.convState)
                             .environment(\.appTextSize, size).environment(\.appLanguage, language)
                             .environment(\.colorScheme, scheme).tint(.orange)
                             .padding(16).background(ParallelCodexVisualStyle.composerSurface)
@@ -492,7 +492,7 @@ struct ExecutionConfigurationTests {
         for locked in [false, true] {
             fixture.model.activeRun = try run(locked: locked)
             for width: CGFloat in [460, 900] {
-                let host = NSHostingView(rootView: ComposerExecutionConfiguration().environmentObject(fixture.model)
+                let host = NSHostingView(rootView: ComposerExecutionConfiguration().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                     .environment(\.appTextSize, .standard).environment(\.appLanguage, .chinese)
                     .environment(\.colorScheme, .dark).padding(16).background(ParallelCodexVisualStyle.composerSurface).frame(width: width))
                 let window = makeWindow(size: host.fittingSize, scheme: .dark)
@@ -545,7 +545,7 @@ struct ExecutionConfigurationTests {
             Spacer()
             Color.clear.frame(height: 28)
                 .background(ExecutionConfigurationAnchor(isPresented: .constant(true), preferredWidth: 368) { width in
-                    ExecutionConfigurationPopover(width: width).environmentObject(model)
+                    ExecutionConfigurationPopover(width: width).environmentObject(model).environmentObject(model.convState)
                         .environment(\.appTextSize, .standard).environment(\.appLanguage, .chinese)
                 })
             Color.clear.frame(height: 100)
@@ -658,7 +658,7 @@ struct ExecutionConfigurationTests {
         fixture.model.settings.synthesisAgents = 4096
         for size in AppTextSize.allCases {
             for scheme in [ColorScheme.light, .dark] {
-                let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(fixture.model)
+                let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(fixture.model).environmentObject(fixture.model.convState)
                     .environment(\.appLanguage, .chinese).environment(\.appTextSize, size).environment(\.colorScheme, scheme))
                 let window = makeWindow(size: host.fittingSize, scheme: scheme)
                 window.contentView = host
@@ -690,7 +690,7 @@ struct ExecutionConfigurationTests {
         defer { fixture.close() }
         fixture.model.activeRun = try run(locked: true)
         let actual = ExecutionStage.synthesis.displayedSettings(in: fixture.model).synthesisAgents
-        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(fixture.model)
+        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(fixture.model).environmentObject(fixture.model.convState)
             .environment(\.appLanguage, .chinese).environment(\.appTextSize, .standard).environment(\.colorScheme, .dark))
         let window = makeWindow(size: host.fittingSize, scheme: .dark)
         defer { window.close() }
@@ -715,7 +715,7 @@ struct ExecutionConfigurationTests {
         defer { fixture.close() }
         fixture.model.promptDraftContext = "offscreen-execution"
         fixture.model.prompt = "A retained draft"
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model)
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(fixture.model).environmentObject(fixture.model.convState)
             .environment(\.appTextSize, .standard).environment(\.colorScheme, .dark).tint(.orange))
         #expect(host.fittingSize.height < 230, "The collapsed composer must not reserve space for the pipeline editor.")
         let window = makeWindow(size: CGSize(width: 960, height: 350), scheme: .dark)
@@ -755,7 +755,7 @@ struct ExecutionConfigurationTests {
             Spacer()
             Color.clear.frame(height: 28)
                 .background(ExecutionConfigurationAnchor(isPresented: .constant(true), preferredWidth: 368) { width in
-                    ExecutionConfigurationPopover(width: width).environmentObject(model)
+                    ExecutionConfigurationPopover(width: width).environmentObject(model).environmentObject(model.convState)
                         .environment(\.appTextSize, .standard).environment(\.appLanguage, .chinese)
                 })
             Color.clear.frame(height: 100)
@@ -811,7 +811,7 @@ struct ExecutionConfigurationTests {
         defer { fixture.close() }
         let model = fixture.model
         model.activeRun = try run(locked: false)
-        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(model)
+        let host = NSHostingView(rootView: ExecutionConfigurationPopover().environmentObject(model).environmentObject(model.convState)
             .environment(\.appTextSize, .standard).environment(\.appLanguage, .chinese))
         let window = makeWindow(size: host.fittingSize, scheme: .dark)
         defer { window.close() }

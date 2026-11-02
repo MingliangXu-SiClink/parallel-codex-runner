@@ -110,6 +110,11 @@ final class AppModel: ObservableObject {
     @Published var storageCleaningRunIDsByMachine: [String: String] = [:]
     private var activeRunValue: RunSummary?
     let activeRunMetrics = ActiveRunMetrics()
+    /// High-frequency run-time state (streaming ticks, workspace polls,
+    /// follow-up countdowns).  Moved out of AppModel's own @Published
+    /// surface so that settings/connection views are not re-rendered on
+    /// every tick.  AppModel forwards these via computed properties below.
+    let convState = ConversationRunState()
     var activeRun: RunSummary? {
         get { activeRunValue }
         set {
@@ -121,8 +126,16 @@ final class AppModel: ObservableObject {
             activeRunMetrics.update(newValue)
         }
     }
-    @Published var workspaceConversations: [WorkspaceConversationSummary] = []
-    @Published var selectedConversationID: String?
+    // MARK: - ConversationRunState forwarding (no @Published on AppModel;
+    // changes publish via convState.objectWillChange only).
+    var workspaceConversations: [WorkspaceConversationSummary] {
+        get { convState.workspaceConversations }
+        set { convState.workspaceConversations = newValue }
+    }
+    var selectedConversationID: String? {
+        get { convState.selectedConversationID }
+        set { convState.selectedConversationID = newValue }
+    }
     @Published var conversationSearchMatchesByRun: [String: ConversationTextMatch] = [:]
     @Published var conversationSearchLoading = false
     @Published var conversationSearchError: String?
@@ -136,13 +149,34 @@ final class AppModel: ObservableObject {
     @Published var lastDeletedConversation: DeletedConversation?
     var conversationTitlesTask: Task<Void, Never>?
     @Published var promptFocusRequestSequence = 0
-    @Published var conversationIndexLoading = false
-    @Published var selectedAgent: Int?
-    @Published var pendingAgentSelection: Int?
-    @Published var transcripts: [Int: AgentTranscript] = [:]
-    @Published var loadingAgentKeys: Set<String> = []
-    @Published var resumeSessions: [ResumeSession] = []
-    @Published var resumeHistory: [ResumeHistoryEntry] = []
+    var conversationIndexLoading: Bool {
+        get { convState.conversationIndexLoading }
+        set { convState.conversationIndexLoading = newValue }
+    }
+    var selectedAgent: Int? {
+        get { convState.selectedAgent }
+        set { convState.selectedAgent = newValue }
+    }
+    var pendingAgentSelection: Int? {
+        get { convState.pendingAgentSelection }
+        set { convState.pendingAgentSelection = newValue }
+    }
+    var transcripts: [Int: AgentTranscript] {
+        get { convState.transcripts }
+        set { convState.transcripts = newValue }
+    }
+    var loadingAgentKeys: Set<String> {
+        get { convState.loadingAgentKeys }
+        set { convState.loadingAgentKeys = newValue }
+    }
+    var resumeSessions: [ResumeSession] {
+        get { convState.resumeSessions }
+        set { convState.resumeSessions = newValue }
+    }
+    var resumeHistory: [ResumeHistoryEntry] {
+        get { convState.resumeHistory }
+        set { convState.resumeHistory = newValue }
+    }
     let modelOptionsCache: CodexModelOptionsCache
     @Published var modelOptionsRevision = 0
     @Published var loadingPrimaryModelOptionsContexts: Set<CodexModelOptionsContext> = []
@@ -165,10 +199,22 @@ final class AppModel: ObservableObject {
         modelOptionsCache.models(for: currentMachineContextID)
     }
     @Published var modelOptionsError: String?
-    @Published var isRunOperationInProgress = false
-    @Published var runOperationsByContext: [String: RunOperationKind] = [:]
-    @Published var pendingPromptSubmission: PersistedPromptSubmission?
-    @Published var storageConfirmationMessage: String?
+    var isRunOperationInProgress: Bool {
+        get { convState.isRunOperationInProgress }
+        set { convState.isRunOperationInProgress = newValue }
+    }
+    var runOperationsByContext: [String: RunOperationKind] {
+        get { convState.runOperationsByContext }
+        set { convState.runOperationsByContext = newValue }
+    }
+    var pendingPromptSubmission: PersistedPromptSubmission? {
+        get { convState.pendingPromptSubmission }
+        set { convState.pendingPromptSubmission = newValue }
+    }
+    var storageConfirmationMessage: String? {
+        get { convState.storageConfirmationMessage }
+        set { convState.storageConfirmationMessage = newValue }
+    }
     @Published var diffPresented = false
     @Published var resultsInspectorVisible = false {
         didSet {
@@ -198,7 +244,10 @@ final class AppModel: ObservableObject {
         }
     }
     var workspaceFileRequestID = UUID()
-    @Published var runOperationIssues: [String: RunOperationIssue] = [:]
+    var runOperationIssues: [String: RunOperationIssue] {
+        get { convState.runOperationIssues }
+        set { convState.runOperationIssues = newValue }
+    }
     @Published var workspaceDocument: WorkspaceFileDocument? {
         didSet {
             if workspaceDocument != nil && !workspaceFilePresented { workspaceFilePresented = true }
@@ -208,14 +257,23 @@ final class AppModel: ObservableObject {
     @Published var addAgentsPresented = false
     @Published var additionalAgentCount = 1
     @Published var queuePresented = false
-    @Published var followUpQueue: [QueuedFollowUp] = []
+    var followUpQueue: [QueuedFollowUp] {
+        get { convState.followUpQueue }
+        set { convState.followUpQueue = newValue }
+    }
     @Published var queueIssue: String? {
         didSet { if queueIssue == nil { queueIssueRecovery = nil } }
     }
     var queueIssueRecovery: (workspaceKey: String, proof: FollowUpQueueReplacementProof, message: String)?
     @Published var queueEditRequest: QueuedFollowUp?
-    @Published var daemonFollowUpSnapshot: RemoteFollowUpQueue?
-    @Published var followUpSecondsRemaining: Int?
+    var daemonFollowUpSnapshot: RemoteFollowUpQueue? {
+        get { convState.daemonFollowUpSnapshot }
+        set { convState.daemonFollowUpSnapshot = newValue }
+    }
+    var followUpSecondsRemaining: Int? {
+        get { convState.followUpSecondsRemaining }
+        set { convState.followUpSecondsRemaining = newValue }
+    }
     var promptHistoryEntries: [String] {
         get { promptDraft.historyEntries }
         set { promptDraft.setHistoryEntries(newValue) }
@@ -224,13 +282,25 @@ final class AppModel: ObservableObject {
         get { promptDraft.historyIndex }
         set { promptDraft.setHistoryIndex(newValue) }
     }
-    @Published var expandedAgentWorkContexts: Set<String> = []
-    @Published var expandedQuestionRequests: Set<String> = []
-    @Published var workProcess = WorkProcessState()
+    var expandedAgentWorkContexts: Set<String> {
+        get { convState.expandedAgentWorkContexts }
+        set { convState.expandedAgentWorkContexts = newValue }
+    }
+    var expandedQuestionRequests: Set<String> {
+        get { convState.expandedQuestionRequests }
+        set { convState.expandedQuestionRequests = newValue }
+    }
+    var workProcess: WorkProcessState {
+        get { convState.workProcess }
+        set { convState.workProcess = newValue }
+    }
     var workOperationTasks: [String: Task<Void, Never>] = [:]
     var workOperationRequestIDs: [String: UUID] = [:]
     var workOperationRequests: [String: WorkOperationRecord] = [:]
-    @Published var collapsedAgentWorkContexts: Set<String> = []
+    var collapsedAgentWorkContexts: Set<String> {
+        get { convState.collapsedAgentWorkContexts }
+        set { convState.collapsedAgentWorkContexts = newValue }
+    }
 
     let client: PcrdClient
     let questionAnswers: AgentAnswerOutbox
@@ -309,7 +379,10 @@ final class AppModel: ObservableObject {
     var agentAnswerLoadTokens: [String: UUID] = [:]
     var agentAnswerReadRetries: [String: AgentAnswerReadRetry] = [:]
     var agentSelectionRequestID = 0
-    @Published var continuationSelections: [String: AgentContinuationSelection] = [:]
+    var continuationSelections: [String: AgentContinuationSelection] {
+        get { convState.continuationSelections }
+        set { convState.continuationSelections = newValue }
+    }
     var continuationSelectionTasks: [String: Task<Void, Never>] = [:]
     var continuationSelectionTaskIDs: [String: UUID] = [:]
     var promptPreparationContexts: Set<String> = []

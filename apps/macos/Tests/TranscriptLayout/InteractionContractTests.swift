@@ -54,7 +54,7 @@ struct InteractionContractTests {
         let context = model.promptDraftContext
         let window = makeWindow()
         defer { window.close() }
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(model))
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(model).environmentObject(model.convState))
         window.contentView = host
         window.makeKeyAndOrderFront(nil)
         try await Task.sleep(for: .milliseconds(80))

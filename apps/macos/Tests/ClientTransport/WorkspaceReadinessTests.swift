@@ -2245,6 +2245,7 @@ struct WorkspaceReadinessTests {
                 jumpToLatestRequest: 0, findQuery: "", findMatch: nil, findNavigationRequest: 0,
                 memory: memory, resultsInspectorVisible: false, openURL: { _, _ in },
                 activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
+                agentSwitchPrepare: AgentSwitchPrepareAction(),
                 itemsRevision: model.conversationTimelineItemsProjectionGeneration,
                 isNearBottom: .constant(true), inlineAgentSwitchPosition: .constant(.missing))
         }

@@ -600,7 +600,7 @@ struct AgentQuestionTests {
         defer { model.stopWindowObservation() }
         for width in [420.0, 980.0] {
             let view = QuestionFixtureForm(request: request(), outbox: fixture.outbox)
-                .environmentObject(model).environment(\.appLanguage, AppLanguage.chinese)
+                .environmentObject(model).environmentObject(model.convState).environment(\.appLanguage, AppLanguage.chinese)
                 .environment(\.appTextSize, AppTextSize.standard).padding(20)
                 .background(Color(nsColor: .windowBackgroundColor)).preferredColorScheme(.light)
             let host = NSHostingView(rootView: view)
@@ -641,7 +641,7 @@ struct AgentQuestionTests {
         let model = AppModel(client: fixture.client, windowID: UUID(), questionAnswers: fixture.outbox)
         defer { model.stopWindowObservation() }
         let host = NSHostingView(rootView: QuestionFixtureForm(request: request(), outbox: fixture.outbox)
-            .environmentObject(model).environment(\.appLanguage, .chinese).padding(20))
+            .environmentObject(model).environmentObject(model.convState).environment(\.appLanguage, .chinese).padding(20))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 380),
             styleMask: .borderless, backing: .buffered, defer: false)
         defer { window.contentView = nil }

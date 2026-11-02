@@ -54,7 +54,7 @@ struct ResultInspectorTests {
         for scheme in [ColorScheme.light, .dark] {
             for size in [AppTextSize.standard, .extraLarge] {
                 let host = NSHostingView(rootView: ConversationResultsInspector(run: run)
-                    .environmentObject(model).environment(\.appLanguage, .chinese)
+                    .environmentObject(model).environmentObject(model.convState).environment(\.appLanguage, .chinese)
                     .environment(\.appTextSize, size).environment(\.colorScheme, scheme))
                 let window = makeWindow()
                 defer { window.close() }

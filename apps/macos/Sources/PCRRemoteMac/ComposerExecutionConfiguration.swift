@@ -110,6 +110,7 @@ extension AppModel {
 
 struct ComposerExecutionConfigurationSummary: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var textSize
     @Binding var isEditing: Bool
     @State private var isPresented = false
@@ -128,7 +129,7 @@ struct ComposerExecutionConfigurationSummary: View {
     var body: some View {
         entry
         .frame(height: 28 * textSize.scale, alignment: .leading)
-        .disabled(model.isRunOperationInProgress)
+        .disabled(convState.isRunOperationInProgress)
         .background(ExecutionConfigurationAnchor(isPresented: $isPresented, preferredWidth: 368 * textSize.scale) { width in
             ExecutionConfigurationPopover(width: width)
                 .environmentObject(model)
@@ -138,7 +139,7 @@ struct ComposerExecutionConfigurationSummary: View {
         })
         .onChange(of: isPresented) { isEditing = $0 }
         .onChange(of: ExecutionEditContext(model)) { _ in dismiss() }
-        .onChange(of: model.isRunOperationInProgress) { if $0 { dismiss() } }
+        .onChange(of: convState.isRunOperationInProgress) { if $0 { dismiss() } }
         .onDisappear(perform: dismiss)
         .task(id: ExecutionCatalogContext(machine: model.currentMachineContextID, online: model.daemonOnline)) {
             guard model.daemonOnline else { return }
@@ -247,6 +248,7 @@ struct ExecutionConfigurationPopover: View {
 
 struct ComposerExecutionConfiguration: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var textSize
 
     var body: some View {
@@ -352,6 +354,7 @@ private enum ExecutionField: String { case model, effort, fast }
 
 private struct ExecutionStageView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let stage: ExecutionStage
@@ -501,7 +504,7 @@ private struct ExecutionStageView: View {
             .padding(.horizontal, 5)
         }
         .fixedSize(horizontal: false, vertical: true)
-        .disabled(locked || model.isRunOperationInProgress)
+        .disabled(locked || convState.isRunOperationInProgress)
     }
 
     private func specModelTitle(_ value: String) -> String {
@@ -535,7 +538,7 @@ private struct ExecutionStageView: View {
         }
         .id(context)
         .frame(width: 56 * textSize.scale, height: 24 * textSize.scale, alignment: .leading)
-        .disabled(locked || model.isRunOperationInProgress)
+        .disabled(locked || convState.isRunOperationInProgress)
         .accessibilityIdentifier("configuration.\(stage.rawValue).count")
         .help(scope)
     }
@@ -560,7 +563,7 @@ private struct ExecutionStageView: View {
             content().padding(.horizontal, 5).frame(minHeight: 24 * textSize.scale).contentShape(Rectangle())
         }
         .id(context)
-        .disabled(locked || model.isRunOperationInProgress || (choices(for: field).isEmpty && model.modelOptionsError == nil))
+        .disabled(locked || convState.isRunOperationInProgress || (choices(for: field).isEmpty && model.modelOptionsError == nil))
         .accessibilityLabel("\(stage.title(language)) · \(label)")
         .accessibilityValue(value(for: field))
         .accessibilityHint(scope)

@@ -24,7 +24,7 @@ struct CodexUsageTests {
         model.selectedWorkspaceID = "one"
         model.daemonOnline = false
         let store = CodexUsageStore()
-        let host = NSHostingView(rootView: SidebarCodexUsage(usage: store).environmentObject(model)
+        let host = NSHostingView(rootView: SidebarCodexUsage(usage: store).environmentObject(model).environmentObject(model.convState)
             .frame(width: 280, height: 48).background(Color.white).environment(\.colorScheme, .light))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 280, height: 48),
             styleMask: [.borderless], backing: .buffered, defer: false)

@@ -20,7 +20,7 @@ struct ComposerModelPickerTests {
             NativeMultilineEditorCommitRegistry.shared.commitPendingText()
             window.close()
         }
-        let host = NSHostingView(rootView: PromptComposer().environmentObject(model))
+        let host = NSHostingView(rootView: PromptComposer().environmentObject(model).environmentObject(model.convState))
         window.contentView = host
         host.layoutSubtreeIfNeeded()
         let editor = try #require(descendants(host).compactMap { $0 as? NSTextView }.first)

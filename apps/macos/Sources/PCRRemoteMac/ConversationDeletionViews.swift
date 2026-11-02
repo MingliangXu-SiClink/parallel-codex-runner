@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ConversationDeleteView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.dismiss) private var dismiss
     let request: ConversationDeleteRequest
     @State private var error: String?
@@ -38,7 +39,7 @@ struct ConversationDeleteView: View {
     }
 
     private var blockReason: String? {
-        let current = conversationMatchingNavigationID(request.conversation.id, in: model.workspaceConversations)
+        let current = conversationMatchingNavigationID(request.conversation.id, in: convState.workspaceConversations)
             ?? request.conversation
         return model.conversationDeleteBlockReason(current)
     }

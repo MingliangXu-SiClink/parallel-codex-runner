@@ -141,6 +141,7 @@ struct ScrollMotionOwnershipTests {
                 jumpToLatestRequest: jumpRequest, findQuery: "", findMatch: nil,
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
+                agentSwitchPrepare: AgentSwitchPrepareAction(),
                 isWorkProcess: true, isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
         }
 

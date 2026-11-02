@@ -615,7 +615,7 @@ struct WorkViewportStabilityTests {
                     ], contentIsLoading: false, jumpToLatestRequest: 0, findQuery: "", findMatch: nil,
                     findNavigationRequest: 0, memory: store.memory, resultsInspectorVisible: false,
                     openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
-                    isNearBottom: $nearBottom, inlineAgentSwitchPosition: $inlinePosition)
+                    agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: $nearBottom, inlineAgentSwitchPosition: $inlinePosition)
             }
         }
     }
@@ -677,7 +677,7 @@ struct WorkViewportStabilityTests {
                 contentIsLoading: false, jumpToLatestRequest: 0, findQuery: "", findMatch: nil,
                 findNavigationRequest: 0, memory: memory, resultsInspectorVisible: false,
                 openURL: { _, _ in }, activateBlock: { _ in }, selectAgent: { _ in }, toggleResults: {},
-                isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
+                agentSwitchPrepare: AgentSwitchPrepareAction(), isNearBottom: .constant(false), inlineAgentSwitchPosition: .constant(.missing))
         }
 
         func update() { coordinator.update(parent: parent()) }

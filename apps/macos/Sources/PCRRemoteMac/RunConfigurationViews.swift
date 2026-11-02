@@ -3,6 +3,7 @@ import SwiftUI
 
 struct RunSettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var appTextSize
     @State private var advancedExpanded = false
 
@@ -107,13 +108,13 @@ struct RunSettingsView: View {
                                     Text(model.appLanguage.localized("New conversation")).tag("")
                                     if let currentSession = usableResumeSessionID(
                                         model.settings.resumeSessionID
-                                    ), !model.resumeSessions.contains(where: {
+                                    ), !convState.resumeSessions.contains(where: {
                                         $0.sessionId == currentSession
                                     }) {
                                         Text(model.appLanguage.localized("Current conversation"))
                                             .tag(currentSession)
                                     }
-                                    ForEach(model.resumeSessions) { session in
+                                    ForEach(convState.resumeSessions) { session in
                                         Text(session.displayTitle == "Previous conversation"
                                             ? model.appLanguage.text("之前的对话", "Previous conversation")
                                             : session.displayTitle)
@@ -405,6 +406,7 @@ private struct SettingsStateNote: View {
 
 struct AgentDiffView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var appTextSize
 
     var body: some View {
@@ -428,6 +430,7 @@ struct AgentDiffView: View {
 
 struct AddAgentsView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var appTextSize
 
     var body: some View {
@@ -511,6 +514,7 @@ struct AgentCountField: View {
 
 struct FollowUpQueueView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var convState: ConversationRunState
     @Environment(\.appTextSize) private var appTextSize
     @State private var editingItem: QueuedFollowUp?
     @State private var updating = false
@@ -546,7 +550,7 @@ struct FollowUpQueueView: View {
                 )
             } else {
                 QueuedMessageList(items: model.composerQueuedMessages,
-                    dispatching: model.daemonFollowUpSnapshot?.state == "dispatching", context: context,
+                    dispatching: convState.daemonFollowUpSnapshot?.state == "dispatching", context: context,
                     updating: updating, expanded: true,
                     change: { await apply($0, change: $1, context: context) }, edit: { editingItem = $0 })
                     .id(context)
