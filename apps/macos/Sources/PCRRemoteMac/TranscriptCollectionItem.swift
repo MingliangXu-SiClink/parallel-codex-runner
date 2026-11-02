@@ -845,6 +845,44 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         return true
     }
 
+    // Add a "Copy Message" item to the text view's right-click menu so the
+    // user can copy the full block text without manually selecting everything.
+    func textView(
+        _ textView: NSTextView,
+        menu: NSMenu?,
+        for event: NSEvent,
+        at charIndex: Int
+    ) -> NSMenu? {
+        guard let block = representedBlock, !block.text.isEmpty else { return menu }
+        let existing = menu ?? NSMenu()
+        // Avoid duplicate insertions on re-entry.
+        let copyItemTag = "pcr-copy-message"
+        if existing.item(withTag: 0x504352) != nil { return existing }
+        let copyItem = NSMenuItem(
+            title: NSLocalizedString("Copy Message", comment: ""),
+            action: #selector(copyMessageText),
+            keyEquivalent: ""
+        )
+        copyItem.target = self
+        copyItem.tag = 0x504352
+        if existing.items.count > 1 {
+            existing.insertItem(.separator(), at: 1)
+            existing.insertItem(copyItem, at: 2)
+        } else {
+            existing.addItem(.separator())
+            existing.addItem(copyItem)
+        }
+        _ = copyItemTag
+        return existing
+    }
+
+    @objc private func copyMessageText() {
+        guard let block = representedBlock else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(block.text, forType: .string)
+    }
+
     private struct Presentation {
         let title: String
         let icon: String
