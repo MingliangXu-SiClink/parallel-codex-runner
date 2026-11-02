@@ -297,6 +297,12 @@ struct ConversationAgentSwitchBar: View {
         .help(agentHelp(agent))
         .accessibilityLabel(agentAccessibilityLabel(agent))
         .accessibilityAddTraits(selected ? .isSelected : [])
+        // Left/right arrow keys navigate to adjacent agents when this tab is focused.
+        // onKeyPress requires macOS 14; on older systems the toolbar
+        // Cmd+Shift+[ / ] shortcuts remain the keyboard navigation path.
+        .modifier(AgentTabArrowKeyModifier(
+            agent: agent.agent, orderedAgents: orderedAgents,
+            selectionEnabled: state.selectionEnabled, selectAgent: selectAgent))
     }
 
     private func branchPosition(_ agent: RunAgentSummary) -> String {
@@ -432,5 +438,38 @@ private struct AgentActivityObservation: View {
                     now = Date()
                 }
             }
+    }
+}
+
+// ViewModifier that adds left/right arrow-key navigation to an agent tab.
+// Requires macOS 14 for onKeyPress; the existing Cmd+Shift+[/] shortcuts
+// remain available on older systems.
+private struct AgentTabArrowKeyModifier: ViewModifier {
+    let agent: Int
+    let orderedAgents: [RunAgentSummary]
+    let selectionEnabled: Bool
+    let selectAgent: (Int) -> Void
+
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content
+                .onKeyPress(.leftArrow) {
+                    guard selectionEnabled,
+                          let idx = orderedAgents.firstIndex(where: { $0.agent == agent }),
+                          idx > orderedAgents.startIndex else { return .ignored }
+                    selectAgent(orderedAgents[orderedAgents.index(before: idx)].agent)
+                    return .handled
+                }
+                .onKeyPress(.rightArrow) {
+                    guard selectionEnabled,
+                          let idx = orderedAgents.firstIndex(where: { $0.agent == agent }) else { return .ignored }
+                    let next = orderedAgents.index(after: idx)
+                    guard next < orderedAgents.endIndex else { return .ignored }
+                    selectAgent(orderedAgents[next].agent)
+                    return .handled
+                }
+        } else {
+            content
+        }
     }
 }
