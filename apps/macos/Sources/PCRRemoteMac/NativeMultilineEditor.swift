@@ -13,8 +13,10 @@ func multilineEditorKeyAction(
 ) -> MultilineEditorKeyAction {
     let isReturn = keyCode == 36 || keyCode == 76
     let modifiers = modifierFlags.intersection(.deviceIndependentFlagsMask)
+    // Cmd+Return submits (same as plain Return). Shift/Ctrl/Option+Return inserts newline.
+    let isCommandOnly = modifiers == .command
     let insertsNewline = !modifiers.intersection([.shift, .control, .option]).isEmpty
-    return isReturn && submitsWithReturn && !insertsNewline ? .submit : .insertText
+    return isReturn && submitsWithReturn && (!insertsNewline || isCommandOnly) ? .submit : .insertText
 }
 
 func multilineEditorShouldApplyExternalText(

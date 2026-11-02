@@ -207,25 +207,45 @@ struct ConversationAgentSwitchBar: View {
 
     private func tabWidth(_ agent: RunAgentSummary) -> CGFloat {
         let selected = agent.agent == state.selectedAgent
-        let font = NSFont.systemFont(
-            ofSize: ParallelCodexVisualStyle.Typography.caption * textSize.scale,
-            weight: selected ? .medium : .regular
-        )
+        let fontKey = TabFontKey(size: textSize, weight: selected ? .medium : .regular)
+        let labelFont = Self.cachedTabFont(for: fontKey)
         let labelWidth = ceil(
-            (displayName(agent) as NSString).size(withAttributes: [.font: font]).width
+            (displayName(agent) as NSString).size(withAttributes: [.font: labelFont]).width
         )
         let fixedWidth = (39 * textSize.scale) + 15
-        return fixedWidth + labelWidth + statusLabelWidth
+        return fixedWidth + labelWidth + cachedStatusLabelWidth
     }
 
-    private var statusLabelWidth: CGFloat {
+    // Cache the NSFont so tabWidth doesn't create one on every call during
+    // streaming updates (it runs in loops over orderedAgents).
+    private struct TabFontKey: Hashable {
+        let size: AppTextSize
+        let weight: NSFont.Weight
+    }
+    private static var tabFontCache: [TabFontKey: NSFont] = [:]
+    private static func cachedTabFont(for key: TabFontKey) -> NSFont {
+        if let cached = tabFontCache[key] { return cached }
+        let font = NSFont.systemFont(
+            ofSize: ParallelCodexVisualStyle.Typography.caption * key.size.scale,
+            weight: key.weight
+        )
+        tabFontCache[key] = font
+        return font
+    }
+
+    private var cachedStatusLabelWidth: CGFloat {
+        let key = "status:\(textSize.rawValue)"
+        if let cached = Self.statusLabelWidthCache[key] { return cached }
         let font = NSFont.systemFont(ofSize: 11 * textSize.scale, weight: .regular)
         // Reserve the longest phase label so state changes do not move neighboring tabs.
-        return [language.text("等待模型", "Waiting for model"), language.text("等待下一步", "Awaiting activity"),
+        let width = [language.text("等待模型", "Waiting for model"), language.text("等待下一步", "Awaiting activity"),
                 language.text("定时等待", "Waiting"), language.text("不可用", "Unavailable")]
             .map { ceil(($0 as NSString).size(withAttributes: [.font: font]).width) }
             .max() ?? 0
+        Self.statusLabelWidthCache[key] = width
+        return width
     }
+    private static var statusLabelWidthCache: [String: CGFloat] = [:]
 
     private func agentTab(_ agent: RunAgentSummary) -> some View {
         let selected = agent.agent == state.highlightedAgent
@@ -251,7 +271,7 @@ struct ConversationAgentSwitchBar: View {
                     .appScaledSystemFont(size: 11)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .frame(width: statusLabelWidth, alignment: .leading)
+                    .frame(width: cachedStatusLabelWidth, alignment: .leading)
                 Image(systemName: agentMarkerSymbol(agent) ?? "checkmark")
                     .appScaledSystemFont(size: 9, weight: .semibold)
                     .foregroundStyle(agentMarkerColor(agent))
