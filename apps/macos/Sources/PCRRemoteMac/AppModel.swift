@@ -416,6 +416,10 @@ final class AppModel: ObservableObject {
     var deferredPromptsByWorkspace: [String: [PersistedDeferredPrompt]] {
         get { domainRepositories.conversations.deferredPromptsByWorkspace }
         set {
+            // Only notify subscribers when the value actually changes.
+            // The previous code fired objectWillChange unconditionally, causing
+            // all 21 @EnvironmentObject subscribers to re-render on every write.
+            guard domainRepositories.conversations.deferredPromptsByWorkspace != newValue else { return }
             objectWillChange.send()
             domainRepositories.conversations.deferredPromptsByWorkspace = newValue
         }

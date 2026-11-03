@@ -134,7 +134,16 @@ struct ConversationTimelineView: NSViewRepresentable {
         private let scrollMotion: NativeScrollMotion
         private var scrollRequestGeneration = 0
         private var activeContext = ""
-        private var renderedItems: [ConversationTimelineItem] = []
+        private var renderedItems: [ConversationTimelineItem] = [] {
+            didSet {
+                cachedStickyAgentSwitchHeight = nil
+                cachedContentHeight = nil
+                cachedAgentSwitchItemIndex = renderedItems.firstIndex {
+                    if case .agentSwitch = $0 { return true }
+                    return false
+                }
+            }
+        }
         private var previousJumpRequest = 0
         private var previousFindNavigationRequest = 0
         private var isRestoring = false
@@ -167,6 +176,8 @@ struct ConversationTimelineView: NSViewRepresentable {
         private var cachedContentHeight: CGFloat?
         private var cachedContentWidth: CGFloat = 0
         private var itemMeasurements: [String: ItemMeasurement] = [:]
+        private var cachedStickyAgentSwitchHeight: CGFloat? = nil
+        private var cachedAgentSwitchItemIndex: Int? = nil
         private var historyEntries: [ConversationHistoryEntry] = []
         private var historyQuestionOffsets: [CGFloat]?
         private var isAttached = false
@@ -1029,10 +1040,13 @@ struct ConversationTimelineView: NSViewRepresentable {
         }
 
         private var stickyAgentSwitchHeight: CGFloat {
-            renderedItems.contains {
+            if let cached = cachedStickyAgentSwitchHeight { return cached }
+            let height: CGFloat = renderedItems.contains {
                 if case .agentSwitch(let state) = $0 { return state.agents.count > 1 }
                 return false
             } ? ConversationAgentSwitchBar.stickyHeight(for: parent.textSize) : 0
+            cachedStickyAgentSwitchHeight = height
+            return height
         }
 
         private func configureMessageItem(_ item: NSCollectionViewItem?, block: TranscriptBlock) {
@@ -1905,10 +1919,7 @@ struct ConversationTimelineView: NSViewRepresentable {
         private func inlineAgentSwitcherPosition() -> TranscriptInlineControlPosition {
             guard let collectionView,
                   let scrollView,
-                  let index = renderedItems.firstIndex(where: {
-                      if case .agentSwitch = $0 { return true }
-                      return false
-                  }),
+                  let index = cachedAgentSwitchItemIndex,
                   let frame = collectionView.collectionViewLayout?
                     .layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame else {
                 return .missing
