@@ -1377,6 +1377,9 @@ private struct WorkspaceConversationInlineList: View {
                     .buttonStyle(.plain)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .disabled(model.openingConversationID == conversation.id)
+                    .onHover { hovering in
+                        if hovering { model.prefetchConversationOnHover(conversation) }
+                    }
                     .accessibilityLabel(conversationAccessibilityLabel(conversation))
                     .accessibilityHint(searchText.isEmpty ? "" : model.searchExcerpt(conversation, query: searchText) ?? "")
                     .accessibilityAddTraits(

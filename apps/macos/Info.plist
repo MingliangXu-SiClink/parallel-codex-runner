@@ -24,9 +24,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.513</string>
+	<string>0.1.514</string>
 	<key>CFBundleVersion</key>
-	<string>513</string>
+	<string>514</string>
     <key>UTExportedTypeDeclarations</key>
     <array>
         <dict>

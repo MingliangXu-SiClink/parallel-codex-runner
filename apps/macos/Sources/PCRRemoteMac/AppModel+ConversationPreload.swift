@@ -714,4 +714,21 @@ extension AppModel {
             timelineInput: nil, timelineBlocks: [], timelineGeneration: 0,
             itemsInput: nil, items: [], itemsGeneration: 0), for: presentationKey)
     }
+
+    /// Pre-fetch a conversation's transcript and history into the disk-backed
+    /// cache when the user hovers its sidebar row, so selecting it later opens
+    /// with already-hydrated data instead of a network round-trip.
+    /// Independent of the selected conversation's own read task — a hover for
+    /// conversation A never cancels the active read for conversation B.
+    func prefetchConversationOnHover(_ conversation: WorkspaceConversationSummary) {
+        guard let workspace = selectedWorkspace,
+              !conversation.latestRunID.isEmpty,
+              !conversation.opensResumeHistory,
+              conversation.id != selectedConversationID else { return }
+        let key = WorkspaceRunViewKey(machineID: currentMachineContextID,
+            workspaceID: workspace.workspaceId, runID: conversation.latestRunID)
+        guard conversationPreloadRetryAfter[key, default: .distantPast] <= Date(),
+              let target = requestTarget(for: key.machineID) else { return }
+        _ = scheduleConversationRead(workspace: workspace, key: key, target: target)
+    }
 }
