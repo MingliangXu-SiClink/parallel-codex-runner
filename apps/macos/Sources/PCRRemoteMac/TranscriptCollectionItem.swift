@@ -271,6 +271,7 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
     private var representedAccentColor: AppAccentColor?
     private var representedAppearance: TranscriptAppearance?
     private var representedAttributedText: NSAttributedString?
+    private var representedAvailableWidth: CGFloat?
     private var currentFindRange: NSRange?
     private var disclosureLeading: NSLayoutConstraint!
 
@@ -423,6 +424,7 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         representedAccentColor = nil
         representedAppearance = nil
         representedAttributedText = nil
+        representedAvailableWidth = nil
         currentFindRange = nil
         textView.textStorage?.setAttributedString(NSAttributedString())
         textView.needsDisplay = true
@@ -444,6 +446,25 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         self.openURL = openURL
         view.isHidden = false
         let displayedBlock = Self.localizedBlock(block, language: language)
+        // Early-exit when the cell already represents the exact same block with
+        // the same presentation and width. During scroll, NSCollectionView reuses
+        // cells and calls configure() even when the cell already displays the
+        // correct content (e.g. after a batch update that didn't change this
+        // item). Skipping the full reconfiguration avoids
+        // NSLayoutManager.ensureLayout and constraint updates per tick.
+        if let existing = representedBlock,
+           existing.id == block.id,
+           existing.text == block.text,
+           existing.kind == block.kind,
+           existing.activityType == block.activityType,
+           existing.status == block.status,
+           representedTextSize == textSize,
+           representedAccentColor == accentColor,
+           representedAppearance == appearance,
+           representedAvailableWidth == availableWidth,
+           findQuery.isEmpty {
+            return
+        }
         let presentation = Self.presentation(
             for: block,
             language: language,
@@ -472,6 +493,7 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         representedAccentColor = accentColor
         representedAppearance = appearance
         representedAttributedText = attributed
+        representedAvailableWidth = availableWidth
         let hasDetails = block.operation?.detailsAvailable == true
             || block.activityType?.hasPrefix("legacy_command") == true
         let actionable = !isWorkSummary && (hasDetails || block.activityType == "operation_more" || block.activityType == "operation_retry")

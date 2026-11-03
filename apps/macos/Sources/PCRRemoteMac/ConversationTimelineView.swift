@@ -178,6 +178,11 @@ struct ConversationTimelineView: NSViewRepresentable {
         private var itemMeasurements: [String: ItemMeasurement] = [:]
         private var cachedStickyAgentSwitchHeight: CGFloat? = nil
         private var cachedAgentSwitchItemIndex: Int? = nil
+        // Throttle currentSnapshot() — only rebuild when offsetY changes by more than
+        // this threshold per tick.  savePosition is debounced 350 ms in any case, so
+        // rebuilding the snapshot at 60 fps (with NSLayoutManager work per tick) is wasteful.
+        private var lastSavedSnapshotOffsetY: CGFloat = .nan
+        private static let snapshotSaveThreshold: CGFloat = 4
         private var historyEntries: [ConversationHistoryEntry] = []
         private var historyQuestionOffsets: [CGFloat]?
         private var isAttached = false
@@ -444,6 +449,8 @@ struct ConversationTimelineView: NSViewRepresentable {
 
             self.parent = parent
             activeContext = parent.contextID
+            // Reset the snapshot throttle so the first scroll in a new context always saves.
+            lastSavedSnapshotOffsetY = .nan
             let itemsChanged = oldItems != parent.items
             if contextChanged || itemsChanged {
                 historyEntries = ConversationHistoryEntry.make(from: parent.items)
@@ -1772,6 +1779,12 @@ struct ConversationTimelineView: NSViewRepresentable {
             userScrollInProgress = false
             trackingScroll = false
             momentumScroll = false
+            // Force a final snapshot save when scroll comes to rest, in case the
+            // throttle in recordScrollPosition skipped the last few pixels.
+            if !discard {
+                lastSavedSnapshotOffsetY = .nan
+                savePosition()
+            }
             let deferred = deferredScrollUpdate
             deferredScrollUpdate = nil
             if !discard, let deferred, deferred.contextID == activeContext {
@@ -1885,19 +1898,24 @@ struct ConversationTimelineView: NSViewRepresentable {
         private func recordScrollPosition(viewportChanged: Bool = false) {
             guard !isRestoring, !collectionUpdateInFlight, !liveResizeInProgress,
                   resizeSnapshot == nil, !scrollMotion.isAnimating else { return }
-            if viewportChanged { followsLatest = nearBottom() }
+            let nearBottomNow = nearBottom()
+            if viewportChanged { followsLatest = nearBottomNow }
             updateHistoryRailPosition()
-            savePosition()
-            let value = nearBottom()
-            if value != lastPublishedNearBottom {
-                lastPublishedNearBottom = value
+            // currentSnapshot() does NSLayoutManager work (readingAnchor) and
+            // iterates all visible items on every call. Throttle to once per
+            // ~4px of movement; TranscriptScrollMemory already debounces 350ms.
+            let currentOffsetY = scrollView?.contentView.documentVisibleRect.minY ?? .nan
+            if abs(currentOffsetY - lastSavedSnapshotOffsetY) >= Self.snapshotSaveThreshold {
+                lastSavedSnapshotOffsetY = currentOffsetY
+                savePosition()
+            }
+            if nearBottomNow != lastPublishedNearBottom {
+                lastPublishedNearBottom = nearBottomNow
                 let context = activeContext
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.activeContext == context,
-                          self.lastPublishedNearBottom == value else { return }
-                    // The binding can already read this value from scroll
-                    // memory without having published it to SwiftUI state.
-                    self.parent.isNearBottom = value
+                          self.lastPublishedNearBottom == nearBottomNow else { return }
+                    self.parent.isNearBottom = nearBottomNow
                 }
             }
 
