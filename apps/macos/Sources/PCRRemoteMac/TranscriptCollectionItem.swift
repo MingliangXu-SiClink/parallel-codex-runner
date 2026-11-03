@@ -426,8 +426,9 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         representedAttributedText = nil
         representedAvailableWidth = nil
         currentFindRange = nil
-        textView.textStorage?.setAttributedString(NSAttributedString())
-        textView.needsDisplay = true
+        // Do not clear textStorage here — configure() replaces it via updateText()
+        // when the content changes. Keeping the existing layout valid avoids an
+        // NSLayoutManager invalidation + re-layout on every cell dequeue during scroll.
         textView.toolTip = nil
     }
 
