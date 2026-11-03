@@ -285,6 +285,11 @@ final class TranscriptCollectionItem: NSCollectionViewItem, NSTextViewDelegate {
         // long reply can otherwise draw outside its collapsed collection row,
         // over the next conversation, even though it is absent from its AX tree.
         view.clipsToBounds = true
+        // Keep the cell's backing layer off the redraw-during-resize path so
+        // NSScrollView can move it on the GPU during scroll without forcing a
+        // host-side redraw (and the frame rate drop it causes) each tick.
+        view.wantsLayer = true
+        view.layerContentsRedrawPolicy = .onSetNeedsDisplay
 
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)

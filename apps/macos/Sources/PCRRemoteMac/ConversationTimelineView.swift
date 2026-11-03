@@ -79,6 +79,7 @@ struct ConversationTimelineView: NSViewRepresentable {
         collection.delegate = coordinator
         collection.isSelectable = false
         collection.wantsLayer = true
+        collection.layerContentsRedrawPolicy = .onSetNeedsDisplay
         collection.register(
             TranscriptCollectionItem.self,
             forItemWithIdentifier: TranscriptCollectionItem.identifier
@@ -208,6 +209,8 @@ struct ConversationTimelineView: NSViewRepresentable {
             // buffers can retain previously scrolled text under SwiftUI's canvas.
             scrollView.wantsLayer = true
             collectionView.wantsLayer = true
+            scrollView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+            collectionView.layerContentsRedrawPolicy = .onSetNeedsDisplay
             scrollView.drawsBackground = true
             (scrollView as? ConversationTimelineScrollView)?.historyRail.navigate = { [weak self] id in
                 self?.scrollToHistoryQuestion(id: id)
