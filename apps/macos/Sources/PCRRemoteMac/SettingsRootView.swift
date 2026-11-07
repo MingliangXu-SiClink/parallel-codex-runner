@@ -97,6 +97,7 @@ struct SettingsRootView: View {
             ComputerSettingsView()
         case .app:
             AppPreferencesView()
+                .task { await model.loadCodexAccounts() }
         case .conversation:
             GeneralConversationSettingsView()
         case .storage:

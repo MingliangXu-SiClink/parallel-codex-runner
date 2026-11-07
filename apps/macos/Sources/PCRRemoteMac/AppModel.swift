@@ -108,6 +108,11 @@ final class AppModel: ObservableObject {
     @Published var storageSummaryLoading = false
     @Published var storageSummaryError: String?
     @Published var storageCleaningRunIDsByMachine: [String: String] = [:]
+    @Published var codexAccounts: [CodexAccountEntry] = []
+    @Published var codexAccountsLoading = false
+    @Published var codexAccountsError: String?
+    @Published var codexAccountActiveID: String?
+    @Published var codexAccountSwitching = false
     private var activeRunValue: RunSummary?
     let activeRunMetrics = ActiveRunMetrics()
     /// High-frequency run-time state (streaming ticks, workspace polls,

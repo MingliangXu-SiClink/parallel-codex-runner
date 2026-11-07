@@ -148,6 +148,7 @@ class RemoteController:
             "codex.resume_history",
             "codex.model_options",
             "codex.account_usage",
+            "codex.accounts.list",
             "prompt_history.list",
             "feedback.list",
             "feedback.get",
@@ -215,6 +216,7 @@ class RemoteController:
             "followups.reconcile_enqueue",
             "followups.select_agent",
             "followups.clear",
+            "codex.accounts.switch",
         }
     )
 
@@ -358,6 +360,8 @@ class RemoteController:
             "codex.resume_history": self._resume_history,
             "codex.model_options": self._model_options,
             "codex.account_usage": self._account_usage,
+            "codex.accounts.list": self._codex_accounts_list,
+            "codex.accounts.switch": self._codex_accounts_switch,
             "prompt_history.list": self._prompt_history_list,
             "prompt_history.append": self._prompt_history_append,
             "feedback.submit": self._feedback_submit,
@@ -2745,6 +2749,153 @@ class RemoteController:
         if callable(execution_status):
             value = {**value, "execution_accounts": execution_status()}
         return value
+
+    # ---------------------------------------------------------------------------
+    # Codex Account Switcher integration
+    # Reads from ~/Library/Application Support/Codex Account Switcher/
+    # Mirrors the logic in AccountStore.installCredential (Swift).
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _switcher_base() -> "Path":
+        """Return the Codex Account Switcher store directory."""
+        import pathlib
+        return pathlib.Path.home() / "Library" / "Application Support" / "Codex Account Switcher"
+
+    def _codex_accounts_list(self, _request: RemoteRequest) -> dict[str, Any]:
+        """Return all accounts saved in the local Codex Account Switcher store."""
+        import json, pathlib
+        from ..codex_auth import selected_home, file_auth
+
+        base = self._switcher_base()
+        registry_path = base / "accounts.json"
+        if not registry_path.exists():
+            return {"accounts": [], "active_account_id": None}
+
+        registry = json.loads(registry_path.read_bytes())
+        active_id: str | None = registry.get("activeAccountID")
+
+        # Also resolve the current active identity from ~/.codex so we can
+        # surface which account the auth actually corresponds to right now.
+        current_auth = file_auth(selected_home(), check_config=False)
+        current_identity = current_auth.identity if current_auth else None
+
+        accounts = []
+        for acc in registry.get("accounts", []):
+            profile_id: str = acc.get("id", "")
+            profile_auth_path = base / "accounts" / profile_id / "auth.json"
+            accounts.append({
+                "id": profile_id,
+                "display_name": acc.get("displayName", ""),
+                "email": acc.get("email"),
+                "account_id": acc.get("accountID"),
+                "has_credential": profile_auth_path.exists(),
+                "last_used_at": acc.get("lastUsedAt"),
+            })
+
+        return {
+            "accounts": accounts,
+            "active_account_id": active_id,
+            "current_identity": current_identity,
+        }
+
+    def _codex_accounts_switch(self, request: RemoteRequest) -> dict[str, Any]:
+        """Switch the active Codex account used by pcrd agents.
+
+        Copies the stored auth.json for the requested account profile into
+        ~/.codex/auth.json (the path that selected_home() returns) and updates
+        config.toml's model_provider when switching between OAuth and API-key
+        accounts — exactly as the Codex Account Switcher desktop app does.
+        """
+        import json, shutil, pathlib, tempfile, os, stat as stat_mod
+
+        account_id: str = self._text(request.body, "account_id")
+
+        base = self._switcher_base()
+        registry_path = base / "accounts.json"
+        if not registry_path.exists():
+            raise RemoteControllerError("not_found", "No Codex Account Switcher store found")
+
+        registry = json.loads(registry_path.read_bytes())
+        profile = next(
+            (a for a in registry.get("accounts", []) if a.get("id") == account_id),
+            None,
+        )
+        if profile is None:
+            raise RemoteControllerError("not_found", f"Account {account_id!r} not found in switcher store")
+
+        source = base / "accounts" / account_id / "auth.json"
+        if not source.exists():
+            raise RemoteControllerError("not_found", f"No credential stored for account {account_id!r}")
+
+        from ..codex_auth import selected_home
+        destination_dir = selected_home()
+        destination = destination_dir / "auth.json"
+
+        # Read credential (keep in memory; never log it).
+        credential = source.read_bytes()
+
+        # Atomic write: write to a temp file, then rename.
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path_str = tempfile.mkstemp(
+            dir=destination_dir, prefix=".auth.json.", suffix=".tmp"
+        )
+        tmp_path = pathlib.Path(tmp_path_str)
+        try:
+            os.write(tmp_fd, credential)
+            os.fsync(tmp_fd)
+            os.close(tmp_fd)
+            os.chmod(tmp_path, stat_mod.S_IRUSR | stat_mod.S_IWUSR)
+            os.replace(tmp_path, destination)
+        except Exception:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        # Determine if this is an API-key account (profile has no email / accountID starts with apikey-).
+        stored_account_id: str | None = profile.get("accountID")
+        is_api_key = (
+            stored_account_id is not None and stored_account_id.startswith("apikey-")
+        ) or profile.get("email") is None
+
+        # Mirror CodexConfigUpdater: set or clear model_provider in config.toml.
+        config_path = destination_dir / "config.toml"
+        if config_path.exists():
+            content = config_path.read_text(encoding="utf-8")
+            lines = content.splitlines(keepends=True)
+            updated_lines = []
+            found = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("model_provider") or stripped.startswith("# model_provider"):
+                    found = True
+                    if is_api_key:
+                        updated_lines.append('model_provider = "fox"\n')
+                    else:
+                        updated_lines.append('# model_provider = "fox"  # API key 账号用，OAuth 个人账号时注释掉\n')
+                else:
+                    updated_lines.append(line)
+            if not found and is_api_key:
+                updated_lines.insert(0, 'model_provider = "fox"\n')
+            new_content = "".join(updated_lines)
+            if new_content != content:
+                config_path.write_text(new_content, encoding="utf-8")
+
+        # Update activeAccountID in the registry.
+        registry["activeAccountID"] = account_id
+        registry_path.write_bytes(
+            json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True).encode()
+        )
+
+        return {
+            "switched_to": account_id,
+            "display_name": profile.get("displayName", ""),
+            "email": profile.get("email"),
+            "is_api_key": is_api_key,
+        }
 
     def _prompt_history_list(self, request: RemoteRequest) -> dict[str, Any]:
         workspace, _workspace_id = self._workspace(request.body)

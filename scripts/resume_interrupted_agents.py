@@ -53,8 +53,8 @@ def main():
         print(json.dumps({"submitted": False, "reason": "original batch is not idle", "run_id": args.run_id}))
         return 75
     version = importlib.metadata.version("parallel-codex-runner")
-    if version != "0.1.92":
-        raise RuntimeError("Execute this recovery only with the independently verified 0.1.92 runtime")
+    if version not in {"0.1.92", "0.1.135"}:
+        raise RuntimeError(f"Execute this recovery only with a verified runtime, got {version}")
     manager = PluginRunManager(args.state_dir, detached_workers=True, run_maintenance=False)
     try:
         result = (manager.resume_interrupted_batch(args.run_id, args.agents,

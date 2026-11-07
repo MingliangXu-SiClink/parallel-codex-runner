@@ -77,6 +77,10 @@ struct AppPreferencesView: View {
                 .accessibilityIdentifier("preferences.conversation-trash")
             }
 
+            Section(model.appLanguage.text("Codex 账号", "Codex Account")) {
+                CodexAccountPickerSection()
+            }
+
             Section(model.appLanguage.text("软件更新", "Software Update")) {
                 HStack(alignment: .firstTextBaseline, spacing: 12) {
                     VStack(alignment: .leading, spacing: 3) {
@@ -245,5 +249,88 @@ struct AppPreferencesView: View {
                 }
             }
         )
+    }
+}
+
+// MARK: - Codex Account Picker
+
+private struct CodexAccountPickerSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        if model.codexAccountsLoading && model.codexAccounts.isEmpty {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(model.appLanguage.text("加载账号列表…", "Loading accounts…"))
+                    .foregroundStyle(.secondary)
+            }
+        } else if model.codexAccounts.isEmpty {
+            HStack(spacing: 8) {
+                Text(model.appLanguage.text(
+                    "未找到账号。请先在 Codex Account Switcher 中添加账号。",
+                    "No accounts found. Add accounts in Codex Account Switcher first."
+                ))
+                .foregroundStyle(.secondary)
+                Button(model.appLanguage.text("刷新", "Refresh")) {
+                    Task { await model.loadCodexAccounts() }
+                }
+            }
+        } else {
+            ForEach(model.codexAccounts) { account in
+                accountRow(account)
+            }
+            if model.codexAccountSwitching {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(model.appLanguage.text("正在切换账号…", "Switching account…"))
+                        .foregroundStyle(.secondary)
+                        .appScaledTextStyle(.caption)
+                }
+            }
+            if let error = model.codexAccountsError {
+                Text(error)
+                    .foregroundStyle(.red)
+                    .appScaledTextStyle(.caption)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func accountRow(_ account: CodexAccountEntry) -> some View {
+        let isActive = account.id == model.codexAccountActiveID
+        Button {
+            guard !isActive, !model.codexAccountSwitching else { return }
+            Task { await model.switchCodexAccount(to: account.id) }
+        } label: {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(isActive ? model.appAccentColor.color : Color.secondary.opacity(0.2))
+                        .frame(width: 28, height: 28)
+                    Text(String(account.displayName.prefix(1)).uppercased())
+                        .appScaledTextStyle(.caption, weight: .semibold)
+                        .foregroundStyle(isActive ? .white : .primary)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(account.displayName)
+                        .appScaledTextStyle(.body)
+                        .foregroundStyle(.primary)
+                    Text(account.subtitle)
+                        .appScaledTextStyle(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if isActive {
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(model.appAccentColor.color)
+                        .appScaledSystemFont(size: 12, weight: .semibold)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isActive || model.codexAccountSwitching)
+        .opacity((!isActive && model.codexAccountSwitching) ? 0.5 : 1)
     }
 }
