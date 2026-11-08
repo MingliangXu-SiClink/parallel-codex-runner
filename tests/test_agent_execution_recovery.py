@@ -338,6 +338,20 @@ class RecoveryErrorTests(unittest.TestCase):
         value["codexErrorInfo"]["responseStreamDisconnected"]["httpStatusCode"] = 200
         self.assertTrue(adapter.transient_error(value))
 
+    def test_relay_cut_without_a_reason_resumes_the_same_thread(self):
+        # Regression: a relay ended every in-flight response at once with
+        # response.incomplete and no reason; Codex reports it with will_retry=false.
+        cut = {"message": "Incomplete response returned, reason: unknown", "codexErrorInfo": "other",
+               "additionalDetails": None, "misalignment": None}
+        self.assertTrue(adapter.transient_error(cut))
+        for reason in ("content_filter", "max_output_tokens"):
+            self.assertFalse(adapter.transient_error(
+                {**cut, "message": f"Incomplete response returned, reason: {reason}"}))
+        self.assertFalse(adapter.transient_error({**cut, "codexErrorInfo": "badRequest"}))
+        blocked = {"stage": "blocked", "error": cut, "thread_id": "thread", "turn_id": "turn",
+                   "client_message_id": "message", "native_pid": 999_999_999}
+        self.assertTrue(adapter.retryable_blocked_execution(blocked, Path("/nonexistent")))
+
 
 class RetainedExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

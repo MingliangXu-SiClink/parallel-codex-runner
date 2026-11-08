@@ -86,6 +86,9 @@ def transient_error(error: dict[str, Any] | None) -> bool:
     return any(text in message for text in (
         "stream disconnected before completion", "stream closed before completion",
         "selected model is at capacity", "high demand", "server overloaded",
+        # A provider or relay ending every in-flight response without a reason
+        # (Codex does not retry it). Known reasons such as content_filter stay final.
+        "incomplete response returned, reason: unknown",
     ))
 
 
