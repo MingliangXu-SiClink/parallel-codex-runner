@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1020,7 +1021,9 @@ class PluginRunManager:
             and not status.get("operation")
             and not status.get("operation_id")
             and bool(status.get("finished_at"))
-            and status.get("last_operation") in {"initial", "more", "retry"}
+            # A delivered async answer is an execution operation like retry:
+            # its owner durably recorded the Agent's new result before idling.
+            and status.get("last_operation") in {"initial", "more", "retry", "async_answer"}
             and status.get("exit_code") == 0
             and not status.get("expired")
             and not status.get("error")
@@ -1036,9 +1039,22 @@ class PluginRunManager:
             journal_path = self._finalization_journal_path(run)
             if journal_path.exists() and read_json(journal_path).get("phase") != "sync_not_applied":
                 return False
-        except (OSError, PluginRunError):
+            # Saving would close the run and silently drop an answer the user
+            # already sent but no owner delivered.
+            if self._has_undelivered_async_answer_locked(run):
+                return False
+        except (OSError, ValueError, sqlite3.Error, QuestionError, PluginRunError):
             return False
         return True
+
+    @staticmethod
+    def _has_undelivered_async_answer_locked(run: ManagedRun) -> bool:
+        meta = Path(run.run_root or "/nonexistent") / "meta"
+        for idx in run.agent_statuses:
+            store = QuestionStore(meta / f"agent_{idx:03d}", async_only=True)
+            if store.path.exists() and store.queued_async():
+                return True
+        return False
 
     def _detect_worker_failure_locked(self, run: ManagedRun) -> bool:
         if (run.worker_state == "stopped" and run.worker_pid is None

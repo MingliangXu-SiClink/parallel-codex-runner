@@ -1296,7 +1296,7 @@ class PluginRunManagerTests(unittest.TestCase):
                     server.server_close()
                     controller.close()
 
-    def record_lost_idle_worker(self, manager, run_id, *, already_crashed=False):
+    def record_lost_idle_worker(self, manager, run_id, *, already_crashed=False, last_operation="initial"):
         with manager._lock:
             run = manager._runs[run_id]
             run.worker_protocol = WORKER_PROTOCOL_VERSION
@@ -1315,7 +1315,7 @@ class PluginRunManagerTests(unittest.TestCase):
             "operation": "",
             "operation_id": "",
             "finished_at": "2026-07-13T12:01:00+00:00",
-            "last_operation": "initial",
+            "last_operation": last_operation,
             "exit_code": 0,
             "expired": False,
             "error": None,
@@ -1355,6 +1355,60 @@ class PluginRunManagerTests(unittest.TestCase):
                     self.assertEqual(finalized["status"], "finalized")
                     self.assertIsNone(finalized["worker_error"])
                     self.assertEqual((root / "workspace" / "tracked.txt").read_text(), "candidate 1\n")
+                finally:
+                    recovered.close()
+
+    def test_completed_result_after_a_delivered_async_answer_survives_worker_loss(self):
+        # Regression: an unclean reboot killed the idle owner that had delivered
+        # an async answer; the finished run then reported it could not continue.
+        for already_crashed in (False, True):
+            with self.subTest(already_crashed=already_crashed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manager = PluginRunManager(root / "state", detached_workers=False)
+                run_id = self.start_completed_run(root, manager, num_agents=1)["run_id"]
+                self.record_lost_idle_worker(manager, run_id, already_crashed=already_crashed,
+                                             last_operation="async_answer")
+                manager.close()
+
+                recovered = PluginRunManager(root / "state", detached_workers=True)
+                try:
+                    summary = recovered.get_run(run_id)
+                    self.assertEqual(summary["worker_state"], "stopped")
+                    self.assertIsNone(summary["worker_error"])
+                    self.assertTrue(summary["agents"][0]["can_accept"])
+                    with mock.patch.object(
+                        recovered, "_accept_agent_via_worker", side_effect=AssertionError("must not replace worker")
+                    ):
+                        finalized = recovered.accept_agent(run_id, 1, keep_workspaces=True)
+                    self.assertEqual(finalized["status"], "finalized")
+                    self.assertEqual((root / "workspace" / "tracked.txt").read_text(), "candidate 1\n")
+                finally:
+                    recovered.close()
+
+    def test_undelivered_async_answer_blocks_saving_without_its_owner(self):
+        from parallel_codex_runner_core.agent_questions import QuestionStore, async_questions
+        from tests.test_agent_questions import async_item
+
+        for last_operation in ("initial", "async_answer"):
+            with self.subTest(last_operation=last_operation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manager = PluginRunManager(root / "state", detached_workers=False)
+                run_id = self.start_completed_run(root, manager, num_agents=1)["run_id"]
+                self.record_lost_idle_worker(manager, run_id, already_crashed=True, last_operation=last_operation)
+                store = QuestionStore(Path(manager._runs[run_id].run_root) / "meta" / "agent_001")
+                key = store.open_async(async_questions("thread", "turn", async_item()))
+                record = store.get(key)
+                store.answer(key, record["connection_id"], "late-answer",
+                             {record["questions"][0]["id"]: {"answers": ["B"]}})
+                self.assertEqual(len(store.queued_async()), 1)
+                manager.close()
+
+                recovered = PluginRunManager(root / "state", detached_workers=True)
+                try:
+                    summary = recovered.get_run(run_id)
+                    self.assertEqual(summary["worker_state"], "crashed")
+                    self.assertFalse(summary["agents"][0]["can_accept"])
+                    self.assertEqual((root / "workspace" / "tracked.txt").read_text(), "original\n")
                 finally:
                     recovered.close()
 
