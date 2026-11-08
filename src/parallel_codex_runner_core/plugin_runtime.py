@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -1380,9 +1381,21 @@ class PluginRunManager:
             run.codex_homes_deleted = bool(payload.get("codex_homes_deleted"))
             run.cleanup_error = str(payload.get("cleanup_error") or "")
         elif kind == "finalize_failed" and idx > 0:
-            run.finalized_agent = idx
-            run.status = "sync_ambiguous"
-            run.error = str(payload.get("message") or "Sync-back failed")
+            message = str(payload.get("message") or "Sync-back failed")
+            if payload.get("stage") == "sync_preflight":
+                # WorkspaceSyncPreflightError: the sync was refused before the
+                # workspace changed, so the save stays retryable, exactly as a
+                # failed finalize operation is (see plugin_operation_failed).
+                if run.status == "finalizing" and run.finalized_agent is None:
+                    run.status = "completed"
+                run.error = (
+                    f"Sync-back preflight check failed for AGENT-{idx:03d}: {message}. "
+                    "The workspace was not modified."
+                )
+            else:
+                run.finalized_agent = idx
+                run.status = "sync_ambiguous"
+                run.error = message
         elif kind == "finalization_metadata_failed":
             run.error = str(
                 payload.get("message") or "Could not update finalization metadata"

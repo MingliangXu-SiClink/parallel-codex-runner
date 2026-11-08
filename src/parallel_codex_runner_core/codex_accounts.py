@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -22,7 +23,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib
+
 from .codex_cli import codex_process_environment, resolve_codex_executable
+
+# PCR's API-key accounts authenticate through this custom provider (it must be
+# defined under [model_providers] in the Codex config the Agents copy). ChatGPT
+# logins only authenticate Codex's built-in OpenAI provider.
+API_KEY_MODEL_PROVIDER = "fox"
+_PROVIDER_NAME = re.compile(r"[A-Za-z0-9_-]+")
+_TABLE_HEADER = re.compile(r"\s*\[")
+_ACTIVE_PROVIDER_LINE = re.compile(r"\s*model_provider\s*=")
+_COMMENTED_PROVIDER_LINE = re.compile(r"\s*#\s*model_provider\s*=")
 
 
 # ---------------------------------------------------------------------------
@@ -36,9 +51,17 @@ def pcr_accounts_base(home: Path | None = None) -> Path:
 
 
 def pcr_codex_home(home: Path | None = None) -> Path:
-    """The PCR-dedicated codex home where the active auth.json lives."""
-    from .codex_auth import selected_home
-    return selected_home()
+    """The PCR-dedicated codex home where the active auth.json lives.
+
+    Never the system ``~/.codex``: switching a PCR account must not rewrite the
+    user's own Codex credential or provider, even when the service manager did
+    not export ``PCR_CODEX_AUTH_SOURCE`` (the Linux unit, a manual ``pcrd``).
+    """
+    from .codex_auth import SOURCE_ENV
+    configured = os.environ.get(SOURCE_ENV)
+    if configured:
+        return Path(configured).expanduser().absolute()
+    return pcr_accounts_base(home).parent / "codex-home"
 
 
 # ---------------------------------------------------------------------------
@@ -153,42 +176,140 @@ def decode_credential_identity(data: bytes) -> tuple[str | None, str | None, boo
 
 
 # ---------------------------------------------------------------------------
-# config.toml model_provider updater (mirrors CodexConfigUpdater.swift)
+# Pairing a credential with the only provider it may be sent to
 # ---------------------------------------------------------------------------
 
+def credential_kind(data: bytes) -> str | None:
+    """Return ``"chatgpt"``, ``"apikey"`` or ``None`` for ``auth.json`` bytes."""
+    try:
+        value = json.loads(data)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    tokens = value.get("tokens")
+    api_key = str(value.get("OPENAI_API_KEY") or "").strip()
+    if (isinstance(tokens, dict) and tokens.get("access_token")
+            and not (api_key and value.get("auth_mode") == "apikey")):
+        return "chatgpt"
+    return "apikey" if api_key else None
+
+
+def effective_model_provider(config: dict[str, Any]) -> str | None:
+    """The provider Codex uses for a parsed config (a selected profile wins)."""
+    profile, profiles = config.get("profile"), config.get("profiles")
+    if isinstance(profile, str) and isinstance(profiles, dict):
+        selected = profiles.get(profile)
+        if isinstance(selected, dict) and selected.get("model_provider") is not None:
+            return str(selected["model_provider"])
+    value = config.get("model_provider")
+    return None if value is None else str(value)
+
+
+def _is_openai(provider: str | None) -> bool:
+    return provider in (None, "openai")
+
+
+def with_top_level_model_provider(text: str, provider: str | None) -> str:
+    """Return ``config.toml`` text whose top-level ``model_provider`` is *provider*.
+
+    ``None`` selects Codex's built-in OpenAI provider by commenting the active
+    line out. Only lines before the first table are edited (a profile's or a
+    provider table's keys never match), and the result must parse to exactly
+    the original configuration apart from that key; anything else is refused.
+    """
+    if provider is not None and not _PROVIDER_NAME.fullmatch(provider):
+        raise ValueError(f"Invalid Codex model provider name: {provider!r}")
+    original = tomllib.loads(text)
+    lines = text.splitlines(keepends=True)
+    end = next((i for i, line in enumerate(lines) if _TABLE_HEADER.match(line)), len(lines))
+    active = [i for i in range(end) if _ACTIVE_PROVIDER_LINE.match(lines[i])]
+    commented = [i for i in range(end) if _COMMENTED_PROVIDER_LINE.match(lines[i])]
+    if provider is None:
+        for i in active:
+            lines[i] = "# " + lines[i]
+    else:
+        assignment = f'model_provider = "{provider}"'
+        reuse = active[:1] or commented[:1]
+        if reuse:
+            # Toggle the same line, so repeated switches never pile up comments.
+            line = lines[reuse[0]]
+            lines[reuse[0]] = assignment + (line[len(line.rstrip("\r\n")):] or "\n")
+        else:
+            lines.insert(0, assignment + "\n")
+        for i in active[1:]:
+            lines[i] = "# " + lines[i]
+    updated = "".join(lines)
+    expected = {key: value for key, value in original.items() if key != "model_provider"}
+    if provider is not None:
+        expected["model_provider"] = provider
+    if tomllib.loads(updated) != expected:
+        raise ValueError("config.toml model_provider could not be changed safely")
+    return updated
+
+
+def require_selected_provider(text: str, provider: str | None) -> None:
+    """Refuse a config that would send the selected credential elsewhere."""
+    config = tomllib.loads(text)
+    effective = effective_model_provider(config)
+    if (effective or "openai") != (provider or "openai"):
+        raise ValueError(
+            f'Codex config.toml profile "{config.get("profile")}" selects model provider '
+            f'"{effective or "openai"}", but the selected PCR account requires "{provider or "openai"}"'
+        )
+    if not _is_openai(provider):
+        providers = config.get("model_providers")
+        if not isinstance(providers, dict) or not isinstance(providers.get(provider), dict):
+            raise ValueError(
+                f'The selected PCR API-key account uses model provider "{provider}", but the Codex '
+                f"config.toml Agents copy does not define [model_providers.{provider}]"
+            )
+
+
+def selected_account_provider(selected_home: Path, auth_bytes: bytes) -> str | None:
+    """The provider the selected credential belongs to (``None`` is OpenAI).
+
+    A ChatGPT login is only valid for the built-in OpenAI provider, whatever the
+    selected home's config says. An API key follows that home's provider, which
+    the account store keeps paired with it.
+    """
+    kind = credential_kind(auth_bytes)
+    if kind == "chatgpt":
+        return None
+    if kind != "apikey":
+        raise ValueError("The selected PCR Codex account has no usable credential")
+    config_path = selected_home / "config.toml"
+    if not config_path.is_file():
+        return None
+    provider = effective_model_provider(tomllib.loads(config_path.read_text(encoding="utf-8")))
+    return None if _is_openai(provider) else provider
+
+
 def _update_model_provider(codex_home: Path, *, api_key_account: bool) -> None:
-    """Activate ``model_provider = "fox"`` for API-key accounts, comment it out
-    for OAuth accounts so codex uses the default OpenAI provider."""
+    """Pair PCR's codex home provider with its active account.
+
+    API-key accounts use :data:`API_KEY_MODEL_PROVIDER`; ChatGPT logins use the
+    built-in OpenAI provider. Raises rather than leaving a credential paired
+    with a provider it was not issued for.
+    """
     config_path = codex_home / "config.toml"
-    if not config_path.exists():
+    if config_path.is_symlink():
+        raise AccountStoreError("PCR's Codex config.toml must not be a symlink")
+    try:
+        content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    except OSError as exc:
+        raise AccountStoreError(f"Cannot read PCR's Codex config.toml: {exc}") from exc
+    if not content and not api_key_account:
         return
     try:
-        content = config_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    lines = content.split("\n")
-    if api_key_account:
-        found = False
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("model_provider") or stripped.startswith("# model_provider"):
-                lines[i] = 'model_provider = "fox"'
-                found = True
-                break
-        if not found:
-            lines.insert(0, 'model_provider = "fox"')
-    else:
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("model_provider") and not stripped.startswith("# model_provider"):
-                lines[i] = '# model_provider = "fox"  # API key 账号用，OAuth 个人账号时注释掉'
-                break
-    updated = "\n".join(lines)
+        updated = with_top_level_model_provider(
+            content, API_KEY_MODEL_PROVIDER if api_key_account else None,
+        )
+    except ValueError as exc:
+        raise AccountStoreError(f"Cannot update model_provider in PCR's Codex config.toml: {exc}") from exc
     if updated != content:
-        try:
-            config_path.write_text(updated, encoding="utf-8")
-        except OSError:
-            pass
+        _atomic_write(config_path, updated.encode("utf-8"))
+        _restrict(config_path, directory=False)
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +432,15 @@ class PCRAccountStore:
             if not auth_src.exists():
                 raise AccountStoreError("Credential not found for this account")
             auth_bytes = auth_src.read_bytes()
+            kind = credential_kind(auth_bytes)
+            if kind is None:
+                raise AccountStoreError("The stored credential for this account is unusable")
             codex_home.mkdir(parents=True, exist_ok=True)
+            # Pair the provider before publishing the credential, so a failed
+            # switch never leaves this credential aimed at another endpoint.
+            _update_model_provider(codex_home, api_key_account=kind == "apikey")
             _atomic_write(codex_home / "auth.json", auth_bytes)
             _restrict(codex_home / "auth.json", directory=False)
-            _update_model_provider(codex_home, api_key_account=profile.is_api_key)
             reg.active_account_id = profile_id
             self._save_registry(reg)
             return profile
@@ -349,6 +475,9 @@ class PCRAccountStore:
         if not account_id and not email:
             return None
         with self._lock:
+            # A ChatGPT login lands here while the home may still select the
+            # API-key provider; keep the home's provider paired with it.
+            _update_model_provider(codex_home, api_key_account=credential_kind(auth_bytes) == "apikey")
             reg = self.load_registry()
             existing = None
             if account_id:

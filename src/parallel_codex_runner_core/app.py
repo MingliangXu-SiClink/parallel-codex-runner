@@ -76,6 +76,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import ExitStack, contextmanager
@@ -722,26 +723,56 @@ def ignore_symlinked_children(directory: str, names: List[str]) -> List[str]:
     return [name for name in names if (Path(directory) / name).is_symlink()]
 
 
-def _inject_pcr_selected_auth(agent_codex_home: Path) -> None:
-    """Overwrite agent_codex_home/auth.json with the PCR-selected credential.
+def _write_private_file(path: Path, data: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=".pcr-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
-    copy_codex_support_entries copies auth.json from the system codex home
-    (~/.codex).  This helper replaces it with whatever account the user has
-    selected in PCR's account manager (PCR_CODEX_AUTH_SOURCE/auth.json), so
-    the agent always runs under the right account regardless of whether
-    supports_file_auth() passes (which excludes API-key accounts).
+
+def _inject_pcr_selected_auth(agent_codex_home: Path) -> None:
+    """Install the PCR-selected Codex account into an Agent's private home.
+
+    copy_codex_support_entries seeds the private home from the system home
+    (~/.codex), whose config.toml still selects the system account's provider.
+    A credential is valid for one provider only: an API-key account sent to the
+    built-in OpenAI provider is rejected (401 invalid_api_key) after the key was
+    disclosed to OpenAI, and a ChatGPT login sent to a custom provider hands its
+    token to that relay. Pair the private config.toml with the selected
+    credential, or refuse to prepare the Agent.
     """
     from .codex_auth import SOURCE_ENV
+    from .codex_accounts import (
+        require_selected_provider, selected_account_provider, with_top_level_model_provider,
+    )
+
     pcr_source = os.environ.get(SOURCE_ENV)
     if not pcr_source:
         return
-    pcr_auth = Path(pcr_source) / "auth.json"
+    selected = Path(pcr_source).expanduser()
+    pcr_auth = selected / "auth.json"
     if not pcr_auth.is_file():
         return
-    try:
-        shutil.copy2(pcr_auth, agent_codex_home / "auth.json", follow_symlinks=True)
-    except OSError:
-        pass
+    auth_bytes = pcr_auth.read_bytes()
+    provider = selected_account_provider(selected, auth_bytes)
+    config_path = agent_codex_home / "config.toml"
+    auth_path = agent_codex_home / "auth.json"
+    if config_path.is_symlink() or auth_path.is_symlink():
+        raise ValueError("Agent Codex config.toml and auth.json must not be symlinks")
+    current = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    updated = with_top_level_model_provider(current, provider)
+    require_selected_provider(updated, provider)
+    # Credential first: an interrupted pairing never leaves the system's
+    # ChatGPT token next to a custom provider. Either failure stops preparation.
+    _write_private_file(auth_path, auth_bytes)
+    if updated != current:
+        _write_private_file(config_path, updated.encode("utf-8"))
 
 
 def copy_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) -> None:
