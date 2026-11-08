@@ -148,6 +148,14 @@ class RemoteController:
             "codex.resume_history",
             "codex.model_options",
             "codex.account_usage",
+            "codex.accounts.list",
+            "codex.accounts.switch",
+            "codex.accounts.delete",
+            "codex.accounts.add_apikey",
+            "codex.accounts.login_start",
+            "codex.accounts.login_poll",
+            "codex.accounts.login_cancel",
+            "codex.accounts.sync",
             "prompt_history.list",
             "feedback.list",
             "feedback.get",
@@ -358,6 +366,14 @@ class RemoteController:
             "codex.resume_history": self._resume_history,
             "codex.model_options": self._model_options,
             "codex.account_usage": self._account_usage,
+            "codex.accounts.list": self._accounts_list,
+            "codex.accounts.switch": self._accounts_switch,
+            "codex.accounts.delete": self._accounts_delete,
+            "codex.accounts.add_apikey": self._accounts_add_apikey,
+            "codex.accounts.login_start": self._accounts_login_start,
+            "codex.accounts.login_poll": self._accounts_login_poll,
+            "codex.accounts.login_cancel": self._accounts_login_cancel,
+            "codex.accounts.sync": self._accounts_sync,
             "prompt_history.list": self._prompt_history_list,
             "prompt_history.append": self._prompt_history_append,
             "feedback.submit": self._feedback_submit,
@@ -2745,6 +2761,125 @@ class RemoteController:
         if callable(execution_status):
             value = {**value, "execution_accounts": execution_status()}
         return value
+
+    # ------------------------------------------------------------------
+    # Native PCR account management
+    # ------------------------------------------------------------------
+
+    @property
+    def _pcr_account_store(self):
+        """Lazily create a shared PCRAccountStore instance."""
+        if not hasattr(self, "_account_store_instance"):
+            from ..codex_accounts import PCRAccountStore
+            self._account_store_instance = PCRAccountStore()
+        return self._account_store_instance
+
+    def _accounts_list(self, request: RemoteRequest) -> dict[str, Any]:
+        """List all stored PCR accounts plus the currently active one."""
+        from ..codex_accounts import PCRAccountStore, pcr_codex_home
+        store = self._pcr_account_store
+        # Auto-import the current active credential if the registry is empty.
+        accounts, active_id = store.list_accounts()
+        if not accounts:
+            codex_home = pcr_codex_home()
+            synced = store.sync_active_credential(codex_home)
+            if synced:
+                accounts, active_id = store.list_accounts()
+        result = []
+        for profile in accounts:
+            d = profile.to_dict()
+            d["isActive"] = profile.id == active_id
+            result.append(d)
+        return {"accounts": result, "activeID": active_id}
+
+    def _accounts_switch(self, request: RemoteRequest) -> dict[str, Any]:
+        """Activate an account by profile ID."""
+        from ..codex_accounts import pcr_codex_home
+        profile_id = str(request.body.get("id") or "").strip()
+        if not profile_id:
+            raise ValueError("Missing account id")
+        store = self._pcr_account_store
+        codex_home = pcr_codex_home()
+        profile = store.activate_profile(profile_id, codex_home)
+        return {"success": True, "account": {**profile.to_dict(), "isActive": True}}
+
+    def _accounts_delete(self, request: RemoteRequest) -> dict[str, Any]:
+        """Remove a stored account by profile ID."""
+        profile_id = str(request.body.get("id") or "").strip()
+        if not profile_id:
+            raise ValueError("Missing account id")
+        self._pcr_account_store.delete_profile(profile_id)
+        return {"success": True}
+
+    def _accounts_add_apikey(self, request: RemoteRequest) -> dict[str, Any]:
+        """Add an API-key account and optionally activate it."""
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from ..codex_accounts import (
+            AccountProfile, decode_credential_identity, pcr_codex_home,
+        )
+        api_key = str(request.body.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("Missing api_key")
+        # Build auth.json for an API-key-only account.
+        auth_json = json.dumps({"OPENAI_API_KEY": api_key}).encode()
+        account_id, _email, _is_api_key = decode_credential_identity(auth_json)
+        profile_id = str(_uuid.uuid4()).upper()
+        display = f"API Key …{api_key[-6:]}"
+        profile = AccountProfile(
+            id=profile_id,
+            display_name=display,
+            email=None,
+            account_id=account_id,
+            is_api_key=True,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        store = self._pcr_account_store
+        store.save_profile_credential(profile_id, auth_json)
+        canonical = store.register_profile(profile)
+        activate = self._boolean(request.body, "activate", default=True)
+        if activate:
+            codex_home = pcr_codex_home()
+            store.activate_profile(canonical.id, codex_home)
+        return {"success": True, "account": {**canonical.to_dict(), "isActive": activate}}
+
+    def _accounts_login_start(self, request: RemoteRequest) -> dict[str, Any]:
+        """Start an OAuth login.  Returns {login_id, auth_url} or {error}."""
+        from ..codex_accounts import login_start, pcr_codex_home
+        settings = self.workspace_config.load_defaults()
+        codex_bin = (settings.codex_bin if settings and settings.codex_bin else None) or "codex"
+        codex_home = pcr_codex_home()
+        store = self._pcr_account_store
+        result = login_start(codex_bin, codex_home, store)
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result
+
+    def _accounts_login_poll(self, request: RemoteRequest) -> dict[str, Any]:
+        """Poll a pending OAuth login.  Returns {status, account?, error?}."""
+        from ..codex_accounts import login_poll
+        login_id = str(request.body.get("login_id") or "").strip()
+        if not login_id:
+            raise ValueError("Missing login_id")
+        return login_poll(login_id)
+
+    def _accounts_login_cancel(self, request: RemoteRequest) -> dict[str, Any]:
+        """Cancel a pending OAuth login."""
+        from ..codex_accounts import login_cancel
+        login_id = str(request.body.get("login_id") or "").strip()
+        login_cancel(login_id)
+        return {"success": True}
+
+    def _accounts_sync(self, request: RemoteRequest) -> dict[str, Any]:
+        """Sync the current active credential into the account store.
+        Useful on first launch to import the existing account."""
+        from ..codex_accounts import pcr_codex_home
+        codex_home = pcr_codex_home()
+        profile = self._pcr_account_store.sync_active_credential(codex_home)
+        if profile is None:
+            return {"synced": False}
+        _, active_id = self._pcr_account_store.list_accounts()
+        return {"synced": True, "account": {**profile.to_dict(), "isActive": profile.id == active_id}}
 
     def _prompt_history_list(self, request: RemoteRequest) -> dict[str, Any]:
         workspace, _workspace_id = self._workspace(request.body)

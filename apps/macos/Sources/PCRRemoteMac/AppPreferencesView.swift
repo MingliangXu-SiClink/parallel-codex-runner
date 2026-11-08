@@ -6,6 +6,8 @@ struct AppPreferencesView: View {
 
     var body: some View {
         Form {
+            CodexAccountSection(model: model)
+
             Section(model.appLanguage.text("语言", "Language")) {
                 Picker(model.appLanguage.text("应用语言", "App language"), selection: languageBinding) {
                     ForEach(AppLanguage.allCases) { language in
