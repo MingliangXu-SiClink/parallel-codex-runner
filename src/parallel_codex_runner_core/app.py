@@ -672,10 +672,7 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 
 def get_codex_home() -> Path:
-    # Respect PCR_CODEX_AUTH_SOURCE (the PCR-isolated home) first, then
-    # the explicit CODEX_HOME, then the system default ~/.codex.
-    from .codex_auth import SOURCE_ENV
-    value = os.environ.get(SOURCE_ENV) or os.environ.get("CODEX_HOME")
+    value = os.environ.get("CODEX_HOME")
     return Path(value).expanduser().resolve() if value else (Path.home() / ".codex").resolve()
 
 
@@ -1359,6 +1356,21 @@ def prepare_agent_codex_home(
 ) -> None:
     make_private_dir(agent_codex_home)
     copy_codex_support_entries(real_codex_home, agent_codex_home)
+    # Override auth.json with PCR's selected account credential when one is
+    # configured.  copy_codex_support_entries above may have written the system
+    # ~/.codex auth.json; replace it unconditionally so that the account chosen
+    # in PCR's account manager is always the one the agent runs under, regardless
+    # of whether supports_file_auth() passes (which excludes API-key accounts).
+    from .codex_auth import SOURCE_ENV, selected_home
+    pcr_source = os.environ.get(SOURCE_ENV)
+    if pcr_source:
+        pcr_auth = Path(pcr_source) / "auth.json"
+        if pcr_auth.is_file():
+            import shutil as _shutil
+            try:
+                _shutil.copy2(pcr_auth, agent_codex_home / "auth.json", follow_symlinks=True)
+            except OSError:
+                pass
     if not resume_session_id:
         return
     if prepared_source is not None:
