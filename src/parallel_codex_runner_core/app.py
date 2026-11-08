@@ -672,7 +672,10 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 
 def get_codex_home() -> Path:
-    value = os.environ.get("CODEX_HOME")
+    # Respect PCR_CODEX_AUTH_SOURCE (the PCR-isolated home) first, then
+    # the explicit CODEX_HOME, then the system default ~/.codex.
+    from .codex_auth import SOURCE_ENV
+    value = os.environ.get(SOURCE_ENV) or os.environ.get("CODEX_HOME")
     return Path(value).expanduser().resolve() if value else (Path.home() / ".codex").resolve()
 
 
