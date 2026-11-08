@@ -70,6 +70,12 @@ def launch_agent_payload(
         "ThrottleInterval": 5,
         "EnvironmentVariables": {
             "PATH": service_environment_path(home),
+            # PCR uses its own dedicated Codex home, isolated from ~/.codex,
+            # so that PCR account switching never touches the system account.
+            "PCR_CODEX_AUTH_SOURCE": str(
+                (home or Path.home()) / "Library" / "Application Support"
+                / "parallel-codex-runner" / "codex-home"
+            ),
         },
         "StandardOutPath": str(logs / "pcrd.stdout.log"),
         "StandardErrorPath": str(logs / "pcrd.stderr.log"),
