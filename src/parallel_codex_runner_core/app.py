@@ -722,6 +722,28 @@ def ignore_symlinked_children(directory: str, names: List[str]) -> List[str]:
     return [name for name in names if (Path(directory) / name).is_symlink()]
 
 
+def _inject_pcr_selected_auth(agent_codex_home: Path) -> None:
+    """Overwrite agent_codex_home/auth.json with the PCR-selected credential.
+
+    copy_codex_support_entries copies auth.json from the system codex home
+    (~/.codex).  This helper replaces it with whatever account the user has
+    selected in PCR's account manager (PCR_CODEX_AUTH_SOURCE/auth.json), so
+    the agent always runs under the right account regardless of whether
+    supports_file_auth() passes (which excludes API-key accounts).
+    """
+    from .codex_auth import SOURCE_ENV
+    pcr_source = os.environ.get(SOURCE_ENV)
+    if not pcr_source:
+        return
+    pcr_auth = Path(pcr_source) / "auth.json"
+    if not pcr_auth.is_file():
+        return
+    try:
+        shutil.copy2(pcr_auth, agent_codex_home / "auth.json", follow_symlinks=True)
+    except OSError:
+        pass
+
+
 def copy_codex_support_entries(real_codex_home: Path, agent_codex_home: Path) -> None:
     if not real_codex_home.exists():
         return
@@ -1356,21 +1378,7 @@ def prepare_agent_codex_home(
 ) -> None:
     make_private_dir(agent_codex_home)
     copy_codex_support_entries(real_codex_home, agent_codex_home)
-    # Override auth.json with PCR's selected account credential when one is
-    # configured.  copy_codex_support_entries above may have written the system
-    # ~/.codex auth.json; replace it unconditionally so that the account chosen
-    # in PCR's account manager is always the one the agent runs under, regardless
-    # of whether supports_file_auth() passes (which excludes API-key accounts).
-    from .codex_auth import SOURCE_ENV, selected_home
-    pcr_source = os.environ.get(SOURCE_ENV)
-    if pcr_source:
-        pcr_auth = Path(pcr_source) / "auth.json"
-        if pcr_auth.is_file():
-            import shutil as _shutil
-            try:
-                _shutil.copy2(pcr_auth, agent_codex_home / "auth.json", follow_symlinks=True)
-            except OSError:
-                pass
+    _inject_pcr_selected_auth(agent_codex_home)
     if not resume_session_id:
         return
     if prepared_source is not None:
@@ -5137,6 +5145,7 @@ def _prepare_retained_execution(
         recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
         unsubmitted = configuration_failed_before_input(home.parent, recovery)
         copy_codex_support_entries(real_codex_home, home)
+        _inject_pcr_selected_auth(home)
         if allow_external_shutdown:
             stop_path = home.parent / "execution_stop"
             stop_path.unlink(missing_ok=True)
@@ -5184,6 +5193,7 @@ def _prepare_retained_resume(
         if path.exists():
             shutil.move(str(path), str(archive / name))
     copy_codex_support_entries(real_codex_home, home)
+    _inject_pcr_selected_auth(home)
     return command, home
 
 
