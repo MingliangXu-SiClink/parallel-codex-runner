@@ -61,12 +61,21 @@ class AccountRestart(RuntimeError):
     pass
 
 
+# A relay out of prepaid or periodic credit answers with a 4xx status
+# (code1.newcli.com: "401 Unauthorized: 额度不足"). Like usageLimitExceeded,
+# the same thread resumes once credit returns or the account is switched.
+# An invalid key ("Incorrect API key provided") stays final.
+RELAY_CREDIT_EXHAUSTED = ("额度不足", "余额不足", "额度已用尽")
+
+
 def transient_error(error: dict[str, Any] | None) -> bool:
     error = error or {}
     info = error.get("codexErrorInfo")
     if info is None and isinstance(error.get("data"), dict):
         info = error["data"].get("codexErrorInfo")
     kind = next(iter(info), "") if isinstance(info, dict) else info
+    if any(text in str(error.get("message") or "") for text in RELAY_CREDIT_EXHAUSTED):
+        return True
     if isinstance(info, dict) and isinstance(info.get(kind), dict):
         status = info[kind].get("httpStatusCode")
         if isinstance(status, int) and 400 <= status < 500 and status not in {408, 425, 429}:

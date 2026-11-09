@@ -352,6 +352,22 @@ class RecoveryErrorTests(unittest.TestCase):
                    "client_message_id": "message", "native_pid": 999_999_999}
         self.assertTrue(adapter.retryable_blocked_execution(blocked, Path("/nonexistent")))
 
+    def test_relay_out_of_credit_waits_on_the_same_thread(self):
+        # Regression: the fox relay answered every Agent with 401 once its
+        # credit ran out; the credit came back hours later.
+        status = {"httpConnectionFailed": {"httpStatusCode": 401}}
+        url = ", url: https://code1.newcli.com/v1/responses"
+        exhausted = {"message": "unexpected status 401 Unauthorized: 额度不足" + url, "codexErrorInfo": status,
+                     "additionalDetails": None, "misalignment": None}
+        self.assertTrue(adapter.transient_error(exhausted))
+        self.assertTrue(adapter.transient_error({**exhausted, "message": "该令牌额度已用尽"}))
+        self.assertFalse(adapter.transient_error({**exhausted,
+            "message": "unexpected status 401 Unauthorized: Incorrect API key provided: sk-ant-o…" + url}))
+        self.assertFalse(adapter.transient_error({**exhausted, "message": "unexpected status 401 Unauthorized" + url}))
+        blocked = {"stage": "blocked", "error": exhausted, "thread_id": "thread", "turn_id": "turn",
+                   "client_message_id": "message", "native_pid": 999_999_999}
+        self.assertTrue(adapter.retryable_blocked_execution(blocked, Path("/nonexistent")))
+
 
 class RetainedExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
