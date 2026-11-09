@@ -92,7 +92,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.03)
                     return json.dumps(next(messages)).encode() + b"\n"
 
-                process.stdout.readline = read
+                process.stdout.readuntil = read
                 output = Path(tmp) / "final.md"
                 command = ["codex", "exec", *(["resume", "session"] if resume else []), "-o", str(output), "-"]
                 events = io.StringIO()
@@ -105,6 +105,8 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
                 requests = self.requests(process)
                 self.assertEqual([r["method"] for r in requests], [
                     "initialize", "initialized", "thread/resume" if resume else "thread/start", "turn/start"])
+                self.assertEqual(requests[0]["params"]["capabilities"]["optOutNotificationMethods"],
+                                 ["turn/diff/updated"])
                 self.assertEqual(requests[-1]["params"]["input"][0]["text"], "question")
                 started = [json.loads(line) for line in events.getvalue().splitlines()
                            if json.loads(line)["type"] == "turn.started"]
@@ -130,7 +132,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
             restoring.set()
             await asyncio.Event().wait()
 
-        process.stdout.readline = read
+        process.stdout.readuntil = read
         with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn, \
              patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": ""}):
             task = asyncio.create_task(codex_app_server.run(
@@ -160,7 +162,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
             accepting.set()
             await asyncio.Event().wait()
 
-        process.stdout.readline = read
+        process.stdout.readuntil = read
         events = io.StringIO()
         with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn, \
              patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": ""}), contextlib.redirect_stdout(events):
@@ -180,7 +182,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
         for status, expected in (("completed", 0), ("failed", 1)):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 process = self.process()
-                process.stdout.readline = AsyncMock(side_effect=[
+                process.stdout.readuntil = AsyncMock(side_effect=[
                     b'{"id":1,"result":{"userAgent":"codex"}}\n',
                     b'{"id":2,"result":{"thread":{"id":"session"}}}\n',
                     b'{"method":"turn/started","params":{"threadId":"session","turn":{"id":"turn"}}}\n',
@@ -201,7 +203,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_after_resume_is_observed_before_submitting_a_turn(self):
         process = self.process()
-        process.stdout.readline = AsyncMock(side_effect=[
+        process.stdout.readuntil = AsyncMock(side_effect=[
             b'{"id":1,"result":{"userAgent":"codex"}}\n',
             b'{"id":2,"result":{"thread":{"id":"session"}}}\n',
         ])
@@ -222,7 +224,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
         for message in (b'', b'{"id":2,"error":{"code":-1,"message":"resume failed"}}\n'):
             with self.subTest(message=message):
                 process = self.process()
-                process.stdout.readline = AsyncMock(side_effect=[
+                process.stdout.readuntil = AsyncMock(side_effect=[
                     b'{"id":1,"result":{"userAgent":"codex"}}\n', message])
                 with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn, \
                      patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": ""}):
@@ -244,7 +246,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
             process.returncode = 7
             await asyncio.Event().wait()
 
-        process.stdout.readline = read
+        process.stdout.readuntil = read
         with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn, \
              patch.object(codex_app_server, "PROCESS_POLL_SECONDS", 0.01), \
              patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": ""}):
@@ -255,7 +257,7 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_initialization_failure_can_use_legacy_before_any_thread_request(self):
         process = self.process()
-        process.stdout.readline = AsyncMock(return_value=b'{"id":1,"error":{"code":-32601,"message":"unsupported"}}\n')
+        process.stdout.readuntil = AsyncMock(return_value=b'{"id":1,"error":{"code":-32601,"message":"unsupported"}}\n')
         legacy = self.process()
         legacy.returncode = 0
         legacy.communicate = AsyncMock()
@@ -265,6 +267,27 @@ class AppServerStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.await_count, 2)
         self.assertEqual([r["method"] for r in self.requests(process)], ["initialize"])
         legacy.communicate.assert_awaited_once_with(b"question")
+
+    async def test_a_message_longer_than_the_stream_limit_survives_a_cancelled_read(self):
+        # Regression: one turn/diff/updated over the 64 MiB limit made readline()
+        # discard it and raise, killing the adapter mid-turn.
+        stream = asyncio.StreamReader(limit=16)
+        reader = codex_app_server.MessageReader(stream)
+        large = json.dumps({"method": "item/completed", "params": {"text": "x" * 200}}).encode() + b"\n"
+        pending = asyncio.create_task(reader.readline())
+        stream.feed_data(large[:100])
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(len(reader.partial), 100)
+        # read_message cancels its pending read on teardown paths.
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        stream.feed_data(large[100:] + b'{"id": 2}\n')
+        stream.feed_eof()
+        self.assertEqual(await reader.readline(), large)
+        self.assertEqual(await reader.readline(), b'{"id": 2}\n')
+        self.assertEqual(await reader.readline(), b"")
 
 
 class AppServerAdapterTests(unittest.TestCase):

@@ -27,7 +27,7 @@ class NativePeer:
         self.process.returncode = None
         self.process.stdin.drain = AsyncMock()
         self.process.stdin.write.side_effect = self.write
-        self.process.stdout.readline = self.queue.get
+        self.process.stdout.readuntil = self.queue.get
         self.process.wait = AsyncMock(return_value=0)
 
     def emit(self, value):
@@ -367,6 +367,19 @@ class RecoveryErrorTests(unittest.TestCase):
         blocked = {"stage": "blocked", "error": exhausted, "thread_id": "thread", "turn_id": "turn",
                    "client_message_id": "message", "native_pid": 999_999_999}
         self.assertTrue(adapter.retryable_blocked_execution(blocked, Path("/nonexistent")))
+
+    def test_receipt_left_by_an_adapter_read_overflow_resumes_the_same_thread(self):
+        # Regression: an older adapter died reading one app-server line over the
+        # 64 MiB stream limit; the native thread itself was intact.
+        blocked = {"stage": "blocked", "thread_id": "thread", "turn_id": "turn",
+                   "client_message_id": "message", "native_pid": 999_999_999}
+        for message in ("Separator is not found, and chunk exceed the limit",
+                        "Separator is found, but chunk is longer than limit"):
+            receipt = {**blocked, "error": {"message": message}}
+            self.assertFalse(adapter.transient_error(receipt["error"]))
+            self.assertTrue(adapter.retryable_blocked_execution(receipt, Path("/nonexistent")))
+        self.assertFalse(adapter.retryable_blocked_execution(
+            {**blocked, "error": {"message": "Invalid Codex app-server message"}}, Path("/nonexistent")))
 
 
 class RetainedExecutionTests(unittest.IsolatedAsyncioTestCase):

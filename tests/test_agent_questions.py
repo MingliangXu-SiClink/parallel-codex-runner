@@ -317,7 +317,7 @@ class InteractivePeer:
                 "item": {"type": "agentMessage", "id": "final", "text": message["result"]["answers"]["choice"]["answers"][0], "phase": "final_answer"}})
             self.event("turn/completed", {"threadId": "original-thread", "turn": {"id": "original-turn", "status": "completed"}})
 
-    async def readline(self):
+    async def readuntil(self):
         return json.dumps(await self.lines.get()).encode() + b"\n"
 
     async def drain(self):

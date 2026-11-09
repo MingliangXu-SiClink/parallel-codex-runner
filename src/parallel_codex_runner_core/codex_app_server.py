@@ -27,6 +27,10 @@ LARGE_RESUME_BYTES = 128 * 1024 * 1024
 MIN_APPLICATION_CONTEXT_VERSION = (0, 159, 2)
 RECOVERY_MIN_DELAY = 10.0
 RECOVERY_MAX_DELAY = 300.0
+# PCR never reads the whole-turn diff. Codex resends all of it after every patch,
+# repeating each long line around a hunk; one edit to an 85 MB results file sent
+# a single message over 64 MiB.
+SUPPRESSED_NOTIFICATIONS = ["turn/diff/updated"]
 RECOVERY_CONTEXT = (
     "PCR is recovering the same interrupted task in the original writable workspace and thread. "
     "The original user's request and permission boundaries still apply. This is not a new task. "
@@ -101,12 +105,54 @@ def transient_error(error: dict[str, Any] | None) -> bool:
     ))
 
 
+class MessageReader:
+    """Newline-delimited app-server messages of any size.
+
+    asyncio's readline() discards a line longer than the stream limit and raises
+    ValueError, which killed the adapter mid-turn. The limit now only bounds each
+    buffered chunk. A partial line outlives a cancelled read, so the next read
+    continues it instead of desynchronizing the stream.
+    """
+
+    def __init__(self, stream: asyncio.StreamReader) -> None:
+        self.stream = stream
+        self.partial = bytearray()
+
+    async def readline(self) -> bytes:
+        while True:
+            try:
+                chunk = await self.stream.readuntil()
+            except asyncio.LimitOverrunError as exc:
+                # These bytes are already buffered, so readexactly returns without
+                # suspending: no cancellation can fall between the read and the append.
+                self.partial += await self.stream.readexactly(exc.consumed)
+                continue
+            except asyncio.IncompleteReadError as exc:
+                chunk = exc.partial
+            if not self.partial:
+                return chunk
+            self.partial += chunk
+            line, self.partial = self.partial, bytearray()
+            return bytes(line)
+
+
+# Adapters before MessageReader died reading one app-server line over the stream
+# limit (readline's ValueError). The native thread was intact, so a receipt they
+# left blocked this way may resume it.
+READ_OVERFLOW_MESSAGES = frozenset({
+    "Separator is not found, and chunk exceed the limit",
+    "Separator is found, but chunk is longer than limit",
+})
+
+
 def retryable_blocked_execution(state: dict[str, Any], private_home: Path | None = None) -> bool:
     from parallel_codex_runner_core.plugin.lifecycle import pid_is_alive
 
     pid = state.get("native_pid")
+    error = state.get("error")
     return (
-        state.get("stage") == "blocked" and (transient_error(state.get("error"))
+        state.get("stage") == "blocked" and (transient_error(error)
+            or (isinstance(error, dict) and error.get("message") in READ_OVERFLOW_MESSAGES)
             or changed_auth_for_block(state, private_home or Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()))
         and all(isinstance(state.get(key), str) and state[key].strip()
                 for key in ("thread_id", "turn_id", "client_message_id"))
@@ -483,6 +529,7 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
         stderr=sys.stderr, limit=64 * 1024 * 1024,
     )
     assert process.stdin is not None and process.stdout is not None
+    messages = MessageReader(process.stdout)
     sequence = 0
     adapter = EventAdapter(lambda event: print(json.dumps(event, ensure_ascii=False), flush=True), recovery)
 
@@ -577,7 +624,7 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
                     "input": [{"type": "text", "text": async_reply(record, record["answers"])}]}})
 
     async def read_message() -> dict[str, Any]:
-        pending = asyncio.create_task(process.stdout.readline())
+        pending = asyncio.create_task(messages.readline())
         try:
             while not pending.done():
                 await asyncio.wait({pending}, timeout=PROCESS_POLL_SECONDS)
@@ -755,7 +802,8 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
         try:
             phase("initializing")
             initialized = await request("initialize", {"clientInfo": {"name": "parallel_codex_runner", "version": "1"},
-                                         "capabilities": {"experimentalApi": True}})
+                                         "capabilities": {"experimentalApi": True,
+                                                          "optOutNotificationMethods": SUPPRESSED_NOTIFICATIONS}})
             if not isinstance(initialized.get("userAgent"), str):
                 raise RuntimeError("Codex app-server initialization was not recognized")
             if additional_developer_instructions is not None or recovery is not None:

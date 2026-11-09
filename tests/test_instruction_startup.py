@@ -112,7 +112,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
         for resume in (False, True):
             with self.subTest(resume=resume), tempfile.TemporaryDirectory() as tmp:
                 process = self.process()
-                process.stdout.readline = AsyncMock(side_effect=[
+                process.stdout.readuntil = AsyncMock(side_effect=[
                     b'{"id":1,"result":{"userAgent":"Codex Desktop/0.159.2 (test)"}}\n',
                     b'{"id":2,"result":{"thread":{"id":"session"}}}\n',
                     b'{"id":3,"result":{"turn":{"id":"turn"}}}\n',
@@ -164,7 +164,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                     preparing.set()
                     await asyncio.Event().wait()
 
-                process.stdout.readline = read
+                process.stdout.readuntil = read
                 with patch.object(codex_app_server.asyncio, "create_subprocess_exec",
                         AsyncMock(return_value=process)) as spawn, \
                      patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": ""}), \
@@ -207,7 +207,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                     await release.wait()
                 return json.dumps(message).encode() + b"\n"
 
-            process.stdout.readline = read
+            process.stdout.readuntil = read
             output = Path(tmp) / "final.md"
             with patch.object(codex_app_server.asyncio, "create_subprocess_exec",
                     AsyncMock(return_value=process)) as spawn, contextlib.redirect_stdout(io.StringIO()):
@@ -237,7 +237,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
         for resume in (False, True):
             with self.subTest(resume=resume):
                 process = self.process()
-                process.stdout.readline = AsyncMock(side_effect=[
+                process.stdout.readuntil = AsyncMock(side_effect=[
                     b'{"id":1,"result":{"userAgent":"codex_cli_rs/0.159.2"}}\n',
                     b'{"id":2,"error":{"message":"invalid project config"}}\n',
                 ])
@@ -253,7 +253,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unrecognized_initialize_cannot_bypass_instruction_preservation(self):
         process = self.process()
-        process.stdout.readline = AsyncMock(return_value=b'{"id":1,"error":{"message":"unsupported"}}\n')
+        process.stdout.readuntil = AsyncMock(return_value=b'{"id":1,"error":{"message":"unsupported"}}\n')
         with patch.object(codex_app_server.asyncio, "create_subprocess_exec",
                 AsyncMock(return_value=process)) as spawn, \
              contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
@@ -265,7 +265,7 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
         for identity in ("codex", "codex_cli_rs/0.159.1", "Codex Desktop/0.158.0 (test)"):
             with self.subTest(identity=identity):
                 process = self.process()
-                process.stdout.readline = AsyncMock(return_value=json.dumps({
+                process.stdout.readuntil = AsyncMock(return_value=json.dumps({
                     "id": 1, "result": {"userAgent": identity}}).encode() + b"\n")
                 with patch.object(codex_app_server.asyncio, "create_subprocess_exec",
                         AsyncMock(return_value=process)) as spawn, \
