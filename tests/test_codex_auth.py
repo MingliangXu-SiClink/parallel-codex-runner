@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from parallel_codex_runner_core import app, codex_app_server as adapter, codex_auth
 from parallel_codex_runner_core.codex_auth import (SOURCE_ENV, changed_auth_for_block, file_auth,
-                                                  install_for_start, selected_home, supports_file_auth)
+                                                  install_for_start, selected_credential_identity,
+                                                  selected_home, supports_file_auth)
 from parallel_codex_runner_core.codex_usage import CodexUsageReader
 from scripts.verify_account_follow_native import fixture_auth
 from tests.test_agent_execution_recovery import NativePeer
@@ -262,6 +263,34 @@ class FileAuthTests(unittest.TestCase):
         # But not when there is no identity change
         state_dict["auth"] = {"identity": file_auth(self.source).identity}
         self.assertFalse(changed_auth_for_block(state_dict, self.private))
+
+    def test_provider_rejection_resumes_only_under_a_different_account(self):
+        # Regression: ChatGPT refused three synthesis Agents ("This request does not
+        # support user-supplied input item IDs") although PCR's selected account was
+        # the fox API key, whose provider accepted the same thread.
+        rejected = {"codexErrorInfo": "other", "message": json.dumps({"type": "error", "error": {
+            "message": "This request does not support user-supplied input item IDs.",
+            "type": "invalid_request_error", "param": "input", "code": "unsupported_parameter"}, "status": 400})}
+        chatgpt = {"identity": file_auth(self.private).identity}  # the login it was refused under
+        blocked = {"error": rejected, "auth": chatgpt, "input_origin": "user"}
+        self.assertTrue(changed_auth_for_block(blocked, self.private))
+        # The selected account is an API key: it has an identity too, never the key itself.
+        (self.source / "auth.json").write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-key"}))
+        identity = selected_credential_identity()
+        self.assertNotIn("sk-test-key", identity)
+        self.assertTrue(changed_auth_for_block(blocked, self.private))
+        for status in (400, 403, 404, 422):
+            error = {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": status}}}
+            self.assertTrue(changed_auth_for_block({**blocked, "error": error}, self.private), status)
+        for error in ({"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 429}}},
+                      {"codexErrorInfo": {"responseStreamConnectionFailed": {"httpStatusCode": 503}}},
+                      {"codexErrorInfo": "other", "message": json.dumps({"type": "error", "error": {}, "status": 500})},
+                      {"codexErrorInfo": "other", "message": "Native recovery changed the Agent workspace"}):
+            self.assertFalse(changed_auth_for_block({**blocked, "error": error}, self.private), error)
+        # Under the same credential, with none recorded, or once a recovery turn was refused: final.
+        self.assertFalse(changed_auth_for_block({**blocked, "auth": {"identity": identity}}, self.private))
+        self.assertFalse(changed_auth_for_block({"error": rejected, "input_origin": "user"}, self.private))
+        self.assertFalse(changed_auth_for_block({**blocked, "input_origin": "pcr_recovery"}, self.private))
 
 
 class AccountPeer(NativePeer):

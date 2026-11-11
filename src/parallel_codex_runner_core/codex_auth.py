@@ -173,8 +173,55 @@ def _is_auth_error(error: dict[str, Any]) -> bool:
     return False
 
 
+def _is_provider_rejection(error: dict[str, Any]) -> bool:
+    """A 4xx answer the provider gave the request, other than a timeout or rate limit.
+
+    Codex reports it either as {"codexErrorInfo": {"<kind>": {"httpStatusCode": 4xx}}}
+    or as codexErrorInfo "other" whose message is the provider's error event, e.g.
+    {"type":"error","error":{"type":"invalid_request_error",...},"status":400}.
+    """
+    info = error.get("codexErrorInfo")
+    if isinstance(info, dict):
+        inner = info.get(next(iter(info), ""))
+        status = inner.get("httpStatusCode") if isinstance(inner, dict) else None
+    else:
+        try:
+            event = json.loads(str(error.get("message") or ""))
+        except ValueError:
+            return False
+        status = event.get("status") if isinstance(event, dict) and isinstance(event.get("error"), dict) else None
+    return isinstance(status, int) and 400 <= status < 500 and status not in {408, 425, 429}
+
+
+def selected_credential_identity(home: Path | None = None) -> str | None:
+    """A stable, non-secret identity for the selected ChatGPT login or API key."""
+    home = home or selected_home()
+    auth = file_auth(home)
+    if auth is not None:
+        return auth.identity
+    try:
+        with (home / "auth.json").open("rb") as stream:
+            value = json.loads(stream.read(1024 * 1024))
+    except (OSError, ValueError):
+        return None
+    key = value.get("OPENAI_API_KEY") if isinstance(value, dict) else None
+    if not isinstance(key, str) or not key.strip():
+        return None
+    return hashlib.sha256(json.dumps(["apikey", key.strip()]).encode()).hexdigest()
+
+
 def changed_auth_for_block(state: dict[str, Any], private_home: Path) -> bool:
+    """Whether a blocked receipt may resume once under the account now selected."""
+    from .history_origins import RECOVERY_ORIGIN
+
     error = state.get("error") or {}
+    if _is_provider_rejection(error) and not _is_auth_error(error):
+        # Accounts can run on different providers, so a request one provider
+        # refused may be accepted under another credential. Only the original
+        # input gets this second chance: a refused recovery turn already had it.
+        previous = (state.get("auth") or {}).get("identity")
+        current = selected_credential_identity()
+        return bool(state.get("input_origin") != RECOVERY_ORIGIN and previous and current and previous != current)
     if not _is_auth_error(error):
         return False
     current = file_auth(selected_home())
