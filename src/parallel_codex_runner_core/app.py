@@ -4034,6 +4034,31 @@ def uses_pcr_compact_prompt(codex_home: Path) -> bool:
                    for key in ("compact_prompt", "experimental_compact_prompt_file"))
 
 
+def custom_provider_environment(
+    command: list[str], codex_home: Path, real_codex_home: Path | None = None,
+) -> dict[str, str]:
+    """Adapter variables for an Agent whose provider is not OpenAI; none on OpenAI.
+
+    Such an Agent compacts locally (codex_app_server.LOCAL_COMPACTION_ENV) and may
+    need its model's window and PCR's compaction prompt.
+    """
+    from .codex_app_server import (
+        COMPACT_PROMPT_ENV,
+        CONTEXT_WINDOW_ENV,
+        LOCAL_COMPACTION_ENV,
+    )
+
+    if _custom_provider_config(codex_home) is None:
+        return {}
+    values = {LOCAL_COMPACTION_ENV: "1"}
+    window = custom_provider_context_window(command, codex_home, real_codex_home)
+    if window is not None:
+        values[CONTEXT_WINDOW_ENV] = str(window)
+    if uses_pcr_compact_prompt(codex_home):
+        values[COMPACT_PROMPT_ENV] = "1"
+    return values
+
+
 def agent_process_environment(
     agent_workspace: Path,
     codex_home: Path,
@@ -4148,17 +4173,15 @@ async def run_one_agent(
         env = agent_process_environment(agent_workspace, codex_home, command[0])
         env["PCR_AGENT_STOP_FILES"] = json.dumps([str(signal.path) for signal in (cancel_event, agent_cancel_event)
                                                  if isinstance(getattr(signal, "path", None), Path)])
-        from .codex_app_server import COMPACT_PROMPT_ENV, CONTEXT_WINDOW_ENV
+        from .codex_app_server import (
+            COMPACT_PROMPT_ENV,
+            CONTEXT_WINDOW_ENV,
+            LOCAL_COMPACTION_ENV,
+        )
 
-        context_window = custom_provider_context_window(command, codex_home)
-        if context_window is not None:
-            env[CONTEXT_WINDOW_ENV] = str(context_window)
-        else:
-            env.pop(CONTEXT_WINDOW_ENV, None)
-        if uses_pcr_compact_prompt(codex_home):
-            env[COMPACT_PROMPT_ENV] = "1"
-        else:
-            env.pop(COMPACT_PROMPT_ENV, None)
+        for key in (CONTEXT_WINDOW_ENV, COMPACT_PROMPT_ENV, LOCAL_COMPACTION_ENV):
+            env.pop(key, None)
+        env.update(custom_provider_environment(command, codex_home))
         process_options: Dict[str, Any] = {}
         if os.name == "posix":
             process_options["start_new_session"] = True

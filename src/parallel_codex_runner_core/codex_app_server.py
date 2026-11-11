@@ -37,6 +37,24 @@ CONTEXT_WINDOW_ENV = "PCR_MODEL_CONTEXT_WINDOW"
 # The worker sets this to "1" when Codex compacts the Agent's thread itself, as it
 # does on a custom provider (see app.uses_pcr_compact_prompt).
 COMPACT_PROMPT_ENV = "PCR_COMPACT_PROMPT"
+# Set to "1" for every Agent whose compactions are local (see
+# app.custom_provider_environment). Such a compaction keeps PCR's turn guidance
+# out of the rest of the turn, which on the fox relay ran for hours, so the
+# adapter injects it again. Codex adds injected items to the next model request
+# only if they arrive before that request is built; otherwise it holds them
+# until the model's final answer and then runs one more round for them, whose
+# answer would replace the Agent's. So the guidance is sent while a tool call has
+# been running for GUIDANCE_TOOL_SECONDS, and the next request carries it.
+LOCAL_COMPACTION_ENV = "PCR_LOCAL_COMPACTION"
+GUIDANCE_TOOL_SECONDS = 0.5
+GUIDANCE_AFTER_COMPACTION = (
+    "PCR repeats this turn's guidance because the context was compacted. Your earlier tool calls "
+    "and their results are no longer visible: continue with your tools as before, and use a "
+    "question tool only for a real question to the user. If you have already given your final "
+    "answer, give it again unchanged."
+)
+TOOL_ITEM_TYPES = frozenset({"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+                             "collabAgentToolCall", "webSearch"})
 # After a local compaction the next model keeps only the user's recent messages,
 # Codex's base context and a summary written to this prompt; PCR's turn guidance
 # and every tool call are dropped. Codex's own prompt asks for a concise summary:
@@ -588,6 +606,11 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
     questions: QuestionOwner | None = None
     async_deliveries: dict[int, tuple[str, dict[str, Any]]] = {}
     deferred_answers: set[str] = set()
+    # PCR guidance a local compaction dropped is injected again (LOCAL_COMPACTION_ENV).
+    restore_guidance = os.environ.get(LOCAL_COMPACTION_ENV) == "1" and additional_developer_instructions is not None
+    guidance_dropped = False
+    guidance_injections: set[int] = set()
+    running_tools: dict[str, float] = {}
     auth_enabled = False
     auth_pending: tuple[int, FileAuth] | None = None
     auth_handoff_turn: str | None = None
@@ -663,11 +686,13 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
                     "input": [{"type": "text", "text": async_reply(record, record["answers"])}]}})
 
     async def read_message() -> dict[str, Any]:
+        await restore_dropped_guidance()
         pending = asyncio.create_task(messages.readline())
         try:
             while not pending.done():
                 await asyncio.wait({pending}, timeout=PROCESS_POLL_SECONDS)
                 await deliver_answers()
+                await restore_dropped_guidance()
                 if not pending.done():
                     await follow_auth()
                 if not pending.done() and process.returncode is not None:
@@ -696,8 +721,59 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
         pending_message = None
         return value
 
+    def track_guidance(method: str, params: dict[str, Any]) -> None:
+        nonlocal guidance_dropped
+        if not restore_guidance or params.get("threadId") != adapter.thread_id:
+            return
+        if method == "turn/completed":
+            running_tools.clear()
+            guidance_dropped = False
+            return
+        if method not in {"item/started", "item/completed"} or params.get("turnId") != adapter.turn_id:
+            return
+        item = params.get("item") or {}
+        kind = item.get("type")
+        if method == "item/completed" and kind == "contextCompaction":
+            guidance_dropped = True
+            running_tools.clear()
+        elif method == "item/started" and kind in {"reasoning", "agentMessage", "agent_message"}:
+            # A new model response is underway, so its request was already built. Only
+            # tools it starts guarantee another request; background commands that were
+            # still running do not.
+            running_tools.clear()
+        elif kind in TOOL_ITEM_TYPES and item.get("id"):
+            if method == "item/started":
+                running_tools[str(item["id"])] = time.monotonic()
+            else:
+                running_tools.pop(str(item["id"]), None)
+
+    async def restore_dropped_guidance() -> None:
+        nonlocal guidance_dropped, sequence
+        if not (restore_guidance and guidance_dropped and adapter.turn_id and adapter.exit_code is None):
+            return
+        now = time.monotonic()
+        if not any(now - started >= GUIDANCE_TOOL_SECONDS for started in running_tools.values()):
+            return
+        guidance_dropped = False
+        sequence += 1
+        guidance_injections.add(sequence)
+        text = (f"<parallel_codex_runner>{GUIDANCE_AFTER_COMPACTION}\n\n"
+                f"{additional_developer_instructions}</parallel_codex_runner>")
+        await send({"id": sequence, "method": "thread/inject_items", "params": {
+            "threadId": adapter.thread_id,
+            "items": [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]}]}})
+        adapter.emit({"type": "pcr.guidance", "status": "restored_after_compaction", "turn_id": adapter.turn_id})
+
     async def handle(message: dict[str, Any]) -> int | None:
-        nonlocal questions, bound_auth, auth_pending, auth_error
+        nonlocal questions, bound_auth, auth_pending, auth_error, restore_guidance
+        if message.get("id") in guidance_injections and "method" not in message:
+            guidance_injections.discard(message["id"])
+            if "error" in message:
+                # This Codex cannot inject history items; the turn itself is unaffected.
+                restore_guidance = False
+                adapter.emit({"type": "pcr.guidance", "status": "not_restored", "error": message["error"]})
+            return None
+        track_guidance(str(message.get("method", "")), message.get("params") or {})
         if auth_pending is not None and message.get("id") == auth_pending[0] and "method" not in message:
             _, credential = auth_pending
             auth_pending = None

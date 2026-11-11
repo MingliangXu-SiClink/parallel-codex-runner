@@ -95,7 +95,7 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreadable_metadata_fails_before_submission(self):
         await self.assert_no_submission('"PCR guidance."', read_error=PermissionError("QA read failure"))
 
-    async def test_only_an_agent_on_a_custom_provider_gets_its_window_and_pcr_compact_prompt(self):
+    async def test_only_an_agent_on_a_custom_provider_gets_its_custom_provider_settings(self):
         for provider, window, compact in (("fox", "500000", "1"), (None, None, None)):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -120,13 +120,15 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
                 # Values the worker itself inherited never reach an Agent on OpenAI.
                 with patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "app-server", "CODEX_HOME": str(real),
                                              codex_app_server.CONTEXT_WINDOW_ENV: "1000",
-                                             codex_app_server.COMPACT_PROMPT_ENV: "1"}), \
+                                             codex_app_server.COMPACT_PROMPT_ENV: "1",
+                                             codex_app_server.LOCAL_COMPACTION_ENV: "1"}), \
                      patch.object(app, "resolve_codex_executable", return_value="codex"), \
                      patch.object(app.asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)):
                     await app.run_one_agent(1, workspace, meta, home, "input", command)
                 self.assertTrue(launched, "the Agent process was not launched")
                 self.assertEqual(launched.get(codex_app_server.CONTEXT_WINDOW_ENV), window)
                 self.assertEqual(launched.get(codex_app_server.COMPACT_PROMPT_ENV), compact)
+                self.assertEqual(launched.get(codex_app_server.LOCAL_COMPACTION_ENV), compact)
 
 
 class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
@@ -208,6 +210,85 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(thread["method"], "thread/resume" if resume else "thread/start")
                 self.assertEqual(thread["params"]["config"]["model_context_window"], 500000)
                 self.assertEqual(thread["params"]["config"]["compact_prompt"], codex_app_server.COMPACT_PROMPT)
+
+    async def run_turn_with(self, lines: list[bytes], *, local_compaction: bool = True, tool_seconds: float = 0.0):
+        """Run one adapter turn on these native messages after the start handshake.
+
+        By default a started tool counts as long-running at once, since these
+        messages arrive without delay.
+        """
+        process = self.process()
+        process.stdout.readuntil = AsyncMock(side_effect=[
+            b'{"id":1,"result":{"userAgent":"Codex Desktop/0.165.0 (test)"}}\n',
+            b'{"id":2,"result":{"thread":{"id":"session"}}}\n',
+            b'{"id":3,"result":{"turn":{"id":"turn"}}}\n',
+            *lines,
+            b'{"method":"item/completed","params":{"threadId":"session","turnId":"turn","item":{"type":"agentMessage","id":"answer","text":"done","phase":"final_answer"}}}\n',
+            b'{"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}}\n',
+        ])
+        environment = {"PCR_CODEX_RESUME_LOCK": ""}
+        if local_compaction:
+            environment[codex_app_server.LOCAL_COMPACTION_ENV] = "1"
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+             patch.object(codex_app_server, "GUIDANCE_TOOL_SECONDS", tool_seconds), \
+             patch.dict(os.environ, environment), contextlib.redirect_stdout(io.StringIO()) as events:
+            code = await codex_app_server.run(["codex", "exec", "-o", str(Path(tmp) / "final.md"), "-"],
+                                              "original input", additional_developer_instructions="PCR guidance.")
+        injections = [r for r in self.requests(process) if r.get("method") == "thread/inject_items"]
+        return code, injections, events.getvalue()
+
+    COMPACTED = b'{"method":"item/completed","params":{"threadId":"session","turnId":"turn","item":{"type":"contextCompaction","id":"c1"}}}\n'
+    TOOL_STARTED = b'{"method":"item/started","params":{"threadId":"session","turnId":"turn","item":{"type":"commandExecution","id":"x1","command":"ls","status":"inProgress"}}}\n'
+    TOOL_COMPLETED = b'{"method":"item/completed","params":{"threadId":"session","turnId":"turn","item":{"type":"commandExecution","id":"x1","command":"ls","status":"completed","exitCode":0}}}\n'
+
+    async def test_guidance_a_local_compaction_dropped_returns_with_the_next_tool_call(self):
+        # Regression: on the fox relay a local compaction removed PCR's turn guidance
+        # for the rest of a turn that ran about ten hours.
+        code, injections, _ = await self.run_turn_with([self.COMPACTED, self.TOOL_STARTED])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(injections), 1)
+        params = injections[0]["params"]
+        self.assertEqual(params["threadId"], "session")
+        [item] = params["items"]
+        self.assertEqual((item["type"], item["role"]), ("message", "developer"))
+        text = item["content"][0]["text"]
+        self.assertTrue(text.startswith("<parallel_codex_runner>" + codex_app_server.GUIDANCE_AFTER_COMPACTION))
+        self.assertTrue(text.endswith("PCR guidance.</parallel_codex_runner>"))
+
+    async def test_guidance_is_not_injected_without_a_local_compaction_or_a_following_tool_call(self):
+        cases = {"no compaction": ([self.TOOL_STARTED], True),
+                 "compaction then the final answer": ([self.COMPACTED], True),
+                 "server-side compaction": ([self.COMPACTED, self.TOOL_STARTED], False),
+                 "another turn's compaction": ([self.COMPACTED.replace(b'"turn"', b'"old"'), self.TOOL_STARTED], True)}
+        for name, (lines, local) in cases.items():
+            with self.subTest(name):
+                code, injections, _ = await self.run_turn_with(lines, local_compaction=local)
+                self.assertEqual((code, injections), (0, []))
+
+    async def test_a_command_still_running_from_before_the_compaction_does_not_carry_the_guidance(self):
+        # A background command keeps its item open while the model moves on, so it
+        # says nothing about whether another model request will follow.
+        background = self.TOOL_STARTED.replace(b'"x1"', b'"bg"')
+        code, injections, _ = await self.run_turn_with([background, self.COMPACTED])
+        self.assertEqual((code, injections), (0, []))
+
+    async def test_a_tool_that_finishes_at_once_never_carries_the_guidance(self):
+        # Codex would hold guidance that arrives after such a tool until the final
+        # answer and then add a round whose answer replaces the Agent's.
+        code, injections, _ = await self.run_turn_with(
+            [self.COMPACTED, self.TOOL_STARTED, self.TOOL_COMPLETED],
+            tool_seconds=codex_app_server.GUIDANCE_TOOL_SECONDS)
+        self.assertEqual((code, injections), (0, []))
+
+    async def test_a_codex_that_refuses_the_injection_keeps_its_turn(self):
+        code, injections, events = await self.run_turn_with([
+            self.COMPACTED, self.TOOL_STARTED,
+            b'{"id":4,"error":{"code":-32601,"message":"Method not found"}}\n',
+            self.COMPACTED, self.TOOL_STARTED.replace(b'"x1"', b'"x2"')])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(injections), 1)
+        self.assertIn('"status": "not_restored"', events)
 
     async def test_pending_initialization_or_resume_is_cancellable_without_submission(self):
         for pending_initialize in (True, False):
