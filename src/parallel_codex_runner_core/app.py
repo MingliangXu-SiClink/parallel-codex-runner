@@ -3983,6 +3983,34 @@ async def terminate_process(proc: Optional[asyncio.subprocess.Process], timeout:
 # -----------------------------------------------------------------------------
 
 
+def custom_provider_context_window(
+    command: list[str], codex_home: Path, real_codex_home: Path | None = None,
+) -> int | None:
+    """The catalog context window of the Agent's model when it runs on a custom provider.
+
+    Codex reads its model catalog only for the built-in OpenAI provider. Under an
+    API-key relay it assumes a default window instead (258,400 tokens for
+    gpt-6.1-sol rather than 475,000), so it compacts about twice as often, and a
+    compaction there keeps only a short local summary. A window the user set in
+    the Codex config is left alone.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+        import tomli as tomllib
+    from .codex_accounts import effective_model_provider
+
+    try:
+        config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if effective_model_provider(config) in (None, "openai") or "model_context_window" in config:
+        return None
+    model = next((command[i + 1] for i, arg in enumerate(command[:-1]) if arg in ("-m", "--model")), None)
+    info = CodexModelRegistry.load(real_codex_home or get_codex_home()).model_info(model or config.get("model"))
+    return info.context_window if info is not None else None
+
+
 def agent_process_environment(
     agent_workspace: Path,
     codex_home: Path,
@@ -4097,6 +4125,13 @@ async def run_one_agent(
         env = agent_process_environment(agent_workspace, codex_home, command[0])
         env["PCR_AGENT_STOP_FILES"] = json.dumps([str(signal.path) for signal in (cancel_event, agent_cancel_event)
                                                  if isinstance(getattr(signal, "path", None), Path)])
+        from .codex_app_server import CONTEXT_WINDOW_ENV
+
+        context_window = custom_provider_context_window(command, codex_home)
+        if context_window is not None:
+            env[CONTEXT_WINDOW_ENV] = str(context_window)
+        else:
+            env.pop(CONTEXT_WINDOW_ENV, None)
         process_options: Dict[str, Any] = {}
         if os.name == "posix":
             process_options["start_new_session"] = True

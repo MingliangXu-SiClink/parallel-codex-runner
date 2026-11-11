@@ -180,6 +180,44 @@ class AgentAccountInstallTests(unittest.TestCase):
         self.assertIn(str(store), message)
 
 
+class CustomProviderWindowTests(unittest.TestCase):
+    # Regression: on the fox relay Codex assumed 258,400 tokens for gpt-6.1-sol
+    # instead of the catalog's 475,000 and compacted about twice as often.
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.real, self.agent = root / "real", root / "agent"
+        self.real.mkdir()
+        self.agent.mkdir()
+        (self.real / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "gpt-6.1-sol", "context_window": 500000},
+            {"slug": "gpt-6-astra", "context_window": 272000},
+            {"slug": "gpt-bad-window", "context_window": True},
+            {"slug": "gpt-no-window"},
+        ]}), encoding="utf-8")
+        self.command = ["codex", "exec", "resume", "--model", "gpt-6.1-sol", "-o", "final.md", "thread", "-"]
+
+    def window(self, config: str, command: list[str] | None = None) -> int | None:
+        (self.agent / "config.toml").write_text(config, encoding="utf-8")
+        return app.custom_provider_context_window(command or self.command, self.agent, self.real)
+
+    def test_custom_provider_gets_the_catalog_window_of_the_agent_model(self) -> None:
+        fox = 'model = "gpt-6-astra"\nmodel_provider = "fox"\n\n[model_providers.fox]\nname = "fox"\n'
+        self.assertEqual(self.window(fox), 500000)  # the Agent's --model, not the config default
+        self.assertEqual(self.window(fox, ["codex", "exec", "-o", "final.md", "-"]), 272000)
+        for model in ("gpt-bad-window", "gpt-no-window", "unknown-model"):
+            self.assertIsNone(self.window(fox, ["codex", "exec", "-m", model, "-o", "final.md", "-"]), model)
+
+    def test_openai_and_a_user_set_window_are_left_to_codex(self) -> None:
+        self.assertIsNone(self.window('model = "gpt-6.1-sol"\n'))
+        self.assertIsNone(self.window('model_provider = "openai"\n'))
+        self.assertIsNone(self.window('model_provider = "fox"\nmodel_context_window = 128000\n'))
+        (self.agent / "config.toml").unlink()
+        self.assertIsNone(app.custom_provider_context_window(self.command, self.agent, self.real))
+
+
 class AccountStoreProviderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

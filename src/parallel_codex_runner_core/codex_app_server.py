@@ -31,6 +31,9 @@ RECOVERY_MAX_DELAY = 300.0
 # repeating each long line around a hunk; one edit to an 85 MB results file sent
 # a single message over 64 MiB.
 SUPPRESSED_NOTIFICATIONS = ["turn/diff/updated"]
+# The worker sets this to the model's catalog window when the Agent runs on a
+# custom provider (see app.custom_provider_context_window).
+CONTEXT_WINDOW_ENV = "PCR_MODEL_CONTEXT_WINDOW"
 RECOVERY_CONTEXT = (
     "PCR is recovering the same interrupted task in the original writable workspace and thread. "
     "The original user's request and permission boundaries still apply. This is not a new task. "
@@ -509,6 +512,10 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
                     recovery: AgentRecovery | None = None) -> int:
     attempt_started = time.monotonic()
     server, params, output, resume = parse_exec_command(command)
+    window = os.environ.get(CONTEXT_WINDOW_ENV, "")
+    if window.isdigit() and int(window) > 0:
+        # Codex reads the model catalog only for its built-in OpenAI provider.
+        params.setdefault("config", {})["model_context_window"] = int(window)
     question_channel = has_question_channel(output)
     if recovery is not None and recovery.state.get("thread_id"):
         resume = recovery.state["thread_id"]

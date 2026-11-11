@@ -30,6 +30,7 @@ class CodexModelInfo:
     default_effort: str | None
     supported_efforts: tuple[str, ...]
     visible: bool = True
+    context_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,7 @@ def _load_model_info(payload: Any) -> dict[str, CodexModelInfo]:
                 effort = _normalized_effort(raw_effort)
                 if effort and effort not in efforts:
                     efforts.append(effort)
+        window = record.get("context_window")
         models[slug] = CodexModelInfo(
             slug=slug,
             default_effort=_normalized_effort(
@@ -213,6 +215,7 @@ def _load_model_info(payload: Any) -> dict[str, CodexModelInfo]:
             ),
             supported_efforts=tuple(efforts),
             visible=record.get("visibility") != "hide",
+            context_window=window if type(window) is int and window > 0 else None,
         )
     return models
 

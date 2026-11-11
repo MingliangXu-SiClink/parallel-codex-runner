@@ -95,6 +95,35 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreadable_metadata_fails_before_submission(self):
         await self.assert_no_submission('"PCR guidance."', read_error=PermissionError("QA read failure"))
 
+    async def test_only_an_agent_on_a_custom_provider_is_given_its_model_window(self):
+        for provider, expected in (("fox", "500000"), (None, None)):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace, meta, real = root / "workspace", root / "meta", root / "real"
+                home = meta / "codex_home"
+                for path in (workspace, home, real):
+                    path.mkdir(parents=True)
+                (meta / "developer_instructions.json").write_text('"PCR guidance."', encoding="utf-8")
+                config = 'model = "gpt-6-astra"\n'
+                if provider:
+                    config += f'model_provider = "{provider}"\n\n[model_providers.{provider}]\nname = "{provider}"\n'
+                (home / "config.toml").write_text(config, encoding="utf-8")
+                (real / "models_cache.json").write_text(json.dumps(
+                    {"models": [{"slug": "gpt-6.1-sol", "context_window": 500000}]}), encoding="utf-8")
+                launched = {}
+
+                async def spawn(*args, captured=launched, **kwargs):
+                    captured.update(kwargs["env"])
+                    raise RuntimeError("environment captured")
+
+                command = ["codex", "exec", "--model", "gpt-6.1-sol", "-o", str(meta / "final_message.md"), "-"]
+                with patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "app-server", "CODEX_HOME": str(real)}), \
+                     patch.object(app, "resolve_codex_executable", return_value="codex"), \
+                     patch.object(app.asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)):
+                    await app.run_one_agent(1, workspace, meta, home, "input", command)
+                self.assertTrue(launched, "the Agent process was not launched")
+                self.assertEqual(launched.get(codex_app_server.CONTEXT_WINDOW_ENV), expected)
+
 
 class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
     def process(self):
@@ -148,6 +177,30 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                         "value": "PCR stage and isolation guidance."}})
                 self.assertIn('"phase": "resuming"' if resume else '"phase": "creating_thread"', events.getvalue())
                 self.assertEqual(output.read_text(), "done")
+                self.assertNotIn("model_context_window", settings.get("config") or {})
+
+    async def test_a_given_model_window_reaches_new_and_resumed_threads(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume), tempfile.TemporaryDirectory() as tmp:
+                process = self.process()
+                process.stdout.readuntil = AsyncMock(side_effect=[
+                    b'{"id":1,"result":{"userAgent":"Codex Desktop/0.165.0 (test)"}}\n',
+                    b'{"id":2,"result":{"thread":{"id":"session"}}}\n',
+                    b'{"id":3,"result":{"turn":{"id":"turn"}}}\n',
+                    b'{"method":"item/completed","params":{"threadId":"session","turnId":"turn","item":{"type":"agentMessage","id":"answer","text":"done","phase":"final_answer"}}}\n',
+                    b'{"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}}\n',
+                ])
+                command = ["codex", "exec", *(["resume", "session"] if resume else []), "-m", "gpt-6.1-sol",
+                           "-o", str(Path(tmp) / "final.md"), "-"]
+                with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+                     patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": "",
+                                             codex_app_server.CONTEXT_WINDOW_ENV: "500000"}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(await codex_app_server.run(command, "original input",
+                        additional_developer_instructions="PCR guidance."), 0)
+                thread = self.requests(process)[2]
+                self.assertEqual(thread["method"], "thread/resume" if resume else "thread/start")
+                self.assertEqual(thread["params"]["config"]["model_context_window"], 500000)
 
     async def test_pending_initialization_or_resume_is_cancellable_without_submission(self):
         for pending_initialize in (True, False):
