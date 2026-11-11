@@ -4,9 +4,11 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 
 from parallel_codex_runner_core.app import retained_execution_preparation
+from parallel_codex_runner_core.codex_auth import SOURCE_ENV
 from parallel_codex_runner_core.plugin_runtime import PluginRunManager
 from parallel_codex_runner_core.workspace import agent_execution_workspace
 
@@ -55,6 +57,11 @@ def main():
     version = importlib.metadata.version("parallel-codex-runner")
     if version not in {"0.1.92", "0.1.135"}:
         raise RuntimeError(f"Execute this recovery only with a verified runtime, got {version}")
+    if not os.environ.get(SOURCE_ENV):
+        # The replacement worker inherits this process's environment. Without
+        # pcrd's account source its Agents silently run on the system ~/.codex
+        # login instead of the account selected in PCR.
+        parser.error(f"{SOURCE_ENV} is unset; run with pcrd's environment (see its launchd plist)")
     manager = PluginRunManager(args.state_dir, detached_workers=True, run_maintenance=False)
     try:
         result = (manager.resume_interrupted_batch(args.run_id, args.agents,

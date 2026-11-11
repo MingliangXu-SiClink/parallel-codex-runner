@@ -37,8 +37,10 @@ from parallel_codex_runner_core.remote.filesystem import (
     RemoteFileSystemError,
 )
 from parallel_codex_runner_core.remote.devices import DeviceRegistry, DeviceRegistryError
+from parallel_codex_runner_core.codex_accounts import default_pcr_codex_home, pcr_codex_home
 from parallel_codex_runner_core.remote.daemon import (
     _configure_daemon_logging,
+    _default_account_source,
     _pair_device,
 )
 from parallel_codex_runner_core.remote.ipc import PcrdClient, PcrdServer
@@ -4859,6 +4861,38 @@ class LaunchAgentTests(unittest.TestCase):
                 installed = plistlib.load(stream)
             self.assertEqual(installed["ProcessType"], "Interactive")
             self.assertEqual(installed["ProgramArguments"], payload["ProgramArguments"])
+
+
+class PcrdAccountSourceTests(unittest.TestCase):
+    # Regression: only the launchd agent exported PCR_CODEX_AUTH_SOURCE. Under the
+    # systemd unit or a manually started pcrd, Agents silently kept the system
+    # ~/.codex login although the switcher saved the selection in PCR's store.
+
+    def test_both_service_managers_use_the_store_the_account_switcher_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = default_pcr_codex_home(root)
+            with mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True):
+                self.assertEqual(pcr_codex_home(), store)
+            launchd = launch_agent_payload(root / "state", home=root)["EnvironmentVariables"]
+            self.assertEqual(launchd["PCR_CODEX_AUTH_SOURCE"], str(store))
+            unit = systemd_user_unit_payload(root / "state", home=root)
+            self.assertIn(f'Environment="PCR_CODEX_AUTH_SOURCE={store}"', unit)
+
+    def test_pcrd_started_without_the_variable_hands_workers_that_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True):
+                self.assertEqual(_default_account_source(), default_pcr_codex_home(root))
+                # Workers are child processes: they must inherit it.
+                child = subprocess.run(
+                    [sys.executable, "-c", "import os; print(os.environ['PCR_CODEX_AUTH_SOURCE'])"],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertEqual(child.stdout.strip(), str(default_pcr_codex_home(root)))
+            with mock.patch.dict(os.environ, {"PCR_CODEX_AUTH_SOURCE": "/configured/home"}):
+                self.assertIsNone(_default_account_source())
+                self.assertEqual(os.environ["PCR_CODEX_AUTH_SOURCE"], "/configured/home")
 
 
 class SystemdUserServiceTests(unittest.TestCase):

@@ -25,6 +25,7 @@ from parallel_codex_runner_core.codex_accounts import (
     AccountProfile,
     PCRAccountStore,
     credential_kind,
+    default_pcr_codex_home,
     pcr_codex_home,
     with_top_level_model_provider,
 )
@@ -150,10 +151,33 @@ class AgentAccountInstallTests(unittest.TestCase):
 
     def test_without_a_pcr_selection_the_system_account_is_kept(self) -> None:
         self.select(API_KEY_AUTH, 'model_provider = "fox"\n')
-        with mock.patch.dict(os.environ, {}, clear=True):
+        app._warn_unused_pcr_account.cache_clear()
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}, clear=True), \
+             mock.patch.object(app, "logger") as log:
             app._inject_pcr_selected_auth(self.agent)
         self.assertEqual((self.agent / "auth.json").read_bytes(), CHATGPT_AUTH)
         self.assertEqual(self.agent_config(), SYSTEM_CONFIG)
+        log.warning.assert_not_called()  # PCR's own store holds no selection here
+
+    def test_an_account_selected_in_pcr_is_never_skipped_silently(self) -> None:
+        # Regression: a maintenance script started without pcrd's environment ran
+        # three synthesis Agents on the system ChatGPT login instead of the fox key.
+        store = default_pcr_codex_home(Path(self.tmp.name))
+        store.mkdir(parents=True)
+        (store / "auth.json").write_bytes(API_KEY_AUTH)
+        app._warn_unused_pcr_account.cache_clear()
+        self.addCleanup(app._warn_unused_pcr_account.cache_clear)
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}, clear=True), \
+             mock.patch.object(app, "logger") as log:
+            app._inject_pcr_selected_auth(self.agent)
+            app._inject_pcr_selected_auth(self.agent)
+        # Outside pcrd the system login stays; the user is told, once per process.
+        self.assertEqual((self.agent / "auth.json").read_bytes(), CHATGPT_AUTH)
+        self.assertEqual(self.agent_config(), SYSTEM_CONFIG)
+        log.warning.assert_called_once()
+        message = log.warning.call_args.args[0]
+        self.assertIn(SOURCE_ENV, message)
+        self.assertIn(str(store), message)
 
 
 class AccountStoreProviderTests(unittest.TestCase):

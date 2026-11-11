@@ -141,7 +141,7 @@ from .visible_paths import (
     record_session_workspace_mapping,
     rewrite_workspace_references,
 )
-from functools import wraps
+from functools import cache, wraps
 
 from .workspace import (
     WorkspaceSyncPreflightError,
@@ -736,6 +736,17 @@ def _write_private_file(path: Path, data: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+@cache
+def _warn_unused_pcr_account(store: str) -> None:
+    """Say once per process that Agents keep the system login, not PCR's selection."""
+    from .codex_auth import SOURCE_ENV
+
+    logger.warning(
+        f"{SOURCE_ENV} is not set, so Agents use the system Codex login (CODEX_HOME or ~/.codex) "
+        f"instead of the account selected in PCR ({store}). Start them through pcrd, or set "
+        f"{SOURCE_ENV} to that directory.")
+
+
 def _inject_pcr_selected_auth(agent_codex_home: Path) -> None:
     """Install the PCR-selected Codex account into an Agent's private home.
 
@@ -749,11 +760,18 @@ def _inject_pcr_selected_auth(agent_codex_home: Path) -> None:
     """
     from .codex_auth import SOURCE_ENV
     from .codex_accounts import (
-        require_selected_provider, selected_account_provider, with_top_level_model_provider,
+        default_pcr_codex_home, require_selected_provider, selected_account_provider,
+        with_top_level_model_provider,
     )
 
     pcr_source = os.environ.get(SOURCE_ENV)
     if not pcr_source:
+        # Not started through pcrd (the pcr CLI, the Codex plugin, a script):
+        # the system login stays, as before, but an account the user selected
+        # in PCR is never skipped silently.
+        dedicated = default_pcr_codex_home()
+        if (dedicated / "auth.json").is_file():
+            _warn_unused_pcr_account(str(dedicated))
         return
     selected = Path(pcr_source).expanduser()
     pcr_auth = selected / "auth.json"

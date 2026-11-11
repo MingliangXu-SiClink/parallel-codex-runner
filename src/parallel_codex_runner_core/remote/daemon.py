@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..codex_accounts import default_pcr_codex_home
+from ..codex_auth import SOURCE_ENV
 from .controller import RemoteController, default_remote_state_dir
 from .follow_up_queue import (
     TRANSIENT_COMMAND_CODES,
@@ -40,6 +42,22 @@ from .service import (
 
 MAX_DAEMON_LOG_BYTES = 5 * 1024 * 1024
 NOISY_DEPENDENCY_LOGGERS = ("httpx", "httpcore")
+
+
+def _default_account_source() -> Path | None:
+    """Give pcrd PCR's own account store when its service manager did not.
+
+    launchd exports PCR_CODEX_AUTH_SOURCE; a systemd unit installed by an older
+    PCR and a manually started pcrd do not. The workers inherit this process's
+    environment, and without the variable their Agents silently keep the
+    system ~/.codex login instead of the account selected in PCR.
+    Returns the path when it was applied here.
+    """
+    if os.environ.get(SOURCE_ENV):
+        return None
+    source = default_pcr_codex_home()
+    os.environ[SOURCE_ENV] = str(source)
+    return source
 
 
 def _configure_daemon_logging() -> None:
@@ -174,6 +192,9 @@ def build_parser() -> argparse.ArgumentParser:
 def _serve(state_dir: Path, socket_path: Path) -> int:
     _configure_daemon_logging()
     logger = logging.getLogger(__name__)
+    source = _default_account_source()
+    if source is not None:
+        logger.info("%s was not set; Agents use PCR's selected account from %s", SOURCE_ENV, source)
     controller = RemoteController(state_dir=state_dir)
     try:
         server = PcrdServer(socket_path, controller)

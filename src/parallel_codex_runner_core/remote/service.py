@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..codex_accounts import default_pcr_codex_home
+from ..codex_auth import SOURCE_ENV
 from ..codex_cli import codex_search_directories
 
 
@@ -72,10 +74,7 @@ def launch_agent_payload(
             "PATH": service_environment_path(home),
             # PCR uses its own dedicated Codex home, isolated from ~/.codex,
             # so that PCR account switching never touches the system account.
-            "PCR_CODEX_AUTH_SOURCE": str(
-                (home or Path.home()) / "Library" / "Application Support"
-                / "parallel-codex-runner" / "codex-home"
-            ),
+            SOURCE_ENV: str(default_pcr_codex_home(home)),
         },
         "StandardOutPath": str(logs / "pcrd.stdout.log"),
         "StandardErrorPath": str(logs / "pcrd.stderr.log"),
@@ -194,6 +193,8 @@ def systemd_user_unit_payload(
             "Type=simple",
             f"ExecStart={command}",
             f"Environment={_systemd_quote(f'PATH={service_path}')}",
+            # The same dedicated account store as the launchd agent.
+            f"Environment={_systemd_quote(f'{SOURCE_ENV}={default_pcr_codex_home(home)}')}",
             f"WorkingDirectory={_systemd_quote(str(home))}",
             "Restart=on-failure",
             "RestartSec=5",

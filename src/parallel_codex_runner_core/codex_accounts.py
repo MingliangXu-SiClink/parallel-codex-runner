@@ -50,18 +50,27 @@ def pcr_accounts_base(home: Path | None = None) -> Path:
     return app_support / "parallel-codex-runner" / "accounts"
 
 
+def default_pcr_codex_home(home: Path | None = None) -> Path:
+    """Where PCR keeps the selected account unless PCR_CODEX_AUTH_SOURCE names another home.
+
+    pcrd's service units export this path, and pcrd assumes it when started
+    without them, so the account switcher and the Agents agree on one store.
+    """
+    return pcr_accounts_base(home).parent / "codex-home"
+
+
 def pcr_codex_home(home: Path | None = None) -> Path:
     """The PCR-dedicated codex home where the active auth.json lives.
 
     Never the system ``~/.codex``: switching a PCR account must not rewrite the
     user's own Codex credential or provider, even when the service manager did
-    not export ``PCR_CODEX_AUTH_SOURCE`` (the Linux unit, a manual ``pcrd``).
+    not export ``PCR_CODEX_AUTH_SOURCE`` (an older Linux unit, a manual ``pcrd``).
     """
     from .codex_auth import SOURCE_ENV
     configured = os.environ.get(SOURCE_ENV)
     if configured:
         return Path(configured).expanduser().absolute()
-    return pcr_accounts_base(home).parent / "codex-home"
+    return default_pcr_codex_home(home)
 
 
 # ---------------------------------------------------------------------------
