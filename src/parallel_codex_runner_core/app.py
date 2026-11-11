@@ -3983,6 +3983,21 @@ async def terminate_process(proc: Optional[asyncio.subprocess.Process], timeout:
 # -----------------------------------------------------------------------------
 
 
+def _custom_provider_config(codex_home: Path) -> dict[str, Any] | None:
+    """The Agent's Codex config when it selects a provider other than OpenAI."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+        import tomli as tomllib
+    from .codex_accounts import effective_model_provider
+
+    try:
+        config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return None if effective_model_provider(config) in (None, "openai") else config
+
+
 def custom_provider_context_window(
     command: list[str], codex_home: Path, real_codex_home: Path | None = None,
 ) -> int | None:
@@ -3994,21 +4009,29 @@ def custom_provider_context_window(
     compaction there keeps only a short local summary. A window the user set in
     the Codex config is left alone.
     """
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-        import tomli as tomllib
-    from .codex_accounts import effective_model_provider
-
-    try:
-        config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if effective_model_provider(config) in (None, "openai") or "model_context_window" in config:
+    config = _custom_provider_config(codex_home)
+    if config is None or "model_context_window" in config:
         return None
     model = next((command[i + 1] for i, arg in enumerate(command[:-1]) if arg in ("-m", "--model")), None)
     info = CodexModelRegistry.load(real_codex_home or get_codex_home()).model_info(model or config.get("model"))
     return info.context_window if info is not None else None
+
+
+def uses_pcr_compact_prompt(codex_home: Path) -> bool:
+    """Whether the Agent's compactions should follow PCR's prompt instead of Codex's.
+
+    On a custom provider Codex compacts a thread itself, into a summary written
+    to its compaction prompt, which asks for a concise one (see
+    codex_app_server.COMPACT_PROMPT). A prompt the user set in the Codex config,
+    or in its selected profile, is left alone.
+    """
+    config = _custom_provider_config(codex_home)
+    if config is None:
+        return False
+    profiles, profile = config.get("profiles"), config.get("profile")
+    selected = profiles.get(profile) if isinstance(profiles, dict) and isinstance(profile, str) else None
+    return not any(key in scope for scope in (config, selected) if isinstance(scope, dict)
+                   for key in ("compact_prompt", "experimental_compact_prompt_file"))
 
 
 def agent_process_environment(
@@ -4125,13 +4148,17 @@ async def run_one_agent(
         env = agent_process_environment(agent_workspace, codex_home, command[0])
         env["PCR_AGENT_STOP_FILES"] = json.dumps([str(signal.path) for signal in (cancel_event, agent_cancel_event)
                                                  if isinstance(getattr(signal, "path", None), Path)])
-        from .codex_app_server import CONTEXT_WINDOW_ENV
+        from .codex_app_server import COMPACT_PROMPT_ENV, CONTEXT_WINDOW_ENV
 
         context_window = custom_provider_context_window(command, codex_home)
         if context_window is not None:
             env[CONTEXT_WINDOW_ENV] = str(context_window)
         else:
             env.pop(CONTEXT_WINDOW_ENV, None)
+        if uses_pcr_compact_prompt(codex_home):
+            env[COMPACT_PROMPT_ENV] = "1"
+        else:
+            env.pop(COMPACT_PROMPT_ENV, None)
         process_options: Dict[str, Any] = {}
         if os.name == "posix":
             process_options["start_new_session"] = True

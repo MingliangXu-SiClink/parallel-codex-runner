@@ -34,6 +34,36 @@ SUPPRESSED_NOTIFICATIONS = ["turn/diff/updated"]
 # The worker sets this to the model's catalog window when the Agent runs on a
 # custom provider (see app.custom_provider_context_window).
 CONTEXT_WINDOW_ENV = "PCR_MODEL_CONTEXT_WINDOW"
+# The worker sets this to "1" when Codex compacts the Agent's thread itself, as it
+# does on a custom provider (see app.uses_pcr_compact_prompt).
+COMPACT_PROMPT_ENV = "PCR_COMPACT_PROMPT"
+# After a local compaction the next model keeps only the user's recent messages,
+# Codex's base context and a summary written to this prompt; PCR's turn guidance
+# and every tool call are dropped. Codex's own prompt asks for a concise summary:
+# on the fox relay those were 1.4-2.5 KB, and Agents then re-read what they had
+# already checked, asked the user again questions that were still open, and often
+# probed their tools (a wait on a made-up cell, a question) instead of using them.
+COMPACT_PROMPT = """\
+You are performing a CONTEXT CHECKPOINT COMPACTION. Write a handoff summary for another model that will continue this task in your place.
+
+After this checkpoint, that model sees only the user's most recent messages and your summary. Your own messages, every tool call and its output, the files you read, and the questions you asked will be gone. Anything you leave out has to be found again, or it is lost. Be complete and exact rather than brief.
+
+Write in the language the user writes in. Copy file paths, hosts, commands, process and job IDs, URLs, numbers and scores exactly. Never copy a secret such as a key, token or password; say where it is kept instead.
+
+Cover each of these that applies:
+
+1. Task and instructions: the user's current request, and every instruction, constraint and preference that still applies, quoting the user where the exact words matter. Say which requests are finished and which are still open.
+2. Environment rules: rules for this environment that still apply, from the system, the developer or the program running you, such as which workspace to use and what must not be touched. They may not be shown to the next model.
+3. Current state: what has been done, what was in progress at this checkpoint, and exactly where it stands, for example edited but not tested, or submitted but not checked.
+4. Verified facts: results, measurements and findings that were confirmed, each with its exact value and where it is recorded (a file, a log, or a command and its output). The next model should rely on these instead of checking them again. List anything unconfirmed separately, labelled as unconfirmed.
+5. Work still running: background processes, remote jobs, training runs and long commands, with their IDs, hosts, log or output paths, how to check on them, and when they should finish. Say which must not be stopped or started again.
+6. Questions to the user: every question you asked, in a message or with a tool such as request_user_input or request_user_input_async, with its wording and whether it has been answered. Give each answer you received. For an unanswered question, say how the work continues until the answer arrives, and say so if the user's instructions already settle it. The next model must not ask these questions again.
+7. Decisions and dead ends: what was decided and why, and which approaches failed or were rejected and why, so they are not tried again.
+8. Files: files created, changed or deleted, and the files to read first, with their paths.
+9. How to use the tools: how you run commands, edit files and wait for results here, with one short tool call that worked, copied exactly. Note any call format that was rejected, and the form that works instead.
+10. Next steps: the specific actions that come next, in order.
+
+Don't retell the history step by step, and don't pad. Include everything the next model needs to continue without redoing work, and leave out what no longer matters."""
 RECOVERY_CONTEXT = (
     "PCR is recovering the same interrupted task in the original writable workspace and thread. "
     "The original user's request and permission boundaries still apply. This is not a new task. "
@@ -516,6 +546,8 @@ async def _run_once(command: list[str], prompt: str, *, additional_developer_ins
     if window.isdigit() and int(window) > 0:
         # Codex reads the model catalog only for its built-in OpenAI provider.
         params.setdefault("config", {})["model_context_window"] = int(window)
+    if os.environ.get(COMPACT_PROMPT_ENV) == "1":
+        params.setdefault("config", {})["compact_prompt"] = COMPACT_PROMPT
     question_channel = has_question_channel(output)
     if recovery is not None and recovery.state.get("thread_id"):
         resume = recovery.state["thread_id"]

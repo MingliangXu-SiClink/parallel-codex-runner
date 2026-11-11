@@ -218,6 +218,30 @@ class CustomProviderWindowTests(unittest.TestCase):
         self.assertIsNone(app.custom_provider_context_window(self.command, self.agent, self.real))
 
 
+class CustomProviderCompactPromptTests(unittest.TestCase):
+    # Regression: on the fox relay Codex's concise local summaries dropped the
+    # questions an Agent had asked, and it asked the user the same ones again.
+
+    def uses(self, config: str | None) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            if config is not None:
+                (Path(tmp) / "config.toml").write_text(config, encoding="utf-8")
+            return app.uses_pcr_compact_prompt(Path(tmp))
+
+    def test_an_agent_on_a_custom_provider_gets_pcr_compact_prompt(self) -> None:
+        self.assertTrue(self.uses('model_provider = "fox"\n\n[model_providers.fox]\nname = "fox"\n'))
+        self.assertTrue(self.uses('profile = "relay"\n\n[profiles.relay]\nmodel_provider = "fox"\n'))
+
+    def test_openai_and_a_compact_prompt_the_user_set_are_left_to_codex(self) -> None:
+        for config in (None, "not toml =", 'model = "gpt-6.1-sol"\n', 'model_provider = "openai"\n',
+                       'model_provider = "fox"\nprofile = "direct"\n\n[profiles.direct]\nmodel_provider = "openai"\n',
+                       'model_provider = "fox"\ncompact_prompt = "Mine."\n',
+                       'model_provider = "fox"\nexperimental_compact_prompt_file = "/tmp/prompt.md"\n',
+                       'profile = "relay"\n\n[profiles.relay]\nmodel_provider = "fox"\ncompact_prompt = "Mine."\n'):
+            with self.subTest(config=config):
+                self.assertFalse(self.uses(config))
+
+
 class AccountStoreProviderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

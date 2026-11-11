@@ -95,8 +95,8 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreadable_metadata_fails_before_submission(self):
         await self.assert_no_submission('"PCR guidance."', read_error=PermissionError("QA read failure"))
 
-    async def test_only_an_agent_on_a_custom_provider_is_given_its_model_window(self):
-        for provider, expected in (("fox", "500000"), (None, None)):
+    async def test_only_an_agent_on_a_custom_provider_gets_its_window_and_pcr_compact_prompt(self):
+        for provider, window, compact in (("fox", "500000", "1"), (None, None, None)):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 workspace, meta, real = root / "workspace", root / "meta", root / "real"
@@ -117,12 +117,16 @@ class RequiredInstructionMetadataTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("environment captured")
 
                 command = ["codex", "exec", "--model", "gpt-6.1-sol", "-o", str(meta / "final_message.md"), "-"]
-                with patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "app-server", "CODEX_HOME": str(real)}), \
+                # Values the worker itself inherited never reach an Agent on OpenAI.
+                with patch.dict(os.environ, {"PCR_CODEX_TRANSPORT": "app-server", "CODEX_HOME": str(real),
+                                             codex_app_server.CONTEXT_WINDOW_ENV: "1000",
+                                             codex_app_server.COMPACT_PROMPT_ENV: "1"}), \
                      patch.object(app, "resolve_codex_executable", return_value="codex"), \
                      patch.object(app.asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)):
                     await app.run_one_agent(1, workspace, meta, home, "input", command)
                 self.assertTrue(launched, "the Agent process was not launched")
-                self.assertEqual(launched.get(codex_app_server.CONTEXT_WINDOW_ENV), expected)
+                self.assertEqual(launched.get(codex_app_server.CONTEXT_WINDOW_ENV), window)
+                self.assertEqual(launched.get(codex_app_server.COMPACT_PROMPT_ENV), compact)
 
 
 class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
@@ -178,8 +182,9 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('"phase": "resuming"' if resume else '"phase": "creating_thread"', events.getvalue())
                 self.assertEqual(output.read_text(), "done")
                 self.assertNotIn("model_context_window", settings.get("config") or {})
+                self.assertNotIn("compact_prompt", settings.get("config") or {})
 
-    async def test_a_given_model_window_reaches_new_and_resumed_threads(self):
+    async def test_custom_provider_settings_reach_new_and_resumed_threads(self):
         for resume in (False, True):
             with self.subTest(resume=resume), tempfile.TemporaryDirectory() as tmp:
                 process = self.process()
@@ -194,13 +199,15 @@ class LiveInstructionTests(unittest.IsolatedAsyncioTestCase):
                            "-o", str(Path(tmp) / "final.md"), "-"]
                 with patch.object(codex_app_server.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
                      patch.dict(os.environ, {"PCR_CODEX_RESUME_LOCK": "",
-                                             codex_app_server.CONTEXT_WINDOW_ENV: "500000"}), \
+                                             codex_app_server.CONTEXT_WINDOW_ENV: "500000",
+                                             codex_app_server.COMPACT_PROMPT_ENV: "1"}), \
                      contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(await codex_app_server.run(command, "original input",
                         additional_developer_instructions="PCR guidance."), 0)
                 thread = self.requests(process)[2]
                 self.assertEqual(thread["method"], "thread/resume" if resume else "thread/start")
                 self.assertEqual(thread["params"]["config"]["model_context_window"], 500000)
+                self.assertEqual(thread["params"]["config"]["compact_prompt"], codex_app_server.COMPACT_PROMPT)
 
     async def test_pending_initialization_or_resume_is_cancellable_without_submission(self):
         for pending_initialize in (True, False):
